@@ -32,7 +32,7 @@ type mockBundleFinalizer struct {
 	mu        sync.Mutex
 }
 
-func (m *mockBundleFinalizer) RegisterCallback(cb func() error) {
+func (m *mockBundleFinalizer) RegisterCallback(_ time.Duration, cb func() error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.callbacks = append(m.callbacks, cb)

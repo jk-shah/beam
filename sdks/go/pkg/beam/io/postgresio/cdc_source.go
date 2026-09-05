@@ -25,13 +25,11 @@ import (
 	"time"
 
 	"github.com/apache/beam/sdks/v2/go/pkg/beam"
-	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/util/reflectx"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/log"
 )
 
 func init() {
 	beam.RegisterType(reflect.TypeOf((*cdcSourceFn)(nil)).Elem())
-	reflectx.RegisterStructWrapper(reflect.TypeOf((*cdcSourceFn)(nil)).Elem())
 }
 
 // cdcSourceFn is a single-consumer DoFn that establishes a logical replication
@@ -47,7 +45,7 @@ func newCDCSourceFn(opts CDCOptions) *cdcSourceFn {
 }
 
 // ProcessElement connects to the PostgreSQL replication slot and emits change events.
-func (fn *cdcSourceFn) ProcessElement(ctx context.Context, _ int, emit func(ChangeEvent), bf beam.BundleFinalizer) error {
+func (fn *cdcSourceFn) ProcessElement(ctx context.Context, _ int, emit func(ChangeEvent), bf beam.BundleFinalization) error {
 	var stream ReplicationStream
 	var err error
 
@@ -105,7 +103,7 @@ func (fn *cdcSourceFn) ProcessElement(ctx context.Context, _ int, emit func(Chan
 
 	// Register bundle commit callback to safely advance confirmedCommittedLSN
 	if bf != nil {
-		bf.RegisterCallback(func() error {
+		bf.RegisterCallback(60*time.Second, func() error {
 			bundleLSN := atomic.LoadUint64(&currentBundleMaxLSN)
 			if bundleLSN > atomic.LoadUint64(&confirmedCommittedLSN) {
 				atomic.StoreUint64(&confirmedCommittedLSN, bundleLSN)
