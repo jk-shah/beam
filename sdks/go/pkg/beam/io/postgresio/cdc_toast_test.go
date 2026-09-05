@@ -16,6 +16,7 @@
 package postgresio
 
 import (
+	"reflect"
 	"testing"
 	"time"
 
