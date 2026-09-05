@@ -13,21 +13,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package main demonstrates an enterprise data reconciliation and delta diff
+// Package main demonstrates an advanced enterprise data reconciliation and delta diff
 // pipeline using Apache Beam with PostgreSQL.
 //
-// Spark Equivalent:
-//
-//	val fullJoin = sourceDf.as("s").join(targetDf.as("t"), $"s.id" === $"t.id", "full_outer")
-//	val audited = fullJoin.withColumn("status",
-//	  when($"s.id".isNull, "MISSING_SOURCE")
-//	  .when($"t.id".isNull, "MISSING_TARGET")
-//	  .when($"s.checksum" =!= $"t.checksum", "VALUE_DRIFT")
-//	  .otherwise("MATCH")
-//	).filter($"status" =!= "MATCH")
-//	audited.write.format("jdbc").mode("overwrite").save()
-//
-// Use Case:
+// Pattern:
+// Ingest snapshot records from both a source table and a target table, execute a full
+// outer co-grouping via CoGroupByKey on primary record ID, detect discrepancies
+// (MATCH, MISSING_TARGET, MISSING_SOURCE, VALUE_DRIFT), and write the audit log to PostgreSQL.
 // Validating data replication accuracy, audit compliance, and identifying value
 // drift between operational primary tables and reporting replicas or warehouses.
 package main

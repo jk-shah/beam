@@ -13,17 +13,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package main demonstrates a windowed Top-N ranking per category pipeline
+// Package main demonstrates an advanced windowed Top-N ranking per category pipeline
 // using Apache Beam with PostgreSQL.
 //
-// Spark Equivalent:
-//
-//	val windowSpec = Window.partitionBy("category").orderBy(col("sales_volume").desc)
-//	df.withColumn("rank", dense_rank().over(windowSpec))
-//	  .filter(col("rank") <= 3)
-//	  .write.format("jdbc").mode("overwrite").save()
-//
-// Use Case:
+// Pattern:
+// Partition catalog records by category, apply memory-bounded sorting within each
+// discrete partition, assign deterministic ranking positions (rank 1..N), filter to
+// the top K products, and write to PostgreSQL with atomic ON CONFLICT upsert.
 // Identifying the top-performing products, merchants, or campaigns within each
 // discrete partition or department is a fundamental analytical operation across
 // merchandising and catalog management.

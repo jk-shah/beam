@@ -13,17 +13,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package main demonstrates a machine learning feature engineering and normalization
+// Package main demonstrates an advanced machine learning feature engineering and normalization
 // pipeline using Apache Beam with PostgreSQL.
 //
-// Spark Equivalent (MLlib):
-//
-//	val scaler = new StandardScaler().setInputCol("features").setOutputCol("scaled_features")
-//	val minMax = new MinMaxScaler().setInputCol("features").setOutputCol("norm_features")
-//	val pipeline = new Pipeline().setStages(Array(scaler, minMax))
-//	pipeline.fit(df).transform(df).write.format("jdbc").mode("overwrite").save()
-//
-// Use Case:
+// Pattern:
+// Compute global population statistics (min, max, mean, standard deviation) across
+// input entities, pass statistics as a side input to a feature transformer DoFn,
+// and apply MinMax scaling [0, 1] and Z-score standardization to generate normalized features.
 // ML training and inference pipelines require numeric features scaled into bounded
 // distributions (Min-Max normalization [0, 1] and Z-Score standardization) to prevent
 // gradient divergence and weight dominance.

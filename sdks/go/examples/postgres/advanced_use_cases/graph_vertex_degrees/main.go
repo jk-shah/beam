@@ -13,19 +13,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package main demonstrates a graph degree and topological centrality pipeline
+// Package main demonstrates an advanced graph degree and topological centrality pipeline
 // using Apache Beam with PostgreSQL.
 //
-// Spark Equivalent (GraphX / GraphFrames):
-//
-//	val graph = GraphFrame(vertices, edges)
-//	val inDeg = graph.inDegrees
-//	val outDeg = graph.outDegrees
-//	val summary = inDeg.join(outDeg, "id")
-//	  .withColumn("total_degree", col("inDegree") + col("outDegree"))
-//	  .write.format("jdbc").mode("overwrite").save()
-//
-// Use Case:
+// Pattern:
+// Ingest directed edges from PostgreSQL, decompose each edge into directional degree
+// and weight contributions, aggregate contributions per vertex via distributed GroupByKey,
+// and compute in-degree, out-degree, total degree, and average edge weight.
 // Computing network topology, node influence, and connectivity in fraud detection
 // networks, telecommunication graphs, and recommendation engines.
 package main

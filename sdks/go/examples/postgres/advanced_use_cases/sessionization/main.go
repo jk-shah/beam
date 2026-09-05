@@ -13,16 +13,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package main demonstrates a user activity sessionization pipeline
+// Package main demonstrates an advanced user activity sessionization pipeline
 // using Apache Beam with PostgreSQL.
 //
-// Spark Equivalent:
-//
-//	df.groupBy(session_window(col("timestamp"), "30 minutes"), col("user_id"))
-//	  .agg(count("*").as("event_count"), min("timestamp").as("session_start"), max("timestamp").as("session_end"))
-//	  .write.format("jdbc").mode("overwrite").save()
-//
-// Use Case:
+// Pattern:
+// Collect user event logs, sort events chronologically per user, delimit new session
+// boundaries when the inactivity gap exceeds a threshold (e.g. 30 minutes), calculate
+// session start, session end, duration in seconds, event count, and bounce flags.
 // Web and mobile analytics aggregate clickstream event logs into continuous user
 // sessions, delimiting new sessions whenever user inactivity exceeds a duration
 // threshold (e.g. 30 minutes).

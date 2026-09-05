@@ -340,3 +340,9 @@ go run sdks/go/examples/postgres/dead_letter_queue/main.go \
 ```
 
 For Cloud SQL or AlloyDB private IP deployments, ensure the Dataflow worker subnet has Private Google Access or VPC peering enabled to reach the PostgreSQL private IP address.
+
+---
+
+## Advanced Distributed Analytical Use Cases
+
+For advanced analytical workloads (multi-dimensional OLAP cubes, Top-N partition ranking, graph degree centrality, statistical feature scaling, sessionization, and data reconciliation diffs), see the dedicated reference implementations in [`advanced_use_cases/`](./advanced_use_cases/).

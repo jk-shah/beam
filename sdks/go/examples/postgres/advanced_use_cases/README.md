@@ -9,30 +9,29 @@
 
       http://www.apache.org/licenses/LICENSE-2.0
 
-    Unless required by applicable law or agreed to in writing,
-    software distributed under the License is distributed on an
-    "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-    KIND, either express or implied.  See the License for the
-    specific language governing permissions and limitations
-    under the License.
+    Unless required by applicable law or agreed to in writing, software
+    distributed under the License is distributed on an "AS IS" BASIS,
+    WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+    See the License for the specific language governing permissions and
+    limitations under the License.
 -->
 
-# Apache Beam Go: Apache Spark Workload Migration Patterns for PostgreSQL
+# Apache Beam Go: Advanced Data Processing Use Cases for PostgreSQL
 
-This library provides production reference implementations for translating the six most prevalent Apache Spark data processing workloads into native Apache Beam Go pipelines using PostgreSQL as the source and sink via `postgresio`.
+This library provides production reference implementations for six advanced distributed data processing use cases using Apache Beam Go with PostgreSQL as both the source and sink via `postgresio`.
 
 ---
 
-## Spark vs. Beam Architectural Mapping Matrix
+## Advanced Use Cases Architecture Matrix
 
-| Spark Architecture / API | Beam Go Implementation | Target PostgreSQL Table | Engineering Trade-offs & Benefits |
+| Advanced Use Case | Beam Go Implementation | Target PostgreSQL Table | Engineering Characteristics |
 | :--- | :--- | :--- | :--- |
-| **1. Multi-Dimensional OLAP Cube**<br>`df.groupBy("region", "category").agg(...)` | Composite Keying (`Region\|Category`) + `beam.GroupByKey` + `aggregateOlapCubeFn` | [`public.olap_sales_cube`](#database-prerequisites--ddl) | Eliminates Spark driver shuffle spill; executes memory-bounded incremental rollup and atomic upsert. |
-| **2. Window Function Top-N per Group**<br>`dense_rank().over(partitionBy("cat").orderBy($"sales".desc))` | Partition by Category + `beam.GroupByKey` + bounded memory sort/heap ranking | [`public.top_products_by_category`](#database-prerequisites--ddl) | Deterministic ranking per partition; bounded heap prevents JVM GC pauses; atomic `(category, rank)` upsert. |
-| **3. Graph Topology & Centrality (GraphX)**<br>`graph.inDegrees.join(graph.outDegrees)` | Edge fan-out to directional degree deltas + `beam.GroupByKey` + `aggregateNodeCentralityFn` | [`public.graph_node_centrality`](#database-prerequisites--ddl) | Replaces heavy GraphX Pregel iterations with single-pass distributed MapReduce vertex combining. |
-| **4. Feature Engineering & Scaling (MLlib)**<br>`StandardScaler` + `MinMaxScaler` | Global population combiner + Beam Side Input + `normalizeFeaturesFn` | [`public.ml_feature_store`](#database-prerequisites--ddl) | Scales features into bounded distributions `[0, 1]` and Z-scores without multi-pass Spark DataFrame caching. |
-| **5. Inactivity Gap Sessionization**<br>`groupBy(session_window($"time", "30 mins"), $"user")` | User event stream sorting + delta time gap evaluation (`timeSinceLast > 30m`) | [`public.user_session_summaries`](#database-prerequisites--ddl) | Direct stream-to-session bounding; captures bounce visits (`event_count == 1`) and session durations in seconds. |
-| **6. Data Reconciliation & Table Diff**<br>`sourceDf.join(targetDf, Seq("id"), "full_outer")` | Outer join via `beam.CoGroupByKey` + anti-join checksum validation DoFn | [`public.data_reconciliation_audit`](#database-prerequisites--ddl) | Audits replication fidelity, pinpointing `MISSING_TARGET`, `MISSING_SOURCE`, and `VALUE_DRIFT` records. |
+| **1. Multi-Dimensional OLAP Cube**<br>Multi-dimensional categorical rollup | Composite Keying (`Region\|Category`) + `beam.GroupByKey` + `aggregateOlapCubeFn` | [`public.olap_sales_cube`](#database-prerequisites--ddl) | Incremental rollup aggregation with memory-bounded execution and atomic upsert on `(region, category)`. |
+| **2. Window Function Top-N per Group**<br>Partition ranking & truncation | Partition by Category + `beam.GroupByKey` + bounded sort/heap ranking | [`public.top_products_by_category`](#database-prerequisites--ddl) | Deterministic ranking per category partition; bounded heap prevents allocation spikes; atomic `(category, rank_position)` upsert. |
+| **3. Graph Topology & Centrality**<br>Directed edge degree aggregation | Edge fan-out to directional degree deltas + `beam.GroupByKey` + `aggregateNodeCentralityFn` | [`public.graph_node_centrality`](#database-prerequisites--ddl) | Computes in-degree, out-degree, total degree, and average edge weights in a single-pass distributed MapReduce pipeline. |
+| **4. Feature Engineering & Scaling**<br>Statistical distribution normalization | Global population combiner + Beam Side Input + `normalizeFeaturesFn` | [`public.ml_feature_store`](#database-prerequisites--ddl) | Normalizes features into bounded distributions `[0, 1]` and Z-scores using population statistics side inputs. |
+| **5. Inactivity Gap Sessionization**<br>Dynamic session timeout bounding | User event stream sorting + delta time gap evaluation (`timeSinceLast > 30m`) | [`public.user_session_summaries`](#database-prerequisites--ddl) | Time-bounded stream grouping; captures single-click bounces (`is_bounce = true`) and session durations in seconds. |
+| **6. Data Reconciliation & Table Diff**<br>Full outer co-grouping & anti-join | Outer join via `beam.CoGroupByKey` + anti-join checksum validation DoFn | [`public.data_reconciliation_audit`](#database-prerequisites--ddl) | Audits replication fidelity, classifying records as `MATCH`, `VALUE_DRIFT`, `MISSING_TARGET`, or `MISSING_SOURCE`. |
 
 ---
 
@@ -117,7 +116,7 @@ GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO beam_test;
 - **File**: [`multi_dimensional_olap/main.go`](./multi_dimensional_olap/main.go)
 - **Execution Command**:
   ```bash
-  go run sdks/go/examples/postgres/spark_patterns/multi_dimensional_olap/main.go \
+  go run sdks/go/examples/postgres/advanced_use_cases/multi_dimensional_olap/main.go \
       --database=postgres --username=beam_test --password=beam_test
   ```
 
@@ -125,7 +124,7 @@ GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO beam_test;
 - **File**: [`top_n_ranking/main.go`](./top_n_ranking/main.go)
 - **Execution Command**:
   ```bash
-  go run sdks/go/examples/postgres/spark_patterns/top_n_ranking/main.go \
+  go run sdks/go/examples/postgres/advanced_use_cases/top_n_ranking/main.go \
       --top_k=3 --database=postgres --username=beam_test --password=beam_test
   ```
 
@@ -133,7 +132,7 @@ GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO beam_test;
 - **File**: [`graph_vertex_degrees/main.go`](./graph_vertex_degrees/main.go)
 - **Execution Command**:
   ```bash
-  go run sdks/go/examples/postgres/spark_patterns/graph_vertex_degrees/main.go \
+  go run sdks/go/examples/postgres/advanced_use_cases/graph_vertex_degrees/main.go \
       --database=postgres --username=beam_test --password=beam_test
   ```
 
@@ -141,7 +140,7 @@ GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO beam_test;
 - **File**: [`ml_feature_engineering/main.go`](./ml_feature_engineering/main.go)
 - **Execution Command**:
   ```bash
-  go run sdks/go/examples/postgres/spark_patterns/ml_feature_engineering/main.go \
+  go run sdks/go/examples/postgres/advanced_use_cases/ml_feature_engineering/main.go \
       --database=postgres --username=beam_test --password=beam_test
   ```
 
@@ -149,7 +148,7 @@ GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO beam_test;
 - **File**: [`sessionization/main.go`](./sessionization/main.go)
 - **Execution Command**:
   ```bash
-  go run sdks/go/examples/postgres/spark_patterns/sessionization/main.go \
+  go run sdks/go/examples/postgres/advanced_use_cases/sessionization/main.go \
       --gap_minutes=30 --database=postgres --username=beam_test --password=beam_test
   ```
 
@@ -157,6 +156,6 @@ GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO beam_test;
 - **File**: [`data_reconciliation_diff/main.go`](./data_reconciliation_diff/main.go)
 - **Execution Command**:
   ```bash
-  go run sdks/go/examples/postgres/spark_patterns/data_reconciliation_diff/main.go \
+  go run sdks/go/examples/postgres/advanced_use_cases/data_reconciliation_diff/main.go \
       --database=postgres --username=beam_test --password=beam_test
   ```

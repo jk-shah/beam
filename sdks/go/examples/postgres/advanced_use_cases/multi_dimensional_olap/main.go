@@ -13,19 +13,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package main demonstrates a multi-dimensional OLAP aggregation and rollup pipeline
+// Package main demonstrates an advanced multi-dimensional OLAP aggregation and rollup pipeline
 // using Apache Beam with PostgreSQL.
 //
-// Spark Equivalent:
-//
-//	df.groupBy("region", "category").agg(
-//	    sum("amount").as("total_revenue"),
-//	    count("transaction_id").as("order_count"),
-//	    avg("amount").as("avg_order_value"),
-//	    max("amount").as("max_order_value")
-//	).write.format("jdbc").mode("overwrite").save()
-//
-// Use Case:
+// Pattern:
+// Ingest granular transactions, aggregate across multiple orthogonal dimensions
+// (region and category), compute statistical rollups (total revenue, count, average,
+// and max order value), and write atomic multi-dimensional cube records to PostgreSQL.
 // Multi-dimensional aggregations summarize high-volume transactions into regional
 // and categorical performance metrics for executive reporting and BI dashboards.
 package main
