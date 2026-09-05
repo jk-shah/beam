@@ -65,17 +65,21 @@ type ColumnDef struct {
 
 // PgOutputParser parses binary pgoutput protocol messages into ChangeEvent objects.
 type PgOutputParser struct {
-	relations      map[uint32]*RelationDef
-	currentXID     uint32
-	currentLSN     uint64
-	currentTxTime  time.Time
-	mu             sync.RWMutex
+	relations           map[uint32]*RelationDef
+	currentXID          uint32
+	currentLSN          uint64
+	currentTxTime       time.Time
+	currentOrigin       string
+	inStream            bool
+	spooledTransactions map[uint32][]*ChangeEvent
+	mu                  sync.RWMutex
 }
 
 // NewPgOutputParser initializes an empty protocol parser.
 func NewPgOutputParser() *PgOutputParser {
 	return &PgOutputParser{
-		relations: make(map[uint32]*RelationDef),
+		relations:           make(map[uint32]*RelationDef),
+		spooledTransactions: make(map[uint32][]*ChangeEvent),
 	}
 }
 
@@ -176,6 +180,7 @@ func (p *PgOutputParser) ParseMessage(data []byte) (*ChangeEvent, error) {
 			LSN:           p.currentLSN,
 			TransactionID: p.currentXID,
 			PrimaryKeys:   rel.PrimaryKeys,
+			Origin:        p.currentOrigin,
 			After:         valuesToMap(values),
 		}, nil
 
@@ -227,6 +232,7 @@ func (p *PgOutputParser) ParseMessage(data []byte) (*ChangeEvent, error) {
 			LSN:           p.currentLSN,
 			TransactionID: p.currentXID,
 			PrimaryKeys:   rel.PrimaryKeys,
+			Origin:        p.currentOrigin,
 			Before:        beforeMap,
 			After:         valuesToMap(afterVals),
 		}, nil
@@ -256,6 +262,7 @@ func (p *PgOutputParser) ParseMessage(data []byte) (*ChangeEvent, error) {
 			LSN:           p.currentLSN,
 			TransactionID: p.currentXID,
 			PrimaryKeys:   rel.PrimaryKeys,
+			Origin:        p.currentOrigin,
 			Before:        valuesToMap(values),
 		}, nil
 
@@ -288,7 +295,52 @@ func (p *PgOutputParser) ParseMessage(data []byte) (*ChangeEvent, error) {
 			CommitTime:    p.currentTxTime,
 			LSN:           p.currentLSN,
 			TransactionID: p.currentXID,
+			Origin:        p.currentOrigin,
 		}, nil
+
+	case 'O': // Origin (Replication loop prevention)
+		var lsn uint64
+		_ = binary.Read(r, binary.BigEndian, &lsn)
+		origin, _ := readNullTerminatedString(r)
+		p.currentOrigin = origin
+		return nil, nil
+
+	case 'M': // Generic logical message
+		return nil, nil
+
+	case 'S': // Stream Start
+		var xid uint32
+		var firstSegment uint8
+		_ = binary.Read(r, binary.BigEndian, &xid)
+		_ = binary.Read(r, binary.BigEndian, &firstSegment)
+		p.inStream = true
+		p.currentXID = xid
+		return nil, nil
+
+	case 'E': // Stream Stop
+		p.inStream = false
+		return nil, nil
+
+	case 'c': // Stream Commit
+		var xid uint32
+		var flags uint8
+		var commitLSN, endLSN uint64
+		_ = binary.Read(r, binary.BigEndian, &xid)
+		_ = binary.Read(r, binary.BigEndian, &flags)
+		_ = binary.Read(r, binary.BigEndian, &commitLSN)
+		_ = binary.Read(r, binary.BigEndian, &endLSN)
+		delete(p.spooledTransactions, xid)
+		return nil, nil
+
+	case 'A': // Stream Abort
+		var xid, subxid uint32
+		_ = binary.Read(r, binary.BigEndian, &xid)
+		_ = binary.Read(r, binary.BigEndian, &subxid)
+		delete(p.spooledTransactions, xid)
+		return nil, nil
+
+	case 'P', 'K': // 2PC Prepare / Commit Prepared
+		return nil, nil
 
 	default:
 		// Unsupported or extension message, skip gracefully
@@ -447,7 +499,21 @@ func parseTupleData(r *bytes.Reader, cols []ColumnDef) ([]ColumnValue, error) {
 			if _, err := r.Read(valBytes); err != nil {
 				return nil, err
 			}
-			cv.Value = valBytes
+			if colType == 3802 { // JSONB
+				if str, err := DecodeBinaryJSONB(valBytes); err == nil {
+					cv.Value = str
+				} else {
+					cv.Value = valBytes
+				}
+			} else if isArrayOID(colType) {
+				if arr, err := DecodeBinaryArray(valBytes); err == nil {
+					cv.Value = arr
+				} else {
+					cv.Value = valBytes
+				}
+			} else {
+				cv.Value = valBytes
+			}
 		default:
 			return nil, fmt.Errorf("unknown column datum kind %c at index %d", kind, i)
 		}
@@ -485,7 +551,39 @@ func valuesToMap(values []ColumnValue) map[string]any {
 	return m
 }
 
+func isArrayOID(typeOID uint32) bool {
+	switch typeOID {
+	case 1000, 1005, 1007, 1016, 1021, 1022, 1009, 1015, 199, 3807:
+		return true
+	}
+	return false
+}
+
+func isRangeOID(typeOID uint32) bool {
+	switch typeOID {
+	case 3904, 3906, 3908, 3910, 3912, 3926:
+		return true
+	}
+	return false
+}
+
 func parseTextValue(typeOID uint32, s string) any {
+	if isArrayOID(typeOID) || (strings.HasPrefix(s, "{") && strings.HasSuffix(s, "}")) {
+		if arr, err := DecodeTextArray(s); err == nil {
+			return arr
+		}
+	}
+	if isRangeOID(typeOID) || strings.HasPrefix(s, "[") || strings.HasPrefix(s, "(") {
+		if rng, err := DecodeRange(s); err == nil {
+			return rng
+		}
+	}
+	if typeOID == 600 || (strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") && strings.Contains(s, ",")) {
+		if pt, err := DecodePoint(s); err == nil {
+			return pt
+		}
+	}
+
 	switch typeOID {
 	case 16: // bool
 		return s == "t" || s == "true" || s == "1"
