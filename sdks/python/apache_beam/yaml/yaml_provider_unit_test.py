@@ -377,3 +377,25 @@ class YamlProvidersCreateTest(unittest.TestCase):
               [('a', None), ('element', 1)],
               [('a', 2), ('element', None)],
           ]))
+
+
+class GoBinaryProviderTest(unittest.TestCase):
+  def test_go_binary_provider_parsing(self):
+    spec = {
+        'type': 'goBinary',
+        'config': {
+            'binary': '/usr/local/bin/beam_go_expansion',
+            'args': ['--idle_timeout=5m'],
+        },
+        'transforms': {
+            'PostgreSqlWrite': 'beam:schematransform:org.apache.beam:postgres_write:v1',
+            'PostgreSqlReadCDC': 'beam:schematransform:org.apache.beam:postgres_read_cdc:v1',
+        },
+    }
+    provider = yaml_provider.ExternalProvider.provider_from_spec('/base/path', spec)
+    self.assertIsInstance(provider, yaml_provider.ExternalGoProvider)
+    self.assertEqual(provider._binary_path, '/usr/local/bin/beam_go_expansion')
+    self.assertIn('PostgreSqlWrite', provider._urns)
+    self.assertIn('PostgreSqlReadCDC', provider._urns)
+    self.assertEqual(provider.cache_artifacts(), ['/usr/local/bin/beam_go_expansion'])
+
