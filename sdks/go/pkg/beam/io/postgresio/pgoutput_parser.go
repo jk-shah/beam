@@ -569,7 +569,10 @@ func isRangeOID(typeOID uint32) bool {
 }
 
 func parseTextValue(typeOID uint32, s string) any {
-	if isArrayOID(typeOID) || (strings.HasPrefix(s, "{") && strings.HasSuffix(s, "}")) {
+	if typeOID == 114 || typeOID == 3802 { // JSON and JSONB
+		return s
+	}
+	if isArrayOID(typeOID) || (strings.HasPrefix(s, "{") && strings.HasSuffix(s, "}") && !strings.Contains(s, ":")) {
 		if arr, err := DecodeTextArray(s); err == nil {
 			return arr
 		}
