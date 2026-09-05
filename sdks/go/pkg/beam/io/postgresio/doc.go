@@ -32,11 +32,23 @@
 // successfully committed records from rejected records (with sanitized error messages
 // and SQL states), preventing credential disclosure in logs or queues.
 //
-// 4. Connection Pool & PgBouncer Safety: Automatically clamps worker connection pool
-// limits based on available CPU cores (NumCPU/2) and supports PgBouncer transaction
-// pooling mode by enforcing simple query protocol execution to prevent SQLState 42P05
-// prepared statement collisions.
+// 4. Change Data Capture Streaming (ReadCDC): Directly streams continuous change events
+// (INSERT, UPDATE, DELETE, TRUNCATE) from PostgreSQL logical replication slots using a
+// native binary pgoutput wire decoder, eliminating Debezium and external JVM processes.
 //
-// 5. Cloud IAM Ready: Decoupled network dialer interface (DialFunc) allowing direct,
-// zero-dependency integration with Google Cloud SQL, AlloyDB, and AWS RDS IAM.
+// 5. Decoupled Heartbeat & Strict Checkpointing: Implements an asynchronous keepalive
+// goroutine sending StandbyStatusUpdate messages to prevent PostgreSQL wal_sender_timeout
+// (60s) drops during downstream backpressure, while coordinating confirmed FlushLSN
+// strictly via Beam's BundleFinalizer to eliminate data loss risks.
+//
+// 6. Stateful TOAST Reassembly (ReassembleToast): Automatically caches baseline tuples
+// in Beam runner state (state.Value[ChangeEvent]) and reassembles unmodified out-of-line
+// TOAST attributes ('u') on UPDATE events when REPLICA IDENTITY DEFAULT is in use.
+//
+// 7. Single-Consumer Ingestion with Auto-Partitioned Fanout (PartitionByPrimaryKey):
+// Enforces strict single-consumer execution at the replication slot boundary (Parallelism = 1)
+// while providing immediate downstream reshuffling and primary-key partitioning across cluster workers.
+//
+// 8. Cloud IAM & Dynamic Auth: Decoupled TokenProvider and DialFunc interfaces allowing
+// dynamic credential renewal across reconnects for Google Cloud SQL, AlloyDB, and AWS RDS IAM.
 package postgresio
