@@ -20,7 +20,6 @@ import (
 	"encoding/binary"
 	"strings"
 	"testing"
-	"time"
 )
 
 // Replicates upstream PostgreSQL toast.sql semantics (unchanged & modified).
