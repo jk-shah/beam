@@ -82,8 +82,9 @@ type ChangeEvent struct {
 	TransactionID uint32         `beam:"transaction_id" json:"transaction_id"`
 	PrimaryKeys   []string       `beam:"primary_keys" json:"primary_keys"`
 	Origin        string         `beam:"origin" json:"origin,omitempty"`
-	Before        map[string]any `beam:"before" json:"before,omitempty"`
-	After         map[string]any `beam:"after" json:"after,omitempty"`
+	Before        map[string]any    `beam:"before" json:"before,omitempty"`
+	After         map[string]any    `beam:"after" json:"after,omitempty"`
+	ColumnTypes   map[string]uint32 `beam:"column_types" json:"column_types,omitempty"`
 }
 
 // FullTableName returns the fully qualified schema.table name.
