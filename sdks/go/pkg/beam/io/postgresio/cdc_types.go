@@ -17,6 +17,7 @@ package postgresio
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
@@ -29,6 +30,22 @@ func init() {
 	beam.RegisterType(reflect.TypeOf((*ChangeEvent)(nil)).Elem())
 	beam.RegisterType(reflect.TypeOf((*ColumnValue)(nil)).Elem())
 	beam.RegisterType(reflect.TypeOf((*StandbyStatus)(nil)).Elem())
+
+	beam.RegisterCoder(
+		reflect.TypeOf((*ChangeEvent)(nil)).Elem(),
+		encodeChangeEvent,
+		decodeChangeEvent,
+	)
+}
+
+func encodeChangeEvent(in ChangeEvent) ([]byte, error) {
+	return json.Marshal(in)
+}
+
+func decodeChangeEvent(in []byte) (ChangeEvent, error) {
+	var out ChangeEvent
+	err := json.Unmarshal(in, &out)
+	return out, err
 }
 
 // OpType represents the mutation operation type captured by PostgreSQL CDC.
