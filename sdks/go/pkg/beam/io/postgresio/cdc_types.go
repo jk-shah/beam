@@ -27,8 +27,6 @@ import (
 )
 
 func init() {
-	beam.RegisterType(reflect.TypeOf((*ChangeEvent)(nil)).Elem())
-	beam.RegisterType(reflect.TypeOf((*ColumnValue)(nil)).Elem())
 	beam.RegisterType(reflect.TypeOf((*StandbyStatus)(nil)).Elem())
 
 	beam.RegisterCoder(

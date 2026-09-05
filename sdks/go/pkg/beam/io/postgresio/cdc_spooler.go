@@ -16,6 +16,7 @@
 package postgresio
 
 import (
+	"encoding/json"
 	"reflect"
 
 	"github.com/apache/beam/sdks/v2/go/pkg/beam"
@@ -35,8 +36,22 @@ const (
 )
 
 func init() {
-	beam.RegisterType(reflect.TypeOf((*TransactionMessage)(nil)).Elem())
 	beam.RegisterType(reflect.TypeOf((*inFlightTransactionSpoolerFn)(nil)).Elem())
+	beam.RegisterCoder(
+		reflect.TypeOf((*TransactionMessage)(nil)).Elem(),
+		encodeTxMessage,
+		decodeTxMessage,
+	)
+}
+
+func encodeTxMessage(in TransactionMessage) ([]byte, error) {
+	return json.Marshal(in)
+}
+
+func decodeTxMessage(in []byte) (TransactionMessage, error) {
+	var out TransactionMessage
+	err := json.Unmarshal(in, &out)
+	return out, err
 }
 
 // TransactionMessage wraps an in-flight mutation or transaction control signal.

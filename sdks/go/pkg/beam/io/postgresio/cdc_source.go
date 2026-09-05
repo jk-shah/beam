@@ -35,12 +35,12 @@ func init() {
 // cdcSourceFn is a single-consumer DoFn that establishes a logical replication
 // stream and yields ChangeEvent records with decoupled background keepalives.
 type cdcSourceFn struct {
-	Options CDCOptions
+	options CDCOptions
 }
 
 func newCDCSourceFn(opts CDCOptions) *cdcSourceFn {
 	return &cdcSourceFn{
-		Options: opts,
+		options: opts,
 	}
 }
 
@@ -49,10 +49,10 @@ func (fn *cdcSourceFn) ProcessElement(ctx context.Context, bf beam.BundleFinaliz
 	var stream ReplicationStream
 	var err error
 
-	if fn.Options.StreamFactory != nil {
-		stream, err = fn.Options.StreamFactory(ctx, fn.Options)
+	if fn.options.StreamFactory != nil {
+		stream, err = fn.options.StreamFactory(ctx, fn.options)
 	} else {
-		stream, err = NewNativeReplicationStream(ctx, fn.Options)
+		stream, err = NewNativeReplicationStream(ctx, fn.options)
 	}
 	if err != nil {
 		return fmt.Errorf("failed to initialize replication stream: %w", err)
@@ -67,15 +67,15 @@ func (fn *cdcSourceFn) ProcessElement(ctx context.Context, bf beam.BundleFinaliz
 	var confirmedCommittedLSN uint64
 	var currentBundleMaxLSN uint64
 
-	atomic.StoreUint64(&latestReceivedLSN, fn.Options.StartLSN)
-	atomic.StoreUint64(&confirmedCommittedLSN, fn.Options.StartLSN)
-	atomic.StoreUint64(&currentBundleMaxLSN, fn.Options.StartLSN)
+	atomic.StoreUint64(&latestReceivedLSN, fn.options.StartLSN)
+	atomic.StoreUint64(&confirmedCommittedLSN, fn.options.StartLSN)
+	atomic.StoreUint64(&currentBundleMaxLSN, fn.options.StartLSN)
 
 	// Decoupled background heartbeat loop
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
 	defer cancelHeartbeat()
 
-	heartbeatTicker := time.NewTicker(fn.Options.HeartbeatInterval)
+	heartbeatTicker := time.NewTicker(fn.options.HeartbeatInterval)
 	defer heartbeatTicker.Stop()
 
 	var heartbeatWg sync.WaitGroup

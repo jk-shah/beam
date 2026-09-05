@@ -59,7 +59,7 @@ type WriteOptions struct {
 	MaxConnections     int
 	UsePgBouncer       bool
 	ConnectionInitSQL  string
-	DialFunc           DialFunc
+	DialFunc           DialFunc `beam:"-" json:"-"`
 }
 
 // Option represents a functional option for configuring WriteOptions.

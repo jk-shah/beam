@@ -18,6 +18,7 @@ package postgresio
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"reflect"
@@ -31,9 +32,22 @@ import (
 )
 
 func init() {
-	beam.RegisterType(reflect.TypeOf((*WriteOptions)(nil)).Elem())
-	beam.RegisterType(reflect.TypeOf((*FailedRow)(nil)).Elem())
-	beam.RegisterType(reflect.TypeOf((*writeFn)(nil)).Elem())
+	beam.RegisterDoFn(&writeFn{})
+	beam.RegisterCoder(
+		reflect.TypeOf((*FailedRow)(nil)).Elem(),
+		encodeFailedRow,
+		decodeFailedRow,
+	)
+}
+
+func encodeFailedRow(in FailedRow) ([]byte, error) {
+	return json.Marshal(in)
+}
+
+func decodeFailedRow(in []byte) (FailedRow, error) {
+	var out FailedRow
+	err := json.Unmarshal(in, &out)
+	return out, err
 }
 
 // FailedRow captures a rejected record with sanitized diagnostic error information
@@ -133,6 +147,12 @@ func (fn *writeFn) inspectColumns(t reflect.Type) {
 				continue
 			}
 			colName := field.Tag.Get("db")
+			if colName == "" {
+				colName = field.Tag.Get("beam")
+			}
+			if colName == "" {
+				colName = field.Tag.Get("json")
+			}
 			if colName == "" {
 				colName = strings.ToLower(field.Name)
 			}
@@ -243,6 +263,7 @@ func (fn *writeFn) buildUnnestQuery(batch []any) (string, []any, error) {
 		columnArrays[i] = make([]any, len(batch))
 	}
 
+	columnTypes := make([]reflect.Type, len(fn.columns))
 	for rowIdx, item := range batch {
 		v := reflect.ValueOf(item)
 		if v.Kind() == reflect.Ptr {
@@ -254,11 +275,14 @@ func (fn *writeFn) buildUnnestQuery(batch []any) (string, []any, error) {
 				t := v.Type()
 				for j := 0; j < t.NumField(); j++ {
 					fld := t.Field(j)
-					if strings.EqualFold(fld.Name, colName) || fld.Tag.Get("db") == colName {
+					if strings.EqualFold(fld.Name, colName) || fld.Tag.Get("db") == colName || fld.Tag.Get("beam") == colName || fld.Tag.Get("json") == colName {
 						f = v.Field(j)
+						columnTypes[colIdx] = fld.Type
 						break
 					}
 				}
+			} else {
+				columnTypes[colIdx] = f.Type()
 			}
 			if f.IsValid() {
 				columnArrays[colIdx][rowIdx] = f.Interface()
@@ -271,7 +295,8 @@ func (fn *writeFn) buildUnnestQuery(batch []any) (string, []any, error) {
 	unnestPlaceholders := make([]string, len(fn.columns))
 	args := make([]any, len(fn.columns))
 	for i := range fn.columns {
-		unnestPlaceholders[i] = fmt.Sprintf("$%d", i+1)
+		cast := goTypeToPgArrayType(columnTypes[i])
+		unnestPlaceholders[i] = fmt.Sprintf("$%d::%s", i+1, cast)
 		args[i] = pq.Array(columnArrays[i])
 	}
 
@@ -322,4 +347,39 @@ func extractSqlState(err error) string {
 		return string(pqErr.Code)
 	}
 	return "UNKNOWN"
+}
+
+func goTypeToPgArrayType(t reflect.Type) string {
+	if t == nil {
+		return "text[]"
+	}
+	for t.Kind() == reflect.Ptr {
+		t = t.Elem()
+	}
+	switch t.Kind() {
+	case reflect.Int64:
+		return "bigint[]"
+	case reflect.Int, reflect.Int32:
+		return "integer[]"
+	case reflect.Int16:
+		return "smallint[]"
+	case reflect.Float64:
+		return "double precision[]"
+	case reflect.Float32:
+		return "real[]"
+	case reflect.Bool:
+		return "boolean[]"
+	case reflect.String:
+		return "text[]"
+	case reflect.Slice:
+		if t.Elem().Kind() == reflect.Uint8 {
+			return "bytea[]"
+		}
+		return "text[]"
+	default:
+		if t.String() == "time.Time" {
+			return "timestamptz[]"
+		}
+		return "text[]"
+	}
 }

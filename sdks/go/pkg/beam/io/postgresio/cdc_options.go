@@ -38,9 +38,9 @@ type CDCOptions struct {
 	StatusInterval       time.Duration
 	CreateSlotIfMissing  bool
 	ReplicaIdentityFull  bool
-	TokenProvider        TokenProvider
-	DialFunc             DialFunc
-	StreamFactory        ReplicationStreamFactory
+	TokenProvider        TokenProvider            `beam:"-" json:"-"`
+	DialFunc             DialFunc                 `beam:"-" json:"-"`
+	StreamFactory        ReplicationStreamFactory `beam:"-" json:"-"`
 }
 
 // CDCOption defines a functional option for configuring CDCOptions.
