@@ -32,6 +32,7 @@ import (
 	jobpb "github.com/apache/beam/sdks/v2/go/pkg/beam/model/jobmanagement_v1"
 	pipepb "github.com/apache/beam/sdks/v2/go/pkg/beam/model/pipeline_v1"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/util/grpcx"
+	"github.com/apache/beam/sdks/v2/go/pkg/beam/util/stager"
 )
 
 // Execute executes a pipeline on the universal runner serving the given endpoint.
@@ -47,8 +48,19 @@ func Execute(ctx context.Context, p *pipepb.Pipeline, endpoint string, opt *JobO
 			log.Infof(ctx, "Using running binary as worker binary: '%v'", bin)
 		} else {
 			// Cross-compile as last resort.
+			targetPlat, err := stager.ResolveTargetArchitecture(stager.TargetResolutionOptions{
+				Experiments:        opt.Experiments,
+				WorkerArchitecture: opt.WorkerArchitecture,
+				IsLocalExecution:   opt.Loopback,
+			})
+			if err != nil {
+				return presult, err
+			}
 
-			worker, err := BuildTempWorkerBinary(ctx, CompileOpts{})
+			worker, err := BuildTempWorkerBinary(ctx, CompileOpts{
+				OS:   targetPlat.OS,
+				Arch: targetPlat.Arch,
+			})
 			if err != nil {
 				return presult, err
 			}
