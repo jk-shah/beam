@@ -125,7 +125,7 @@ func TestCDCSourceFnExecutionWithMockStream(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
 
-	err := fn.ProcessElement(ctx, 1, emit, bf)
+	err := fn.ProcessElement(ctx, bf, 1, emit)
 	if err != nil {
 		t.Fatalf("unexpected error executing cdcSourceFn: %v", err)
 	}
