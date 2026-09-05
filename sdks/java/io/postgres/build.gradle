@@ -1,0 +1,57 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+plugins { id 'org.apache.beam.module' }
+applyJavaNature(
+  automaticModuleName: 'org.apache.beam.sdk.io.postgres',
+  enableSpotbugs: false,
+)
+provideIntegrationTestingDependencies()
+enableJavaPerformanceTesting()
+
+description = "Apache Beam :: SDKs :: Java :: IO :: PostgreSQL"
+ext.summary = "Dedicated, high-throughput PostgreSQL connector supporting CDC Splittable DoFn and streaming multi-mode sinks."
+
+dependencies {
+  implementation library.java.vendored_guava_32_1_2_jre
+  implementation project(path: ":sdks:java:core", configuration: "shadow")
+  implementation project(path: ":sdks:java:managed")
+  implementation project(path: ":model:pipeline", configuration: "shadow")
+  implementation library.java.postgres
+  implementation 'com.zaxxer:HikariCP:4.0.3'
+  implementation library.java.joda_time
+  implementation library.java.slf4j_api
+  implementation library.java.jackson_databind
+  implementation library.java.auto_value_annotations
+  compileOnly "com.google.auto.service:auto-service-annotations:1.1.1"
+  compileOnly "com.google.auth:google-auth-library-oauth2-http:1.24.1"
+
+  permitUnusedDeclared library.java.vendored_guava_32_1_2_jre
+  permitUnusedDeclared 'com.zaxxer:HikariCP:4.0.3'
+
+  testImplementation project(path: ":sdks:java:core", configuration: "shadowTest")
+  testImplementation project(path: ":sdks:java:io:common")
+  testImplementation project(path: ":sdks:java:managed")
+  testImplementation project(path: ":sdks:java:testing:test-utils")
+  testImplementation library.java.junit
+  testImplementation library.java.mockito_inline
+  testImplementation library.java.testcontainers_postgresql
+  testImplementation library.java.testcontainers_base
+  testRuntimeOnly library.java.slf4j_jdk14
+  testRuntimeOnly project(path: ":runners:direct-java", configuration: "shadow")
+}
