@@ -23,7 +23,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"os"
-	"strings"
 
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/metrics"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/runtime/graphx"
@@ -32,6 +31,7 @@ import (
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/log"
 	pipepb "github.com/apache/beam/sdks/v2/go/pkg/beam/model/pipeline_v1"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/runners/universal/runnerlib"
+	"github.com/apache/beam/sdks/v2/go/pkg/beam/util/stager"
 	df "google.golang.org/api/dataflow/v1b3"
 	"google.golang.org/api/googleapi"
 )
@@ -48,10 +48,18 @@ func Execute(ctx context.Context, raw *pipepb.Pipeline, opts *JobOptions, worker
 			log.Infof(ctx, "Using running binary as worker binary: '%v'", bin)
 		} else {
 			// Cross-compile as last resort.
+			targetPlat, err := stager.ResolveTargetArchitecture(stager.TargetResolutionOptions{
+				MachineType:        opts.MachineType,
+				Experiments:        opts.Experiments,
+				WorkerArchitecture: opts.WorkerArchitecture,
+			})
+			if err != nil {
+				return presult, err
+			}
 
-			var copts runnerlib.CompileOpts
-			if strings.HasPrefix(opts.MachineType, "t2a") {
-				copts.Arch = "arm64"
+			copts := runnerlib.CompileOpts{
+				OS:   targetPlat.OS,
+				Arch: targetPlat.Arch,
 			}
 
 			worker, err := runnerlib.BuildTempWorkerBinary(ctx, copts)
