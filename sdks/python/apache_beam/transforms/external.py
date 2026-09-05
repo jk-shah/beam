@@ -1191,6 +1191,67 @@ class BeamJarExpansionService(JavaJarExpansionService):
         maven_repository_url=maven_repository_url)
 
 
+class GoBinaryExpansionService(object):
+  """An expansion service based on an executable Go binary.
+
+  This can be passed into an ExternalTransform as the expansion_service
+  argument which will spawn a subprocess using this Go executable to expand the
+  transform.
+
+  Args:
+    path_to_binary: the path to a locally available executable binary file to be used
+      to start up the expansion service.
+    extra_args: arguments to be provided when starting up the expansion service.
+    append_args: arguments to be appended to the command line.
+  """
+  def __init__(
+      self,
+      path_to_binary,
+      extra_args=None,
+      append_args=None):
+    if extra_args and append_args:
+      raise ValueError('Only one of extra_args or append_args may be provided')
+    self.path_to_binary = path_to_binary
+    self._extra_args = extra_args
+    self._append_args = append_args or []
+    self._service_count = 0
+    self._service_provider = None
+    self._service = None
+
+  def is_existing_service(self):
+    return subprocess_server.is_service_endpoint(self.path_to_binary)
+
+  def _default_args(self):
+    return ['--port={{PORT}}']
+
+  def __enter__(self):
+    if self._service_count == 0:
+      if self.is_existing_service():
+        return self.path_to_binary
+      if self._extra_args is None:
+        cmd_args = self._default_args() + self._append_args
+      else:
+        cmd_args = list(self._extra_args)
+      cmd = [self.path_to_binary] + cmd_args
+      logging.info(
+          'Starting a Go-based expansion service from binary %s',
+          self.path_to_binary)
+      self._service_provider = subprocess_server.SubprocessServer(
+          ExpansionAndArtifactRetrievalStub,
+          cmd,
+          logger="GoExpansionService")
+      self._service = self._service_provider.__enter__()
+    self._service_count += 1
+    return self._service
+
+  def __exit__(self, *args):
+    self._service_count -= 1
+    if self._service_count == 0 and self._service_provider is not None:
+      self._service_provider.__exit__(*args)
+      self._service_provider = None
+      self._service = None
+
+
 def _maybe_use_transform_service(provided_service=None, options=None):
   # For anything other than 'JavaJarExpansionService' we just use the
   # provided service. For example, string address of an already available

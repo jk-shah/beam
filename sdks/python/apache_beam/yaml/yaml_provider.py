@@ -407,6 +407,40 @@ class ExternalJavaProvider(ExternalProvider):
         classpath=(list(self._classpath or []) + list(jars)))
 
 
+@ExternalProvider.register_provider_type('goBinary')
+def go_binary(
+    urns,
+    provider_base_path=None,
+    binary: str = '',
+    args: Optional[list[str]] = None):
+  if provider_base_path and not os.path.isabs(binary):
+    full_path = _join_url_or_filepath(provider_base_path, binary)
+  else:
+    full_path = binary
+  return ExternalGoProvider(urns, full_path, args=args)
+
+
+class ExternalGoProvider(ExternalProvider):
+  def __init__(
+      self,
+      urns,
+      binary_path: str,
+      args: Optional[list[str]] = None):
+    super().__init__(
+        urns, lambda: external.GoBinaryExpansionService(
+            binary_path, extra_args=args))
+    self._binary_path = binary_path
+
+  def available(self):
+    if os.path.exists(self._binary_path) or shutil.which(self._binary_path):
+      return True
+    return NotAvailableWithReason(
+        f'Unable to locate Go executable binary: {self._binary_path}')
+
+  def cache_artifacts(self):
+    return [self._binary_path]
+
+
 @ExternalProvider.register_provider_type('python')
 def python(urns, provider_base_path, packages=()):
   if packages:
