@@ -73,7 +73,7 @@ func (o *CDCOptions) Validate() error {
 	if o.Publication == "" {
 		return fmt.Errorf("publication name must not be empty")
 	}
-	if err := SanitizeIdentifier(o.Publication); err != nil {
+	if _, err := SanitizeIdentifier(o.Publication); err != nil {
 		return fmt.Errorf("invalid publication name %q: %w", o.Publication, err)
 	}
 	if o.HeartbeatInterval <= 0 {
