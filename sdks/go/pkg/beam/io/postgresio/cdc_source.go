@@ -45,7 +45,7 @@ func newCDCSourceFn(opts CDCOptions) *cdcSourceFn {
 }
 
 // ProcessElement connects to the PostgreSQL replication slot and emits change events.
-func (fn *cdcSourceFn) ProcessElement(ctx context.Context, _ int, emit func(ChangeEvent), bf beam.BundleFinalization) error {
+func (fn *cdcSourceFn) ProcessElement(ctx context.Context, bf beam.BundleFinalization, _ int, emit func(ChangeEvent)) error {
 	var stream ReplicationStream
 	var err error
 
