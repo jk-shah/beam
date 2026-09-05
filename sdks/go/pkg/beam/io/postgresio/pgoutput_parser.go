@@ -183,6 +183,7 @@ func (p *PgOutputParser) ParseMessage(data []byte) (*ChangeEvent, error) {
 			PrimaryKeys:   rel.PrimaryKeys,
 			Origin:        p.currentOrigin,
 			After:         valuesToMap(values),
+			ColumnTypes:   valuesToColumnTypes(values),
 		}, nil
 
 	case 'U': // Update
@@ -236,6 +237,7 @@ func (p *PgOutputParser) ParseMessage(data []byte) (*ChangeEvent, error) {
 			Origin:        p.currentOrigin,
 			Before:        beforeMap,
 			After:         valuesToMap(afterVals),
+			ColumnTypes:   valuesToColumnTypes(afterVals),
 		}, nil
 
 	case 'D': // Delete
@@ -265,6 +267,7 @@ func (p *PgOutputParser) ParseMessage(data []byte) (*ChangeEvent, error) {
 			PrimaryKeys:   rel.PrimaryKeys,
 			Origin:        p.currentOrigin,
 			Before:        valuesToMap(values),
+			ColumnTypes:   valuesToColumnTypes(values),
 		}, nil
 
 	case 'T': // Truncate
@@ -548,6 +551,14 @@ func valuesToMap(values []ColumnValue) map[string]any {
 		} else {
 			m[v.Name] = v.Value
 		}
+	}
+	return m
+}
+
+func valuesToColumnTypes(values []ColumnValue) map[string]uint32 {
+	m := make(map[string]uint32, len(values))
+	for _, v := range values {
+		m[v.Name] = v.TypeOID
 	}
 	return m
 }
