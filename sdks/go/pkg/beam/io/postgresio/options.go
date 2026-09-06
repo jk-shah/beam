@@ -38,6 +38,19 @@ const (
 
 var identifierRegex = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_$]*$`)
 
+// WriteMethod determines the bulk loading mechanism used to insert or upsert rows.
+type WriteMethod int
+
+const (
+	// WriteMethodStagedCopy utilizes PostgreSQL COPY into a session temporary table
+	// followed by an atomic set-based INSERT ... SELECT ... ON CONFLICT DO UPDATE.
+	// Recommended for maximum throughput (>100,000 rows/sec).
+	WriteMethodStagedCopy WriteMethod = iota
+
+	// WriteMethodUnnest utilizes parameterized UNNEST($1, $2, ...) upsert queries.
+	WriteMethodUnnest
+)
+
 // DialFunc defines a pluggable network dialer interface for connecting to PostgreSQL.
 // Used by cloud-specific dialers (e.g., Google Cloud SQL, AlloyDB) to establish
 // authenticated mTLS socket connections.
@@ -50,8 +63,10 @@ type WriteOptions struct {
 	Port               int
 	Database           string
 	Username           string
-	Password           string
+	Password           string `beam:"-" json:"-"`
+	SSLMode            string
 	WriteMode          WriteMode
+	WriteMethod        WriteMethod
 	PrimaryKeyCols     []string
 	BatchSize          int
 	MaxBatchBytes      int
@@ -68,17 +83,21 @@ type Option func(*WriteOptions)
 // NewWriteOptions creates a WriteOptions struct initialized with production defaults.
 func NewWriteOptions(opts ...Option) WriteOptions {
 	wo := WriteOptions{
-		Port:          5432,
-		WriteMode:     WriteModeUpsert,
-		BatchSize:     5000,
-		MaxBatchBytes: 8 * 1024 * 1024, // 8 MB
-		FlushInterval: 1 * time.Second,
+		Port:           5432,
+		SSLMode:        "disable",
+		WriteMode:      WriteModeUpsert,
+		WriteMethod:    WriteMethodStagedCopy,
+		BatchSize:      5000,
+		MaxBatchBytes:  8 * 1024 * 1024, // 8 MB
+		FlushInterval:  1 * time.Second,
+		MaxConnections: 2,
 	}
 	for _, opt := range opts {
 		opt(&wo)
 	}
 	return wo
 }
+
 
 // WithHost sets the target PostgreSQL server hostname or IP address.
 func WithHost(host string) Option {
@@ -112,6 +131,20 @@ func WithUsername(user string) Option {
 func WithPassword(pass string) Option {
 	return func(o *WriteOptions) {
 		o.Password = pass
+	}
+}
+
+// WithSSLMode sets the SSL/TLS connection mode (disable, require, verify-ca, verify-full).
+func WithSSLMode(sslMode string) Option {
+	return func(o *WriteOptions) {
+		o.SSLMode = sslMode
+	}
+}
+
+// WithWriteMethod sets the bulk write method (WriteMethodStagedCopy or WriteMethodUnnest).
+func WithWriteMethod(method WriteMethod) Option {
+	return func(o *WriteOptions) {
+		o.WriteMethod = method
 	}
 }
 

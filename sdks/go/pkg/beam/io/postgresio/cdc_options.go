@@ -30,7 +30,8 @@ type CDCOptions struct {
 	Port                 int
 	Database             string
 	Username             string
-	Password             string
+	Password             string                   `beam:"-" json:"-"`
+	SSLMode              string
 	SlotName             string
 	Publication          string
 	StartLSN             uint64
@@ -128,6 +129,13 @@ func WithCDCPassword(password string) CDCOption {
 	return func(o *CDCOptions) {
 		o.Password = password
 		o.TokenProvider = NewStaticTokenProvider(password)
+	}
+}
+
+// WithCDCSSLMode sets the SSL/TLS mode (disable, require, verify-ca, verify-full).
+func WithCDCSSLMode(sslMode string) CDCOption {
+	return func(o *CDCOptions) {
+		o.SSLMode = sslMode
 	}
 }
 

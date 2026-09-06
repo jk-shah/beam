@@ -17,7 +17,10 @@ package postgresio
 
 import (
 	"context"
+	"crypto/md5"
+	"crypto/tls"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net"
@@ -123,6 +126,35 @@ func NewNativeReplicationStream(ctx context.Context, opts CDCOptions) (*NativeRe
 		return nil, fmt.Errorf("failed to dial postgres host %s: %w", addr, err)
 	}
 
+	// Negotiate SSL/TLS via PostgreSQL SSLRequest protocol if sslmode is not disable
+	if opts.SSLMode != "disable" && opts.SSLMode != "" {
+		sslReq := []byte{0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f}
+		if _, err := conn.Write(sslReq); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("failed to send SSLRequest: %w", err)
+		}
+		var sslResp [1]byte
+		if _, err := io.ReadFull(conn, sslResp[:]); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("failed to read SSLRequest response: %w", err)
+		}
+		if sslResp[0] == 'S' {
+			tlsConfig := &tls.Config{
+				ServerName:         opts.Host,
+				InsecureSkipVerify: opts.SSLMode == "require",
+			}
+			tlsConn := tls.Client(conn, tlsConfig)
+			if err := tlsConn.HandshakeContext(ctx); err != nil {
+				_ = conn.Close()
+				return nil, fmt.Errorf("TLS handshake failed: %w", err)
+			}
+			conn = tlsConn
+		} else if opts.SSLMode == "verify-full" || opts.SSLMode == "verify-ca" || opts.SSLMode == "require" {
+			_ = conn.Close()
+			return nil, fmt.Errorf("postgresio: server does not support SSL but sslmode=%q is required", opts.SSLMode)
+		}
+	}
+
 	stream := &NativeReplicationStream{
 		conn: conn,
 		opts: opts,
@@ -184,6 +216,22 @@ func (s *NativeReplicationStream) handshake(ctx context.Context) error {
 					return err
 				}
 				if err := s.sendPasswordMessage(pwd); err != nil {
+					return err
+				}
+			case 5: // MD5Password
+				pwd, err := s.resolvePassword(ctx)
+				if err != nil {
+					return err
+				}
+				if len(payload) < 8 {
+					return fmt.Errorf("malformed MD5 auth challenge")
+				}
+				salt := payload[4:8]
+				h1 := md5.Sum([]byte(pwd + s.opts.Username))
+				hex1 := hex.EncodeToString(h1[:])
+				h2 := md5.Sum(append([]byte(hex1), salt...))
+				token := "md5" + hex.EncodeToString(h2[:])
+				if err := s.sendPasswordMessage(token); err != nil {
 					return err
 				}
 			default:

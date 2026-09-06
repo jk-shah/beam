@@ -138,9 +138,10 @@ func main() {
 		Username:       *username,
 		Password:       *password,
 		WriteMode:      postgresio.WriteModeUpsert,
+		WriteMethod:    postgresio.WriteMethodStagedCopy,
 		PrimaryKeyCols: []string{"id"},
-		BatchSize:      5000,
-		MaxBatchBytes:  8 * 1024 * 1024, // 8MB buffer chunks
+		BatchSize:      25000,
+		MaxBatchBytes:  16 * 1024 * 1024, // 16MB buffer chunks
 	}
 
 	result := postgresio.Write(s, "public.migrated_transactions", writeOpts, normalized)

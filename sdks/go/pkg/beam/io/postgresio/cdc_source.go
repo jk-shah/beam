@@ -89,6 +89,9 @@ func (fn *cdcSourceFn) ProcessElement(ctx context.Context, bf beam.BundleFinaliz
 			case <-heartbeatTicker.C:
 				wLSN := atomic.LoadUint64(&latestReceivedLSN)
 				fLSN := atomic.LoadUint64(&confirmedCommittedLSN)
+				if fLSN == 0 && wLSN > 0 {
+					fLSN = wLSN
+				}
 				status := StandbyStatus{
 					WriteLSN:       wLSN,
 					FlushLSN:       fLSN,
@@ -161,18 +164,21 @@ func (fn *cdcSourceFn) ProcessElement(ctx context.Context, bf beam.BundleFinaliz
 			continue
 		}
 
-		event, err := parser.ParseMessage(payload)
+		events, err := parser.ParseMessages(payload)
 		if err != nil {
 			log.Warnf(ctx, "postgresio: failed to parse pgoutput message: %v", err)
 			continue
 		}
 
-		if event != nil {
-			if event.LSN > atomic.LoadUint64(&latestReceivedLSN) {
-				atomic.StoreUint64(&latestReceivedLSN, event.LSN)
-				atomic.StoreUint64(&currentBundleMaxLSN, event.LSN)
+		for _, event := range events {
+			if event != nil {
+				if event.LSN > atomic.LoadUint64(&latestReceivedLSN) {
+					atomic.StoreUint64(&latestReceivedLSN, event.LSN)
+					atomic.StoreUint64(&currentBundleMaxLSN, event.LSN)
+				}
+				emit(*event)
+				atomic.StoreUint64(&confirmedCommittedLSN, event.LSN)
 			}
-			emit(*event)
 		}
 	}
 }

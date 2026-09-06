@@ -100,9 +100,22 @@ func (p *PgOutputParser) GetRelation(relID uint32) (*RelationDef, bool) {
 }
 
 // ParseMessage decodes a single pgoutput frame payload.
-// Returns a ChangeEvent if the message represents a DML event (INSERT, UPDATE, DELETE, TRUNCATE),
-// or nil if it was a protocol control message ('B', 'C', 'R').
+// If the message is part of a streamed transaction, mutations are buffered until
+// Stream Commit ('c'). Use ParseMessages for full multi-event streaming support.
 func (p *PgOutputParser) ParseMessage(data []byte) (*ChangeEvent, error) {
+	events, err := p.ParseMessages(data)
+	if err != nil {
+		return nil, err
+	}
+	if len(events) == 0 {
+		return nil, nil
+	}
+	return events[0], nil
+}
+
+// ParseMessages decodes a single pgoutput frame payload and returns zero or more ChangeEvents.
+// Returns buffered events upon Stream Commit ('c') or a single event for standard DML ('I', 'U', 'D', 'T').
+func (p *PgOutputParser) ParseMessages(data []byte) ([]*ChangeEvent, error) {
 	if len(data) == 0 {
 		return nil, fmt.Errorf("empty pgoutput payload")
 	}
@@ -173,7 +186,7 @@ func (p *PgOutputParser) ParseMessage(data []byte) (*ChangeEvent, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse Insert tuple: %w", err)
 		}
-		return &ChangeEvent{
+		ev := &ChangeEvent{
 			Operation:     OpInsert,
 			Schema:        rel.Namespace,
 			Table:         rel.RelationName,
@@ -184,7 +197,8 @@ func (p *PgOutputParser) ParseMessage(data []byte) (*ChangeEvent, error) {
 			Origin:        p.currentOrigin,
 			After:         valuesToMap(values),
 			ColumnTypes:   valuesToColumnTypes(values),
-		}, nil
+		}
+		return p.emitOrSpool(ev), nil
 
 	case 'U': // Update
 		var relID uint32
@@ -226,7 +240,7 @@ func (p *PgOutputParser) ParseMessage(data []byte) (*ChangeEvent, error) {
 			beforeMap = valuesToMap(beforeVals)
 		}
 
-		return &ChangeEvent{
+		ev := &ChangeEvent{
 			Operation:     OpUpdate,
 			Schema:        rel.Namespace,
 			Table:         rel.RelationName,
@@ -238,7 +252,8 @@ func (p *PgOutputParser) ParseMessage(data []byte) (*ChangeEvent, error) {
 			Before:        beforeMap,
 			After:         valuesToMap(afterVals),
 			ColumnTypes:   valuesToColumnTypes(afterVals),
-		}, nil
+		}
+		return p.emitOrSpool(ev), nil
 
 	case 'D': // Delete
 		var relID uint32
@@ -250,14 +265,17 @@ func (p *PgOutputParser) ParseMessage(data []byte) (*ChangeEvent, error) {
 			return nil, fmt.Errorf("unknown relation ID %d for Delete", relID)
 		}
 		subType, err := r.ReadByte()
-		if err != nil || (subType != 'K' && subType != 'O') {
-			return nil, fmt.Errorf("expected 'K' or 'O' tuple type for Delete, got %c: %w", subType, err)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read Delete sub-type: %w", err)
+		}
+		if subType != 'K' && subType != 'O' {
+			return nil, fmt.Errorf("expected 'K' or 'O' tuple type for Delete, got %c", subType)
 		}
 		values, err := parseTupleData(r, rel.Columns)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse Delete tuple: %w", err)
 		}
-		return &ChangeEvent{
+		ev := &ChangeEvent{
 			Operation:     OpDelete,
 			Schema:        rel.Namespace,
 			Table:         rel.RelationName,
@@ -268,7 +286,8 @@ func (p *PgOutputParser) ParseMessage(data []byte) (*ChangeEvent, error) {
 			Origin:        p.currentOrigin,
 			Before:        valuesToMap(values),
 			ColumnTypes:   valuesToColumnTypes(values),
-		}, nil
+		}
+		return p.emitOrSpool(ev), nil
 
 	case 'T': // Truncate
 		var numRelations uint32
@@ -292,7 +311,7 @@ func (p *PgOutputParser) ParseMessage(data []byte) (*ChangeEvent, error) {
 				schemaName = rel.Namespace
 			}
 		}
-		return &ChangeEvent{
+		ev := &ChangeEvent{
 			Operation:     OpTruncate,
 			Schema:        schemaName,
 			Table:         tableName,
@@ -300,7 +319,8 @@ func (p *PgOutputParser) ParseMessage(data []byte) (*ChangeEvent, error) {
 			LSN:           p.currentLSN,
 			TransactionID: p.currentXID,
 			Origin:        p.currentOrigin,
-		}, nil
+		}
+		return p.emitOrSpool(ev), nil
 
 	case 'O': // Origin (Replication loop prevention)
 		var lsn uint64
@@ -333,8 +353,15 @@ func (p *PgOutputParser) ParseMessage(data []byte) (*ChangeEvent, error) {
 		_ = binary.Read(r, binary.BigEndian, &flags)
 		_ = binary.Read(r, binary.BigEndian, &commitLSN)
 		_ = binary.Read(r, binary.BigEndian, &endLSN)
+		p.currentLSN = endLSN
+		spooled := p.spooledTransactions[xid]
 		delete(p.spooledTransactions, xid)
-		return nil, nil
+		for _, ev := range spooled {
+			if ev.LSN == 0 {
+				ev.LSN = commitLSN
+			}
+		}
+		return spooled, nil
 
 	case 'A': // Stream Abort
 		var xid, subxid uint32
@@ -350,6 +377,14 @@ func (p *PgOutputParser) ParseMessage(data []byte) (*ChangeEvent, error) {
 		// Unsupported or extension message, skip gracefully
 		return nil, nil
 	}
+}
+
+func (p *PgOutputParser) emitOrSpool(ev *ChangeEvent) []*ChangeEvent {
+	if p.inStream {
+		p.spooledTransactions[p.currentXID] = append(p.spooledTransactions[p.currentXID], ev)
+		return nil
+	}
+	return []*ChangeEvent{ev}
 }
 
 // ParseKeepAlive decodes a Primary Keepalive ('k') message.

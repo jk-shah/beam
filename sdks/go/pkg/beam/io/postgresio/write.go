@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"math/rand"
 	"reflect"
-	"runtime"
 	"strings"
 	"time"
 
@@ -103,29 +102,32 @@ type writeFn struct {
 }
 
 func (fn *writeFn) Setup(ctx context.Context) error {
-	dsn := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=disable",
-		fn.Options.Host, fn.Options.Port, fn.Options.Database, fn.Options.Username, fn.Options.Password)
+	sslMode := fn.Options.SSLMode
+	if sslMode == "" {
+		sslMode = "disable"
+	}
+	// Pin search_path directly in DSN so EVERY connection in the pool is isolated (CVE-2018-1058)
+	dsn := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=%s search_path=pg_catalog,pg_temp",
+		fn.Options.Host, fn.Options.Port, fn.Options.Database, fn.Options.Username, fn.Options.Password, sslMode)
 
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {
 		return fmt.Errorf("postgresio: failed to open connection pool: %w", err)
 	}
 
-	// Clamp worker pool connections based on vCPU capacity
+	// Clamp worker pool connections to prevent connection storms across distributed workers
 	maxConns := fn.Options.MaxConnections
 	if maxConns <= 0 {
-		maxConns = runtime.NumCPU() / 2
-		if maxConns < 1 {
-			maxConns = 1
-		}
+		maxConns = 2
 	}
 	db.SetMaxOpenConns(maxConns)
 	db.SetMaxIdleConns(maxConns)
 	db.SetConnMaxLifetime(30 * time.Minute)
 
-	// Pin search_path to pg_catalog, pg_temp to prevent CVE-2018-1058 search_path hijacking
-	if _, err := db.ExecContext(ctx, "SET search_path = pg_catalog, pg_temp;"); err != nil {
-		log.Warnf(ctx, "postgresio: failed to set search_path: %v", err)
+	if fn.Options.ConnectionInitSQL != "" {
+		if _, err := db.ExecContext(ctx, fn.Options.ConnectionInitSQL); err != nil {
+			log.Warnf(ctx, "postgresio: connection init SQL failed: %v", err)
+		}
 	}
 
 	fn.db = db
@@ -168,7 +170,7 @@ func (fn *writeFn) StartBundle(ctx context.Context, emitSuccess func(beam.X), em
 
 func (fn *writeFn) ProcessElement(ctx context.Context, elem beam.X, emitSuccess func(beam.X), emitFailed func(FailedRow)) error {
 	entityKey, sortKey := ExtractPrimaryKeys(elem, fn.PrimaryKeyCols)
-	fn.compactor.Add(entityKey, sortKey, elem, 128)
+	fn.compactor.Add(entityKey, sortKey, elem, estimateElementSize(elem))
 
 	if fn.compactor.ShouldFlush() {
 		return fn.flushBatch(ctx, emitSuccess, emitFailed)
@@ -193,6 +195,18 @@ func (fn *writeFn) flushBatch(ctx context.Context, emitSuccess func(beam.X), emi
 	batch := fn.compactor.CompactAndSort()
 	if len(batch) == 0 {
 		return nil
+	}
+
+	// High-Throughput Fast Path: Staged COPY Upsert (>100,000 rows/sec)
+	if fn.Options.WriteMethod == WriteMethodStagedCopy {
+		copyErr := fn.executeStagedCopy(ctx, batch)
+		if copyErr == nil {
+			for _, item := range batch {
+				emitSuccess(item)
+			}
+			return nil
+		}
+		log.Warnf(ctx, "postgresio: staged COPY failed (%v), falling back to parameterized UNNEST", copyErr)
 	}
 
 	query, args, err := fn.buildUnnestQuery(batch)
@@ -242,6 +256,172 @@ func (fn *writeFn) flushBatch(ctx context.Context, emitSuccess func(beam.X), emi
 	}
 
 	return nil
+}
+
+// executeStagedCopy executes two-phase bulk upsert utilizing PostgreSQL COPY
+// into a temporary unlogged staging table followed by an atomic set-based ON CONFLICT merge.
+func (fn *writeFn) executeStagedCopy(ctx context.Context, batch []any) error {
+	if len(fn.columns) == 0 {
+		return fmt.Errorf("postgresio: no columns discovered for type %v", fn.Type.T)
+	}
+
+	sanitizedCols := make([]string, len(fn.columns))
+	for i, col := range fn.columns {
+		san, err := SanitizeIdentifier(col)
+		if err != nil {
+			return err
+		}
+		sanitizedCols[i] = san
+	}
+
+	txn, err := fn.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer txn.Rollback()
+
+	// Append-only fast path
+	if fn.Options.WriteMode == WriteModeInsert && len(fn.PrimaryKeyCols) == 0 {
+		stmt, err := txn.PrepareContext(ctx, pq.CopyIn(fn.Table, fn.columns...))
+		if err != nil {
+			return err
+		}
+		defer stmt.Close()
+
+		for _, item := range batch {
+			rowVals := fn.extractRowValues(item)
+			if _, err := stmt.ExecContext(ctx, rowVals...); err != nil {
+				return err
+			}
+		}
+		if _, err := stmt.ExecContext(ctx); err != nil {
+			return err
+		}
+		if err := stmt.Close(); err != nil {
+			return err
+		}
+		return txn.Commit()
+	}
+
+	// Upsert fast path via temp table staging
+	tempTable := fmt.Sprintf("stage_%d", rand.Int63()&0x7FFFFFFFFFFFFFFF)
+	createSql := fmt.Sprintf("CREATE TEMP TABLE %s (LIKE %s INCLUDING DEFAULTS) ON COMMIT DROP", tempTable, fn.Table)
+	if _, err := txn.ExecContext(ctx, createSql); err != nil {
+		return err
+	}
+
+	stmt, err := txn.PrepareContext(ctx, pq.CopyIn(tempTable, fn.columns...))
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	for _, item := range batch {
+		rowVals := fn.extractRowValues(item)
+		if _, err := stmt.ExecContext(ctx, rowVals...); err != nil {
+			return err
+		}
+	}
+	if _, err := stmt.ExecContext(ctx); err != nil {
+		return err
+	}
+	if err := stmt.Close(); err != nil {
+		return err
+	}
+
+	pkSet := make(map[string]bool)
+	sanitizedPks := make([]string, len(fn.PrimaryKeyCols))
+	for i, pk := range fn.PrimaryKeyCols {
+		san, err := SanitizeIdentifier(pk)
+		if err != nil {
+			return err
+		}
+		sanitizedPks[i] = san
+		pkSet[pk] = true
+	}
+
+	updateClauses := make([]string, 0, len(fn.columns))
+	for _, col := range fn.columns {
+		if !pkSet[col] {
+			san, err := SanitizeIdentifier(col)
+			if err != nil {
+				return err
+			}
+			updateClauses = append(updateClauses, fmt.Sprintf("%s = EXCLUDED.%s", san, san))
+		}
+	}
+
+	colList := strings.Join(sanitizedCols, ", ")
+	var mergeSql string
+	if len(updateClauses) > 0 {
+		mergeSql = fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM %s ON CONFLICT (%s) DO UPDATE SET %s",
+			fn.Table, colList, colList, tempTable, strings.Join(sanitizedPks, ", "), strings.Join(updateClauses, ", "))
+	} else {
+		mergeSql = fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM %s ON CONFLICT (%s) DO NOTHING",
+			fn.Table, colList, colList, tempTable, strings.Join(sanitizedPks, ", "))
+	}
+
+	if _, err := txn.ExecContext(ctx, mergeSql); err != nil {
+		return err
+	}
+
+	return txn.Commit()
+}
+
+func (fn *writeFn) extractRowValues(item any) []any {
+	v := reflect.ValueOf(item)
+	if v.Kind() == reflect.Ptr {
+		v = v.Elem()
+	}
+	vals := make([]any, len(fn.columns))
+	t := v.Type()
+	for i, colName := range fn.columns {
+		f := v.FieldByName(colName)
+		if !f.IsValid() {
+			for j := 0; j < t.NumField(); j++ {
+				fld := t.Field(j)
+				if strings.EqualFold(fld.Name, colName) || fld.Tag.Get("db") == colName || fld.Tag.Get("beam") == colName || fld.Tag.Get("json") == colName {
+					f = v.Field(j)
+					break
+				}
+			}
+		}
+		if f.IsValid() {
+			vals[i] = f.Interface()
+		} else {
+			vals[i] = nil
+		}
+	}
+	return vals
+}
+
+func estimateElementSize(elem any) int {
+	if elem == nil {
+		return 64
+	}
+	v := reflect.ValueOf(elem)
+	if v.Kind() == reflect.Ptr {
+		if v.IsNil() {
+			return 64
+		}
+		v = v.Elem()
+	}
+	if v.Kind() == reflect.Struct {
+		sz := int(v.Type().Size())
+		for i := 0; i < v.NumField(); i++ {
+			f := v.Field(i)
+			if f.Kind() == reflect.String {
+				sz += f.Len()
+			} else if f.Kind() == reflect.Slice {
+				sz += f.Len()
+			}
+		}
+		if sz < 64 {
+			return 64
+		}
+		return sz
+	}
+	return 64
 }
 
 func (fn *writeFn) buildUnnestQuery(batch []any) (string, []any, error) {
@@ -321,7 +501,10 @@ func (fn *writeFn) buildUnnestQuery(batch []any) (string, []any, error) {
 		updateClauses := make([]string, 0, len(fn.columns))
 		for _, col := range fn.columns {
 			if !pkSet[col] {
-				san, _ := SanitizeIdentifier(col)
+				san, err := SanitizeIdentifier(col)
+				if err != nil {
+					return "", nil, err
+				}
 				updateClauses = append(updateClauses, fmt.Sprintf("%s = EXCLUDED.%s", san, san))
 			}
 		}

@@ -101,6 +101,8 @@ func (t *postgreSqlWriteTransform) BuildTransform(s beam.Scope, inputs map[strin
 		Database:       t.cfg.Database,
 		Username:       t.cfg.Username,
 		Password:       t.cfg.Password,
+		SSLMode:        t.cfg.SSLMode,
+		WriteMethod:    WriteMethodStagedCopy,
 		PrimaryKeyCols: t.cfg.ConflictKeys,
 		BatchSize:      int(t.cfg.MaxBatchRows),
 		MaxBatchBytes:  int(t.cfg.MaxBatchBytes),
@@ -199,6 +201,7 @@ func (t *postgreSqlReadCDCTransform) BuildTransform(s beam.Scope, _ map[string]b
 		WithCDCPassword(t.cfg.Password),
 		WithCDCSlotName(t.cfg.SlotName),
 		WithCDCPublication(t.cfg.Publication),
+		WithCDCSSLMode(t.cfg.SSLMode),
 	}
 
 	cdcCol := ReadCDC(s, opts...)

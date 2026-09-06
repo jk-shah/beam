@@ -27,7 +27,7 @@ import (
 
 var (
 	passwordRegex = regexp.MustCompile(`(?i)(password|token|secret|key|access_token|client_secret)\s*[:=]\s*['"]?[^\s,'"]+['"]?`)
-	urlCredRegex  = regexp.MustCompile(`(?i)(:[^/:]+)://([^:]+):([^@]+)@`)
+	urlCredRegex  = regexp.MustCompile(`(?i)([a-zA-Z][a-zA-Z0-9+.-]*)://([^:]+):([^@]+)@`)
 	bearerRegex   = regexp.MustCompile(`(?i)Bearer\s+[a-zA-Z0-9_\-\.~+/]+=*`)
 	ipRegex       = regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`)
 )

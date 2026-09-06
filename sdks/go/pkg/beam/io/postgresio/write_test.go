@@ -16,9 +16,13 @@
 package postgresio
 
 import (
+	"context"
+	"database/sql"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/apache/beam/sdks/v2/go/pkg/beam"
 )
@@ -42,7 +46,7 @@ func TestBuildUnnestQueryUpsert(t *testing.T) {
 		t.Fatalf("unexpected error building unnest query: %v", err)
 	}
 
-	expectedPrefix := `INSERT INTO "public"."orders" ("id", "region", "amount") SELECT * FROM UNNEST($1, $2, $3)`
+	expectedPrefix := `INSERT INTO "public"."orders" ("id", "region", "amount") SELECT * FROM UNNEST($1::bigint[], $2::text[], $3::double precision[])`
 	if !strings.HasPrefix(query, expectedPrefix) {
 		t.Errorf("expected query to start with %q, got %q", expectedPrefix, query)
 	}
@@ -127,3 +131,54 @@ func TestWriteRejectsInvalidTableNameAtGraphConstruction(t *testing.T) {
 	// Malicious table name should panic at graph construction time
 	Write(s, `orders"; DROP TABLE users; --`, opts, col)
 }
+
+func TestStagedCopyExecutionDirect(t *testing.T) {
+	db, err := sql.Open("postgres", "host=localhost port=5432 user=beam_test password=beam_test dbname=postgres sslmode=disable search_path=pg_catalog,pg_temp")
+	if err != nil {
+		t.Skipf("skipping db integration test: %v", err)
+	}
+	defer db.Close()
+	if err := db.Ping(); err != nil {
+		t.Skipf("skipping db integration test: %v", err)
+	}
+
+	type StagedRecord struct {
+		ID       int64     `db:"id"`
+		Code     string    `db:"code"`
+		Amount   float64   `db:"amount"`
+		Region   string    `db:"region"`
+		Tier     string    `db:"tier"`
+		LoadedAt time.Time `db:"loaded_at"`
+	}
+
+	fn := &writeFn{
+		Table:          `"public"."migrated_transactions"`,
+		Options:        NewWriteOptions(WithWriteMethod(WriteMethodStagedCopy), WithWriteMode(WriteModeUpsert)),
+		Type:           beam.EncodedType{T: reflect.TypeOf(StagedRecord{})},
+		PrimaryKeyCols: []string{"id"},
+		db:             db,
+	}
+	fn.inspectColumns(reflect.TypeOf(StagedRecord{}))
+
+	batch := make([]any, 25000)
+	now := time.Now().UTC()
+	for i := 0; i < 25000; i++ {
+		batch[i] = StagedRecord{
+			ID:       int64(900000 + i),
+			Code:     fmt.Sprintf("STAGED-%d", i),
+			Amount:   123.45,
+			Region:   "us-west1",
+			Tier:     "ENTERPRISE",
+			LoadedAt: now,
+		}
+	}
+
+	ctx := context.Background()
+	start := time.Now()
+	if err := fn.executeStagedCopy(ctx, batch); err != nil {
+		t.Fatalf("executeStagedCopy failed: %v", err)
+	}
+	dur := time.Since(start)
+	t.Logf("executeStagedCopy inserted %d rows in %v (Rate: %.2f rows/sec)", len(batch), dur, float64(len(batch))/dur.Seconds())
+}
+

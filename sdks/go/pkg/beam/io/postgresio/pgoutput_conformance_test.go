@@ -18,6 +18,7 @@ package postgresio
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -214,3 +215,95 @@ func TestUpstreamOriginMessage(t *testing.T) {
 		t.Errorf("expected event Origin 'remote_node_east', got %q", event.Origin)
 	}
 }
+
+// Replicates streaming in-flight transactions with uncommitted mutations discarded on Stream Abort ('A').
+func TestUpstreamInFlightStreamingSpoolAndAbort(t *testing.T) {
+	parser := NewPgOutputParser()
+	cols := []ColumnDef{{Flags: 1, Name: "id", TypeOID: 23, TypeModifier: -1}}
+	relPayload := buildMockRelationPayload(16600, "public", "streamed_orders", 'd', cols)
+	_, _ = parser.ParseMessage(relPayload)
+
+	// Stream Start (xid = 6001)
+	var streamStart bytes.Buffer
+	streamStart.WriteByte('S')
+	_ = binary.Write(&streamStart, binary.BigEndian, uint32(6001))
+	streamStart.WriteByte(1)
+	_, _ = parser.ParseMessage(streamStart.Bytes())
+
+	// Insert while in stream - should be buffered (returns nil)
+	insertPayload := buildMockInsertPayload(16600, []string{"101"})
+	ev, err := parser.ParseMessage(insertPayload)
+	if err != nil || ev != nil {
+		t.Fatalf("expected nil event for in-stream insert, got ev=%v, err=%v", ev, err)
+	}
+
+	// Stream Stop
+	_, _ = parser.ParseMessage([]byte{'E'})
+
+	// Stream Abort ('A')
+	var streamAbort bytes.Buffer
+	streamAbort.WriteByte('A')
+	_ = binary.Write(&streamAbort, binary.BigEndian, uint32(6001))
+	_ = binary.Write(&streamAbort, binary.BigEndian, uint32(0))
+	events, err := parser.ParseMessages(streamAbort.Bytes())
+	if err != nil {
+		t.Fatalf("unexpected error parsing Stream Abort: %v", err)
+	}
+	if len(events) != 0 {
+		t.Errorf("expected 0 events on abort, got %d", len(events))
+	}
+}
+
+// Replicates streaming in-flight transactions with mutations emitted on Stream Commit ('c').
+func TestUpstreamInFlightStreamingSpoolAndCommit(t *testing.T) {
+	parser := NewPgOutputParser()
+	cols := []ColumnDef{{Flags: 1, Name: "id", TypeOID: 23, TypeModifier: -1}}
+	relPayload := buildMockRelationPayload(16700, "public", "streamed_orders", 'd', cols)
+	_, _ = parser.ParseMessage(relPayload)
+
+	// Stream Start (xid = 7001)
+	var streamStart bytes.Buffer
+	streamStart.WriteByte('S')
+	_ = binary.Write(&streamStart, binary.BigEndian, uint32(7001))
+	streamStart.WriteByte(1)
+	_, _ = parser.ParseMessage(streamStart.Bytes())
+
+	// Insert 1
+	insert1 := buildMockInsertPayload(16700, []string{"201"})
+	ev1, err := parser.ParseMessage(insert1)
+	if err != nil || ev1 != nil {
+		t.Fatalf("expected nil event for in-stream insert1, got ev=%v, err=%v", ev1, err)
+	}
+
+	// Insert 2
+	insert2 := buildMockInsertPayload(16700, []string{"202"})
+	ev2, err := parser.ParseMessage(insert2)
+	if err != nil || ev2 != nil {
+		t.Fatalf("expected nil event for in-stream insert2, got ev=%v, err=%v", ev2, err)
+	}
+
+	// Stream Stop
+	_, _ = parser.ParseMessage([]byte{'E'})
+
+	// Stream Commit ('c')
+	var streamCommit bytes.Buffer
+	streamCommit.WriteByte('c')
+	_ = binary.Write(&streamCommit, binary.BigEndian, uint32(7001))
+	streamCommit.WriteByte(0)
+	_ = binary.Write(&streamCommit, binary.BigEndian, uint64(5000))
+	_ = binary.Write(&streamCommit, binary.BigEndian, uint64(5050))
+	events, err := parser.ParseMessages(streamCommit.Bytes())
+	if err != nil {
+		t.Fatalf("unexpected error parsing Stream Commit: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected 2 committed events, got %d", len(events))
+	}
+	if fmt.Sprint(events[0].After["id"]) != "201" || fmt.Sprint(events[1].After["id"]) != "202" {
+		t.Errorf("unexpected event payloads: %+v, %+v", events[0], events[1])
+	}
+	if events[0].LSN != 5000 || events[1].LSN != 5000 {
+		t.Errorf("expected commit LSN 5000, got %d, %d", events[0].LSN, events[1].LSN)
+	}
+}
+
