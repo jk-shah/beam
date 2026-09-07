@@ -287,3 +287,63 @@ func TestPostgreSqlReadCDCTransform_BuildTransform(t *testing.T) {
 		t.Errorf("missing main output tag in arrow cdc transform outputs")
 	}
 }
+
+func TestPostgreSqlSchemaTransformProviders_MetadataAndFactory(t *testing.T) {
+	// 1. Write Provider
+	wp := &postgreSqlWriteProvider{}
+	if got := wp.Identifier(); got != WriteSchemaTransformURN {
+		t.Errorf("wp.Identifier() = %q, want %q", got, WriteSchemaTransformURN)
+	}
+	if got := wp.Description(); got == "" {
+		t.Errorf("wp.Description() is empty")
+	}
+	if in := wp.InputCollectionNames(); len(in) != 1 || in[0] != schematransform.MainInputTag {
+		t.Errorf("wp.InputCollectionNames() = %v, want [%q]", in, schematransform.MainInputTag)
+	}
+	if out := wp.OutputCollectionNames(); len(out) != 2 {
+		t.Errorf("wp.OutputCollectionNames() len = %d, want 2", len(out))
+	}
+	writeCfg := PostgreSqlWriteConfig{
+		Host:     "localhost",
+		Database: "testdb",
+		Table:    "users",
+		Username: "beam_test",
+	}
+	tf, err := wp.CreateTransform(writeCfg)
+	if err != nil {
+		t.Fatalf("wp.CreateTransform() err = %v, want nil", err)
+	}
+	if tf == nil {
+		t.Fatalf("wp.CreateTransform() returned nil transform")
+	}
+
+	// 2. Read CDC Provider
+	rp := &postgreSqlReadCDCProvider{}
+	if got := rp.Identifier(); got != ReadCDCSchemaTransformURN {
+		t.Errorf("rp.Identifier() = %q, want %q", got, ReadCDCSchemaTransformURN)
+	}
+	if got := rp.Description(); got == "" {
+		t.Errorf("rp.Description() is empty")
+	}
+	if in := rp.InputCollectionNames(); in != nil {
+		t.Errorf("rp.InputCollectionNames() = %v, want nil", in)
+	}
+	if out := rp.OutputCollectionNames(); len(out) != 1 || out[0] != schematransform.MainOutputTag {
+		t.Errorf("rp.OutputCollectionNames() = %v, want [%q]", out, schematransform.MainOutputTag)
+	}
+	readCfg := PostgreSqlReadCDCConfig{
+		Host:        "localhost",
+		Database:    "testdb",
+		SlotName:    "slot_test",
+		Publication: "pub_test",
+		Username:    "beam_test",
+	}
+	rtf, err := rp.CreateTransform(readCfg)
+	if err != nil {
+		t.Fatalf("rp.CreateTransform() err = %v, want nil", err)
+	}
+	if rtf == nil {
+		t.Fatalf("rp.CreateTransform() returned nil transform")
+	}
+}
+

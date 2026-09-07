@@ -623,14 +623,14 @@ func parseTextValue(typeOID uint32, s string) any {
 			return arr
 		}
 	}
+	if typeOID == 600 || (strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") && strings.Contains(s, ",") && !isRangeOID(typeOID)) {
+		if pt, err := DecodePoint(s); err == nil {
+			return pt
+		}
+	}
 	if isRangeOID(typeOID) || strings.HasPrefix(s, "[") || strings.HasPrefix(s, "(") {
 		if rng, err := DecodeRange(s); err == nil {
 			return rng
-		}
-	}
-	if typeOID == 600 || (strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") && strings.Contains(s, ",")) {
-		if pt, err := DecodePoint(s); err == nil {
-			return pt
 		}
 	}
 
