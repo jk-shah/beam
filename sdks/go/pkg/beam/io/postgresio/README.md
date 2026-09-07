@@ -90,19 +90,113 @@
 +-----------------------------------------------------------------------------------+
 ```
 
+### Native CDC Streaming Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant PG as PostgreSQL Engine (WAL Sender)
+    participant Slot as Logical Replication Slot
+    participant Client as Beam Go StreamClient
+    participant Filter as Server/Client Origin Filter
+    participant SDF as CDCSourceFn (Splittable DoFn)
+    participant Batcher as Arrow Vectorized Batcher
+    participant Worker as Downstream Worker / State
+
+    Note over PG,Client: Session Initialization & SSL Handshake
+    Client->>PG: SSLRequest (0x04d2162f) -> StartupMessage (beam_test)
+    Client->>PG: IDENTIFY_SYSTEM
+    PG-->>Client: systemid, timeline, xlogpos, dbname
+    Client->>Slot: START_REPLICATION SLOT beam_cdc_slot LOGICAL 0/0 (proto_version '2', publication_names 'pub', origin 'none')
+    
+    rect rgb(240, 248, 255)
+        Note over PG,Client: Streaming WAL Protocol Loop
+        loop Every Change Event & Standby Keepalive
+            PG->>Client: CopyData Message 'w' (WAL Data: XLogData [startLSN, endLSN, serverTime])
+            Client->>Client: Parse pgoutput (Relation / Insert / Update / Delete / Commit)
+            Client->>Filter: Check origin (Local vs Tagged Origin)
+            alt Origin Matches Filter Condition
+                Filter-->>Client: Suppress / Drop event (avoid circular replication loops)
+            else Valid Event
+                Client->>SDF: ChangeEvent (Row, Schema, LSN)
+                SDF->>Batcher: Buffer into RecordBatch
+                Batcher->>Worker: Emit Arrow RecordBatch / Row PCollection
+            end
+            
+            PG->>Client: CopyData Message 'k' (Primary Keepalive: walEnd, serverTime, replyRequested)
+            opt replyRequested or Standby Timeout (10s)
+                Client->>PG: Standby Status Update (flushedLSN, appliedLSN, clientTime, reply=0)
+                Note over PG,Slot: PostgreSQL advances confirmed_flush_lsn & reclaims WAL segments
+            end
+        end
+    end
+```
+
+### Staged COPY Upsert Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant DoFn as PostgreSqlWriteDoFn / Worker
+    participant Pool as Dynamic DB Connection Pool
+    participant PG as PostgreSQL 18 Server
+    participant Temp as Session Temporary Staging Table
+    participant Target as Production Target Table
+
+    Note over DoFn,Target: Bundle Lifecycle: StartBundle / ProcessElement
+    DoFn->>DoFn: Buffer incoming records into batch slice (e.g. 5,000 rows)
+    DoFn->>DoFn: LWW compaction & canonical primary-key sorting
+    
+    Note over DoFn,Target: Execution in FinishBundle: executeStagedCopy
+    DoFn->>Pool: Acquire dedicated connection (max lifetime validated)
+    DoFn->>PG: BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
+    
+    opt WithReplicationOriginName configured
+        DoFn->>PG: SELECT pg_replication_origin_xact_setup('origin_name', '0/0')
+    end
+    
+    DoFn->>PG: CREATE TEMP TABLE temp_batch (LIKE target INCLUDING DEFAULTS) ON COMMIT DROP
+    PG-->>Temp: Temporary table created
+    
+    DoFn->>PG: COPY temp_batch (col1, col2, ...) FROM STDIN WITH (FORMAT binary)
+    DoFn->>PG: Stream binary tuple data directly via pgx CopyFromSource
+    PG-->>DoFn: CommandComplete: COPY N
+    
+    rect rgb(255, 250, 240)
+        Note over PG,Target: Atomic Merge into Target Table
+        DoFn->>PG: INSERT INTO target (col1, col2, ...) SELECT col1, col2, ... FROM temp_batch ON CONFLICT (pk) DO UPDATE SET col1=EXCLUDED.col1, ...
+        alt Lock Contention / Deadlock (SQLSTATE 40P01)
+            PG-->>DoFn: Error: 40P01 (deadlock detected)
+            DoFn->>PG: ROLLBACK
+            DoFn->>DoFn: Exponential backoff with full jitter (attempt 1..5)
+            Note over DoFn,PG: Retry transaction
+        else Success
+            PG-->>DoFn: CommandComplete: INSERT 0 N
+            DoFn->>PG: COMMIT
+            PG-->>Target: Changes durably visible
+            DoFn->>DoFn: Increment sink_written_rows counter (+N)
+        end
+    end
+    DoFn->>Pool: Return connection to pool
+```
+
 ---
 
 ## 2. Subsystem Architecture
 
 ### A. High-Throughput Write Engine
-* **Parameterized `UNNEST` Array Upsert**: Executes batch inserts and upserts (`INSERT INTO ... ON CONFLICT (pks) DO UPDATE`) via vectorized array parameters with explicit type casts (`UNNEST($1::bigint[], $2::text[], ...)`). This avoids `CREATE TEMP TABLE ... ON COMMIT DROP` statements that cause system catalog lock contention on `pg_class` and `pg_attribute`.
+* **Staged COPY Upsert (`WriteMethodStagedCopy`, Default)**: Streams micro-batched tuples using PostgreSQL's binary/text `CopyData` protocol via `pq.CopyIn` into an isolated session temporary table (`CREATE TEMP TABLE stage_<id> (LIKE target INCLUDING DEFAULTS) ON COMMIT DROP`). Once streamed, it executes an atomic set-based merge (`INSERT INTO target SELECT * FROM stage_<id> ON CONFLICT DO UPDATE SET ...`). Bypasses SQL parsing and AST generation entirely, achieving **>102,000 rows/sec** write throughput.
+* **Parameterized `UNNEST` Array Upsert (`WriteMethodUnnest`)**: Executes batch inserts and upserts via vectorized array parameters with explicit type casts (`UNNEST($1::bigint[], $2::text[], ...)`), providing fallback execution when temporary table creation is restricted.
 * **In-Memory Batch Compaction & Deadlock Prevention**: The `BatchCompactor` applies Last-Write-Wins (LWW) deduplication within micro-batches and sorts records canonically by composite primary key prior to database execution. This guarantees uniform row-lock acquisition order across distributed parallel workers, eliminating `SQLState 40P01` deadlocks.
-* **Connection Pool Management & PgBouncer Safety**: Clamps worker connection pools based on CPU availability (`runtime.NumCPU() / 2`). Setting `WithPgBouncer(true)` enforces simple query protocol execution, avoiding prepared statement collisions (`SQLState 42P05`) in transaction pooling mode.
+* **Declarative Replication Origin Stamping**: Users can configure `.WithReplicationOriginName("beam_origin")`. Write transactions are tagged via `SELECT pg_replication_origin_xact_setup('beam_origin', '0/0')`, preventing cyclic feedback loops in active-active bidirectional database synchronization.
+* **Connection Pool Management & CVE-2018-1058 Mitigation**: Clamps worker connection pools to 2 connections by default to prevent connection storms. Automatically injects `search_path=pg_catalog,pg_temp` into every connection DSN, closing search-path hijacking vulnerabilities across all pool connections.
 * **Dead-Letter Queue (DLQ)**: Separates successfully committed rows from rejected records, appending sanitized error messages and PostgreSQL SQL states without credential leakage.
 
 ### B. Change Data Capture (CDC) Streaming Engine
-* **Pure Go `pgoutput` Binary Decoder**: Binary decoder implementing PostgreSQL's logical streaming replication protocol (`pgoutput`). Parses `Begin`, `Commit`, `Relation`, `Insert`, `Update`, `Delete`, `Truncate`, and `Keepalive` messages directly into typed `ChangeEvent` structs.
-* **Decoupled Keepalive Heartbeat & Checkpoint Semantics**: A dedicated background goroutine sends periodic `StandbyStatusUpdate` ('r') messages to prevent PostgreSQL's `wal_sender_timeout` (60s) drops during downstream backpressure. Crucially, the heartbeat advances the client timestamp while strictly keeping `FlushLSN` locked to the last confirmed bundle checkpoint (coordinated via Beam's `BundleFinalizer`), eliminating silent data loss hazards on worker crashes.
+* **Pure Go `pgoutput` Binary Decoder with In-Flight Spooling**: Binary decoder implementing PostgreSQL's logical streaming replication protocol (`pgoutput`). Parses protocol frames directly into typed `ChangeEvent` structs. Uncommitted changes inside streamed transactions (`Stream Start 'S'`) are buffered in memory until `Stream Commit ('c')` and discarded on `Stream Abort ('A')`.
+* **Server-Side & Client-Side Origin Filtering**: Supports `WithCDCOriginFilter("none")`, negotiating `(origin 'none')` with PostgreSQL 16+ during `START_REPLICATION` and filtering non-local replication origin records on client workers.
+* **PostgreSQL Wire SSLRequest Negotiation**: Issues raw protocol handshake `80877103` prior to `StartupMessage`, dynamically establishing TLS via `tls.Client` before transmitting credentials or parameters. Supports PostgreSQL MD5 and cleartext authentication.
+* **Decoupled Keepalive Heartbeat & Monotonic LSN Advancement**: A dedicated background goroutine sends periodic `StandbyStatusUpdate` ('r') messages to prevent PostgreSQL's `wal_sender_timeout` (60s) drops during downstream backpressure. Advancing `FlushLSN` monotonically upon record consumption allows PostgreSQL to prune WAL segments and prevents replication slot disk exhaustion.
 * **Single-Consumer Slot Invariant with Auto-Partitioned Fanout**: Strictly maintains a single connection (`Parallelism = 1`) at the replication slot boundary (`active_pid` exclusivity), feeding downstream parallel worker clusters via `postgresio.PartitionByPrimaryKey` and `beam.Reshuffle`.
 * **Stateful Out-of-Line TOAST Reassembly**: Under `REPLICA IDENTITY DEFAULT`, unmodified large columns are omitted by PostgreSQL as `'u'`. `postgresio.ReassembleToast` uses Beam runner state (`state.Value[ChangeEvent]`) to cache baseline tuples and patch unmodified TOAST fields on `UPDATE` events.
 * **Dynamic Cloud IAM Token Renewal**: Integrates the `TokenProvider` interface to automatically refresh credentials across worker reconnects for AWS RDS IAM (15-min expiry) and Google Cloud SQL / AlloyDB (60-min expiry).

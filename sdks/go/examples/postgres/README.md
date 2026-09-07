@@ -35,6 +35,12 @@ Each example demonstrates idiomatic Apache Beam pipeline design, error-handling 
 | **4. Slowly Changing Dimensions (SCD Type 2)** | [`scd_type2/`](./scd_type2/) | Temporal Sorting, Version Generation, Window State | Non-destructive audit history with `valid_from`, `valid_to`, `is_current` flags in `customer_dim_history`. |
 | **5. High-Throughput Vectorized Batch ETL** | [`vectorized_batch_etl/`](./vectorized_batch_etl/) | Parameterized `UNNEST` Vectorization, Micro-Batching | High-speed database migration loading >33,000 rows/sec with zero per-row heap allocations. |
 | **6. Real-Time Streaming Windowed Aggregation** | [`streaming_aggregation/`](./streaming_aggregation/) | `postgresio.ReadCDC`, `window.NewFixedWindows`, Rollup Grouping | Decoupled logical replication stream source + continuous window rollup table sink. |
+| **7. Multi-Dimensional OLAP Sales Cube** | [`advanced_use_cases/multi_dimensional_olap/`](./advanced_use_cases/multi_dimensional_olap/) | Composite Keys (`Region\|Category`), `beam.GroupByKey`, Rollups | Incremental rollup aggregation with memory-bounded execution and atomic upsert on `(region, category)`. |
+| **8. Window Function Top-N per Group** | [`advanced_use_cases/top_n_ranking/`](./advanced_use_cases/top_n_ranking/) | Partition by Category, Bounded Sort/Heap, Truncation | Deterministic ranking per category partition; bounded heap prevents allocation spikes; atomic `(category, rank_position)` upsert. |
+| **9. Graph Topology & Degree Centrality** | [`advanced_use_cases/graph_vertex_degrees/`](./advanced_use_cases/graph_vertex_degrees/) | Edge Fan-Out, Directional Degree Deltas, `beam.GroupByKey` | Computes in-degree, out-degree, total degree, and average edge weights in a single-pass MapReduce pipeline. |
+| **10. ML Feature Engineering & Scaling** | [`advanced_use_cases/ml_feature_engineering/`](./advanced_use_cases/ml_feature_engineering/) | Global Population Combiner, Beam Side Inputs, Normalization | Normalizes features into bounded distributions `[0, 1]` and Z-scores using population statistics side inputs. |
+| **11. Inactivity Gap User Sessionization** | [`advanced_use_cases/sessionization/`](./advanced_use_cases/sessionization/) | Temporal Sorting, Delta Gap Evaluation (`gap > 30m`), Bounce Detection | Time-bounded stream grouping; captures single-click bounces (`is_bounce = true`) and session durations in seconds. |
+| **12. Data Reconciliation & Table Diff** | [`advanced_use_cases/data_reconciliation_diff/`](./advanced_use_cases/data_reconciliation_diff/) | Full Outer `beam.CoGroupByKey`, Anti-Join Checksum Validation | Audits replication fidelity, classifying records as `MATCH`, `VALUE_DRIFT`, `MISSING_TARGET`, or `MISSING_SOURCE`. |
 
 ---
 
@@ -115,6 +121,71 @@ CREATE TABLE IF NOT EXISTS public.merchant_minute_rollups (
     total_amount NUMERIC(14,2) NOT NULL,
     max_amount NUMERIC(14,2) NOT NULL,
     PRIMARY KEY (merchant_id, window_start)
+);
+
+-- 7. Multi-Dimensional OLAP Sales Cube
+CREATE TABLE IF NOT EXISTS public.olap_sales_cube (
+    region TEXT NOT NULL,
+    category TEXT NOT NULL,
+    total_revenue NUMERIC(14,2) NOT NULL,
+    order_count BIGINT NOT NULL,
+    avg_order_value NUMERIC(14,2) NOT NULL,
+    max_order_value NUMERIC(14,2) NOT NULL,
+    computed_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (region, category)
+);
+
+-- 8. Top-N Ranking per Category
+CREATE TABLE IF NOT EXISTS public.top_products_by_category (
+    category TEXT NOT NULL,
+    rank_position INT NOT NULL,
+    product_id TEXT NOT NULL,
+    product_name TEXT NOT NULL,
+    sales_volume NUMERIC(14,2) NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (category, rank_position)
+);
+
+-- 9. Graph Degree Centrality
+CREATE TABLE IF NOT EXISTS public.graph_node_centrality (
+    node_id TEXT PRIMARY KEY,
+    in_degree INT NOT NULL,
+    out_degree INT NOT NULL,
+    total_degree INT NOT NULL,
+    avg_edge_weight NUMERIC(10,4) NOT NULL,
+    computed_at TIMESTAMPTZ NOT NULL
+);
+
+-- 10. Machine Learning Feature Store
+CREATE TABLE IF NOT EXISTS public.ml_feature_store (
+    entity_id TEXT PRIMARY KEY,
+    raw_income NUMERIC(12,2) NOT NULL,
+    norm_income NUMERIC(8,4) NOT NULL,
+    z_income NUMERIC(8,4) NOT NULL,
+    raw_score NUMERIC(6,2) NOT NULL,
+    norm_score NUMERIC(8,4) NOT NULL,
+    engineered_at TIMESTAMPTZ NOT NULL
+);
+
+-- 11. User Activity Session Summaries
+CREATE TABLE IF NOT EXISTS public.user_session_summaries (
+    user_id TEXT NOT NULL,
+    session_start TIMESTAMPTZ NOT NULL,
+    session_end TIMESTAMPTZ NOT NULL,
+    duration_seconds BIGINT NOT NULL,
+    event_count BIGINT NOT NULL,
+    is_bounce BOOLEAN NOT NULL,
+    PRIMARY KEY (user_id, session_start)
+);
+
+-- 12. Data Reconciliation Audit
+CREATE TABLE IF NOT EXISTS public.data_reconciliation_audit (
+    record_id TEXT PRIMARY KEY,
+    reconciliation_status TEXT NOT NULL,
+    source_checksum TEXT,
+    target_checksum TEXT,
+    difference_details TEXT,
+    audited_at TIMESTAMPTZ NOT NULL
 );
 
 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO beam_test;

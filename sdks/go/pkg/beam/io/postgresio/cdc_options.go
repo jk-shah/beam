@@ -40,6 +40,7 @@ type CDCOptions struct {
 	CreateSlotIfMissing  bool
 	ReplicaIdentityFull  bool
 	TokenProvider        TokenProvider            `beam:"-" json:"-"`
+	OriginFilter         string
 	DialFunc             DialFunc                 `beam:"-" json:"-"`
 	StreamFactory        ReplicationStreamFactory `beam:"-" json:"-"`
 }
@@ -201,5 +202,14 @@ func WithCDCDialFunc(dial DialFunc) CDCOption {
 func WithCDCStreamFactory(factory ReplicationStreamFactory) CDCOption {
 	return func(o *CDCOptions) {
 		o.StreamFactory = factory
+	}
+}
+
+// WithCDCOriginFilter configures the replication origin filter ('all' or 'none').
+// When set to 'none', logical replication streams only locally-originated mutations,
+// eliminating cyclic feedback loops in bidirectional active-active synchronization.
+func WithCDCOriginFilter(filter string) CDCOption {
+	return func(o *CDCOptions) {
+		o.OriginFilter = filter
 	}
 }

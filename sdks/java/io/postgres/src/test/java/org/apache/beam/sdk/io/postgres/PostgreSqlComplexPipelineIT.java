@@ -46,10 +46,8 @@ import org.junit.runner.RunWith;
 import org.junit.runners.JUnit4;
 
 /**
- * End-to-End Integration Test demonstrating complex PostgreSQL-to-PostgreSQL pipelines in Java:
- * 1. Pure Replication
- * 2. Filtering Pipeline
- * 3. Complex Transformation & PII Masking Pipeline
+ * End-to-End Integration Test demonstrating complex PostgreSQL-to-PostgreSQL pipelines in Java: 1.
+ * Pure Replication 2. Filtering Pipeline 3. Complex Transformation & PII Masking Pipeline
  */
 @RunWith(JUnit4.class)
 public class PostgreSqlComplexPipelineIT implements Serializable {
@@ -122,7 +120,8 @@ public class PostgreSqlComplexPipelineIT implements Serializable {
 
     try (Connection conn = DriverManager.getConnection(JDBC_URL, DB_USER, DB_PASS);
         Statement stmt = conn.createStatement();
-        ResultSet rs = stmt.executeQuery("SELECT count(*) FROM test_pipelines.target_orders_replicated;")) {
+        ResultSet rs =
+            stmt.executeQuery("SELECT count(*) FROM test_pipelines.target_orders_replicated;")) {
       assertTrue(rs.next());
       assertEquals(20, rs.getInt(1));
     }
@@ -168,7 +167,8 @@ public class PostgreSqlComplexPipelineIT implements Serializable {
 
     try (Connection conn = DriverManager.getConnection(JDBC_URL, DB_USER, DB_PASS);
         Statement stmt = conn.createStatement();
-        ResultSet rs = stmt.executeQuery("SELECT count(*) FROM test_pipelines.target_orders_filtered;")) {
+        ResultSet rs =
+            stmt.executeQuery("SELECT count(*) FROM test_pipelines.target_orders_filtered;")) {
       assertTrue(rs.next());
       assertEquals(13, rs.getInt(1));
     }
@@ -205,11 +205,14 @@ public class PostgreSqlComplexPipelineIT implements Serializable {
 
     try (Connection conn = DriverManager.getConnection(JDBC_URL, DB_USER, DB_PASS);
         Statement stmt = conn.createStatement()) {
-      try (ResultSet rs = stmt.executeQuery("SELECT count(*) FROM test_pipelines.target_orders_transformed;")) {
+      try (ResultSet rs =
+          stmt.executeQuery("SELECT count(*) FROM test_pipelines.target_orders_transformed;")) {
         assertTrue(rs.next());
         assertEquals(20, rs.getInt(1));
       }
-      try (ResultSet rs = stmt.executeQuery("SELECT count(*) FROM test_pipelines.target_orders_transformed WHERE customer_tier = 'VIP';")) {
+      try (ResultSet rs =
+          stmt.executeQuery(
+              "SELECT count(*) FROM test_pipelines.target_orders_transformed WHERE customer_tier = 'VIP';")) {
         assertTrue(rs.next());
         assertEquals(7, rs.getInt(1));
       }

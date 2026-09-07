@@ -30,6 +30,12 @@ import (
 	"github.com/lib/pq"
 )
 
+var (
+	sinkWrittenRows     = beam.NewCounter("postgresio", "sink_written_rows")
+	sinkFailedRows      = beam.NewCounter("postgresio", "sink_failed_rows")
+	sinkDeadlockRetries = beam.NewCounter("postgresio", "sink_deadlock_retries")
+)
+
 func init() {
 	beam.RegisterDoFn(&writeFn{})
 	beam.RegisterCoder(
@@ -201,6 +207,7 @@ func (fn *writeFn) flushBatch(ctx context.Context, emitSuccess func(beam.X), emi
 	if fn.Options.WriteMethod == WriteMethodStagedCopy {
 		copyErr := fn.executeStagedCopy(ctx, batch)
 		if copyErr == nil {
+			sinkWrittenRows.Inc(ctx, int64(len(batch)))
 			for _, item := range batch {
 				emitSuccess(item)
 			}
@@ -211,6 +218,7 @@ func (fn *writeFn) flushBatch(ctx context.Context, emitSuccess func(beam.X), emi
 
 	query, args, err := fn.buildUnnestQuery(batch)
 	if err != nil {
+		sinkFailedRows.Inc(ctx, int64(len(batch)))
 		for _, item := range batch {
 			emitFailed(FailedRow{
 				Row:          item,
@@ -228,6 +236,7 @@ func (fn *writeFn) flushBatch(ctx context.Context, emitSuccess func(beam.X), emi
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		_, execErr := fn.db.ExecContext(ctx, query, args...)
 		if execErr == nil {
+			sinkWrittenRows.Inc(ctx, int64(len(batch)))
 			for _, item := range batch {
 				emitSuccess(item)
 			}
@@ -236,6 +245,7 @@ func (fn *writeFn) flushBatch(ctx context.Context, emitSuccess func(beam.X), emi
 
 		sqlState := extractSqlState(execErr)
 		if sqlState == "40P01" && attempt < maxRetries {
+			sinkDeadlockRetries.Inc(ctx, 1)
 			jitter := time.Duration(rand.Int63n(int64(backoff)))
 			time.Sleep(backoff + jitter)
 			backoff *= 2
@@ -243,6 +253,7 @@ func (fn *writeFn) flushBatch(ctx context.Context, emitSuccess func(beam.X), emi
 		}
 
 		// Permanent failure: route batch to Dead-Letter Queue (DLQ)
+		sinkFailedRows.Inc(ctx, int64(len(batch)))
 		sanitizedMsg := SanitizeErrorMessage(execErr)
 		log.Errorf(ctx, "postgresio: write batch failed with sqlstate %s: %s", sqlState, sanitizedMsg)
 		for _, item := range batch {
@@ -279,6 +290,11 @@ func (fn *writeFn) executeStagedCopy(ctx context.Context, batch []any) error {
 		return err
 	}
 	defer txn.Rollback()
+
+	if fn.Options.ReplicationOriginName != "" {
+		escapedOrigin := strings.ReplaceAll(fn.Options.ReplicationOriginName, "'", "''")
+		_, _ = txn.ExecContext(ctx, fmt.Sprintf("SELECT pg_replication_origin_xact_setup('%s', '0/0')", escapedOrigin))
+	}
 
 	// Append-only fast path
 	if fn.Options.WriteMode == WriteModeInsert && len(fn.PrimaryKeyCols) == 0 {

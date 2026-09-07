@@ -36,4 +36,13 @@ public interface DynamicPasswordProvider extends Serializable {
    * @throws Exception If token generation or network acquisition fails.
    */
   String getPassword() throws Exception;
+
+  /**
+   * Optional expiration instant for short-lived cloud IAM tokens.
+   *
+   * @return An Optional containing the token expiration Instant, or empty if unknown or static.
+   */
+  default java.util.Optional<java.time.Instant> getExpirationTime() {
+    return java.util.Optional.empty();
+  }
 }

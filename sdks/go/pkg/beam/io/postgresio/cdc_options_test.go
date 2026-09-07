@@ -112,3 +112,15 @@ func TestCDCOptionsPasswordRedaction(t *testing.T) {
 		t.Fatalf("options string missing <redacted> token: %s", str)
 	}
 }
+
+func TestCDCOptionsOriginFilter(t *testing.T) {
+	opts := NewCDCOptions(
+		WithCDCSlotName("slot"),
+		WithCDCPublication("pub"),
+		WithCDCOriginFilter("none"),
+	)
+	if opts.OriginFilter != "none" {
+		t.Errorf("expected origin filter 'none', got %q", opts.OriginFilter)
+	}
+}
+

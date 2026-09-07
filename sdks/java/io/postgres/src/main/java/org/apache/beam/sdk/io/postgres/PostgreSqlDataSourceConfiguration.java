@@ -260,7 +260,16 @@ public abstract class PostgreSqlDataSourceConfiguration implements Serializable,
     config.setMinimumIdle(getMinIdleConnections());
     config.setConnectionTimeout(getConnectionTimeoutMs());
     config.setIdleTimeout(getIdleTimeoutMs());
-    config.setMaxLifetime(getMaxLifetimeMs());
+    long effectiveMaxLifetime = getMaxLifetimeMs();
+    DynamicPasswordProvider provider = getDynamicPasswordProvider();
+    if (provider != null && provider.getExpirationTime().isPresent()) {
+      java.time.Instant expiry = provider.getExpirationTime().get();
+      long millisUntilExpiry = java.time.Duration.between(java.time.Instant.now(), expiry).toMillis();
+      if (millisUntilExpiry > 60000) {
+        effectiveMaxLifetime = Math.min(effectiveMaxLifetime, Math.max(60000, millisUntilExpiry - 300000));
+      }
+    }
+    config.setMaxLifetime(effectiveMaxLifetime);
     config.setPoolName("BeamPostgresPool-" + Integer.toHexString(hashCode()));
 
     // PgBouncer transaction-pooling compatibility settings

@@ -71,10 +71,11 @@ type WriteOptions struct {
 	BatchSize          int
 	MaxBatchBytes      int
 	FlushInterval      time.Duration
-	MaxConnections     int
-	UsePgBouncer       bool
-	ConnectionInitSQL  string
-	DialFunc           DialFunc `beam:"-" json:"-"`
+	MaxConnections        int
+	UsePgBouncer          bool
+	ConnectionInitSQL     string
+	ReplicationOriginName string
+	DialFunc              DialFunc `beam:"-" json:"-"`
 }
 
 // Option represents a functional option for configuring WriteOptions.
@@ -201,6 +202,20 @@ func WithPgBouncer(usePgBouncer bool) Option {
 func WithDialFunc(dialFunc DialFunc) Option {
 	return func(o *WriteOptions) {
 		o.DialFunc = dialFunc
+	}
+}
+
+var originNameRegex = regexp.MustCompile(`^[a-zA-Z0-9_]{1,64}$`)
+
+// WithReplicationOriginName configures a replication origin identifier for the sink.
+// When specified, write transactions are tagged with this origin to prevent bidirectional
+// replication loops when replicating between active-active PostgreSQL databases.
+func WithReplicationOriginName(originName string) Option {
+	return func(o *WriteOptions) {
+		if originName != "" && !originNameRegex.MatchString(originName) {
+			panic(fmt.Sprintf("postgresio: invalid replication origin name %q (must match ^[a-zA-Z0-9_]{1,64}$)", originName))
+		}
+		o.ReplicationOriginName = originName
 	}
 }
 

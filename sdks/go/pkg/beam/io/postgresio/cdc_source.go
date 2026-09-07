@@ -28,6 +28,11 @@ import (
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/log"
 )
 
+var (
+	cdcProcessedRecords = beam.NewCounter("postgresio", "cdc_processed_records")
+	cdcFilteredRecords  = beam.NewCounter("postgresio", "cdc_filtered_origin_records")
+)
+
 func init() {
 	beam.RegisterType(reflect.TypeOf((*cdcSourceFn)(nil)).Elem())
 }
@@ -172,6 +177,11 @@ func (fn *cdcSourceFn) ProcessElement(ctx context.Context, bf beam.BundleFinaliz
 
 		for _, event := range events {
 			if event != nil {
+				if fn.options.OriginFilter == "none" && event.Origin != "" {
+					cdcFilteredRecords.Inc(ctx, 1)
+					continue
+				}
+				cdcProcessedRecords.Inc(ctx, 1)
 				if event.LSN > atomic.LoadUint64(&latestReceivedLSN) {
 					atomic.StoreUint64(&latestReceivedLSN, event.LSN)
 					atomic.StoreUint64(&currentBundleMaxLSN, event.LSN)

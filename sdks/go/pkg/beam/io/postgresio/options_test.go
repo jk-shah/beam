@@ -155,3 +155,18 @@ func TestSanitizeTableIdentifierRejectsMultiPart(t *testing.T) {
 		t.Errorf("expected error for 3-part identifier, got nil")
 	}
 }
+
+func TestWriteOptionsReplicationOriginValidation(t *testing.T) {
+	opts := NewWriteOptions(WithReplicationOriginName("beam_node_1"))
+	if opts.ReplicationOriginName != "beam_node_1" {
+		t.Errorf("expected origin beam_node_1, got %q", opts.ReplicationOriginName)
+	}
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Errorf("expected panic for invalid origin with special characters")
+		}
+	}()
+	_ = NewWriteOptions(WithReplicationOriginName("invalid; DROP TABLE users;"))
+}
+

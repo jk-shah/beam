@@ -56,8 +56,26 @@ public class PostgreSqlToastReconstructionDoFn
           PostgreSqlToastReconstructionDoFn.class, "PostgreSQL_Toast_Columns_Reconstructed");
   private final Counter toastCacheHitsCounter =
       Metrics.counter(PostgreSqlToastReconstructionDoFn.class, "PostgreSQL_Toast_Cache_Hits");
+  private final Counter toastL1CacheHitsCounter =
+      Metrics.counter(PostgreSqlToastReconstructionDoFn.class, "PostgreSQL_Toast_L1_Cache_Hits");
   private final Counter toastCacheMissesCounter =
       Metrics.counter(PostgreSqlToastReconstructionDoFn.class, "PostgreSQL_Toast_Cache_Misses");
+
+  private transient java.util.Map<String, Row> l1Cache;
+
+  private java.util.Map<String, Row> getL1Cache() {
+    if (l1Cache == null) {
+      l1Cache =
+          Collections.synchronizedMap(
+              new java.util.LinkedHashMap<String, Row>(1024, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(java.util.Map.Entry<String, Row> eldest) {
+                  return size() > 10000;
+                }
+              });
+    }
+    return l1Cache;
+  }
 
   @StateId("lastKnownFullRowState")
   private final StateSpec<ValueState<Row>> lastKnownRowStateSpec =
@@ -85,11 +103,15 @@ public class PostgreSqlToastReconstructionDoFn
 
     ChangeEvent<Row> event = element.getValue();
     OpType opType = event.getOpType();
+    String key = element.getKey();
 
     if (opType == OpType.INSERT || opType == OpType.READ) {
-      // Cache the full baseline row in state
+      // Cache the full baseline row in L1 memory and L2 state
       Row afterRow = event.getAfter();
       if (afterRow != null) {
+        if (key != null) {
+          getL1Cache().put(key, afterRow);
+        }
         lastKnownRowState.write(afterRow);
         if (stateTtl != null) {
           toastExpiryTimer.offset(stateTtl).setRelative();
@@ -102,8 +124,18 @@ public class PostgreSqlToastReconstructionDoFn
       Set<String> unchangedToastCols = event.getUnchangedToastColumns();
 
       if (afterRow != null && !unchangedToastCols.isEmpty()) {
-        // Reconstruct unchanged TOAST columns from cached baseline row
-        Row cachedRow = lastKnownRowState.read();
+        // Check L1 transient in-memory cache first, fallback to L2 persistent state
+        Row cachedRow = null;
+        if (key != null) {
+          cachedRow = getL1Cache().get(key);
+          if (cachedRow != null) {
+            toastL1CacheHitsCounter.inc();
+          }
+        }
+        if (cachedRow == null) {
+          cachedRow = lastKnownRowState.read();
+        }
+
         Schema schema = afterRow.getSchema();
         List<Object> reconstructedValues = new ArrayList<>();
 
@@ -125,6 +157,9 @@ public class PostgreSqlToastReconstructionDoFn
         }
 
         Row reconstructedRow = Row.withSchema(schema).addValues(reconstructedValues).build();
+        if (key != null) {
+          getL1Cache().put(key, reconstructedRow);
+        }
         lastKnownRowState.write(reconstructedRow);
 
         ChangeEvent<Row> reconstructedEvent =

@@ -48,8 +48,9 @@ type PostgreSqlWriteConfig struct {
 	ConflictKeys  []string `beam:"conflict_keys" doc:"Columns used as primary or unique key conflict targets for UPSERT."`
 	UpdateFields  []string `beam:"update_fields" doc:"Columns to update ON CONFLICT DO UPDATE. If empty, uses DO NOTHING."`
 	MaxBatchRows  int32    `beam:"max_batch_rows" doc:"Maximum rows per batch UNNEST statement (default: 5000)."`
-	MaxBatchBytes int32    `beam:"max_batch_bytes" doc:"Maximum byte buffer threshold before flushing (default: 8MB)."`
-	UsePgBouncer  bool     `beam:"use_pgbouncer" doc:"Enable single-statement transaction pooling for PgBouncer compatibility."`
+	MaxBatchBytes     int32    `beam:"max_batch_bytes" doc:"Maximum byte buffer threshold before flushing (default: 8MB)."`
+	UsePgBouncer      bool     `beam:"use_pgbouncer" doc:"Enable single-statement transaction pooling for PgBouncer compatibility."`
+	ReplicationOrigin string   `beam:"replication_origin" doc:"Replication origin name to tag write transactions to prevent cyclic loops."`
 }
 
 // Validate checks configuration invariants before pipeline graph expansion.
@@ -104,9 +105,10 @@ func (t *postgreSqlWriteTransform) BuildTransform(s beam.Scope, inputs map[strin
 		SSLMode:        t.cfg.SSLMode,
 		WriteMethod:    WriteMethodStagedCopy,
 		PrimaryKeyCols: t.cfg.ConflictKeys,
-		BatchSize:      int(t.cfg.MaxBatchRows),
-		MaxBatchBytes:  int(t.cfg.MaxBatchBytes),
-		UsePgBouncer:   t.cfg.UsePgBouncer,
+		BatchSize:             int(t.cfg.MaxBatchRows),
+		MaxBatchBytes:         int(t.cfg.MaxBatchBytes),
+		UsePgBouncer:          t.cfg.UsePgBouncer,
+		ReplicationOriginName: t.cfg.ReplicationOrigin,
 	}
 	if opts.Port <= 0 {
 		opts.Port = 5432
@@ -157,6 +159,7 @@ type PostgreSqlReadCDCConfig struct {
 	Password       string   `beam:"password,secret" doc:"Replication user password."`
 	SSLMode        string   `beam:"sslmode" doc:"SSL mode (e.g. disable, require, verify-ca, verify-full)."`
 	Tables         []string `beam:"tables" doc:"Optional list of tables to capture (empty captures all in publication)."`
+	OriginFilter   string   `beam:"origin_filter" doc:"Replication origin filter: 'all' (default) or 'none'."`
 	OutputFormat   string   `beam:"output_format" doc:"Output format: 'row' (default) or 'arrow'."`
 	ArrowBatchRows int32    `beam:"arrow_batch_rows" doc:"Maximum rows per Arrow batch when output_format='arrow' (default: 4096)."`
 }
@@ -181,6 +184,9 @@ func (c PostgreSqlReadCDCConfig) Validate() error {
 	if c.Username == "" {
 		return errors.New("username cannot be empty")
 	}
+	if c.OriginFilter != "" && c.OriginFilter != "all" && c.OriginFilter != "none" {
+		return fmt.Errorf("origin_filter must be 'all' or 'none', got %q", c.OriginFilter)
+	}
 	if c.OutputFormat != "" && c.OutputFormat != "row" && c.OutputFormat != "arrow" {
 		return fmt.Errorf("output_format must be 'row' or 'arrow', got %q", c.OutputFormat)
 	}
@@ -202,6 +208,7 @@ func (t *postgreSqlReadCDCTransform) BuildTransform(s beam.Scope, _ map[string]b
 		WithCDCSlotName(t.cfg.SlotName),
 		WithCDCPublication(t.cfg.Publication),
 		WithCDCSSLMode(t.cfg.SSLMode),
+		WithCDCOriginFilter(t.cfg.OriginFilter),
 	}
 
 	cdcCol := ReadCDC(s, opts...)

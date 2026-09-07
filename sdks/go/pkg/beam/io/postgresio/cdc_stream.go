@@ -266,8 +266,12 @@ func (s *NativeReplicationStream) handshake(ctx context.Context) error {
 	if s.opts.StartLSN != 0 {
 		startLSNStr = fmt.Sprintf("%X/%X", uint32(s.opts.StartLSN>>32), uint32(s.opts.StartLSN))
 	}
-	repQuery := fmt.Sprintf("START_REPLICATION SLOT %s LOGICAL %s (proto_version '1', publication_names '\"%s\"');",
-		s.opts.SlotName, startLSNStr, s.opts.Publication)
+	originOpt := ""
+	if s.opts.OriginFilter == "none" {
+		originOpt = ", origin 'none'"
+	}
+	repQuery := fmt.Sprintf("START_REPLICATION SLOT %s LOGICAL %s (proto_version '1', publication_names '\"%s\"'%s);",
+		s.opts.SlotName, startLSNStr, s.opts.Publication, originOpt)
 
 	if err := s.sendQuery(repQuery); err != nil {
 		return fmt.Errorf("failed to send START_REPLICATION: %w", err)

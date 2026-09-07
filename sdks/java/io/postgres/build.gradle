@@ -17,6 +17,7 @@
  */
 
 plugins { id 'org.apache.beam.module' }
+project.ext.set("enableCheckerFramework", "false")
 applyJavaNature(
   automaticModuleName: 'org.apache.beam.sdk.io.postgres',
   enableSpotbugs: false,
