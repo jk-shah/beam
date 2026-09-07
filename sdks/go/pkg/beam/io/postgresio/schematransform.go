@@ -162,6 +162,9 @@ type PostgreSqlReadCDCConfig struct {
 	OriginFilter   string   `beam:"origin_filter" doc:"Replication origin filter: 'all' (default) or 'none'."`
 	OutputFormat   string   `beam:"output_format" doc:"Output format: 'row' (default) or 'arrow'."`
 	ArrowBatchRows int32    `beam:"arrow_batch_rows" doc:"Maximum rows per Arrow batch when output_format='arrow' (default: 4096)."`
+	ProtoVersion   int32    `beam:"proto_version" doc:"pgoutput protocol version (0 for auto-negotiation: 4 on PG >= 19, 1 on older)."`
+	BinaryMode     *bool    `beam:"binary_mode" doc:"Whether column values are streamed in binary format (auto: true on PG >= 19)."`
+	StreamingMode  string   `beam:"streaming_mode" doc:"In-progress transaction streaming mode (auto: 'parallel' on PG >= 19)."`
 }
 
 // Validate checks configuration invariants before pipeline graph expansion.
@@ -209,6 +212,15 @@ func (t *postgreSqlReadCDCTransform) BuildTransform(s beam.Scope, _ map[string]b
 		WithCDCPublication(t.cfg.Publication),
 		WithCDCSSLMode(t.cfg.SSLMode),
 		WithCDCOriginFilter(t.cfg.OriginFilter),
+	}
+	if t.cfg.ProtoVersion > 0 {
+		opts = append(opts, WithCDCProtoVersion(int(t.cfg.ProtoVersion)))
+	}
+	if t.cfg.BinaryMode != nil {
+		opts = append(opts, WithCDCBinaryMode(*t.cfg.BinaryMode))
+	}
+	if t.cfg.StreamingMode != "" {
+		opts = append(opts, WithCDCStreamingMode(t.cfg.StreamingMode))
 	}
 
 	cdcCol := ReadCDC(s, opts...)

@@ -1294,3 +1294,387 @@ func TestWriteFn_Teardown(t *testing.T) {
 	fn.Teardown()
 }
 
+func TestCDCStream_BuildStartReplicationQuery_VersionNegotiation(t *testing.T) {
+	opts := NewCDCOptions(
+		WithCDCSlotName("beam_slot"),
+		WithCDCPublication("beam_pub"),
+	)
+
+	// Case 1: Server Version >= 19 -> proto_version '4', binary 'true', streaming 'parallel'
+	streamPG19 := &NativeReplicationStream{
+		opts:               opts,
+		serverMajorVersion: 19,
+		serverVersion:      "19.0",
+	}
+	queryPG19 := streamPG19.BuildStartReplicationQuery("0/0")
+	if !strings.Contains(queryPG19, "proto_version '4'") {
+		t.Errorf("PG19 query expected proto_version '4', got: %s", queryPG19)
+	}
+	if !strings.Contains(queryPG19, "binary 'true'") {
+		t.Errorf("PG19 query expected binary 'true', got: %s", queryPG19)
+	}
+	if !strings.Contains(queryPG19, "streaming 'parallel'") {
+		t.Errorf("PG19 query expected streaming 'parallel', got: %s", queryPG19)
+	}
+
+	// Case 2: Server Version 18 (Older) -> reverts cleanly to proto_version '1', no binary, no streaming
+	streamPG18 := &NativeReplicationStream{
+		opts:               opts,
+		serverMajorVersion: 18,
+		serverVersion:      "18.6",
+	}
+	queryPG18 := streamPG18.BuildStartReplicationQuery("0/0")
+	if !strings.Contains(queryPG18, "proto_version '1'") {
+		t.Errorf("PG18 query expected proto_version '1', got: %s", queryPG18)
+	}
+	if strings.Contains(queryPG18, "binary 'true'") {
+		t.Errorf("PG18 query should not contain binary 'true', got: %s", queryPG18)
+	}
+	if strings.Contains(queryPG18, "streaming 'parallel'") {
+		t.Errorf("PG18 query should not contain streaming 'parallel', got: %s", queryPG18)
+	}
+
+	// Case 3: Server Version 0 (unknown/unparsed) -> reverts to older proto_version '1'
+	streamUnknown := &NativeReplicationStream{
+		opts:               opts,
+		serverMajorVersion: 0,
+	}
+	queryUnknown := streamUnknown.BuildStartReplicationQuery("0/0")
+	if !strings.Contains(queryUnknown, "proto_version '1'") || strings.Contains(queryUnknown, "binary 'true'") {
+		t.Errorf("Unknown version query should revert to proto_version '1', got: %s", queryUnknown)
+	}
+
+	// Case 4: PG19 with originFilter 'none'
+	optsOrigin := NewCDCOptions(
+		WithCDCSlotName("beam_slot"),
+		WithCDCPublication("beam_pub"),
+		WithCDCOriginFilter("none"),
+	)
+	streamPG19Origin := &NativeReplicationStream{
+		opts:               optsOrigin,
+		serverMajorVersion: 19,
+	}
+	queryPG19Origin := streamPG19Origin.BuildStartReplicationQuery("0/0")
+	if !strings.Contains(queryPG19Origin, "origin 'none'") {
+		t.Errorf("PG19 with originFilter 'none' expected origin 'none', got: %s", queryPG19Origin)
+	}
+
+	// Case 5: Explicit overrides on PG19
+	optsOverride := NewCDCOptions(
+		WithCDCSlotName("beam_slot"),
+		WithCDCPublication("beam_pub"),
+		WithCDCProtoVersion(2),
+		WithCDCBinaryMode(false),
+		WithCDCStreamingMode("off"),
+	)
+	streamOverride := &NativeReplicationStream{
+		opts:               optsOverride,
+		serverMajorVersion: 19,
+	}
+	queryOverride := streamOverride.BuildStartReplicationQuery("0/0")
+	if !strings.Contains(queryOverride, "proto_version '2'") {
+		t.Errorf("expected overridden proto_version '2', got: %s", queryOverride)
+	}
+	if strings.Contains(queryOverride, "binary 'true'") {
+		t.Errorf("expected binary 'true' to be disabled by override, got: %s", queryOverride)
+	}
+	if strings.Contains(queryOverride, "streaming") {
+		t.Errorf("expected streaming to be disabled by override, got: %s", queryOverride)
+	}
+}
+
+func TestCDCStream_ParameterStatus_WireNegotiation(t *testing.T) {
+	t.Run("PG19_NegotiatesProto4BinaryAndParallelStreaming", func(t *testing.T) {
+		clientConn, serverConn := net.Pipe()
+		defer clientConn.Close()
+		defer serverConn.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		serverDone := make(chan struct{})
+		go func() {
+			defer close(serverDone)
+			// 1. StartupMessage
+			var lenBuf [4]byte
+			if _, err := io.ReadFull(serverConn, lenBuf[:]); err != nil {
+				return
+			}
+			length := binary.BigEndian.Uint32(lenBuf[:])
+			body := make([]byte, length-4)
+			if _, err := io.ReadFull(serverConn, body); err != nil {
+				return
+			}
+
+			// 2. AuthOk ('R')
+			authOk := []byte{'R', 0, 0, 0, 8, 0, 0, 0, 0}
+			if _, err := serverConn.Write(authOk); err != nil {
+				return
+			}
+
+			// 3. ParameterStatus ('S') for server_version = "19.1"
+			paramPayload := []byte("server_version\x0019.1\x00")
+			paramPkt := make([]byte, 5+len(paramPayload))
+			paramPkt[0] = 'S'
+			binary.BigEndian.PutUint32(paramPkt[1:5], uint32(len(paramPkt)-1))
+			copy(paramPkt[5:], paramPayload)
+			if _, err := serverConn.Write(paramPkt); err != nil {
+				return
+			}
+
+			// 4. ReadyForQuery ('Z')
+			ready := []byte{'Z', 0, 0, 0, 5, 'I'}
+			if _, err := serverConn.Write(ready); err != nil {
+				return
+			}
+
+			// 5. Read search_path query ('Q')
+			var qType [1]byte
+			if _, err := io.ReadFull(serverConn, qType[:]); err != nil {
+				return
+			}
+			if _, err := io.ReadFull(serverConn, lenBuf[:]); err != nil {
+				return
+			}
+			qLen := binary.BigEndian.Uint32(lenBuf[:])
+			qBody := make([]byte, qLen-4)
+			if _, err := io.ReadFull(serverConn, qBody); err != nil {
+				return
+			}
+			if _, err := serverConn.Write(ready); err != nil {
+				return
+			}
+
+			// 6. Read START_REPLICATION query ('Q')
+			if _, err := io.ReadFull(serverConn, qType[:]); err != nil {
+				return
+			}
+			if _, err := io.ReadFull(serverConn, lenBuf[:]); err != nil {
+				return
+			}
+			qLen2 := binary.BigEndian.Uint32(lenBuf[:])
+			qBody2 := make([]byte, qLen2-4)
+			if _, err := io.ReadFull(serverConn, qBody2); err != nil {
+				return
+			}
+			repQueryStr := string(qBody2)
+			if !strings.Contains(repQueryStr, "proto_version '4'") {
+				t.Errorf("wire query expected proto_version '4', got: %s", repQueryStr)
+			}
+			if !strings.Contains(repQueryStr, "binary 'true'") {
+				t.Errorf("wire query expected binary 'true', got: %s", repQueryStr)
+			}
+			if !strings.Contains(repQueryStr, "streaming 'parallel'") {
+				t.Errorf("wire query expected streaming 'parallel', got: %s", repQueryStr)
+			}
+
+			// 7. Respond with CopyBothResponse ('W')
+			copyBoth := []byte{'W', 0, 0, 0, 7, 0, 0, 0}
+			_, _ = serverConn.Write(copyBoth)
+		}()
+
+		opts := NewCDCOptions(
+			WithCDCHost("localhost"),
+			WithCDCUsername("beam_test"),
+			WithCDCSlotName("test_slot"),
+			WithCDCPublication("test_pub"),
+			WithCDCDialFunc(func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return clientConn, nil
+			}),
+		)
+
+		stream, err := NewNativeReplicationStream(ctx, opts)
+		if err != nil {
+			t.Fatalf("NewNativeReplicationStream() err = %v", err)
+		}
+		defer stream.Close()
+
+		if stream.ServerMajorVersion() != 19 {
+			t.Errorf("stream.ServerMajorVersion() = %d, want 19", stream.ServerMajorVersion())
+		}
+		if stream.ServerVersion() != "19.1" {
+			t.Errorf("stream.ServerVersion() = %q, want '19.1'", stream.ServerVersion())
+		}
+
+		<-serverDone
+	})
+
+	t.Run("PG18_RevertsToOlderProto1AndOmitBinaryParallelStreaming", func(t *testing.T) {
+		clientConn, serverConn := net.Pipe()
+		defer clientConn.Close()
+		defer serverConn.Close()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		serverDone := make(chan struct{})
+		go func() {
+			defer close(serverDone)
+			var lenBuf [4]byte
+			if _, err := io.ReadFull(serverConn, lenBuf[:]); err != nil {
+				return
+			}
+			length := binary.BigEndian.Uint32(lenBuf[:])
+			body := make([]byte, length-4)
+			if _, err := io.ReadFull(serverConn, body); err != nil {
+				return
+			}
+
+			// AuthOk
+			authOk := []byte{'R', 0, 0, 0, 8, 0, 0, 0, 0}
+			if _, err := serverConn.Write(authOk); err != nil {
+				return
+			}
+
+			// ParameterStatus ('S') for server_version = "18.6 (Debian 18.6-1)"
+			paramPayload := []byte("server_version\x0018.6 (Debian 18.6-1)\x00")
+			paramPkt := make([]byte, 5+len(paramPayload))
+			paramPkt[0] = 'S'
+			binary.BigEndian.PutUint32(paramPkt[1:5], uint32(len(paramPkt)-1))
+			copy(paramPkt[5:], paramPayload)
+			if _, err := serverConn.Write(paramPkt); err != nil {
+				return
+			}
+
+			// ReadyForQuery
+			ready := []byte{'Z', 0, 0, 0, 5, 'I'}
+			if _, err := serverConn.Write(ready); err != nil {
+				return
+			}
+
+			// search_path
+			var qType [1]byte
+			if _, err := io.ReadFull(serverConn, qType[:]); err != nil {
+				return
+			}
+			if _, err := io.ReadFull(serverConn, lenBuf[:]); err != nil {
+				return
+			}
+			qLen := binary.BigEndian.Uint32(lenBuf[:])
+			qBody := make([]byte, qLen-4)
+			if _, err := io.ReadFull(serverConn, qBody); err != nil {
+				return
+			}
+			if _, err := serverConn.Write(ready); err != nil {
+				return
+			}
+
+			// START_REPLICATION query
+			if _, err := io.ReadFull(serverConn, qType[:]); err != nil {
+				return
+			}
+			if _, err := io.ReadFull(serverConn, lenBuf[:]); err != nil {
+				return
+			}
+			qLen2 := binary.BigEndian.Uint32(lenBuf[:])
+			qBody2 := make([]byte, qLen2-4)
+			if _, err := io.ReadFull(serverConn, qBody2); err != nil {
+				return
+			}
+			repQueryStr := string(qBody2)
+			if !strings.Contains(repQueryStr, "proto_version '1'") {
+				t.Errorf("PG18 wire query expected proto_version '1', got: %s", repQueryStr)
+			}
+			if strings.Contains(repQueryStr, "binary 'true'") {
+				t.Errorf("PG18 wire query should NOT contain binary 'true', got: %s", repQueryStr)
+			}
+			if strings.Contains(repQueryStr, "streaming 'parallel'") {
+				t.Errorf("PG18 wire query should NOT contain streaming 'parallel', got: %s", repQueryStr)
+			}
+
+			// Respond with CopyBothResponse ('W')
+			copyBoth := []byte{'W', 0, 0, 0, 7, 0, 0, 0}
+			_, _ = serverConn.Write(copyBoth)
+		}()
+
+		opts := NewCDCOptions(
+			WithCDCHost("localhost"),
+			WithCDCUsername("beam_test"),
+			WithCDCSlotName("test_slot"),
+			WithCDCPublication("test_pub"),
+			WithCDCDialFunc(func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return clientConn, nil
+			}),
+		)
+
+		stream, err := NewNativeReplicationStream(ctx, opts)
+		if err != nil {
+			t.Fatalf("NewNativeReplicationStream() err = %v", err)
+		}
+		defer stream.Close()
+
+		if stream.ServerMajorVersion() != 18 {
+			t.Errorf("stream.ServerMajorVersion() = %d, want 18", stream.ServerMajorVersion())
+		}
+		if stream.ServerVersion() != "18.6 (Debian 18.6-1)" {
+			t.Errorf("stream.ServerVersion() = %q", stream.ServerVersion())
+		}
+
+		<-serverDone
+	})
+}
+
+func TestPgOutputParser_ParseBinaryValue_AllTypes(t *testing.T) {
+	// bool (16)
+	if v := parseBinaryValue(16, []byte{1}); v != true {
+		t.Errorf("parseBinaryValue(16, [1]) = %v, want true", v)
+	}
+	if v := parseBinaryValue(16, []byte{0}); v != false {
+		t.Errorf("parseBinaryValue(16, [0]) = %v, want false", v)
+	}
+
+	// int2 (21)
+	var int2Buf [2]byte
+	binary.BigEndian.PutUint16(int2Buf[:], 42)
+	if v := parseBinaryValue(21, int2Buf[:]); v != int16(42) {
+		t.Errorf("parseBinaryValue(21) = %v, want 42", v)
+	}
+
+	// int4 (23)
+	var int4Buf [4]byte
+	binary.BigEndian.PutUint32(int4Buf[:], 123456)
+	if v := parseBinaryValue(23, int4Buf[:]); v != int32(123456) {
+		t.Errorf("parseBinaryValue(23) = %v, want 123456", v)
+	}
+
+	// int8 (20)
+	var int8Buf [8]byte
+	binary.BigEndian.PutUint64(int8Buf[:], 9876543210)
+	if v := parseBinaryValue(20, int8Buf[:]); v != int64(9876543210) {
+		t.Errorf("parseBinaryValue(20) = %v, want 9876543210", v)
+	}
+
+	// float8 (701)
+	var f8Buf [8]byte
+	binary.BigEndian.PutUint64(f8Buf[:], 0x400921fb54442d18) // ~3.141592653589793
+	if v := parseBinaryValue(701, f8Buf[:]); v != 3.141592653589793 {
+		t.Errorf("parseBinaryValue(701) = %v", v)
+	}
+
+	// text (25)
+	if v := parseBinaryValue(25, []byte("postgres_binary_test")); v != "postgres_binary_test" {
+		t.Errorf("parseBinaryValue(25) = %v", v)
+	}
+
+	// point (600)
+	var ptBuf [16]byte
+	binary.BigEndian.PutUint64(ptBuf[0:8], 0x3ff0000000000000) // 1.0
+	binary.BigEndian.PutUint64(ptBuf[8:16], 0x4000000000000000) // 2.0
+	if pt, ok := parseBinaryValue(600, ptBuf[:]).(PgPoint); !ok || pt.X != 1.0 || pt.Y != 2.0 {
+		t.Errorf("parseBinaryValue(600) = %v, want PgPoint{1.0, 2.0}", pt)
+	}
+
+	// bytea (17)
+	bData := []byte{0xDE, 0xAD, 0xBE, 0xEF}
+	if v := parseBinaryValue(17, bData); !bytes.Equal(v.([]byte), bData) {
+		t.Errorf("parseBinaryValue(17) = %v", v)
+	}
+
+	// JSONB (3802)
+	jsonbData := append([]byte{1}, []byte(`{"key":"val"}`)...)
+	if v := parseBinaryValue(3802, jsonbData); v != `{"key":"val"}` {
+		t.Errorf("parseBinaryValue(3802) = %v", v)
+	}
+}
+
+

@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync"
@@ -538,21 +539,7 @@ func parseTupleData(r *bytes.Reader, cols []ColumnDef) ([]ColumnValue, error) {
 			if _, err := r.Read(valBytes); err != nil {
 				return nil, err
 			}
-			if colType == 3802 { // JSONB
-				if str, err := DecodeBinaryJSONB(valBytes); err == nil {
-					cv.Value = str
-				} else {
-					cv.Value = valBytes
-				}
-			} else if isArrayOID(colType) {
-				if arr, err := DecodeBinaryArray(valBytes); err == nil {
-					cv.Value = arr
-				} else {
-					cv.Value = valBytes
-				}
-			} else {
-				cv.Value = valBytes
-			}
+			cv.Value = parseBinaryValue(colType, valBytes)
 		default:
 			return nil, fmt.Errorf("unknown column datum kind %c at index %d", kind, i)
 		}
@@ -673,3 +660,73 @@ func parseTextValue(typeOID uint32, s string) any {
 	}
 	return s
 }
+
+func parseBinaryValue(typeOID uint32, valBytes []byte) any {
+	switch typeOID {
+	case 16: // bool
+		if len(valBytes) >= 1 {
+			return valBytes[0] != 0
+		}
+		return false
+	case 20: // int8 (bigint)
+		if len(valBytes) >= 8 {
+			return int64(binary.BigEndian.Uint64(valBytes))
+		}
+	case 21: // int2 (smallint)
+		if len(valBytes) >= 2 {
+			return int16(binary.BigEndian.Uint16(valBytes))
+		}
+	case 23: // int4 (integer)
+		if len(valBytes) >= 4 {
+			return int32(binary.BigEndian.Uint32(valBytes))
+		}
+	case 700: // float4
+		if len(valBytes) >= 4 {
+			bits := binary.BigEndian.Uint32(valBytes)
+			return float64(math.Float32frombits(bits))
+		}
+	case 701: // float8
+		if len(valBytes) >= 8 {
+			bits := binary.BigEndian.Uint64(valBytes)
+			return math.Float64frombits(bits)
+		}
+	case 25, 1043, 1042: // text, varchar, bpchar
+		return string(valBytes)
+	case 17: // bytea
+		return valBytes
+	case 114: // json
+		return string(valBytes)
+	case 3802: // jsonb
+		if str, err := DecodeBinaryJSONB(valBytes); err == nil {
+			return str
+		}
+		return string(valBytes)
+	case 1114, 1184: // timestamp, timestamptz
+		if len(valBytes) >= 8 {
+			micros := int64(binary.BigEndian.Uint64(valBytes))
+			return pgEpoch.Add(time.Duration(micros) * time.Microsecond)
+		}
+	case 1082: // date
+		if len(valBytes) >= 4 {
+			days := int32(binary.BigEndian.Uint32(valBytes))
+			return pgEpoch.AddDate(0, 0, int(days))
+		}
+	case 600: // point
+		if len(valBytes) >= 16 {
+			xBits := binary.BigEndian.Uint64(valBytes[0:8])
+			yBits := binary.BigEndian.Uint64(valBytes[8:16])
+			return PgPoint{
+				X: math.Float64frombits(xBits),
+				Y: math.Float64frombits(yBits),
+			}
+		}
+	default:
+		if isArrayOID(typeOID) {
+			if arr, err := DecodeBinaryArray(valBytes); err == nil {
+				return arr
+			}
+		}
+	}
+	return valBytes
+}
+

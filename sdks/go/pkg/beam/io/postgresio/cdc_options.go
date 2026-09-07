@@ -43,6 +43,10 @@ type CDCOptions struct {
 	OriginFilter         string
 	DialFunc             DialFunc                 `beam:"-" json:"-"`
 	StreamFactory        ReplicationStreamFactory `beam:"-" json:"-"`
+	ProtoVersion         int
+	BinaryMode           *bool
+	StreamingMode        string
+	TwoPhaseCommit       bool
 }
 
 // CDCOption defines a functional option for configuring CDCOptions.
@@ -213,3 +217,36 @@ func WithCDCOriginFilter(filter string) CDCOption {
 		o.OriginFilter = filter
 	}
 }
+
+// WithCDCProtoVersion explicitly sets the pgoutput proto_version (e.g. 1, 2, 4).
+// When 0, the connector negotiates proto_version '4' on PostgreSQL >= 19
+// and reverts to '1' on older versions.
+func WithCDCProtoVersion(version int) CDCOption {
+	return func(o *CDCOptions) {
+		o.ProtoVersion = version
+	}
+}
+
+// WithCDCBinaryMode sets whether column values are streamed in binary format ('b').
+// When nil (default), binary mode is automatically enabled on PostgreSQL >= 19 and disabled on older versions.
+func WithCDCBinaryMode(binary bool) CDCOption {
+	return func(o *CDCOptions) {
+		o.BinaryMode = &binary
+	}
+}
+
+// WithCDCStreamingMode sets the in-progress transaction streaming mode ("parallel", "on", "off").
+// When empty (default), "parallel" is automatically negotiated on PostgreSQL >= 19 and omitted on older versions.
+func WithCDCStreamingMode(mode string) CDCOption {
+	return func(o *CDCOptions) {
+		o.StreamingMode = mode
+	}
+}
+
+// WithCDCTwoPhase sets whether two-phase commit prepared transactions are decoded.
+func WithCDCTwoPhase(twoPhase bool) CDCOption {
+	return func(o *CDCOptions) {
+		o.TwoPhaseCommit = twoPhase
+	}
+}
+

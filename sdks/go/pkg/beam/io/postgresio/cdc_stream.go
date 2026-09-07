@@ -16,6 +16,7 @@
 package postgresio
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"crypto/tls"
@@ -24,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"time"
 )
@@ -99,11 +101,13 @@ func (m *MockReplicationStream) GetStatusLog() []StandbyStatus {
 
 // NativeReplicationStream establishes a pure-Go logical replication connection over TCP/TLS.
 type NativeReplicationStream struct {
-	conn      net.Conn
-	writeMu   sync.Mutex
-	readMu    sync.Mutex
-	opts      CDCOptions
-	closed    bool
+	conn               net.Conn
+	writeMu            sync.Mutex
+	readMu             sync.Mutex
+	opts               CDCOptions
+	serverMajorVersion int
+	serverVersion      string
+	closed             bool
 }
 
 // NewNativeReplicationStream connects to PostgreSQL in replication mode.
@@ -242,11 +246,22 @@ func (s *NativeReplicationStream) handshake(ctx context.Context) error {
 		}
 	}
 
-	// Read until ReadyForQuery ('Z')
+	// Read until ReadyForQuery ('Z'), capturing ParameterStatus ('S')
 	for {
-		msgType, _, err := s.readRawMessage()
+		msgType, payload, err := s.readRawMessage()
 		if err != nil {
 			return err
+		}
+		if msgType == 'S' {
+			parts := bytes.Split(payload, []byte{0})
+			if len(parts) >= 2 {
+				paramName := string(parts[0])
+				paramVal := string(parts[1])
+				if paramName == "server_version" {
+					s.serverVersion = paramVal
+					s.serverMajorVersion = parseMajorVersion(paramVal)
+				}
+			}
 		}
 		if msgType == 'Z' {
 			break
@@ -261,17 +276,12 @@ func (s *NativeReplicationStream) handshake(ctx context.Context) error {
 		return fmt.Errorf("failed during search_path setup: %w", err)
 	}
 
-	// 4. Issue START_REPLICATION command
+	// 4. Issue START_REPLICATION command with version negotiation (Options A & B for PG >= 19)
 	startLSNStr := "0/0"
 	if s.opts.StartLSN != 0 {
 		startLSNStr = fmt.Sprintf("%X/%X", uint32(s.opts.StartLSN>>32), uint32(s.opts.StartLSN))
 	}
-	originOpt := ""
-	if s.opts.OriginFilter == "none" {
-		originOpt = ", origin 'none'"
-	}
-	repQuery := fmt.Sprintf("START_REPLICATION SLOT %s LOGICAL %s (proto_version '1', publication_names '\"%s\"'%s);",
-		s.opts.SlotName, startLSNStr, s.opts.Publication, originOpt)
+	repQuery := s.BuildStartReplicationQuery(startLSNStr)
 
 	if err := s.sendQuery(repQuery); err != nil {
 		return fmt.Errorf("failed to send START_REPLICATION: %w", err)
@@ -393,3 +403,84 @@ func (s *NativeReplicationStream) Close() error {
 	s.closed = true
 	return s.conn.Close()
 }
+
+// ServerMajorVersion returns the parsed major version of the connected PostgreSQL server (e.g. 19, 18, 16).
+func (s *NativeReplicationStream) ServerMajorVersion() int {
+	return s.serverMajorVersion
+}
+
+// ServerVersion returns the raw server_version string reported by PostgreSQL ParameterStatus.
+func (s *NativeReplicationStream) ServerVersion() string {
+	return s.serverVersion
+}
+
+// BuildStartReplicationQuery constructs the START_REPLICATION command, automatically negotiating
+// proto_version '4', binary mode 'true' (Option A), and parallel streaming 'parallel' (Option B)
+// when connected to PostgreSQL >= 19, while reverting cleanly to proto_version '1' without binary
+// or parallel streaming on older PostgreSQL versions.
+func (s *NativeReplicationStream) BuildStartReplicationQuery(startLSNStr string) string {
+	var opts []string
+
+	isPG19OrHigher := s.serverMajorVersion >= 19
+
+	// 1. Protocol Version (Option A): 4 for PG >= 19, 1 for older PG
+	protoVer := 1
+	if isPG19OrHigher {
+		protoVer = 4
+	}
+	if s.opts.ProtoVersion > 0 {
+		protoVer = s.opts.ProtoVersion
+	}
+	opts = append(opts, fmt.Sprintf("proto_version '%d'", protoVer))
+
+	// 2. Publication name
+	opts = append(opts, fmt.Sprintf("publication_names '\"%s\"'", s.opts.Publication))
+
+	// 3. Binary Mode (Option A): binary 'true' only on PostgreSQL >= 19 or if explicitly enabled
+	useBinary := isPG19OrHigher
+	if s.opts.BinaryMode != nil {
+		useBinary = *s.opts.BinaryMode
+	}
+	if useBinary {
+		opts = append(opts, "binary 'true'")
+	}
+
+	// 4. In-progress transaction streaming (Option B): streaming 'parallel' on PostgreSQL >= 19 or if explicitly enabled
+	streaming := ""
+	if isPG19OrHigher {
+		streaming = "parallel"
+	}
+	if s.opts.StreamingMode != "" {
+		streaming = s.opts.StreamingMode
+	}
+	if streaming != "" && streaming != "off" {
+		opts = append(opts, fmt.Sprintf("streaming '%s'", streaming))
+	}
+
+	// 5. Two-phase commit decoding
+	if s.opts.TwoPhaseCommit {
+		opts = append(opts, "two_phase 'true'")
+	}
+
+	// 6. Replication origin filter (loop prevention)
+	if s.opts.OriginFilter == "none" {
+		opts = append(opts, "origin 'none'")
+	}
+
+	return fmt.Sprintf("START_REPLICATION SLOT %s LOGICAL %s (%s);",
+		s.opts.SlotName, startLSNStr, strings.Join(opts, ", "))
+}
+
+// parseMajorVersion extracts the leading integer from a server_version string (e.g. "19.0", "18.6 (Debian 18.6-1)").
+func parseMajorVersion(verStr string) int {
+	var major int
+	for _, ch := range verStr {
+		if ch >= '0' && ch <= '9' {
+			major = major*10 + int(ch-'0')
+		} else {
+			break
+		}
+	}
+	return major
+}
+
