@@ -19,7 +19,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,7 +33,7 @@ var (
 )
 
 func init() {
-	beam.RegisterType(reflect.TypeOf((*cdcSourceFn)(nil)).Elem())
+	beam.RegisterDoFn(&cdcSourceFn{})
 }
 
 // cdcSourceFn is a single-consumer DoFn that establishes a logical replication
@@ -94,9 +93,6 @@ func (fn *cdcSourceFn) ProcessElement(ctx context.Context, bf beam.BundleFinaliz
 			case <-heartbeatTicker.C:
 				wLSN := atomic.LoadUint64(&latestReceivedLSN)
 				fLSN := atomic.LoadUint64(&confirmedCommittedLSN)
-				if fLSN == 0 && wLSN > 0 {
-					fLSN = wLSN
-				}
 				status := StandbyStatus{
 					WriteLSN:       wLSN,
 					FlushLSN:       fLSN,
@@ -184,10 +180,14 @@ func (fn *cdcSourceFn) ProcessElement(ctx context.Context, bf beam.BundleFinaliz
 				cdcProcessedRecords.Inc(ctx, 1)
 				if event.LSN > atomic.LoadUint64(&latestReceivedLSN) {
 					atomic.StoreUint64(&latestReceivedLSN, event.LSN)
+				}
+				if event.LSN > atomic.LoadUint64(&currentBundleMaxLSN) {
 					atomic.StoreUint64(&currentBundleMaxLSN, event.LSN)
 				}
 				emit(*event)
-				atomic.StoreUint64(&confirmedCommittedLSN, event.LSN)
+				if bf == nil {
+					atomic.StoreUint64(&confirmedCommittedLSN, event.LSN)
+				}
 			}
 		}
 	}

@@ -30,7 +30,7 @@ import (
 )
 
 func init() {
-	beam.RegisterType(reflect.TypeOf((*arrowBatcherFn)(nil)))
+	beam.RegisterDoFn(&arrowBatcherFn{})
 	beam.RegisterType(reflect.TypeOf((*tableBuffer)(nil)))
 }
 

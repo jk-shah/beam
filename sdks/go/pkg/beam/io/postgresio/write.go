@@ -21,6 +21,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"os"
 	"reflect"
 	"strings"
 	"time"
@@ -112,13 +113,23 @@ func (fn *writeFn) Setup(ctx context.Context) error {
 	if sslMode == "" {
 		sslMode = "disable"
 	}
+	password := fn.Options.Password
+	if password == "" {
+		password = os.Getenv("PGPASSWORD")
+	}
 	// Pin search_path directly in DSN so EVERY connection in the pool is isolated (CVE-2018-1058)
 	dsn := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=%s search_path=pg_catalog,pg_temp",
-		fn.Options.Host, fn.Options.Port, fn.Options.Database, fn.Options.Username, fn.Options.Password, sslMode)
+		fn.Options.Host, fn.Options.Port, fn.Options.Database, fn.Options.Username, password, sslMode)
 
-	db, err := sql.Open("postgres", dsn)
-	if err != nil {
-		return fmt.Errorf("postgresio: failed to open connection pool: %w", err)
+	var db *sql.DB
+	var err error
+	if fn.Options.DialFunc != nil {
+		db = sql.OpenDB(&pqConnector{dialer: &pqDialerAdapter{dialFunc: fn.Options.DialFunc}, dsn: dsn})
+	} else {
+		db, err = sql.Open("postgres", dsn)
+		if err != nil {
+			return fmt.Errorf("postgresio: failed to open connection pool: %w", err)
+		}
 	}
 
 	// Clamp worker pool connections to prevent connection storms across distributed workers
@@ -369,7 +380,10 @@ func (fn *writeFn) executeStagedCopy(ctx context.Context, batch []any) error {
 
 	colList := strings.Join(sanitizedCols, ", ")
 	var mergeSql string
-	if len(updateClauses) > 0 {
+	if len(sanitizedPks) == 0 {
+		mergeSql = fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM %s ON CONFLICT DO NOTHING",
+			fn.Table, colList, colList, tempTable)
+	} else if len(updateClauses) > 0 {
 		mergeSql = fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM %s ON CONFLICT (%s) DO UPDATE SET %s",
 			fn.Table, colList, colList, tempTable, strings.Join(sanitizedPks, ", "), strings.Join(updateClauses, ", "))
 	} else {
@@ -502,36 +516,40 @@ func (fn *writeFn) buildUnnestQuery(batch []any) (string, []any, error) {
 		strings.Join(sanitizedCols, ", "),
 		strings.Join(unnestPlaceholders, ", ")))
 
-	if fn.Options.WriteMode == WriteModeUpsert && len(fn.PrimaryKeyCols) > 0 {
-		sanitizedPks := make([]string, len(fn.PrimaryKeyCols))
-		pkSet := make(map[string]bool)
-		for i, pk := range fn.PrimaryKeyCols {
-			san, err := SanitizeIdentifier(pk)
-			if err != nil {
-				return "", nil, err
-			}
-			sanitizedPks[i] = san
-			pkSet[pk] = true
-		}
-
-		updateClauses := make([]string, 0, len(fn.columns))
-		for _, col := range fn.columns {
-			if !pkSet[col] {
-				san, err := SanitizeIdentifier(col)
+	if fn.Options.WriteMode == WriteModeUpsert {
+		if len(fn.PrimaryKeyCols) == 0 {
+			sb.WriteString(" ON CONFLICT DO NOTHING")
+		} else {
+			sanitizedPks := make([]string, len(fn.PrimaryKeyCols))
+			pkSet := make(map[string]bool)
+			for i, pk := range fn.PrimaryKeyCols {
+				san, err := SanitizeIdentifier(pk)
 				if err != nil {
 					return "", nil, err
 				}
-				updateClauses = append(updateClauses, fmt.Sprintf("%s = EXCLUDED.%s", san, san))
+				sanitizedPks[i] = san
+				pkSet[pk] = true
 			}
-		}
 
-		if len(updateClauses) > 0 {
-			sb.WriteString(fmt.Sprintf(" ON CONFLICT (%s) DO UPDATE SET %s",
-				strings.Join(sanitizedPks, ", "),
-				strings.Join(updateClauses, ", ")))
-		} else {
-			sb.WriteString(fmt.Sprintf(" ON CONFLICT (%s) DO NOTHING",
-				strings.Join(sanitizedPks, ", ")))
+			updateClauses := make([]string, 0, len(fn.columns))
+			for _, col := range fn.columns {
+				if !pkSet[col] {
+					san, err := SanitizeIdentifier(col)
+					if err != nil {
+						return "", nil, err
+					}
+					updateClauses = append(updateClauses, fmt.Sprintf("%s = EXCLUDED.%s", san, san))
+				}
+			}
+
+			if len(updateClauses) > 0 {
+				sb.WriteString(fmt.Sprintf(" ON CONFLICT (%s) DO UPDATE SET %s",
+					strings.Join(sanitizedPks, ", "),
+					strings.Join(updateClauses, ", ")))
+			} else {
+				sb.WriteString(fmt.Sprintf(" ON CONFLICT (%s) DO NOTHING",
+					strings.Join(sanitizedPks, ", ")))
+			}
 		}
 	}
 

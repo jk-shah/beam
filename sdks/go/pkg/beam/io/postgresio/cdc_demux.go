@@ -16,15 +16,13 @@
 package postgresio
 
 import (
-	"reflect"
-
 	"github.com/apache/beam/sdks/v2/go/pkg/beam"
 )
 
 func init() {
-	beam.RegisterType(reflect.TypeOf((*filterByTableFn)(nil)).Elem())
-	beam.RegisterType(reflect.TypeOf((*filterBySchemaFn)(nil)).Elem())
-	beam.RegisterType(reflect.TypeOf((*filterByOriginFn)(nil)).Elem())
+	beam.RegisterDoFn(&filterByTableFn{})
+	beam.RegisterDoFn(&filterBySchemaFn{})
+	beam.RegisterDoFn(&filterByOriginFn{})
 }
 
 type filterByTableFn struct {

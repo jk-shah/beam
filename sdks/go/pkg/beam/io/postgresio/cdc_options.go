@@ -30,7 +30,7 @@ type CDCOptions struct {
 	Port                 int
 	Database             string
 	Username             string
-	Password             string                   `beam:"-" json:"-"`
+	Password             string                   `json:"password,omitempty"`
 	SSLMode              string
 	SlotName             string
 	Publication          string

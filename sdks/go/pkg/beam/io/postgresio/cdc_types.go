@@ -16,6 +16,7 @@
 package postgresio
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -42,8 +43,48 @@ func encodeChangeEvent(in ChangeEvent) ([]byte, error) {
 
 func decodeChangeEvent(in []byte) (ChangeEvent, error) {
 	var out ChangeEvent
-	err := json.Unmarshal(in, &out)
-	return out, err
+	dec := json.NewDecoder(bytes.NewReader(in))
+	dec.UseNumber()
+	if err := dec.Decode(&out); err != nil {
+		return out, err
+	}
+	out.Before = normalizeJSONNumbers(out.Before)
+	out.After = normalizeJSONNumbers(out.After)
+	return out, nil
+}
+
+func normalizeJSONNumbers(m map[string]any) map[string]any {
+	if m == nil {
+		return nil
+	}
+	res := make(map[string]any, len(m))
+	for k, v := range m {
+		res[k] = normalizeValue(v)
+	}
+	return res
+}
+
+func normalizeValue(v any) any {
+	switch val := v.(type) {
+	case json.Number:
+		if i, err := val.Int64(); err == nil {
+			return i
+		}
+		if f, err := val.Float64(); err == nil {
+			return f
+		}
+		return val.String()
+	case map[string]any:
+		return normalizeJSONNumbers(val)
+	case []any:
+		out := make([]any, len(val))
+		for i, item := range val {
+			out[i] = normalizeValue(item)
+		}
+		return out
+	default:
+		return v
+	}
 }
 
 // OpType represents the mutation operation type captured by PostgreSQL CDC.

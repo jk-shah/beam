@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"reflect"
 	"strconv"
 	"time"
 
@@ -31,7 +30,7 @@ import (
 )
 
 func init() {
-	beam.RegisterType(reflect.TypeOf((*fromArrowBatchesFn)(nil)))
+	beam.RegisterDoFn(&fromArrowBatchesFn{})
 }
 
 // fromArrowBatchesFn is a Beam DoFn that unpacks Arrow IPC RecordBatches into individual ChangeEvents.

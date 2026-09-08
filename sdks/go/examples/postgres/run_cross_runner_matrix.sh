@@ -24,9 +24,9 @@ DOT_DIR="/tmp/beam_test_graphs"
 LOG_DIR="/tmp/beam_runner_test_logs"
 mkdir -p "${DOT_DIR}" "${LOG_DIR}"
 
-GCP_PROJECT="${GCP_PROJECT:-jkshah-gcp}"
+GCP_PROJECT="${GCP_PROJECT:-beam-test-project}"
 GCP_REGION="${GCP_REGION:-us-central1}"
-GCS_STAGING="${GCS_STAGING:-gs://jkshah-dataflow-via-testing/staging}"
+GCS_STAGING="${GCS_STAGING:-gs://beam-test-staging-bucket/staging}"
 JOB_ENDPOINT="${JOB_ENDPOINT:-localhost:8073}"
 
 echo "================================================================================"

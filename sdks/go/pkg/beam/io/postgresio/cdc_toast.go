@@ -16,8 +16,6 @@
 package postgresio
 
 import (
-	"reflect"
-
 	"github.com/apache/beam/sdks/v2/go/pkg/beam"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/state"
 )
@@ -25,9 +23,9 @@ import (
 const unchangedToastMarker = "<unchanged_toast>"
 
 func init() {
-	beam.RegisterType(reflect.TypeOf((*toastReassemblyFn)(nil)).Elem())
-	beam.RegisterType(reflect.TypeOf((*keyByPrimaryKeyFn)(nil)).Elem())
-	beam.RegisterType(reflect.TypeOf((*dropKeyFn)(nil)).Elem())
+	beam.RegisterDoFn(&toastReassemblyFn{})
+	beam.RegisterDoFn(&keyByPrimaryKeyFn{})
+	beam.RegisterDoFn(&dropKeyFn{})
 }
 
 // toastReassemblyFn is a stateful Beam DoFn that caches baseline rows on INSERT

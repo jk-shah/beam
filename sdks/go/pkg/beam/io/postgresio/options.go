@@ -17,11 +17,14 @@ package postgresio
 
 import (
 	"context"
+	"database/sql/driver"
 	"fmt"
 	"net"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/lib/pq"
 )
 
 // WriteMode defines the write mutation strategy against the target PostgreSQL table.
@@ -63,7 +66,7 @@ type WriteOptions struct {
 	Port               int
 	Database           string
 	Username           string
-	Password           string `beam:"-" json:"-"`
+	Password           string `json:"password,omitempty"`
 	SSLMode            string
 	WriteMode          WriteMode
 	WriteMethod        WriteMethod
@@ -76,6 +79,35 @@ type WriteOptions struct {
 	ConnectionInitSQL     string
 	ReplicationOriginName string
 	DialFunc              DialFunc `beam:"-" json:"-"`
+}
+
+// pqDialerAdapter adapts a postgresio DialFunc into a pq.Dialer.
+type pqDialerAdapter struct {
+	dialFunc DialFunc
+}
+
+func (a *pqDialerAdapter) Dial(network, address string) (net.Conn, error) {
+	return a.dialFunc(context.Background(), network, address)
+}
+
+func (a *pqDialerAdapter) DialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return a.dialFunc(ctx, network, address)
+}
+
+// pqConnector implements driver.Connector using a custom pq.Dialer.
+type pqConnector struct {
+	dialer pq.Dialer
+	dsn    string
+}
+
+func (c *pqConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	return pq.DialOpen(c.dialer, c.dsn)
+}
+
+func (c *pqConnector) Driver() driver.Driver {
+	return &pq.Driver{}
 }
 
 // Option represents a functional option for configuring WriteOptions.

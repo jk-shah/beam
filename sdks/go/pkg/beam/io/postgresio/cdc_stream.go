@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -303,7 +304,10 @@ func (s *NativeReplicationStream) resolvePassword(ctx context.Context) (string, 
 	if s.opts.TokenProvider != nil {
 		return s.opts.TokenProvider.GetPassword(ctx)
 	}
-	return s.opts.Password, nil
+	if s.opts.Password != "" {
+		return s.opts.Password, nil
+	}
+	return os.Getenv("PGPASSWORD"), nil
 }
 
 func (s *NativeReplicationStream) sendPasswordMessage(password string) error {

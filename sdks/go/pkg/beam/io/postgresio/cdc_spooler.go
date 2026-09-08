@@ -16,6 +16,7 @@
 package postgresio
 
 import (
+	"bytes"
 	"encoding/json"
 	"reflect"
 
@@ -36,7 +37,7 @@ const (
 )
 
 func init() {
-	beam.RegisterType(reflect.TypeOf((*inFlightTransactionSpoolerFn)(nil)).Elem())
+	beam.RegisterDoFn(&inFlightTransactionSpoolerFn{})
 	beam.RegisterCoder(
 		reflect.TypeOf((*TransactionMessage)(nil)).Elem(),
 		encodeTxMessage,
@@ -50,8 +51,16 @@ func encodeTxMessage(in TransactionMessage) ([]byte, error) {
 
 func decodeTxMessage(in []byte) (TransactionMessage, error) {
 	var out TransactionMessage
-	err := json.Unmarshal(in, &out)
-	return out, err
+	dec := json.NewDecoder(bytes.NewReader(in))
+	dec.UseNumber()
+	if err := dec.Decode(&out); err != nil {
+		return out, err
+	}
+	if out.Event != nil {
+		out.Event.Before = normalizeJSONNumbers(out.Event.Before)
+		out.Event.After = normalizeJSONNumbers(out.Event.After)
+	}
+	return out, nil
 }
 
 // TransactionMessage wraps an in-flight mutation or transaction control signal.

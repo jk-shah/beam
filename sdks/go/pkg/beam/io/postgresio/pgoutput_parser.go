@@ -57,6 +57,9 @@ type RelationDef struct {
 	PrimaryKeys     []string
 }
 
+// RelationMessage is an alias for RelationDef representing a relation schema message.
+type RelationMessage = RelationDef
+
 // ColumnDef describes a single column within a RelationDef.
 type ColumnDef struct {
 	Flags        uint8
@@ -90,6 +93,14 @@ func (p *PgOutputParser) RegisterRelation(rel *RelationDef) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.relations[rel.RelationID] = rel
+}
+
+// SetRelation stores or updates a relation definition by relation ID.
+func (p *PgOutputParser) SetRelation(relID uint32, rel *RelationDef) {
+	if rel != nil {
+		rel.RelationID = relID
+		p.RegisterRelation(rel)
+	}
 }
 
 // GetRelation retrieves a cached relation definition.
@@ -305,23 +316,25 @@ func (p *PgOutputParser) ParseMessages(data []byte) ([]*ChangeEvent, error) {
 				return nil, fmt.Errorf("failed to parse Truncate relation ID %d: %w", i, err)
 			}
 		}
-		var tableName, schemaName string
-		if len(relIDs) > 0 {
-			if rel, ok := p.GetRelation(relIDs[0]); ok {
+		var truncEvents []*ChangeEvent
+		for _, relID := range relIDs {
+			var tableName, schemaName string
+			if rel, ok := p.GetRelation(relID); ok {
 				tableName = rel.RelationName
 				schemaName = rel.Namespace
 			}
+			ev := &ChangeEvent{
+				Operation:     OpTruncate,
+				Schema:        schemaName,
+				Table:         tableName,
+				CommitTime:    p.currentTxTime,
+				LSN:           p.currentLSN,
+				TransactionID: p.currentXID,
+				Origin:        p.currentOrigin,
+			}
+			truncEvents = append(truncEvents, p.emitOrSpool(ev)...)
 		}
-		ev := &ChangeEvent{
-			Operation:     OpTruncate,
-			Schema:        schemaName,
-			Table:         tableName,
-			CommitTime:    p.currentTxTime,
-			LSN:           p.currentLSN,
-			TransactionID: p.currentXID,
-			Origin:        p.currentOrigin,
-		}
-		return p.emitOrSpool(ev), nil
+		return truncEvents, nil
 
 	case 'O': // Origin (Replication loop prevention)
 		var lsn uint64

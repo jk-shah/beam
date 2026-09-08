@@ -64,7 +64,7 @@ func TestCoders_Roundtrip(t *testing.T) {
 		TransactionID: 100,
 		PrimaryKeys:   []string{"id"},
 		After: map[string]any{
-			"id":   float64(101),
+			"id":   int64(101),
 			"name": "alice",
 		},
 	}
@@ -78,6 +78,9 @@ func TestCoders_Roundtrip(t *testing.T) {
 	}
 	if decCE.Table != ce.Table || decCE.LSN != ce.LSN {
 		t.Errorf("ChangeEvent decode mismatch: got %+v, want %+v", decCE, ce)
+	}
+	if idVal, ok := decCE.After["id"].(int64); !ok || idVal != 101 {
+		t.Errorf("ChangeEvent After['id'] type coerced: got %T (%v), want int64(101)", decCE.After["id"], decCE.After["id"])
 	}
 
 	// 3. TransactionMessage Coder
@@ -1674,6 +1677,110 @@ func TestPgOutputParser_ParseBinaryValue_AllTypes(t *testing.T) {
 	jsonbData := append([]byte{1}, []byte(`{"key":"val"}`)...)
 	if v := parseBinaryValue(3802, jsonbData); v != `{"key":"val"}` {
 		t.Errorf("parseBinaryValue(3802) = %v", v)
+	}
+}
+
+func TestPgOutputParser_MultiTableTruncate(t *testing.T) {
+	parser := NewPgOutputParser()
+	parser.RegisterRelation(&RelationDef{
+		RelationID:   101,
+		Namespace:    "public",
+		RelationName: "table_a",
+	})
+	parser.RegisterRelation(&RelationDef{
+		RelationID:   102,
+		Namespace:    "public",
+		RelationName: "table_b",
+	})
+	parser.RegisterRelation(&RelationDef{
+		RelationID:   103,
+		Namespace:    "analytics",
+		RelationName: "table_c",
+	})
+
+	// Construct 'T' message with 3 relations
+	var buf bytes.Buffer
+	buf.WriteByte('T')
+	_ = binary.Write(&buf, binary.BigEndian, uint32(3)) // 3 relations
+	buf.WriteByte(0)                                    // options
+	_ = binary.Write(&buf, binary.BigEndian, uint32(101))
+	_ = binary.Write(&buf, binary.BigEndian, uint32(102))
+	_ = binary.Write(&buf, binary.BigEndian, uint32(103))
+
+	events, err := parser.ParseMessages(buf.Bytes())
+	if err != nil {
+		t.Fatalf("ParseMessages('T') err = %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("expected 3 truncate events, got %d", len(events))
+	}
+	if events[0].Table != "table_a" || events[1].Table != "table_b" || events[2].Table != "table_c" {
+		t.Errorf("unexpected truncate events tables: %+v", events)
+	}
+	for i, e := range events {
+		if e.Operation != OpTruncate {
+			t.Errorf("event %d operation = %v, want OpTruncate", i, e.Operation)
+		}
+	}
+}
+
+func TestWrite_EmptyPKUpsertQuery(t *testing.T) {
+	fn := &writeFn{
+		Table:          "users",
+		columns:        []string{"id", "email"},
+		PrimaryKeyCols: []string{}, // Empty primary keys
+		Options: WriteOptions{
+			WriteMode: WriteModeUpsert,
+		},
+		Type: beam.EncodedType{T: reflect.TypeOf(struct {
+			ID    int64  `db:"id"`
+			Email string `db:"email"`
+		}{})},
+	}
+
+	batch := []any{
+		struct {
+			ID    int64  `db:"id"`
+			Email string `db:"email"`
+		}{ID: 1, Email: "test@example.com"},
+	}
+
+	query, _, err := fn.buildUnnestQuery(batch)
+	if err != nil {
+		t.Fatalf("buildUnnestQuery err = %v", err)
+	}
+	if strings.Contains(query, "ON CONFLICT ()") {
+		t.Errorf("query contains invalid syntax ON CONFLICT (): %s", query)
+	}
+	if !strings.Contains(query, "ON CONFLICT DO NOTHING") {
+		t.Errorf("query should contain ON CONFLICT DO NOTHING: %s", query)
+	}
+}
+
+func TestWrite_PQDialerAdapter(t *testing.T) {
+	dialed := false
+	dialer := &pqDialerAdapter{
+		dialFunc: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialed = true
+			c1, _ := net.Pipe()
+			return c1, nil
+		},
+	}
+
+	c, err := dialer.Dial("tcp", "127.0.0.1:5432")
+	if err != nil || c == nil || !dialed {
+		t.Errorf("Dial failed: %v", err)
+	}
+	if c != nil {
+		_ = c.Close()
+	}
+
+	cTimeout, err := dialer.DialTimeout("tcp", "127.0.0.1:5432", 1*time.Second)
+	if err != nil || cTimeout == nil {
+		t.Errorf("DialTimeout failed: %v", err)
+	}
+	if cTimeout != nil {
+		_ = cTimeout.Close()
 	}
 }
 
