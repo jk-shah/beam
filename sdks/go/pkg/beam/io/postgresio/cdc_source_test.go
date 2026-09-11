@@ -138,6 +138,12 @@ func TestCDCSourceFnExecutionWithMockStream(t *testing.T) {
 	if evt.Operation != OpInsert || evt.Table != "customers" || evt.After["name"] != "Alice" {
 		t.Errorf("unexpected event content: %+v", evt)
 	}
+	if evt.EventID == "" {
+		t.Errorf("expected non-empty EventID on emitted ChangeEvent, got empty string")
+	}
+	if ChangeEventKeyFn(evt) != evt.EventID {
+		t.Errorf("ChangeEventKeyFn mismatch: got %q, want %q", ChangeEventKeyFn(evt), evt.EventID)
+	}
 
 	// Finalize bundle: triggers callback advancing confirmedCommittedLSN
 	if err := bf.FinalizeBundle(); err != nil {
@@ -148,5 +154,54 @@ func TestCDCSourceFnExecutionWithMockStream(t *testing.T) {
 	statuses := mockStream.GetStatusLog()
 	if len(statuses) == 0 {
 		t.Errorf("expected mockStream to receive standby status updates, got none")
+	}
+}
+
+func TestChangeEventDeterministicEventID(t *testing.T) {
+	ev1 := ChangeEvent{
+		Operation:     OpInsert,
+		Schema:        "public",
+		Table:         "orders",
+		LSN:           50001,
+		TransactionID: 42,
+		PrimaryKeys:   []string{"order_id"},
+		After:         map[string]any{"order_id": int64(101), "amount": 99.5},
+	}
+	ev1.PopulateEventID()
+
+	ev2 := ChangeEvent{
+		Operation:     OpInsert,
+		Schema:        "public",
+		Table:         "orders",
+		LSN:           50001,
+		TransactionID: 42,
+		PrimaryKeys:   []string{"order_id"},
+		After:         map[string]any{"order_id": int64(101), "amount": 99.5},
+	}
+	ev2.PopulateEventID()
+
+	if ev1.EventID != ev2.EventID {
+		t.Errorf("expected deterministic EventID equality, got %q != %q", ev1.EventID, ev2.EventID)
+	}
+
+	// Ensure different primary key or LSN yields different EventID
+	ev3 := ChangeEvent{
+		Operation:     OpInsert,
+		Schema:        "public",
+		Table:         "orders",
+		LSN:           50002,
+		TransactionID: 42,
+		PrimaryKeys:   []string{"order_id"},
+		After:         map[string]any{"order_id": int64(102), "amount": 99.5},
+	}
+	ev3.PopulateEventID()
+
+	if ev1.EventID == ev3.EventID {
+		t.Errorf("expected distinct EventIDs for different LSNs/records, got collision %q", ev1.EventID)
+	}
+
+	expectedKey := "50001:42:public.orders:public.orders:101"
+	if ev1.EventID != expectedKey {
+		t.Errorf("unexpected EventID format: got %q, want %q", ev1.EventID, expectedKey)
 	}
 }

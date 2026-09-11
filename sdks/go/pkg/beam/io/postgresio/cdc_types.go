@@ -29,6 +29,7 @@ import (
 
 func init() {
 	beam.RegisterType(reflect.TypeOf((*StandbyStatus)(nil)).Elem())
+	beam.RegisterFunction(ChangeEventKeyFn)
 
 	beam.RegisterCoder(
 		reflect.TypeOf((*ChangeEvent)(nil)).Elem(),
@@ -113,14 +114,15 @@ type ColumnValue struct {
 // ChangeEvent represents an immutable Change Data Capture event decoded from
 // PostgreSQL's logical replication stream (pgoutput).
 type ChangeEvent struct {
-	Operation     OpType         `beam:"operation" json:"operation"`
-	Schema        string         `beam:"schema" json:"schema"`
-	Table         string         `beam:"table" json:"table"`
-	CommitTime    time.Time      `beam:"commit_time" json:"commit_time"`
-	LSN           uint64         `beam:"lsn" json:"lsn"`
-	TransactionID uint32         `beam:"transaction_id" json:"transaction_id"`
-	PrimaryKeys   []string       `beam:"primary_keys" json:"primary_keys"`
-	Origin        string         `beam:"origin" json:"origin,omitempty"`
+	EventID       string            `beam:"event_id" json:"event_id,omitempty"`
+	Operation     OpType            `beam:"operation" json:"operation"`
+	Schema        string            `beam:"schema" json:"schema"`
+	Table         string            `beam:"table" json:"table"`
+	CommitTime    time.Time         `beam:"commit_time" json:"commit_time"`
+	LSN           uint64            `beam:"lsn" json:"lsn"`
+	TransactionID uint32            `beam:"transaction_id" json:"transaction_id"`
+	PrimaryKeys   []string          `beam:"primary_keys" json:"primary_keys"`
+	Origin        string            `beam:"origin" json:"origin,omitempty"`
 	Before        map[string]any    `beam:"before" json:"before,omitempty"`
 	After         map[string]any    `beam:"after" json:"after,omitempty"`
 	ColumnTypes   map[string]uint32 `beam:"column_types" json:"column_types,omitempty"`
@@ -154,6 +156,29 @@ func (e ChangeEvent) PrimaryKeyString() string {
 		}
 	}
 	return fmt.Sprintf("%s:%s", e.FullTableName(), strings.Join(parts, "|"))
+}
+
+// EventIDString returns a deterministic unique event identifier
+// (LSN:TransactionID:Table:PrimaryKey) for exactly-once deduplication across Beam runners.
+func (e ChangeEvent) EventIDString() string {
+	if e.EventID != "" {
+		return e.EventID
+	}
+	return fmt.Sprintf("%d:%d:%s:%s", e.LSN, e.TransactionID, e.FullTableName(), e.PrimaryKeyString())
+}
+
+// PopulateEventID computes and assigns the deterministic unique EventID
+// (LSN:TransactionID:Table:PrimaryKey) if not already populated.
+func (e *ChangeEvent) PopulateEventID() {
+	if e.EventID == "" {
+		e.EventID = e.EventIDString()
+	}
+}
+
+// ChangeEventKeyFn returns the deterministic EventIDString for a ChangeEvent.
+// This function can be used with beam.KeyBy or beam.Deduplicate in streaming pipelines.
+func ChangeEventKeyFn(e ChangeEvent) string {
+	return e.EventIDString()
 }
 
 // StandbyStatus encapsulates client replication position acknowledged to PostgreSQL.
