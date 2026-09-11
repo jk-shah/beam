@@ -173,6 +173,15 @@ func WithCDCHeartbeatInterval(interval time.Duration) CDCOption {
 	}
 }
 
+// WithCDCStatusInterval sets the frequency at which standby status updates are sent.
+// Must be strictly less than wal_sender_timeout (default 60s).
+func WithCDCStatusInterval(interval time.Duration) CDCOption {
+	return func(o *CDCOptions) {
+		o.StatusInterval = interval
+		o.HeartbeatInterval = interval
+	}
+}
+
 // WithCDCCreateSlotIfMissing instructs the reader to create the replication slot if it does not exist.
 func WithCDCCreateSlotIfMissing(create bool) CDCOption {
 	return func(o *CDCOptions) {

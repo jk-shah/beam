@@ -79,7 +79,14 @@ func (fn *cdcSourceFn) ProcessElement(ctx context.Context, bf beam.BundleFinaliz
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
 	defer cancelHeartbeat()
 
-	heartbeatTicker := time.NewTicker(fn.options.HeartbeatInterval)
+	statusInterval := fn.options.StatusInterval
+	if statusInterval <= 0 {
+		statusInterval = fn.options.HeartbeatInterval
+	}
+	if statusInterval <= 0 {
+		statusInterval = 10 * time.Second
+	}
+	heartbeatTicker := time.NewTicker(statusInterval)
 	defer heartbeatTicker.Stop()
 
 	var heartbeatWg sync.WaitGroup

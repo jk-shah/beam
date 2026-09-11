@@ -394,6 +394,9 @@ func (p *PgOutputParser) ParseMessages(data []byte) ([]*ChangeEvent, error) {
 }
 
 func (p *PgOutputParser) emitOrSpool(ev *ChangeEvent) []*ChangeEvent {
+	if ev != nil {
+		ev.PopulateEventID()
+	}
 	if p.inStream {
 		p.spooledTransactions[p.currentXID] = append(p.spooledTransactions[p.currentXID], ev)
 		return nil
