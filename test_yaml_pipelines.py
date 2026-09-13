@@ -46,6 +46,19 @@ def validate_yaml_pipeline(file_path: Path):
             assert "url" in config, f"{t_name} missing 'url'"
             assert "table" in config, f"{t_name} missing 'table'"
             print(f"    -> Table: {config['table']}, URL: {config['url']}")
+        elif t_type in ("ReadFromPostgreSQLCDC", "ReadFromPostgresCDC"):
+            config = t.get("config", {})
+            assert "slot_name" in config, f"{t_name} missing 'slot_name'"
+            assert "publication" in config, f"{t_name} missing 'publication'"
+            print(f"    -> Slot: {config['slot_name']}, Pub: {config['publication']}")
+        elif t_type == "WriteToPostgreSQL":
+            config = t.get("config", {})
+            assert "table" in config, f"{t_name} missing 'table'"
+            print(f"    -> Table: {config['table']}")
+        elif t_type == "Sql":
+            config = t.get("config", {})
+            assert "query" in config, f"{t_name} missing 'query'"
+            print(f"    -> Query: {config['query'].strip()[:60]}...")
         elif t_type == "Filter":
             config = t.get("config", {})
             assert "keep" in config, f"{t_name} missing 'keep' predicate"
@@ -63,10 +76,11 @@ if __name__ == "__main__":
         base_dir / "postgres_replication.yaml",
         base_dir / "postgres_filtering.yaml",
         base_dir / "postgres_transformation.yaml",
+        base_dir / "postgres_streaming_materialized_view.yaml",
     ]
     for yf in yaml_files:
         if not yf.exists():
             print(f"ERROR: File not found: {yf}", file=sys.stderr)
             sys.exit(1)
         validate_yaml_pipeline(yf)
-    print("ALL 3 PostgreSQL-to-PostgreSQL YAML pipelines validated successfully!")
+    print("ALL 4 PostgreSQL Beam YAML pipelines validated successfully!")
