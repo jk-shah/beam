@@ -1,0 +1,86 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# Real-Time Streaming Materialized View Maintenance Pipeline with LSN Freshness Tracking
+#
+# Problem:
+# In PostgreSQL, native `MATERIALIZED VIEW` objects require `REFRESH MATERIALIZED VIEW CONCURRENTLY`,
+# which scans entire tables, spikes database CPU, and causes write lock contention.
+#
+# Solution:
+# This declarative Beam YAML pipeline acts as an off-database incremental computation engine:
+# 1. Reads incoming mutations continuously via PostgreSQL logical replication CDC.
+# 2. Applies tumbling 1-minute windowed aggregations via Beam SQL.
+# 3. Tracks the highest Log Sequence Number (MAX(lsn)) and source commit timestamp (MAX(commit_time)).
+# 4. Upserts the rolling metrics into `public.merchant_minute_rollups` using staged COPY.
+# 5. Allows PostgreSQL clients to query `last_applied_lsn` and calculate replication lag in bytes
+#    using `pg_wal_lsn_diff(pg_current_wal_lsn(), last_applied_lsn)`.
+
+pipeline:
+  type: chain
+  transforms:
+    # 1. Continuous CDC Replication Stream
+    - type: ReadFromPostgreSQLCDC
+      name: IngestTransactionsCDC
+      config:
+        host: "localhost"
+        port: 5432
+        database: "postgres"
+        slot_name: "beam_mv_slot"
+        publication: "transactions_pub"
+        username: "beam_test"
+        password: "beam_password"
+        output_format: "row"
+
+    # 2. Windowed Streaming Aggregation & LSN Tracking via Beam SQL
+    - type: Sql
+      name: ComputeMaterializedViewRollup
+      config:
+        query: >
+          SELECT
+            merchant_id,
+            TUMBLE_START(event_timestamp, INTERVAL '1' MINUTE) AS window_start,
+            TUMBLE_END(event_timestamp, INTERVAL '1' MINUTE)   AS window_end,
+            COUNT(*)                                           AS transaction_count,
+            SUM(amount)                                        AS total_amount,
+            MAX(amount)                                        AS max_amount,
+            MAX(lsn)                                           AS last_applied_lsn,
+            MAX(commit_time)                                   AS last_tx_time
+          FROM PCOLLECTION
+          GROUP BY
+            merchant_id,
+            TUMBLE(event_timestamp, INTERVAL '1' MINUTE)
+
+    # 3. Incremental Materialized View Write Sink (Staged COPY Upsert)
+    - type: WriteToPostgreSQL
+      name: MaintainMaterializedViewTable
+      config:
+        host: "localhost"
+        port: 5432
+        database: "postgres"
+        table: "public.merchant_minute_rollups"
+        username: "beam_test"
+        password: "beam_password"
+        conflict_keys: 
+          - "merchant_id"
+          - "window_start"
+        update_fields:
+          - "transaction_count"
+          - "total_amount"
+          - "max_amount"
+          - "last_applied_lsn"
+          - "last_tx_time"
