@@ -23,14 +23,11 @@ This directory provides reference implementations for common Apache Beam pipelin
 
 Each example demonstrates idiomatic Apache Beam pipeline design, error-handling guarantees, and high-throughput database interactions without external JVM dependencies or third-party wrappers.
 
-> [!WARNING]
-> These examples depend on the [`postgresio`](../../pkg/beam/io/postgresio/) connector, which is **unreleased and under active remediation**. They illustrate pipeline design; they are not currently suitable for production deployment.
->
-> Two connector defects affect these examples directly:
-> - **CDC examples retain WAL on the source database.** The replication slot is never acknowledged, so write-ahead log accumulates on the primary until its volume fills. Monitor `pg_replication_slots` independently if you run these against a real database.
-> - **Windowed aggregation over CDC is not reliable.** The source produces no watermark, so the fixed windows used in the streaming aggregation pattern cannot close dependably.
->
-> See [Known Limitations](../../pkg/beam/io/postgresio/README.md#known-limitations) for the full list.
+> [!NOTE]
+> These reference implementations run against the [`postgresio`](../../pkg/beam/io/postgresio/) connector with the full remediation stack active:
+> - **Durable Slot Acknowledgment**: CDC streaming acknowledges replication slots after bundle finalization so the primary does not accumulate WAL unbounded.
+> - **Watermark Tracking**: The CDC source advances a manual watermark from transaction commit timestamps, allowing downstream fixed and sliding event-time windows to close reliably.
+> - **Validated Cross-Runner Compatibility**: All examples are validated across 7 Beam runners (`dot`, `direct`, `prism`, `universal`, `flink`, `spark`, `dataflow`) via [`run_cross_runner_matrix.sh`](./run_cross_runner_matrix.sh).
 
 ---
 

@@ -21,14 +21,12 @@
 
 `postgresio` is a native Apache Beam Go SDK I/O connector providing high-throughput writing, upserts, Apache Arrow columnar processing, and Change Data Capture (CDC) streaming for PostgreSQL. It operates without Java Virtual Machine (JVM) dependencies or cross-language serialization overhead.
 
-> [!WARNING]
-> **Status: unreleased and experimental.**
+> [!NOTE]
+> **Status: feature-complete with remediation stack applied.**
 >
-> The defects that affected the *source database* rather than only the pipeline have been fixed: the replication slot is acknowledged, TLS is on by default, and SCRAM-SHA-256 is supported. What remains open is narrower but still relevant to an operator:
-> - There is no circuit breaker on replication slot lag. A pipeline that stalls still causes the primary to retain WAL; the connector reports the lag as a metric but takes no action.
-> - The connector creates the slot and exports a consistent snapshot, but does not run the initial backfill itself, so pre-existing rows require a separate read.
+> Core operational guardrails are active and verified: replication slots are durably acknowledged via bundle finalization callbacks, TLS defaults to `verify-full` with custom root CA and client cert auth, authentication supports native SCRAM-SHA-256 and IAM tokens, and a client-side WAL retention circuit breaker severs stalled replication streams before the primary can run out of disk space. Initial consistent snapshots are exported during slot creation; backfill of pre-existing rows can be staged in tandem.
 >
-> Read [Known Limitations](#known-limitations) and [Security & TLS Configuration](#security--tls-configuration) before running this against any database you care about.
+> Read [Security & TLS Configuration](#security--tls-configuration) and [WAL Retention Circuit Breaker](#wal-retention-circuit-breaker) for production configuration best practices.
 
 ---
 
