@@ -50,6 +50,9 @@ type JobOptions struct {
 
 	// Loopback indicates this job is running in loopback mode and will reconnect to the local process.
 	Loopback bool
+
+	// WorkerArchitecture is the explicit target architecture override (e.g., "arm64", "amd64").
+	WorkerArchitecture string
 }
 
 // Prepare prepares a job to the given job service. It returns the preparation id

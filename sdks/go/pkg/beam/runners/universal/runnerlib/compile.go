@@ -21,16 +21,14 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
-	"sync/atomic"
-
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/internal/errors"
-	"github.com/apache/beam/sdks/v2/go/pkg/beam/log"
+	"github.com/apache/beam/sdks/v2/go/pkg/beam/util/stager"
 )
 
 // IsWorkerCompatibleBinary returns the path to itself and true if running
@@ -60,13 +58,7 @@ func BuildTempWorkerBinary(ctx context.Context, opts CompileOpts) (string, error
 	return filename, nil
 }
 
-// buildWorkerBinary creates a local worker binary for linux/amd64. It finds the filename
-// by examining the call stack. We want the user entry (*), for example:
-//
-//	  /Users/herohde/go/src/github.com/apache/beam/sdks/go/pkg/beam/runners/beamexec/main.go (skip: 2)
-//	* /Users/herohde/go/src/github.com/apache/beam/sdks/go/examples/wordcount/wordcount.go (skip: 3)
-//	  /usr/local/go/src/runtime/proc.go (skip: 4)      // not always present
-//	  /usr/local/go/src/runtime/asm_amd64.s (skip: 4 or 5)
+// buildWorkerBinary creates a local worker binary for the target platform using stager.
 func buildWorkerBinary(ctx context.Context, filename string, opts CompileOpts) error {
 	program := ""
 	var isTest bool
@@ -93,24 +85,15 @@ func buildWorkerBinary(ctx context.Context, filename string, opts CompileOpts) e
 		goarch = opts.Arch
 	}
 
-	cgo := "0"
-
-	log.Infof(ctx, "Cross-compiling %v with GOOS=%s GOARCH=%s CGO_ENABLED=%s as %v", program, goos, goarch, cgo, filename)
-
-	// Cross-compile given go program. Not awesome.
-	program = program[:strings.LastIndex(program, "/")+1]
-	program = program + "."
-	var build []string
-	if isTest {
-		build = []string{"go", "test", "-trimpath", "-c", "-o", filename, program}
-	} else {
-		build = []string{"go", "build", "-trimpath", "-o", filename, program}
-	}
-
-	cmd := exec.Command(build[0], build[1:]...)
-	cmd.Env = append(os.Environ(), "GOOS="+goos, "GOARCH="+goarch, "CGO_ENABLED="+cgo)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return errors.Errorf("failed to cross-compile %v, see https://beam.apache.org/documentation/sdks/go-cross-compilation/ for details: %v\n%v", program, err, string(out))
-	}
-	return nil
+	pkgDir := program[:strings.LastIndex(program, "/")+1]
+	_, err := stager.BuildStaticWorkerBinary(ctx, stager.CompileOptions{
+		Platform: stager.TargetPlatform{
+			OS:   goos,
+			Arch: goarch,
+		},
+		PackagePath: pkgDir,
+		OutputFile:  filename,
+		IsTest:      isTest,
+	})
+	return err
 }

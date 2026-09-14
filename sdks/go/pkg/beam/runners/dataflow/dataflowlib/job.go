@@ -88,6 +88,9 @@ type JobOptions struct {
 	// WorkerHash is the SHA-256 hash of the worker binary.
 	WorkerHash string
 
+	// WorkerArchitecture is the explicit target architecture override (e.g., "arm64", "amd64").
+	WorkerArchitecture string
+
 	// -- Internal use only. Not supported in public Dataflow. --
 
 	TeardownPolicy string
