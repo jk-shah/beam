@@ -346,4 +346,3 @@ func TestPostgreSqlSchemaTransformProviders_MetadataAndFactory(t *testing.T) {
 		t.Fatalf("rp.CreateTransform() returned nil transform")
 	}
 }
-

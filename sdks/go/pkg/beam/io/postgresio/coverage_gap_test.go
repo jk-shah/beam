@@ -1127,11 +1127,11 @@ func TestCDCDecoders_BinaryArrayAndJSONB(t *testing.T) {
 
 		// Construct 1-dim INT4 array: [100, NULL, 200]
 		buf := new(bytes.Buffer)
-		_ = binary.Write(buf, binary.BigEndian, int32(1))   // ndim = 1
-		_ = binary.Write(buf, binary.BigEndian, int32(0))   // flags = 0
-		_ = binary.Write(buf, binary.BigEndian, int32(23))  // elemOID = 23 (INT4)
-		_ = binary.Write(buf, binary.BigEndian, int32(3))   // dimLen = 3
-		_ = binary.Write(buf, binary.BigEndian, int32(1))   // dimLbound = 1
+		_ = binary.Write(buf, binary.BigEndian, int32(1))  // ndim = 1
+		_ = binary.Write(buf, binary.BigEndian, int32(0))  // flags = 0
+		_ = binary.Write(buf, binary.BigEndian, int32(23)) // elemOID = 23 (INT4)
+		_ = binary.Write(buf, binary.BigEndian, int32(3))  // dimLen = 3
+		_ = binary.Write(buf, binary.BigEndian, int32(1))  // dimLbound = 1
 		// Item 0: 100
 		_ = binary.Write(buf, binary.BigEndian, int32(4))
 		_ = binary.Write(buf, binary.BigEndian, int32(100))
@@ -1151,11 +1151,11 @@ func TestCDCDecoders_BinaryArrayAndJSONB(t *testing.T) {
 
 		// Construct 1-dim TEXT array: ["hello", "world"]
 		bufText := new(bytes.Buffer)
-		_ = binary.Write(bufText, binary.BigEndian, int32(1))   // ndim = 1
-		_ = binary.Write(bufText, binary.BigEndian, int32(0))   // flags = 0
-		_ = binary.Write(bufText, binary.BigEndian, int32(25))  // elemOID = 25 (TEXT)
-		_ = binary.Write(bufText, binary.BigEndian, int32(2))   // dimLen = 2
-		_ = binary.Write(bufText, binary.BigEndian, int32(1))   // dimLbound = 1
+		_ = binary.Write(bufText, binary.BigEndian, int32(1))  // ndim = 1
+		_ = binary.Write(bufText, binary.BigEndian, int32(0))  // flags = 0
+		_ = binary.Write(bufText, binary.BigEndian, int32(25)) // elemOID = 25 (TEXT)
+		_ = binary.Write(bufText, binary.BigEndian, int32(2))  // dimLen = 2
+		_ = binary.Write(bufText, binary.BigEndian, int32(1))  // dimLbound = 1
 		// Item 0: "hello"
 		_ = binary.Write(bufText, binary.BigEndian, int32(5))
 		bufText.WriteString("hello")
@@ -1661,7 +1661,7 @@ func TestPgOutputParser_ParseBinaryValue_AllTypes(t *testing.T) {
 
 	// point (600)
 	var ptBuf [16]byte
-	binary.BigEndian.PutUint64(ptBuf[0:8], 0x3ff0000000000000) // 1.0
+	binary.BigEndian.PutUint64(ptBuf[0:8], 0x3ff0000000000000)  // 1.0
 	binary.BigEndian.PutUint64(ptBuf[8:16], 0x4000000000000000) // 2.0
 	if pt, ok := parseBinaryValue(600, ptBuf[:]).(PgPoint); !ok || pt.X != 1.0 || pt.Y != 2.0 {
 		t.Errorf("parseBinaryValue(600) = %v, want PgPoint{1.0, 2.0}", pt)
@@ -1783,5 +1783,3 @@ func TestWrite_PQDialerAdapter(t *testing.T) {
 		_ = cTimeout.Close()
 	}
 }
-
-

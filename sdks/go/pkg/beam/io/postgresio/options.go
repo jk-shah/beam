@@ -62,18 +62,18 @@ type DialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 // WriteOptions configures connection pooling, write mutation modes, batch thresholds,
 // and safety guards for writing to PostgreSQL.
 type WriteOptions struct {
-	Host               string
-	Port               int
-	Database           string
-	Username           string
-	Password           string `json:"password,omitempty"`
-	SSLMode            string
-	WriteMode          WriteMode
-	WriteMethod        WriteMethod
-	PrimaryKeyCols     []string
-	BatchSize          int
-	MaxBatchBytes      int
-	FlushInterval      time.Duration
+	Host                  string
+	Port                  int
+	Database              string
+	Username              string
+	Password              string `json:"password,omitempty"`
+	SSLMode               string
+	WriteMode             WriteMode
+	WriteMethod           WriteMethod
+	PrimaryKeyCols        []string
+	BatchSize             int
+	MaxBatchBytes         int
+	FlushInterval         time.Duration
 	MaxConnections        int
 	UsePgBouncer          bool
 	ConnectionInitSQL     string
@@ -130,7 +130,6 @@ func NewWriteOptions(opts ...Option) WriteOptions {
 	}
 	return wo
 }
-
 
 // WithHost sets the target PostgreSQL server hostname or IP address.
 func WithHost(host string) Option {

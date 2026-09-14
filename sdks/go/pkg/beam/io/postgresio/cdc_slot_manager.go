@@ -58,11 +58,11 @@ type SlotHealthReport struct {
 
 // SlotRepairResult captures the outcome of a repair operation.
 type SlotRepairResult struct {
-	Repaired           bool             `json:"repaired"`
-	SlotName           string           `json:"slot_name"`
-	NewConsistentLSN   string           `json:"new_consistent_lsn"`
-	PolicyApplied      SlotRepairPolicy `json:"policy_applied"`
-	Message            string           `json:"message"`
+	Repaired         bool             `json:"repaired"`
+	SlotName         string           `json:"slot_name"`
+	NewConsistentLSN string           `json:"new_consistent_lsn"`
+	PolicyApplied    SlotRepairPolicy `json:"policy_applied"`
+	Message          string           `json:"message"`
 }
 
 // SlotRepairManager coordinates replication slot inspection and automated remediation.

@@ -175,7 +175,7 @@ func TestUpstreamLogicalDecodingMessages(t *testing.T) {
 	var msgBuf bytes.Buffer
 	msgBuf.WriteByte('M')
 	_ = binary.Write(&msgBuf, binary.BigEndian, uint32(0)) // xid
-	msgBuf.WriteByte(0)                                   // non-transactional
+	msgBuf.WriteByte(0)                                    // non-transactional
 	_ = binary.Write(&msgBuf, binary.BigEndian, uint64(5000))
 	msgBuf.WriteString("beam_heartbeat\000")
 	payload := []byte("2026-09-05T18:00:00Z")
@@ -306,4 +306,3 @@ func TestUpstreamInFlightStreamingSpoolAndCommit(t *testing.T) {
 		t.Errorf("expected commit LSN 5000, got %d, %d", events[0].LSN, events[1].LSN)
 	}
 }
-

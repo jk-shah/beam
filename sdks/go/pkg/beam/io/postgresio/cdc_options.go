@@ -26,27 +26,27 @@ var validSlotRegex = regexp.MustCompile(`^[a-z0-9_]{1,63}$`)
 
 // CDCOptions configures the PostgreSQL CDC replication source.
 type CDCOptions struct {
-	Host                 string
-	Port                 int
-	Database             string
-	Username             string
-	Password             string                   `json:"password,omitempty"`
-	SSLMode              string
-	SlotName             string
-	Publication          string
-	StartLSN             uint64
-	HeartbeatInterval    time.Duration
-	StatusInterval       time.Duration
-	CreateSlotIfMissing  bool
-	ReplicaIdentityFull  bool
-	TokenProvider        TokenProvider            `beam:"-" json:"-"`
-	OriginFilter         string
-	DialFunc             DialFunc                 `beam:"-" json:"-"`
-	StreamFactory        ReplicationStreamFactory `beam:"-" json:"-"`
-	ProtoVersion         int
-	BinaryMode           *bool
-	StreamingMode        string
-	TwoPhaseCommit       bool
+	Host                string
+	Port                int
+	Database            string
+	Username            string
+	Password            string `json:"password,omitempty"`
+	SSLMode             string
+	SlotName            string
+	Publication         string
+	StartLSN            uint64
+	HeartbeatInterval   time.Duration
+	StatusInterval      time.Duration
+	CreateSlotIfMissing bool
+	ReplicaIdentityFull bool
+	TokenProvider       TokenProvider `beam:"-" json:"-"`
+	OriginFilter        string
+	DialFunc            DialFunc                 `beam:"-" json:"-"`
+	StreamFactory       ReplicationStreamFactory `beam:"-" json:"-"`
+	ProtoVersion        int
+	BinaryMode          *bool
+	StreamingMode       string
+	TwoPhaseCommit      bool
 }
 
 // CDCOption defines a functional option for configuring CDCOptions.
@@ -258,4 +258,3 @@ func WithCDCTwoPhase(twoPhase bool) CDCOption {
 		o.TwoPhaseCommit = twoPhase
 	}
 }
-
