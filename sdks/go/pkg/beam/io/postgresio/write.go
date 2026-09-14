@@ -216,8 +216,33 @@ func (fn *writeFn) flushBatch(ctx context.Context, emitSuccess func(beam.X), emi
 		return nil
 	}
 
-	// High-Throughput Fast Path: Staged COPY Upsert (>100,000 rows/sec)
-	if fn.Options.WriteMethod == WriteMethodStagedCopy {
+	// Rows in one batch may carry different column sets: a CDC UPDATE omits
+	// columns whose TOASTed values the server did not retransmit. A single
+	// statement can only name one column list, so the batch is grouped by the
+	// set of columns present and each group written separately.
+	for _, part := range partitionBatchByUnchangedColumns(batch, fn.columns) {
+		if err := fn.writePartition(ctx, part, emitSuccess, emitFailed); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (fn *writeFn) writePartition(ctx context.Context, part writePartition, emitSuccess func(beam.X), emitFailed func(FailedRow)) error {
+	batch := part.Rows
+	if len(batch) == 0 {
+		return nil
+	}
+
+	// High-Throughput Fast Path: Staged COPY Upsert (>100,000 rows/sec).
+	//
+	// Only a complete partition is eligible. The staging table is created LIKE
+	// the target, so it carries every column; streaming a partial row into it
+	// would materialize a zero value for the omitted columns and the merge
+	// would then write that over the stored value. Partial partitions fall
+	// through to the parameterized path, which can name an arbitrary column
+	// subset. This is a rare case, so the hot path is unaffected.
+	if fn.Options.WriteMethod == WriteMethodStagedCopy && part.IsComplete() {
 		copyErr := fn.executeStagedCopy(ctx, batch)
 		if copyErr == nil {
 			sinkWrittenRows.Inc(ctx, int64(len(batch)))
@@ -229,7 +254,7 @@ func (fn *writeFn) flushBatch(ctx context.Context, emitSuccess func(beam.X), emi
 		log.Warnf(ctx, "postgresio: staged COPY failed (%v), falling back to parameterized UNNEST", copyErr)
 	}
 
-	query, args, err := fn.buildUnnestQuery(batch)
+	query, args, err := fn.buildUnnestQueryForColumns(batch, part.Columns)
 	if err != nil {
 		sinkFailedRows.Inc(ctx, int64(len(batch)))
 		for _, item := range batch {
@@ -533,12 +558,27 @@ func estimateElementSize(elem any) int {
 }
 
 func (fn *writeFn) buildUnnestQuery(batch []any) (string, []any, error) {
-	if len(fn.columns) == 0 {
+	return fn.buildUnnestQueryForColumns(batch, fn.columns)
+}
+
+// buildUnnestQueryForColumns builds the parameterized write for a specific set
+// of columns.
+//
+// The column set is a parameter rather than always being fn.columns because a
+// CDC UPDATE may omit columns whose TOASTed values the server did not
+// retransmit. Such a column must be absent from both the INSERT column list and
+// the DO UPDATE SET clause: including it would write a zero value over the
+// stored one, which is the very data loss the structural TOAST representation
+// exists to prevent. Omitting it from the INSERT list means a row that does not
+// yet exist in the target takes the column's default, which is the best
+// available answer when the source did not send a value.
+func (fn *writeFn) buildUnnestQueryForColumns(batch []any, columns []string) (string, []any, error) {
+	if len(columns) == 0 {
 		return "", nil, fmt.Errorf("no columns discovered for type %v", fn.Type.T)
 	}
 
-	sanitizedCols := make([]string, len(fn.columns))
-	for i, col := range fn.columns {
+	sanitizedCols := make([]string, len(columns))
+	for i, col := range columns {
 		san, err := SanitizeIdentifier(col)
 		if err != nil {
 			return "", nil, err
@@ -546,18 +586,18 @@ func (fn *writeFn) buildUnnestQuery(batch []any) (string, []any, error) {
 		sanitizedCols[i] = san
 	}
 
-	columnArrays := make([][]any, len(fn.columns))
+	columnArrays := make([][]any, len(columns))
 	for i := range columnArrays {
 		columnArrays[i] = make([]any, len(batch))
 	}
 
-	columnTypes := make([]reflect.Type, len(fn.columns))
+	columnTypes := make([]reflect.Type, len(columns))
 	for rowIdx, item := range batch {
 		v := reflect.ValueOf(item)
 		if v.Kind() == reflect.Ptr {
 			v = v.Elem()
 		}
-		for colIdx, colName := range fn.columns {
+		for colIdx, colName := range columns {
 			f := v.FieldByName(colName)
 			if !f.IsValid() {
 				t := v.Type()
@@ -580,9 +620,9 @@ func (fn *writeFn) buildUnnestQuery(batch []any) (string, []any, error) {
 		}
 	}
 
-	unnestPlaceholders := make([]string, len(fn.columns))
-	args := make([]any, len(fn.columns))
-	for i := range fn.columns {
+	unnestPlaceholders := make([]string, len(columns))
+	args := make([]any, len(columns))
+	for i := range columns {
 		cast := goTypeToPgArrayType(columnTypes[i])
 		unnestPlaceholders[i] = fmt.Sprintf("$%d::%s", i+1, cast)
 		args[i] = pq.Array(columnArrays[i])
@@ -609,8 +649,8 @@ func (fn *writeFn) buildUnnestQuery(batch []any) (string, []any, error) {
 				pkSet[pk] = true
 			}
 
-			updateClauses := make([]string, 0, len(fn.columns))
-			for _, col := range fn.columns {
+			updateClauses := make([]string, 0, len(columns))
+			for _, col := range columns {
 				if !pkSet[col] {
 					san, err := SanitizeIdentifier(col)
 					if err != nil {
