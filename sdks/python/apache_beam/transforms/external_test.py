@@ -49,6 +49,7 @@ from apache_beam.transforms.external import ImplicitSchemaPayloadBuilder
 from apache_beam.transforms.external import JavaClassLookupPayloadBuilder
 from apache_beam.transforms.external import JavaExternalTransform
 from apache_beam.transforms.external import JavaJarExpansionService
+from apache_beam.transforms.external import GoBinaryExpansionService
 from apache_beam.transforms.external import NamedTupleBasedPayloadBuilder
 from apache_beam.transforms.external import SchemaTransformPayloadBuilder
 from apache_beam.typehints import typehints
@@ -891,6 +892,29 @@ class JavaJarExpansionServiceTest(unittest.TestCase):
 
       finally:
         os.chdir(oldwd)
+
+
+class GoBinaryExpansionServiceTest(unittest.TestCase):
+  def test_default_args(self):
+    service = GoBinaryExpansionService('/path/to/expansion_service')
+    self.assertEqual(service._default_args(), ['--port={{PORT}}'])
+    self.assertFalse(service.is_existing_service())
+
+  def test_append_args(self):
+    service = GoBinaryExpansionService(
+        '/path/to/expansion_service', append_args=['--idle_timeout=10m'])
+    self.assertEqual(service._append_args, ['--idle_timeout=10m'])
+
+  def test_mutually_exclusive_args(self):
+    with self.assertRaises(ValueError):
+      GoBinaryExpansionService(
+          '/path/to/expansion_service',
+          extra_args=['--flag1'],
+          append_args=['--flag2'])
+
+  def test_existing_service(self):
+    service = GoBinaryExpansionService('localhost:8080')
+    self.assertTrue(service.is_existing_service())
 
 
 if __name__ == '__main__':

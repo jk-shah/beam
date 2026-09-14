@@ -339,14 +339,12 @@ def beam_jar(
     managed_replacement=None,
     appendix=None,
     version=beam_version,
-    artifact_id=None,
-    classpath=None):
+    artifact_id=None):
   return ExternalJavaProvider(
       urns, lambda: subprocess_server.JavaJarServer.path_to_beam_jar(
           gradle_target=gradle_target, version=version, artifact_id=artifact_id
       ),
-      managed_replacement=managed_replacement,
-      classpath=classpath)
+      managed_replacement=managed_replacement)
 
 
 @ExternalProvider.register_provider_type('docker')
@@ -407,6 +405,40 @@ class ExternalJavaProvider(ExternalProvider):
         self._urns,
         jar_provider=self._jar_provider,
         classpath=(list(self._classpath or []) + list(jars)))
+
+
+@ExternalProvider.register_provider_type('goBinary')
+def go_binary(
+    urns,
+    provider_base_path=None,
+    binary: str = '',
+    args: Optional[list[str]] = None):
+  if provider_base_path and not os.path.isabs(binary):
+    full_path = _join_url_or_filepath(provider_base_path, binary)
+  else:
+    full_path = binary
+  return ExternalGoProvider(urns, full_path, args=args)
+
+
+class ExternalGoProvider(ExternalProvider):
+  def __init__(
+      self,
+      urns,
+      binary_path: str,
+      args: Optional[list[str]] = None):
+    super().__init__(
+        urns, lambda: external.GoBinaryExpansionService(
+            binary_path, extra_args=args))
+    self._binary_path = binary_path
+
+  def available(self):
+    if os.path.exists(self._binary_path) or shutil.which(self._binary_path):
+      return True
+    return NotAvailableWithReason(
+        f'Unable to locate Go executable binary: {self._binary_path}')
+
+  def cache_artifacts(self):
+    return [self._binary_path]
 
 
 @ExternalProvider.register_provider_type('python')
@@ -471,14 +503,10 @@ class ExternalPythonProvider(ExternalProvider):
 
 @ExternalProvider.register_provider_type('yaml')
 class YamlProvider(Provider):
-  def __init__(
-      self,
-      transforms: Mapping[str, Mapping[str, Any]],
-      provider_base_path: Optional[str] = None):
+  def __init__(self, transforms: Mapping[str, Mapping[str, Any]]):
     if not isinstance(transforms, dict):
       raise ValueError('Transform mapping must be a dict.')
     self._transforms = transforms
-    self._provider_base_path = provider_base_path
 
   def available(self):
     return True
@@ -530,10 +558,7 @@ class YamlProvider(Provider):
     else:
       body_str = yaml.safe_dump(SafeLineLoader.strip_metadata(body))
     # Now re-parse resolved templatization.
-    search_paths = [FileSystems.split(self._provider_base_path)[0]
-                    ] if self._provider_base_path else []
-    body = yaml.load(
-        expand_jinja(body_str, args, search_paths), Loader=SafeLineLoader)
+    body = yaml.load(expand_jinja(body_str, args), Loader=SafeLineLoader)
     if (body.get('type') == 'chain' and 'input' not in body and
         spec.get('requires_inputs', True)):
       body['input'] = 'input'
