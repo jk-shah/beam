@@ -637,9 +637,14 @@ Integration tests require a running PostgreSQL instance with logical replication
    go test -v -race -run TestGoComplexPipeline_PostgresToPostgres
    ```
 
-3. **Execute Crash-Restart & Resiliency Tests**:
+3. **Execute Crash-Restart & Resiliency Tests** (requires a live PostgreSQL instance):
    ```bash
-   python3 test_resilience_and_recovery.py
+   python3 sdks/go/examples/postgres/verify_resilience_and_recovery.py
+   ```
+
+4. **Validate the Beam YAML example specifications** (static; no database needed):
+   ```bash
+   python3 sdks/python/apache_beam/yaml/examples/testing/validate_postgres_examples.py
    ```
 
 ### Benchmarks & Performance Profiling

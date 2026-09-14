@@ -16,10 +16,20 @@
 #
 
 """
-Verification script for PostgreSQL-to-PostgreSQL Beam YAML pipelines:
-1. Pure Replication
-2. Filtering
-3. Complex Transformation & PII Masking
+Structural validation for the PostgreSQL Beam YAML example pipelines in
+``sdks/python/apache_beam/yaml/examples/transforms/postgres``.
+
+Parses each specification and asserts that it declares a well-formed
+pipeline, reporting the transforms in each stage. This is a static check:
+it does not execute the pipelines and needs no PostgreSQL instance.
+
+Covers pure replication, filtering, transformation with PII masking,
+a streaming materialized view, dimension-table enrichment, and local
+model inference.
+
+Run directly:
+
+    python3 sdks/python/apache_beam/yaml/examples/testing/validate_postgres_examples.py
 """
 
 import sys
@@ -71,7 +81,9 @@ def validate_yaml_pipeline(file_path: Path):
     print(f"SUCCESS: {file_path.name} is a valid Beam YAML specification!\n")
 
 if __name__ == "__main__":
-    base_dir = Path(__file__).resolve().parent / "sdks" / "python" / "apache_beam" / "yaml" / "examples" / "transforms" / "postgres"
+    # This script lives in yaml/examples/testing/; the specifications it
+    # validates are in the sibling directory yaml/examples/transforms/postgres.
+    base_dir = Path(__file__).resolve().parent.parent / "transforms" / "postgres"
     yaml_files = [
         base_dir / "postgres_replication.yaml",
         base_dir / "postgres_filtering.yaml",
