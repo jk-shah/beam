@@ -44,12 +44,12 @@ type ReplicationStreamFactory func(ctx context.Context, opts CDCOptions) (Replic
 
 // MockReplicationStream provides an in-memory stream for deterministic testing.
 type MockReplicationStream struct {
-	messages     [][]byte
-	msgIdx       int
-	statusLog    []StandbyStatus
-	mu           sync.Mutex
-	closed       bool
-	blockUntil   chan struct{}
+	messages   [][]byte
+	msgIdx     int
+	statusLog  []StandbyStatus
+	mu         sync.Mutex
+	closed     bool
+	blockUntil chan struct{}
 }
 
 // NewMockReplicationStream creates a mock replication stream initialized with the given messages.
@@ -487,4 +487,3 @@ func parseMajorVersion(verStr string) int {
 	}
 	return major
 }
-

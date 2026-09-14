@@ -39,7 +39,7 @@ func StartingFrom(fromLSN uint64) LSNRange {
 
 // LSNRangeTracker tracks monotonic LSN consumption and checkpoint splits.
 type LSNRangeTracker struct {
-	rangeVal LSNRange
+	rangeVal    LSNRange
 	lastClaimed uint64
 	hasClaimed  bool
 	mu          sync.Mutex

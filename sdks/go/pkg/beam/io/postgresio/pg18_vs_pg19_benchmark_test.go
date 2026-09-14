@@ -42,13 +42,13 @@ func init() {
 }
 
 var benchCols = []ColumnDef{
-	{Name: "id", TypeOID: 20},          // int8
-	{Name: "customer_id", TypeOID: 23}, // int4
-	{Name: "merchant_id", TypeOID: 25}, // text
-	{Name: "amount", TypeOID: 701},     // float8
-	{Name: "is_vip", TypeOID: 16},      // bool
-	{Name: "metadata", TypeOID: 3802},  // jsonb
-	{Name: "created_at", TypeOID: 1184},// timestamptz
+	{Name: "id", TypeOID: 20},           // int8
+	{Name: "customer_id", TypeOID: 23},  // int4
+	{Name: "merchant_id", TypeOID: 25},  // text
+	{Name: "amount", TypeOID: 701},      // float8
+	{Name: "is_vip", TypeOID: 16},       // bool
+	{Name: "metadata", TypeOID: 3802},   // jsonb
+	{Name: "created_at", TypeOID: 1184}, // timestamptz
 }
 
 func buildPG18TextTupleFrame() []byte {

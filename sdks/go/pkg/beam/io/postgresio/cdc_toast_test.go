@@ -51,8 +51,8 @@ func (m *mockStateProvider) ClearValueState(val state.Transaction) error {
 func (m *mockStateProvider) ReadBagState(id string) ([]any, []state.Transaction, error) {
 	return nil, nil, nil
 }
-func (m *mockStateProvider) WriteBagState(val state.Transaction) error { return nil }
-func (m *mockStateProvider) ClearBagState(val state.Transaction) error { return nil }
+func (m *mockStateProvider) WriteBagState(val state.Transaction) error   { return nil }
+func (m *mockStateProvider) ClearBagState(val state.Transaction) error   { return nil }
 func (m *mockStateProvider) CreateAccumulatorFn(id string) reflectx.Func { return nil }
 func (m *mockStateProvider) AddInputFn(id string) reflectx.Func          { return nil }
 func (m *mockStateProvider) MergeAccumulatorsFn(id string) reflectx.Func { return nil }
@@ -85,10 +85,10 @@ func TestToastReassemblyLifecycle(t *testing.T) {
 		LSN:         1000,
 		PrimaryKeys: []string{"id"},
 		After: map[string]any{
-			"id":        int64(42),
-			"title":     "Apache Beam in Go",
-			"body":      "A very large out-of-line TOAST document with thousands of characters...",
-			"view_cnt":  int64(0),
+			"id":       int64(42),
+			"title":    "Apache Beam in Go",
+			"body":     "A very large out-of-line TOAST document with thousands of characters...",
+			"view_cnt": int64(0),
 		},
 	}
 
@@ -116,10 +116,10 @@ func TestToastReassemblyLifecycle(t *testing.T) {
 		LSN:         1050,
 		PrimaryKeys: []string{"id"},
 		After: map[string]any{
-			"id":        int64(42),
-			"title":     "Apache Beam in Go (Updated Title)",
-			"body":      unchangedToastMarker,
-			"view_cnt":  int64(10),
+			"id":       int64(42),
+			"title":    "Apache Beam in Go (Updated Title)",
+			"body":     unchangedToastMarker,
+			"view_cnt": int64(10),
 		},
 	}
 

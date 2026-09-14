@@ -169,4 +169,3 @@ func TestWriteOptionsReplicationOriginValidation(t *testing.T) {
 	}()
 	_ = NewWriteOptions(WithReplicationOriginName("invalid; DROP TABLE users;"))
 }
-

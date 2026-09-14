@@ -181,4 +181,3 @@ func TestStagedCopyExecutionDirect(t *testing.T) {
 	dur := time.Since(start)
 	t.Logf("executeStagedCopy inserted %d rows in %v (Rate: %.2f rows/sec)", len(batch), dur, float64(len(batch))/dur.Seconds())
 }
-

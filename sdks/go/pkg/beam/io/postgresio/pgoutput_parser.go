@@ -745,4 +745,3 @@ func parseBinaryValue(typeOID uint32, valBytes []byte) any {
 	}
 	return valBytes
 }
-

@@ -38,16 +38,16 @@ func init() {
 
 // PostgreSqlWriteConfig defines the configuration parameters for the PostgreSQL Write SchemaTransform.
 type PostgreSqlWriteConfig struct {
-	Host          string   `beam:"host" doc:"PostgreSQL database server hostname or IP address."`
-	Port          int32    `beam:"port" doc:"PostgreSQL database server port (default: 5432)."`
-	Database      string   `beam:"database" doc:"Target PostgreSQL database name."`
-	Table         string   `beam:"table" doc:"Target PostgreSQL table name."`
-	Username      string   `beam:"username" doc:"Authentication username."`
-	Password      string   `beam:"password,secret" doc:"Authentication password."`
-	SSLMode       string   `beam:"sslmode" doc:"SSL mode (e.g. disable, require, verify-ca, verify-full)."`
-	ConflictKeys  []string `beam:"conflict_keys" doc:"Columns used as primary or unique key conflict targets for UPSERT."`
-	UpdateFields  []string `beam:"update_fields" doc:"Columns to update ON CONFLICT DO UPDATE. If empty, uses DO NOTHING."`
-	MaxBatchRows  int32    `beam:"max_batch_rows" doc:"Maximum rows per batch UNNEST statement (default: 5000)."`
+	Host              string   `beam:"host" doc:"PostgreSQL database server hostname or IP address."`
+	Port              int32    `beam:"port" doc:"PostgreSQL database server port (default: 5432)."`
+	Database          string   `beam:"database" doc:"Target PostgreSQL database name."`
+	Table             string   `beam:"table" doc:"Target PostgreSQL table name."`
+	Username          string   `beam:"username" doc:"Authentication username."`
+	Password          string   `beam:"password,secret" doc:"Authentication password."`
+	SSLMode           string   `beam:"sslmode" doc:"SSL mode (e.g. disable, require, verify-ca, verify-full)."`
+	ConflictKeys      []string `beam:"conflict_keys" doc:"Columns used as primary or unique key conflict targets for UPSERT."`
+	UpdateFields      []string `beam:"update_fields" doc:"Columns to update ON CONFLICT DO UPDATE. If empty, uses DO NOTHING."`
+	MaxBatchRows      int32    `beam:"max_batch_rows" doc:"Maximum rows per batch UNNEST statement (default: 5000)."`
 	MaxBatchBytes     int32    `beam:"max_batch_bytes" doc:"Maximum byte buffer threshold before flushing (default: 8MB)."`
 	UsePgBouncer      bool     `beam:"use_pgbouncer" doc:"Enable single-statement transaction pooling for PgBouncer compatibility."`
 	ReplicationOrigin string   `beam:"replication_origin" doc:"Replication origin name to tag write transactions to prevent cyclic loops."`
@@ -97,14 +97,14 @@ func (t *postgreSqlWriteTransform) BuildTransform(s beam.Scope, inputs map[strin
 	}
 
 	opts := WriteOptions{
-		Host:           t.cfg.Host,
-		Port:           int(t.cfg.Port),
-		Database:       t.cfg.Database,
-		Username:       t.cfg.Username,
-		Password:       t.cfg.Password,
-		SSLMode:        t.cfg.SSLMode,
-		WriteMethod:    WriteMethodStagedCopy,
-		PrimaryKeyCols: t.cfg.ConflictKeys,
+		Host:                  t.cfg.Host,
+		Port:                  int(t.cfg.Port),
+		Database:              t.cfg.Database,
+		Username:              t.cfg.Username,
+		Password:              t.cfg.Password,
+		SSLMode:               t.cfg.SSLMode,
+		WriteMethod:           WriteMethodStagedCopy,
+		PrimaryKeyCols:        t.cfg.ConflictKeys,
 		BatchSize:             int(t.cfg.MaxBatchRows),
 		MaxBatchBytes:         int(t.cfg.MaxBatchBytes),
 		UsePgBouncer:          t.cfg.UsePgBouncer,

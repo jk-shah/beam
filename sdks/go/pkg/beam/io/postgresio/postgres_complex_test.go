@@ -44,16 +44,16 @@ type SourceOrder struct {
 
 // TransformedOrder represents the enriched and masked row written to test_pipelines.target_orders_transformed.
 type TransformedOrder struct {
-	OrderID        int64     `beam:"order_id" db:"order_id"`
-	CustomerID     string    `beam:"customer_id" db:"customer_id"`
-	MaskedEmail    string    `beam:"masked_email" db:"masked_email"`
-	NetAmount      float64   `beam:"net_amount" db:"net_amount"`
-	ProcessingFee  float64   `beam:"processing_fee" db:"processing_fee"`
-	CustomerTier   string    `beam:"customer_tier" db:"customer_tier"`
-	Status         string    `beam:"status" db:"status"`
-	CountryCode    string    `beam:"country_code" db:"country_code"`
-	ItemsCount     int       `beam:"items_count" db:"items_count"`
-	ProcessedAt    time.Time `beam:"processed_at" db:"processed_at"`
+	OrderID       int64     `beam:"order_id" db:"order_id"`
+	CustomerID    string    `beam:"customer_id" db:"customer_id"`
+	MaskedEmail   string    `beam:"masked_email" db:"masked_email"`
+	NetAmount     float64   `beam:"net_amount" db:"net_amount"`
+	ProcessingFee float64   `beam:"processing_fee" db:"processing_fee"`
+	CustomerTier  string    `beam:"customer_tier" db:"customer_tier"`
+	Status        string    `beam:"status" db:"status"`
+	CountryCode   string    `beam:"country_code" db:"country_code"`
+	ItemsCount    int       `beam:"items_count" db:"items_count"`
+	ProcessedAt   time.Time `beam:"processed_at" db:"processed_at"`
 }
 
 // ReadOrdersFn reads orders from PostgreSQL table into PCollection<SourceOrder>.

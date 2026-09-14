@@ -123,4 +123,3 @@ func TestCDCOptionsOriginFilter(t *testing.T) {
 		t.Errorf("expected origin filter 'none', got %q", opts.OriginFilter)
 	}
 }
-
