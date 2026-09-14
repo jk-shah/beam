@@ -136,6 +136,17 @@ type ChangeEvent struct {
 	// omit these columns from the generated UPDATE so the existing value is
 	// preserved.
 	UnchangedColumns []string `beam:"unchanged_columns" json:"unchanged_columns,omitempty"`
+
+	// TxSeq is the zero-based position of this change within its transaction.
+	//
+	// LSN cannot serve this purpose. pgoutput stamps every row change in a
+	// transaction with the LSN carried by the BEGIN record, so all changes in
+	// one transaction share an identical LSN. Ordering by LSN alone therefore
+	// leaves changes to the same row mutually unordered, and applying them in
+	// the wrong order converges the sink to the wrong final value.
+	//
+	// The pair (LSN, TxSeq) is a total order over the change stream.
+	TxSeq uint32 `beam:"tx_seq" json:"tx_seq"`
 }
 
 // FullTableName returns the fully qualified schema.table name.
@@ -169,16 +180,23 @@ func (e ChangeEvent) PrimaryKeyString() string {
 }
 
 // EventIDString returns a deterministic unique event identifier
-// (LSN:TransactionID:Table:PrimaryKey) for exactly-once deduplication across Beam runners.
+// (LSN:TransactionID:TxSeq:Table:PrimaryKey) for exactly-once deduplication
+// across Beam runners.
+//
+// TxSeq is part of the identity because it is the only component that
+// distinguishes two changes to the same row within one transaction: pgoutput
+// gives every change in a transaction the same LSN, and the XID, table and
+// primary key are identical by construction. Omitting it makes the identifier
+// collide, and a deduplicating runner then discards the later change.
 func (e ChangeEvent) EventIDString() string {
 	if e.EventID != "" {
 		return e.EventID
 	}
-	return fmt.Sprintf("%d:%d:%s:%s", e.LSN, e.TransactionID, e.FullTableName(), e.PrimaryKeyString())
+	return fmt.Sprintf("%d:%d:%d:%s:%s", e.LSN, e.TransactionID, e.TxSeq, e.FullTableName(), e.PrimaryKeyString())
 }
 
 // PopulateEventID computes and assigns the deterministic unique EventID
-// (LSN:TransactionID:Table:PrimaryKey) if not already populated.
+// (LSN:TransactionID:TxSeq:Table:PrimaryKey) if not already populated.
 func (e *ChangeEvent) PopulateEventID() {
 	if e.EventID == "" {
 		e.EventID = e.EventIDString()

@@ -78,6 +78,18 @@ type PgOutputParser struct {
 	inStream            bool
 	spooledTransactions map[uint32][]*ChangeEvent
 	mu                  sync.RWMutex
+
+	// txSeqByXID counts row changes within each in-progress transaction. It is
+	// keyed by XID rather than being a single counter because streamed
+	// transactions interleave on the wire: a transaction's changes arrive in
+	// several StreamStart/StreamStop segments with other transactions'
+	// segments in between. A single counter would restart numbering on each
+	// resumed segment and assign the same sequence twice within a transaction.
+	//
+	// The counter supplies the intra-transaction ordering that LSN cannot,
+	// because pgoutput reuses the BEGIN record's LSN for every change in the
+	// transaction.
+	txSeqByXID map[uint32]uint32
 }
 
 // NewPgOutputParser initializes an empty protocol parser.
@@ -85,6 +97,7 @@ func NewPgOutputParser() *PgOutputParser {
 	return &PgOutputParser{
 		relations:           make(map[uint32]*RelationDef),
 		spooledTransactions: make(map[uint32][]*ChangeEvent),
+		txSeqByXID:          make(map[uint32]uint32),
 	}
 }
 
@@ -152,6 +165,7 @@ func (p *PgOutputParser) ParseMessages(data []byte) ([]*ChangeEvent, error) {
 		p.currentXID = xid
 		p.currentLSN = finalLSN
 		p.currentTxTime = PgTimeToGo(commitTimeMicros)
+		p.txSeqByXID[xid] = 0
 		return nil, nil
 
 	case 'C': // Commit
@@ -171,6 +185,9 @@ func (p *PgOutputParser) ParseMessages(data []byte) ([]*ChangeEvent, error) {
 			return nil, fmt.Errorf("failed to parse Commit commitTime: %w", err)
 		}
 		p.currentLSN = endLSN
+		// Release the counter; a long-lived stream would otherwise accumulate
+		// one map entry per transaction.
+		delete(p.txSeqByXID, p.currentXID)
 		return nil, nil
 
 	case 'R': // Relation
@@ -378,8 +395,15 @@ func (p *PgOutputParser) ParseMessages(data []byte) ([]*ChangeEvent, error) {
 		p.currentLSN = endLSN
 		spooled := p.spooledTransactions[xid]
 		delete(p.spooledTransactions, xid)
+		delete(p.txSeqByXID, xid)
+
+		// Assign the commit LSN unconditionally. A streamed transaction has no
+		// BEGIN record, so these events were stamped with whatever LSN the
+		// previously decoded transaction left in currentLSN. That value is
+		// stale and non-zero, so a zero-check would never correct it and the
+		// events would sort into the wrong transaction.
 		for _, ev := range spooled {
-			if ev.LSN == 0 {
+			if ev != nil {
 				ev.LSN = commitLSN
 			}
 		}
@@ -390,6 +414,7 @@ func (p *PgOutputParser) ParseMessages(data []byte) ([]*ChangeEvent, error) {
 		_ = binary.Read(r, binary.BigEndian, &xid)
 		_ = binary.Read(r, binary.BigEndian, &subxid)
 		delete(p.spooledTransactions, xid)
+		delete(p.txSeqByXID, xid)
 		return nil, nil
 
 	case 'P', 'K': // 2PC Prepare / Commit Prepared
@@ -401,8 +426,16 @@ func (p *PgOutputParser) ParseMessages(data []byte) ([]*ChangeEvent, error) {
 	}
 }
 
+// emitOrSpool stamps the intra-transaction sequence number and either returns
+// the event or holds it until the streamed transaction commits.
+//
+// The sequence is assigned here because this is the one path every change
+// event takes, and it must be set before PopulateEventID since the event ID is
+// derived from it.
 func (p *PgOutputParser) emitOrSpool(ev *ChangeEvent) []*ChangeEvent {
 	if ev != nil {
+		ev.TxSeq = p.txSeqByXID[p.currentXID]
+		p.txSeqByXID[p.currentXID]++
 		ev.PopulateEventID()
 	}
 	if p.inStream {

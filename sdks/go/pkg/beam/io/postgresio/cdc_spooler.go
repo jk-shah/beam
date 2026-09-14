@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"reflect"
+	"sort"
 
 	"github.com/apache/beam/sdks/v2/go/pkg/beam"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/state"
@@ -114,6 +115,7 @@ func (fn *inFlightTransactionSpoolerFn) ProcessElement(sp state.Provider, xid ui
 	case MessageTypeCommit:
 		events, _, err := fn.SpooledEvents.Read(sp)
 		if err == nil {
+			sortChangeEvents(events)
 			for _, e := range events {
 				emit(e)
 			}
@@ -123,4 +125,27 @@ func (fn *inFlightTransactionSpoolerFn) ProcessElement(sp state.Provider, xid ui
 		_ = fn.SpooledEvents.Clear(sp)
 	}
 	return nil
+}
+
+// sortChangeEvents restores replication order over a slice of events.
+//
+// BagState makes no ordering guarantee: a runner may return the bag's contents
+// in any order, and after a checkpoint restore the order is whatever the state
+// backend yields. Emitting in that order applies a transaction's changes to the
+// sink in an arbitrary sequence, so for two changes to the same row the sink
+// converges to whichever happened to be applied last rather than to the value
+// the source committed.
+//
+// (LSN, TxSeq) is the replication order. LSN alone is insufficient because
+// pgoutput assigns every change in a transaction the LSN of its BEGIN record,
+// leaving changes within a transaction mutually unordered. The sort is stable
+// so that any events predating the TxSeq field, which all carry TxSeq 0, keep
+// their relative arrival order rather than being shuffled.
+func sortChangeEvents(events []ChangeEvent) {
+	sort.SliceStable(events, func(i, j int) bool {
+		if events[i].LSN != events[j].LSN {
+			return events[i].LSN < events[j].LSN
+		}
+		return events[i].TxSeq < events[j].TxSeq
+	})
 }

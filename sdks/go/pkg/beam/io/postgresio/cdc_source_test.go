@@ -200,7 +200,10 @@ func TestChangeEventDeterministicEventID(t *testing.T) {
 		t.Errorf("expected distinct EventIDs for different LSNs/records, got collision %q", ev1.EventID)
 	}
 
-	expectedKey := "50001:42:public.orders:public.orders:101"
+	// The identifier is LSN:TransactionID:TxSeq:Table:PrimaryKey. TxSeq is
+	// present because LSN, XID, table and primary key are all identical for two
+	// changes to the same row within one transaction.
+	expectedKey := "50001:42:0:public.orders:public.orders:101"
 	if ev1.EventID != expectedKey {
 		t.Errorf("unexpected EventID format: got %q, want %q", ev1.EventID, expectedKey)
 	}
