@@ -113,6 +113,11 @@ type NativeReplicationStream struct {
 	serverMajorVersion int
 	serverVersion      string
 	closed             bool
+
+	// slotCreation records the outcome of CREATE_REPLICATION_SLOT when this
+	// stream created the slot. It carries the exported snapshot name a backfill
+	// needs, and is nil when the slot already existed or was not created here.
+	slotCreation *SlotCreationResult
 }
 
 // NewNativeReplicationStream connects to PostgreSQL in replication mode.
@@ -307,7 +312,17 @@ func (s *NativeReplicationStream) handshake(ctx context.Context) error {
 		return fmt.Errorf("failed during search_path setup: %w", err)
 	}
 
-	// 4. Issue START_REPLICATION command with version negotiation (Options A & B for PG >= 19)
+	// 4. Create the replication slot if requested. This must precede
+	// START_REPLICATION, which fails if the slot does not exist, and must run on
+	// this same replication connection because an exported snapshot is only
+	// valid for the session that created it.
+	if s.opts.CreateSlotIfMissing {
+		if err := s.ensureReplicationSlot(); err != nil {
+			return err
+		}
+	}
+
+	// 5. Issue START_REPLICATION command with version negotiation (Options A & B for PG >= 19)
 	startLSNStr := "0/0"
 	if s.opts.StartLSN != 0 {
 		startLSNStr = fmt.Sprintf("%X/%X", uint32(s.opts.StartLSN>>32), uint32(s.opts.StartLSN))
@@ -514,6 +529,105 @@ func (s *NativeReplicationStream) drainQueryResponses() error {
 			return fmt.Errorf("query error: %s", string(payload))
 		}
 	}
+}
+
+// SlotCreation returns the outcome of CREATE_REPLICATION_SLOT if this stream
+// created the slot, and nil otherwise. The SnapshotName it carries is what an
+// initial backfill must adopt to read a view of the tables consistent with the
+// slot's starting LSN.
+func (s *NativeReplicationStream) SlotCreation() *SlotCreationResult {
+	return s.slotCreation
+}
+
+// ensureReplicationSlot issues CREATE_REPLICATION_SLOT for the configured slot.
+//
+// A duplicate-slot error is not a failure. The slot is durable server state
+// that outlives the pipeline, so on every restart after the first the slot
+// already exists; and when several workers start concurrently exactly one wins
+// the create. Treating the collision as fatal would make the option unusable
+// beyond a single cold start.
+//
+// When the slot already exists no snapshot is exported, because the snapshot is
+// only produced at creation time. Callers must therefore not assume
+// SlotCreation() is non-nil.
+func (s *NativeReplicationStream) ensureReplicationSlot() error {
+	query, err := buildCreateSlotQuery(s.opts.SlotName, "pgoutput", true, s.opts.TwoPhaseCommit)
+	if err != nil {
+		return err
+	}
+
+	if err := s.sendQuery(query); err != nil {
+		return fmt.Errorf("failed to send CREATE_REPLICATION_SLOT: %w", err)
+	}
+
+	var fields []string
+	for {
+		msgType, payload, err := s.readRawMessage()
+		if err != nil {
+			return fmt.Errorf("failed reading CREATE_REPLICATION_SLOT response: %w", err)
+		}
+		switch msgType {
+		case 'D': // DataRow: slot_name, consistent_point, snapshot_name, output_plugin
+			fields, err = parseDataRow(payload)
+			if err != nil {
+				return fmt.Errorf("failed parsing CREATE_REPLICATION_SLOT row: %w", err)
+			}
+		case 'E': // ErrorResponse
+			qerr := fmt.Errorf("CREATE_REPLICATION_SLOT failed: %s", sanitizeErrorPayload(payload))
+			if isDuplicateSlotError(qerr) {
+				// The slot is already present. Drain to ReadyForQuery so the
+				// connection is usable for START_REPLICATION.
+				if derr := s.drainToReadyForQuery(); derr != nil {
+					return derr
+				}
+				s.slotCreation = &SlotCreationResult{
+					SlotName:       s.opts.SlotName,
+					AlreadyExisted: true,
+				}
+				return nil
+			}
+			return qerr
+		case 'Z': // ReadyForQuery
+			if fields == nil {
+				return fmt.Errorf("CREATE_REPLICATION_SLOT returned no result row for slot %q", s.opts.SlotName)
+			}
+			res, perr := parseCreateSlotResponse(fields)
+			if perr != nil {
+				return perr
+			}
+			s.slotCreation = &res
+			return nil
+		}
+	}
+}
+
+// drainToReadyForQuery consumes messages until the server reports it is ready
+// for the next command, discarding any further error payloads.
+func (s *NativeReplicationStream) drainToReadyForQuery() error {
+	for {
+		msgType, _, err := s.readRawMessage()
+		if err != nil {
+			return err
+		}
+		if msgType == 'Z' {
+			return nil
+		}
+	}
+}
+
+// sanitizeErrorPayload renders an ErrorResponse body as readable text. The
+// body is a sequence of null-terminated, single-byte-tagged fields; joining
+// them with spaces keeps the SQLSTATE and message visible for classification
+// without interpreting the wire format field by field.
+func sanitizeErrorPayload(payload []byte) string {
+	parts := parseNullTerminatedList(payload)
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if len(p) > 1 {
+			out = append(out, string(p[1:]))
+		}
+	}
+	return strings.Join(out, " ")
 }
 
 func (s *NativeReplicationStream) readRawMessage() (byte, []byte, error) {
