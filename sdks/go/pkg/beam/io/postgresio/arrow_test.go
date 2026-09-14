@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/apache/arrow/go/v15/arrow"
+	"github.com/apache/arrow/go/v15/arrow/array"
 	"github.com/apache/arrow/go/v15/arrow/memory"
 )
 
@@ -455,3 +456,45 @@ func BenchmarkArrowBatching(b *testing.B) {
 		}
 	}
 }
+
+func TestInferArrowTypeVector(t *testing.T) {
+	vec := Vector{1.0, 2.0, 3.0}
+	inferred := InferArrowType(vec)
+	if inferred.ID() != arrow.LIST {
+		t.Fatalf("expected LIST type for Vector, got %v", inferred.ID())
+	}
+	elemType := inferred.(*arrow.ListType).Elem()
+	if elemType.ID() != arrow.FLOAT32 {
+		t.Errorf("expected FLOAT32 list element, got %v", elemType.ID())
+	}
+
+	rawFloats := []float32{0.5, 1.5}
+	inferredRaw := InferArrowType(rawFloats)
+	if inferredRaw.ID() != arrow.LIST {
+		t.Fatalf("expected LIST type for []float32, got %v", inferredRaw.ID())
+	}
+}
+
+func TestAppendColumnValueVector(t *testing.T) {
+	alloc := memory.NewGoAllocator()
+	builder := array.NewListBuilder(alloc, arrow.PrimitiveTypes.Float32)
+	defer builder.Release()
+
+	vec := Vector{1.25, -4.5, 9.0}
+	AppendColumnValue(builder, vec)
+
+	arr := builder.NewArray().(*array.List)
+	defer arr.Release()
+
+	if arr.Len() != 1 {
+		t.Fatalf("expected list array length 1, got %d", arr.Len())
+	}
+	values := arr.ListValues().(*array.Float32)
+	if values.Len() != 3 {
+		t.Fatalf("expected 3 values in child float array, got %d", values.Len())
+	}
+	if values.Value(0) != 1.25 || values.Value(1) != -4.5 || values.Value(2) != 9.0 {
+		t.Errorf("unexpected float values: %v, %v, %v", values.Value(0), values.Value(1), values.Value(2))
+	}
+}
+

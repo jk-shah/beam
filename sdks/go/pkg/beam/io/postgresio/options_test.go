@@ -169,3 +169,30 @@ func TestWriteOptionsReplicationOriginValidation(t *testing.T) {
 	}()
 	_ = NewWriteOptions(WithReplicationOriginName("invalid; DROP TABLE users;"))
 }
+
+func TestWriteOptionsMergeAndExplain(t *testing.T) {
+	opts := NewWriteOptions(
+		WithWriteMode(WriteModeMerge),
+		WithOpColumn("_op_type"),
+		WithDeleteOpValue("DELETE"),
+		WithExplainAnalyze(true),
+		WithExplainSampleRate(0.05),
+	)
+
+	if opts.WriteMode != WriteModeMerge {
+		t.Errorf("expected WriteModeMerge, got %v", opts.WriteMode)
+	}
+	if opts.OpColumn != "_op_type" {
+		t.Errorf("expected OpColumn _op_type, got %q", opts.OpColumn)
+	}
+	if opts.DeleteOpValue != "DELETE" {
+		t.Errorf("expected DeleteOpValue DELETE, got %q", opts.DeleteOpValue)
+	}
+	if !opts.ExplainAnalyze {
+		t.Errorf("expected ExplainAnalyze to be true")
+	}
+	if opts.ExplainSampleRate != 0.05 {
+		t.Errorf("expected ExplainSampleRate 0.05, got %f", opts.ExplainSampleRate)
+	}
+}
+

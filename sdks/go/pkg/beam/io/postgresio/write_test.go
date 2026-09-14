@@ -18,6 +18,7 @@ package postgresio
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"strings"
@@ -407,3 +408,103 @@ func TestWriteAcceptsSchemaQualifiedTableName(t *testing.T) {
 	col := beam.Create(s, TestOrder{ID: 1, Region: "US", Amount: 100.0})
 	Write(s, "public.orders", NewWriteOptions(WithPrimaryKeyColumns("id")), col)
 }
+
+func TestBuildMergeQuery(t *testing.T) {
+	t.Run("merge with op column conditional delete", func(t *testing.T) {
+		query, err := buildMergeQuery(
+			"public.orders",
+			"pg_temp.stage_orders",
+			[]string{"order_id", "customer_id", "amount", "_op_type"},
+			[]string{"order_id"},
+			"_op_type",
+			"D",
+		)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if !strings.Contains(query, `MERGE INTO "public"."orders" AS target`) {
+			t.Errorf("missing MERGE INTO target, got:\n%s", query)
+		}
+		if !strings.Contains(query, `USING "pg_temp"."stage_orders" AS source`) {
+			t.Errorf("missing USING source, got:\n%s", query)
+		}
+		if !strings.Contains(query, `ON target."order_id" = source."order_id"`) {
+			t.Errorf("missing ON condition, got:\n%s", query)
+		}
+		if !strings.Contains(query, `WHEN MATCHED AND source."_op_type" = 'D' THEN`+"\n"+`  DELETE`) {
+			t.Errorf("missing conditional DELETE, got:\n%s", query)
+		}
+		if !strings.Contains(query, `WHEN MATCHED THEN`+"\n"+`  UPDATE SET`+"\n"+`    "customer_id" = source."customer_id",`+"\n"+`    "amount" = source."amount"`) {
+			t.Errorf("missing UPDATE SET, got:\n%s", query)
+		}
+		if !strings.Contains(query, `WHEN NOT MATCHED AND source."_op_type" <> 'D' THEN`+"\n"+`  INSERT ("order_id", "customer_id", "amount")`+"\n"+`  VALUES (source."order_id", source."customer_id", source."amount")`) {
+			t.Errorf("missing INSERT clause, got:\n%s", query)
+		}
+	})
+
+	t.Run("merge without op column", func(t *testing.T) {
+		query, err := buildMergeQuery(
+			"public.users",
+			"pg_temp.stage_users",
+			[]string{"user_id", "email"},
+			[]string{"user_id"},
+			"",
+			"",
+		)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if strings.Contains(query, "DELETE") {
+			t.Errorf("query should not contain DELETE when opCol is empty")
+		}
+		if !strings.Contains(query, `WHEN NOT MATCHED THEN`+"\n"+`  INSERT ("user_id", "email")`) {
+			t.Errorf("missing standard WHEN NOT MATCHED THEN INSERT clause")
+		}
+	})
+
+	t.Run("missing primary keys returns error", func(t *testing.T) {
+		_, err := buildMergeQuery("public.orders", "pg_temp.stage", []string{"id", "data"}, nil, "", "")
+		if err == nil {
+			t.Fatalf("expected error for empty pkCols")
+		}
+	})
+}
+
+func TestExplainPlanParsingAndSampling(t *testing.T) {
+	if shouldSampleExplain(0.0) {
+		// With default rate (0.001), sampling is probabilistic. Explicit 0.0 defaults to 0.001.
+	}
+
+	planJSON := []byte(`[
+		{
+			"Plan": {
+				"Node Type": "Merge",
+				"Relation Name": "orders",
+				"Shared Hit Blocks": 4200,
+				"Shared Read Blocks": 150,
+				"Actual Rows": 500
+			},
+			"Planning Time": 1.25,
+			"Execution Time": 285.50
+		}
+	]`)
+
+	// Ensure recordExplainTelemetry runs without panic or error
+	recordExplainTelemetry(planJSON, "public.orders")
+
+	var results []ExplainPlanResult
+	if err := json.Unmarshal(planJSON, &results); err != nil {
+		t.Fatalf("failed to unmarshal plan JSON: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if results[0].ExecutionTime != 285.50 {
+		t.Errorf("expected Execution Time 285.50, got %f", results[0].ExecutionTime)
+	}
+	if results[0].Plan.SharedHitBlocks != 4200 {
+		t.Errorf("expected Shared Hit Blocks 4200, got %d", results[0].Plan.SharedHitBlocks)
+	}
+}
+

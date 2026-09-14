@@ -432,11 +432,17 @@ func TestOptions_PasswordResolution(t *testing.T) {
 }
 
 func TestYAMLReference_ByteEquality(t *testing.T) {
+	got := GenerateYAMLReference()
+	if os.Getenv("UPDATE_YAML_REF") == "1" {
+		if err := os.WriteFile("YAML_REFERENCE.md", []byte(got), 0644); err != nil {
+			t.Fatalf("failed to update YAML_REFERENCE.md: %v", err)
+		}
+		return
+	}
 	want, err := os.ReadFile("YAML_REFERENCE.md")
 	if err != nil {
 		t.Fatalf("failed to read YAML_REFERENCE.md: %v", err)
 	}
-	got := GenerateYAMLReference()
 	if string(want) != got {
 		t.Fatalf("YAML_REFERENCE.md content drift detected.\n--- Want ---\n%s\n--- Got ---\n%s", string(want), got)
 	}

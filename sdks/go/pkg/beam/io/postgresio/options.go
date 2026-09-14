@@ -38,6 +38,8 @@ const (
 	WriteModeUpsert
 	// WriteModeUpdate executes bulk UPDATE statements matched on primary key columns.
 	WriteModeUpdate
+	// WriteModeMerge executes SQL-standard MERGE INTO statements (PostgreSQL 15+).
+	WriteModeMerge
 )
 
 var identifierRegex = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_$]*$`)
@@ -81,6 +83,10 @@ type WriteOptions struct {
 	ConnectionInitSQL     string
 	ReplicationOriginName string
 	DialFunc              DialFunc `beam:"-" json:"-"`
+	OpColumn              string
+	DeleteOpValue         string
+	ExplainAnalyze        bool
+	ExplainSampleRate     float64
 }
 
 // pqDialerAdapter adapts a postgresio DialFunc into a pq.Dialer.
@@ -274,6 +280,35 @@ func WithReplicationOriginName(originName string) Option {
 			panic(fmt.Sprintf("postgresio: invalid replication origin name %q (must match ^[a-zA-Z0-9_]{1,64}$)", originName))
 		}
 		o.ReplicationOriginName = originName
+	}
+}
+
+// WithOpColumn specifies the column indicating the mutation operation type for WriteModeMerge.
+func WithOpColumn(col string) Option {
+	return func(o *WriteOptions) {
+		o.OpColumn = col
+	}
+}
+
+// WithDeleteOpValue specifies the value in OpColumn that represents a DELETE mutation for WriteModeMerge.
+func WithDeleteOpValue(val string) Option {
+	return func(o *WriteOptions) {
+		o.DeleteOpValue = val
+	}
+}
+
+// WithExplainAnalyze enables EXPLAIN (ANALYZE, BUFFERS) query plan sampling on sink writes.
+func WithExplainAnalyze(enabled bool) Option {
+	return func(o *WriteOptions) {
+		o.ExplainAnalyze = enabled
+	}
+}
+
+// WithExplainSampleRate sets the sampling rate for EXPLAIN (ANALYZE, BUFFERS) [0.0 to 1.0].
+// If unset or <= 0, defaults to 0.001 (0.1% or 1 in 1000 batches).
+func WithExplainSampleRate(rate float64) Option {
+	return func(o *WriteOptions) {
+		o.ExplainSampleRate = rate
 	}
 }
 

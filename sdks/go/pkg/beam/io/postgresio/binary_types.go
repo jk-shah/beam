@@ -18,6 +18,7 @@ package postgresio
 import (
 	"encoding/binary"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -254,3 +255,69 @@ func decodeBinaryInterval(b []byte) (PgInterval, error) {
 		Months:      int32(binary.BigEndian.Uint32(b[12:16])),
 	}, nil
 }
+
+// Vector represents a pgvector dense vector of IEEE 754 float32 numbers.
+type Vector []float32
+
+// String formats the vector into PostgreSQL's standard literal syntax: "[1.0,2.0,3.0]".
+func (v Vector) String() string {
+	return FormatVectorLiteral(v)
+}
+
+// DecodeBinaryVector decodes the PostgreSQL pgvector binary wire format:
+// uint16 dim, uint16 unused (0), followed by dim * 4 bytes of IEEE 754 float32 values in big-endian order.
+func DecodeBinaryVector(b []byte) (Vector, error) {
+	if len(b) < 4 {
+		return nil, fmt.Errorf("pgvector: header requires 4 bytes, got %d", len(b))
+	}
+	dim := int(binary.BigEndian.Uint16(b[0:2]))
+	unused := binary.BigEndian.Uint16(b[2:4])
+	if unused != 0 {
+		return nil, fmt.Errorf("pgvector: expected unused word to be 0, got %d", unused)
+	}
+	expectedLen := 4 + dim*4
+	if len(b) != expectedLen {
+		return nil, fmt.Errorf("pgvector: declared dimension %d expects %d bytes, got %d", dim, expectedLen, len(b))
+	}
+	vec := make(Vector, dim)
+	offset := 4
+	for i := 0; i < dim; i++ {
+		bits := binary.BigEndian.Uint32(b[offset : offset+4])
+		vec[i] = math.Float32frombits(bits)
+		offset += 4
+	}
+	return vec, nil
+}
+
+// EncodeBinaryVector encodes a float32 vector into PostgreSQL pgvector binary wire format.
+func EncodeBinaryVector(vec []float32) []byte {
+	dim := len(vec)
+	buf := make([]byte, 4+dim*4)
+	binary.BigEndian.PutUint16(buf[0:2], uint16(dim))
+	binary.BigEndian.PutUint16(buf[2:4], 0)
+	offset := 4
+	for _, val := range vec {
+		bits := math.Float32bits(val)
+		binary.BigEndian.PutUint32(buf[offset:offset+4], bits)
+		offset += 4
+	}
+	return buf
+}
+
+// FormatVectorLiteral converts a float32 vector into PostgreSQL's canonical text literal format: "[1.0,2.0,3.0]".
+func FormatVectorLiteral(vec []float32) string {
+	if len(vec) == 0 {
+		return "[]"
+	}
+	var sb strings.Builder
+	sb.WriteByte('[')
+	for i, v := range vec {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(strconv.FormatFloat(float64(v), 'f', -1, 32))
+	}
+	sb.WriteByte(']')
+	return sb.String()
+}
+

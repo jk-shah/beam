@@ -269,3 +269,66 @@ func TestParseBinaryValueDecodesInterval(t *testing.T) {
 		t.Errorf("interval microseconds = %d, want 3600000000", iv.Microthings)
 	}
 }
+
+func TestPgVectorBinaryEncodeDecode(t *testing.T) {
+	orig := Vector{0.125, -1.5, 42.0, 0.0, 3.1415927}
+	encoded := EncodeBinaryVector(orig)
+
+	decoded, err := DecodeBinaryVector(encoded)
+	if err != nil {
+		t.Fatalf("unexpected error decoding vector: %v", err)
+	}
+	if len(decoded) != len(orig) {
+		t.Fatalf("dimension mismatch: got %d, want %d", len(decoded), len(orig))
+	}
+	for i := range orig {
+		if decoded[i] != orig[i] {
+			t.Errorf("element %d mismatch: got %f, want %f", i, decoded[i], orig[i])
+		}
+	}
+}
+
+func TestPgVectorDecodeRejectsInvalidHeader(t *testing.T) {
+	t.Run("short payload", func(t *testing.T) {
+		_, err := DecodeBinaryVector([]byte{0x00, 0x02})
+		if err == nil {
+			t.Errorf("expected error on short payload")
+		}
+	})
+
+	t.Run("non-zero unused word", func(t *testing.T) {
+		// dim = 1, unused = 1
+		payload := []byte{0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00}
+		_, err := DecodeBinaryVector(payload)
+		if err == nil {
+			t.Errorf("expected error for non-zero unused header word")
+		}
+	})
+
+	t.Run("truncated data", func(t *testing.T) {
+		// dim = 3, expects 4 + 12 = 16 bytes, but only 8 provided
+		payload := []byte{0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+		_, err := DecodeBinaryVector(payload)
+		if err == nil {
+			t.Errorf("expected error for truncated vector data")
+		}
+	})
+}
+
+func TestPgVectorFormatting(t *testing.T) {
+	vec := Vector{1.5, -2.0, 3.25}
+	formatted := FormatVectorLiteral(vec)
+	expected := "[1.5,-2,3.25]"
+	if formatted != expected {
+		t.Errorf("expected %q, got %q", expected, formatted)
+	}
+	if vec.String() != expected {
+		t.Errorf("expected String() %q, got %q", expected, vec.String())
+	}
+
+	emptyVec := Vector{}
+	if FormatVectorLiteral(emptyVec) != "[]" {
+		t.Errorf("expected [], got %q", FormatVectorLiteral(emptyVec))
+	}
+}
+

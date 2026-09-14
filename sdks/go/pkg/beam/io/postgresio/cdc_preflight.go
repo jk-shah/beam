@@ -487,3 +487,31 @@ func Preflight(ctx context.Context, opts CDCOptions) error {
 	logPreflight(ctx, results)
 	return preflightError(results)
 }
+
+// ValidatePublicationProjections validates that table-specific publication column lists include
+// all primary key / replica identity attributes, and that row filters are syntactically safe.
+// PostgreSQL halts replication if a publication column projection omits any replica identity attribute.
+func ValidatePublicationProjections(configs []PublicationTableConfig, pkMap map[string][]string) error {
+	for _, cfg := range configs {
+		if err := SanitizeRowFilter(cfg.RowFilter); err != nil {
+			return err
+		}
+		if len(cfg.Columns) > 0 {
+			pks, ok := pkMap[cfg.TableName]
+			if ok && len(pks) > 0 {
+				colSet := make(map[string]bool, len(cfg.Columns))
+				for _, col := range cfg.Columns {
+					colSet[col] = true
+				}
+				for _, pk := range pks {
+					if !colSet[pk] {
+						return fmt.Errorf("postgresio: table %q publication column list %v omits replica identity primary key column %q; PostgreSQL will reject UPDATE and DELETE operations",
+							cfg.TableName, cfg.Columns, pk)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+

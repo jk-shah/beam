@@ -42,6 +42,10 @@ type ProvisioningConfig struct {
 	// search_path on its connections, so an unqualified name cannot resolve.
 	Tables []string
 
+	// PublicationTables configures table-specific column projections and row filter predicates (PostgreSQL 15+).
+	// If set, this takes precedence over Tables when defining the publication.
+	PublicationTables []PublicationTableConfig
+
 	// HealthViewName overrides DefaultHealthViewName.
 	HealthViewName string
 
@@ -145,27 +149,69 @@ func PostgresProvisioningScript(cfg ProvisioningConfig) (string, error) {
 		return "", fmt.Errorf("postgresio: invalid health view name: %w", err)
 	}
 
-	if len(cfg.Tables) == 0 {
+	if len(cfg.PublicationTables) == 0 && len(cfg.Tables) == 0 {
 		return "", fmt.Errorf("postgresio: at least one table is required to create a publication")
 	}
-	tables := make([]string, 0, len(cfg.Tables))
-	schemas := make([]string, 0, len(cfg.Tables))
-	seenSchema := map[string]bool{}
-	for _, t := range cfg.Tables {
-		if !strings.Contains(t, ".") {
-			return "", fmt.Errorf("postgresio: table %q must be schema-qualified as schema.table: "+
-				"the connector pins search_path, so an unqualified name cannot resolve", t)
-		}
-		sanitized, err := SanitizeTableIdentifier(t)
-		if err != nil {
-			return "", fmt.Errorf("postgresio: invalid table %q: %w", t, err)
-		}
-		tables = append(tables, sanitized)
 
-		schema := sanitized[:strings.Index(sanitized, ".")]
-		if !seenSchema[schema] {
-			seenSchema[schema] = true
-			schemas = append(schemas, schema)
+	tableClauses := make([]string, 0)
+	tables := make([]string, 0)
+	schemas := make([]string, 0)
+	seenSchema := map[string]bool{}
+
+	if len(cfg.PublicationTables) > 0 {
+		for _, pt := range cfg.PublicationTables {
+			if !strings.Contains(pt.TableName, ".") {
+				return "", fmt.Errorf("postgresio: table %q must be schema-qualified as schema.table", pt.TableName)
+			}
+			sanitized, err := SanitizeTableIdentifier(pt.TableName)
+			if err != nil {
+				return "", fmt.Errorf("postgresio: invalid table %q: %w", pt.TableName, err)
+			}
+			tables = append(tables, sanitized)
+			clause := sanitized
+			if len(pt.Columns) > 0 {
+				sanCols := make([]string, len(pt.Columns))
+				for i, col := range pt.Columns {
+					sc, err := SanitizeIdentifier(col)
+					if err != nil {
+						return "", fmt.Errorf("postgresio: invalid column %q: %w", col, err)
+					}
+					sanCols[i] = sc
+				}
+				clause += fmt.Sprintf(" (%s)", strings.Join(sanCols, ", "))
+			}
+			if pt.RowFilter != "" {
+				if err := SanitizeRowFilter(pt.RowFilter); err != nil {
+					return "", err
+				}
+				clause += fmt.Sprintf(" WHERE (%s)", strings.TrimSpace(pt.RowFilter))
+			}
+			tableClauses = append(tableClauses, clause)
+
+			schema := sanitized[:strings.Index(sanitized, ".")]
+			if !seenSchema[schema] {
+				seenSchema[schema] = true
+				schemas = append(schemas, schema)
+			}
+		}
+	} else {
+		for _, t := range cfg.Tables {
+			if !strings.Contains(t, ".") {
+				return "", fmt.Errorf("postgresio: table %q must be schema-qualified as schema.table: "+
+					"the connector pins search_path, so an unqualified name cannot resolve", t)
+			}
+			sanitized, err := SanitizeTableIdentifier(t)
+			if err != nil {
+				return "", fmt.Errorf("postgresio: invalid table %q: %w", t, err)
+			}
+			tables = append(tables, sanitized)
+			tableClauses = append(tableClauses, sanitized)
+
+			schema := sanitized[:strings.Index(sanitized, ".")]
+			if !seenSchema[schema] {
+				seenSchema[schema] = true
+				schemas = append(schemas, schema)
+			}
 		}
 	}
 
@@ -187,7 +233,7 @@ func PostgresProvisioningScript(cfg ProvisioningConfig) (string, error) {
 	fmt.Fprintf(&b, "GRANT CONNECT ON DATABASE %s TO %s;\n", database, role)
 	b.WriteString("\n")
 
-	fmt.Fprintf(&b, "CREATE PUBLICATION %s FOR TABLE %s;\n", publication, strings.Join(tables, ", "))
+	fmt.Fprintf(&b, "CREATE PUBLICATION %s FOR TABLE %s;\n", publication, strings.Join(tableClauses, ", "))
 	b.WriteString("\n")
 
 	b.WriteString("-- Change data capture does not require SELECT on the published tables.\n")
@@ -233,3 +279,30 @@ func PostgresProvisioningScript(cfg ProvisioningConfig) (string, error) {
 
 	return b.String(), nil
 }
+
+// SanitizeRowFilter validates row filter expressions used in PostgreSQL 15+ publications,
+// rejecting semicolons, SQL comments, and DDL/transaction keywords to prevent injection.
+func SanitizeRowFilter(expr string) error {
+	trimmed := strings.TrimSpace(expr)
+	if trimmed == "" {
+		return nil
+	}
+	if strings.Contains(trimmed, ";") {
+		return fmt.Errorf("postgresio: row filter %q contains illegal semicolon", expr)
+	}
+	if strings.Contains(trimmed, "--") || strings.Contains(trimmed, "/*") {
+		return fmt.Errorf("postgresio: row filter %q contains illegal SQL comment sequence", expr)
+	}
+	lower := strings.ToLower(trimmed)
+	disallowed := []string{
+		"drop ", "alter ", "create ", "truncate ", "commit", "rollback",
+		"grant ", "revoke ", "insert ", "update ", "delete ",
+	}
+	for _, word := range disallowed {
+		if strings.Contains(lower, word) {
+			return fmt.Errorf("postgresio: row filter %q contains disallowed SQL keyword %q", expr, strings.TrimSpace(word))
+		}
+	}
+	return nil
+}
+

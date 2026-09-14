@@ -27,6 +27,10 @@ Do not edit this document manually; update the struct tags in `schematransform.g
 | `max_batch_bytes` | integer (int32) | No | Maximum byte buffer threshold before flushing (default: 8MB). |
 | `use_pgbouncer` | boolean | No | Enable single-statement transaction pooling for PgBouncer compatibility. |
 | `replication_origin` | string | No | Replication origin name to tag write transactions to prevent cyclic loops. |
+| `write_mode` | string | No | Write mutation mode (INSERT, UPSERT, UPDATE, MERGE). Default UPSERT. |
+| `op_column` | string | No | Column name containing CDC operation type for MERGE mode. |
+| `delete_op_value` | string | No | Value in op_column that indicates a DELETE in MERGE mode. |
+| `explain_analyze` | boolean | No | Enable in-band EXPLAIN (ANALYZE, BUFFERS) query plan sampling on sink batches. |
 
 ## ReadFromPostgresCDC
 
@@ -54,3 +58,5 @@ Do not edit this document manually; update the struct tags in `schematransform.g
 | `proto_version` | integer (int32) | No | pgoutput protocol version (0 for auto-negotiation: 4 on PG >= 19, 1 on older). |
 | `binary_mode` | boolean | No | Whether column values are streamed in binary format (auto: true on PG >= 19). |
 | `streaming_mode` | string | No | In-progress transaction streaming mode (auto: 'parallel' on PG >= 19). |
+| `failover_slot` | boolean | No | Whether to create replication slot with FAILOVER option (PostgreSQL 17+). |
+| `publication_tables` | list[object] | No | Optional list of table-specific column lists and row filters for publication (PostgreSQL 15+). |

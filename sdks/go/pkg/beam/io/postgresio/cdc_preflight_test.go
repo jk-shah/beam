@@ -613,3 +613,57 @@ func TestWithCDCPreflightReadsInThePositive(t *testing.T) {
 		t.Error("WithCDCPreflight(false) enabled construction-time preflight")
 	}
 }
+
+func TestValidatePublicationProjections(t *testing.T) {
+	pkMap := map[string][]string{
+		"public.orders":   {"order_id"},
+		"public.payments": {"account_id", "seq_no"},
+	}
+
+	t.Run("valid projection containing all primary keys", func(t *testing.T) {
+		configs := []PublicationTableConfig{
+			{
+				TableName: "public.orders",
+				Columns:   []string{"order_id", "amount", "status"},
+				RowFilter: "amount > 50",
+			},
+			{
+				TableName: "public.payments",
+				Columns:   []string{"account_id", "seq_no", "amount"},
+			},
+		}
+		if err := ValidatePublicationProjections(configs, pkMap); err != nil {
+			t.Fatalf("unexpected error for valid projections: %v", err)
+		}
+	})
+
+	t.Run("projection omitting primary key is rejected", func(t *testing.T) {
+		configs := []PublicationTableConfig{
+			{
+				TableName: "public.orders",
+				Columns:   []string{"amount", "status"}, // omits order_id!
+			},
+		}
+		err := ValidatePublicationProjections(configs, pkMap)
+		if err == nil {
+			t.Fatalf("expected error when publication column list omits primary key")
+		}
+		if !strings.Contains(err.Error(), "omits replica identity primary key column") {
+			t.Errorf("unexpected error message: %v", err)
+		}
+	})
+
+	t.Run("projection with dangerous row filter is rejected", func(t *testing.T) {
+		configs := []PublicationTableConfig{
+			{
+				TableName: "public.orders",
+				Columns:   []string{"order_id", "amount"},
+				RowFilter: "amount > 0; DROP TABLE users",
+			},
+		}
+		if err := ValidatePublicationProjections(configs, pkMap); err == nil {
+			t.Fatalf("expected error for SQL injection in row filter")
+		}
+	})
+}
+

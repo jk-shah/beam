@@ -1,0 +1,70 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# Schema Evolution & Adaptive Ingestion in Declarative Beam YAML
+#
+# Use Case:
+# Handles mid-stream database schema modifications (e.g. ALTER TABLE orders ADD COLUMN loyalty_tier).
+# Applies resilient field projection with safe defaults for older record versions and dynamic
+# accommodation of schema expansions.
+#
+# Execution:
+#   python3 -m apache_beam.yaml.main --yaml_pipeline_file=pipeline.yaml
+
+pipeline:
+  type: chain
+  transforms:
+    - type: ReadFromPostgreSQLCDC
+      name: IngestAdaptiveCDC
+      config:
+        host: "localhost"
+        port: 5432
+        database: "postgres"
+        username: "beam_test"
+        password_env_var: "PGPASSWORD"
+        slot_name: "schema_evolution_slot"
+        publication: "orders_pub"
+
+    - type: Filter
+      name: FilterMutations
+      config:
+        language: "python"
+        keep: "operation in ('INSERT', 'UPDATE')"
+
+    - type: MapToFields
+      name: AdaptSchemaVersions
+      config:
+        language: "python"
+        fields:
+          order_id: "int(after.get('order_id', 0))"
+          customer_id: "str(after.get('customer_id', 'UNKNOWN'))"
+          amount: "float(after.get('amount', 0.0))"
+          loyalty_tier: "str(after.get('loyalty_tier', 'STANDARD'))"
+          schema_ver: "2 if 'loyalty_tier' in after else 1"
+
+    - type: WriteToPostgreSQL
+      name: SinkToEvolvedTarget
+      config:
+        host: "localhost"
+        port: 5432
+        database: "postgres"
+        username: "beam_test"
+        password_env_var: "PGPASSWORD"
+        table: "public.evolved_orders"
+        primary_key_columns: ["order_id"]
+        write_mode: "UPSERT"
+        batch_size: 1000

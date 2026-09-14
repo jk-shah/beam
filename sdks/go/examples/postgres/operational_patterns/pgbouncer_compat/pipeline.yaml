@@ -1,0 +1,57 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# PgBouncer Transaction Pooling Compatibility in Declarative Beam YAML
+#
+# Use Case:
+# Sinks high-throughput event streams through PgBouncer in transaction pooling mode.
+# Configures use_pgbouncer: true to suppress prepared statement caching and enforce
+# transaction-scoped staging tables (ON COMMIT DROP).
+#
+# Execution:
+#   python3 -m apache_beam.yaml.main --yaml_pipeline_file=pipeline.yaml
+
+pipeline:
+  type: chain
+  transforms:
+    - type: Create
+      name: GenerateSourceEvents
+      config:
+        elements:
+          - event_id: 101
+            source: "worker-1"
+            payload: "telemetry_metric_alpha"
+          - event_id: 102
+            source: "worker-2"
+            payload: "telemetry_metric_beta"
+          - event_id: 103
+            source: "worker-3"
+            payload: "telemetry_metric_gamma"
+
+    - type: WriteToPostgreSQL
+      name: SinkViaPgBouncer
+      config:
+        host: "localhost"
+        port: 6432
+        database: "postgres"
+        username: "beam_pooler"
+        password_env_var: "PGPASSWORD"
+        table: "public.pooled_events"
+        primary_key_columns: ["event_id"]
+        write_mode: "UPSERT"
+        use_pgbouncer: true
+        batch_size: 1000

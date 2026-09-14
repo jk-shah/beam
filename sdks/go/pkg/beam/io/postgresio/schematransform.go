@@ -59,6 +59,10 @@ type PostgreSqlWriteConfig struct {
 	MaxBatchBytes     int32    `beam:"max_batch_bytes" doc:"Maximum byte buffer threshold before flushing (default: 8MB)."`
 	UsePgBouncer      bool     `beam:"use_pgbouncer" doc:"Enable single-statement transaction pooling for PgBouncer compatibility."`
 	ReplicationOrigin string   `beam:"replication_origin" doc:"Replication origin name to tag write transactions to prevent cyclic loops."`
+	WriteMode         string   `beam:"write_mode" doc:"Write mutation mode (INSERT, UPSERT, UPDATE, MERGE). Default UPSERT."`
+	OpColumn          string   `beam:"op_column" doc:"Column name containing CDC operation type for MERGE mode."`
+	DeleteOpValue     string   `beam:"delete_op_value" doc:"Value in op_column that indicates a DELETE in MERGE mode."`
+	ExplainAnalyze    bool     `beam:"explain_analyze" doc:"Enable in-band EXPLAIN (ANALYZE, BUFFERS) query plan sampling on sink batches."`
 }
 
 // Validate checks configuration invariants before pipeline graph expansion.
@@ -125,14 +129,26 @@ func (t *postgreSqlWriteTransform) BuildTransform(s beam.Scope, inputs map[strin
 		UsePgBouncer:          t.cfg.UsePgBouncer,
 		ReplicationOriginName: t.cfg.ReplicationOrigin,
 		PasswordEnvVar:        t.cfg.PasswordEnvVar,
+		OpColumn:              t.cfg.OpColumn,
+		DeleteOpValue:         t.cfg.DeleteOpValue,
+		ExplainAnalyze:        t.cfg.ExplainAnalyze,
 	}
 	if opts.Port <= 0 {
 		opts.Port = 5432
 	}
-	if len(opts.PrimaryKeyCols) > 0 {
-		opts.WriteMode = WriteModeUpsert
-	} else {
+	switch strings.ToUpper(t.cfg.WriteMode) {
+	case "INSERT":
 		opts.WriteMode = WriteModeInsert
+	case "UPDATE":
+		opts.WriteMode = WriteModeUpdate
+	case "MERGE":
+		opts.WriteMode = WriteModeMerge
+	default:
+		if len(opts.PrimaryKeyCols) > 0 {
+			opts.WriteMode = WriteModeUpsert
+		} else {
+			opts.WriteMode = WriteModeInsert
+		}
 	}
 
 	res := Write(s, t.cfg.Table, opts, in)
@@ -181,7 +197,9 @@ type PostgreSqlReadCDCConfig struct {
 	ArrowBatchRows int32    `beam:"arrow_batch_rows" doc:"Maximum rows per Arrow batch when output_format='arrow' (default: 4096)."`
 	ProtoVersion   int32    `beam:"proto_version" doc:"pgoutput protocol version (0 for auto-negotiation: 4 on PG >= 19, 1 on older)."`
 	BinaryMode     *bool    `beam:"binary_mode" doc:"Whether column values are streamed in binary format (auto: true on PG >= 19)."`
-	StreamingMode  string   `beam:"streaming_mode" doc:"In-progress transaction streaming mode (auto: 'parallel' on PG >= 19)."`
+	StreamingMode     string                   `beam:"streaming_mode" doc:"In-progress transaction streaming mode (auto: 'parallel' on PG >= 19)."`
+	FailoverSlot      bool                     `beam:"failover_slot" doc:"Whether to create replication slot with FAILOVER option (PostgreSQL 17+)."`
+	PublicationTables []PublicationTableConfig `beam:"publication_tables" doc:"Optional list of table-specific column lists and row filters for publication (PostgreSQL 15+)."`
 }
 
 // Validate checks configuration invariants before pipeline graph expansion.
@@ -241,6 +259,12 @@ func (t *postgreSqlReadCDCTransform) BuildTransform(s beam.Scope, _ map[string]b
 	}
 	if t.cfg.PasswordEnvVar != "" {
 		opts = append(opts, WithCDCPasswordEnvVar(t.cfg.PasswordEnvVar))
+	}
+	if t.cfg.FailoverSlot {
+		opts = append(opts, WithCDCFailoverSlot(true))
+	}
+	if len(t.cfg.PublicationTables) > 0 {
+		opts = append(opts, WithCDCPublicationTables(t.cfg.PublicationTables...))
 	}
 
 	cdcCol := ReadCDC(s, opts...)

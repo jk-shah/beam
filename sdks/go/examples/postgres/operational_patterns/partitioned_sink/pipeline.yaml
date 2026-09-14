@@ -1,0 +1,59 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# Partitioned Table Sink with Composite Conflict Target in Declarative Beam YAML
+#
+# Use Case:
+# Sinks records into PostgreSQL declarative partitioned tables (PARTITION BY RANGE).
+# Enforces composite conflict target [order_id, order_date] matching the table's
+# composite primary key required by PostgreSQL partitioning semantics.
+#
+# Execution:
+#   python3 -m apache_beam.yaml.main --yaml_pipeline_file=pipeline.yaml
+
+pipeline:
+  type: chain
+  transforms:
+    - type: Create
+      name: GeneratePartitionedRecords
+      config:
+        elements:
+          - order_id: 1001
+            order_date: "2026-09-01"
+            customer_id: "USER-001"
+            total_amount: 149.99
+          - order_id: 1002
+            order_date: "2026-09-02"
+            customer_id: "USER-002"
+            total_amount: 89.50
+          - order_id: 1003
+            order_date: "2026-09-03"
+            customer_id: "USER-003"
+            total_amount: 210.00
+
+    - type: WriteToPostgreSQL
+      name: SinkToPartitionedTable
+      config:
+        host: "localhost"
+        port: 5432
+        database: "postgres"
+        username: "beam_test"
+        password_env_var: "PGPASSWORD"
+        table: "public.orders_partitioned"
+        primary_key_columns: ["order_id", "order_date"]
+        write_mode: "UPSERT"
+        batch_size: 1000

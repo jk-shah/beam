@@ -513,7 +513,17 @@ func (fn *writeFn) executeStagedCopy(ctx context.Context, batch []any) error {
 
 	colList := strings.Join(sanitizedCols, ", ")
 	var mergeSql string
-	if len(sanitizedPks) == 0 {
+	if fn.Options.WriteMode == WriteModeMerge {
+		if len(batch) >= 1000 {
+			// Pre-analyze staging table to prevent optimizer from selecting sequential scans on large targets
+			_, _ = txn.ExecContext(ctx, fmt.Sprintf("ANALYZE %s", tempTable))
+		}
+		var err error
+		mergeSql, err = buildMergeQuery(fn.Table, tempTable, fn.columns, fn.PrimaryKeyCols, fn.Options.OpColumn, fn.Options.DeleteOpValue)
+		if err != nil {
+			return err
+		}
+	} else if len(sanitizedPks) == 0 {
 		mergeSql = fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM %s ON CONFLICT DO NOTHING",
 			fn.Table, colList, colList, tempTable)
 	} else if len(updateClauses) > 0 {
@@ -524,8 +534,17 @@ func (fn *writeFn) executeStagedCopy(ctx context.Context, batch []any) error {
 			fn.Table, colList, colList, tempTable, strings.Join(sanitizedPks, ", "))
 	}
 
-	if _, err := txn.ExecContext(ctx, mergeSql); err != nil {
-		return err
+	if fn.Options.ExplainAnalyze && shouldSampleExplain(fn.Options.ExplainSampleRate) {
+		explainSql := fmt.Sprintf("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) %s", mergeSql)
+		var planJSON []byte
+		if err := txn.QueryRowContext(ctx, explainSql).Scan(&planJSON); err != nil {
+			return err
+		}
+		recordExplainTelemetry(planJSON, fn.Table)
+	} else {
+		if _, err := txn.ExecContext(ctx, mergeSql); err != nil {
+			return err
+		}
 	}
 
 	return txn.Commit()
@@ -550,7 +569,14 @@ func (fn *writeFn) extractRowValues(item any) []any {
 			}
 		}
 		if f.IsValid() {
-			vals[i] = f.Interface()
+			val := f.Interface()
+			if vec, ok := val.(Vector); ok {
+				vals[i] = FormatVectorLiteral(vec)
+			} else if f32s, ok := val.([]float32); ok {
+				vals[i] = FormatVectorLiteral(f32s)
+			} else {
+				vals[i] = val
+			}
 		} else {
 			vals[i] = nil
 		}
@@ -748,3 +774,114 @@ func goTypeToPgArrayType(t reflect.Type) string {
 		return "text[]"
 	}
 }
+
+// ExplainPlanResult captures PostgreSQL JSON plan metrics from EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON).
+type ExplainPlanResult struct {
+	PlanningTime  float64 `json:"Planning Time"`
+	ExecutionTime float64 `json:"Execution Time"`
+	Plan          struct {
+		NodeType         string `json:"Node Type"`
+		RelationName     string `json:"Relation Name"`
+		SharedHitBlocks  int64  `json:"Shared Hit Blocks"`
+		SharedReadBlocks int64  `json:"Shared Read Blocks"`
+		ActualRows       int64  `json:"Actual Rows"`
+	} `json:"Plan"`
+}
+
+func shouldSampleExplain(rate float64) bool {
+	if rate <= 0 {
+		rate = 0.001 // 0.1% default (1 in 1000 batches)
+	}
+	return rand.Float64() < rate
+}
+
+func recordExplainTelemetry(planJSON []byte, targetTable string) {
+	var results []ExplainPlanResult
+	if err := json.Unmarshal(planJSON, &results); err != nil || len(results) == 0 {
+		return
+	}
+	res := results[0]
+	if res.ExecutionTime > 250.0 {
+		log.Warnf(context.Background(),
+			"[POSTGRES_SINK_PLAN_ALERT] table=%s execution_time=%.2fms planning_time=%.2fms node=%s hit_blocks=%d read_blocks=%d",
+			targetTable, res.ExecutionTime, res.PlanningTime, res.Plan.NodeType,
+			res.Plan.SharedHitBlocks, res.Plan.SharedReadBlocks)
+	}
+}
+
+// buildMergeQuery generates an SQL-standard MERGE statement for PostgreSQL 15+.
+func buildMergeQuery(targetTable, sourceTable string, columns, pkCols []string, opCol, deleteOpVal string) (string, error) {
+	if len(pkCols) == 0 {
+		return "", fmt.Errorf("postgresio: MERGE mode requires at least one primary key column")
+	}
+
+	sanitizedTarget, err := SanitizeTableIdentifier(targetTable)
+	if err != nil {
+		return "", err
+	}
+	sanitizedSource, err := SanitizeTableIdentifier(sourceTable)
+	if err != nil {
+		return "", err
+	}
+
+	pkSet := make(map[string]bool)
+	var onConditions []string
+	for _, pk := range pkCols {
+		san, err := SanitizeIdentifier(pk)
+		if err != nil {
+			return "", err
+		}
+		pkSet[pk] = true
+		onConditions = append(onConditions, fmt.Sprintf("target.%s = source.%s", san, san))
+	}
+
+	var updateClauses []string
+	var insertCols []string
+	var insertVals []string
+
+	for _, col := range columns {
+		san, err := SanitizeIdentifier(col)
+		if err != nil {
+			return "", err
+		}
+		if col != opCol {
+			insertCols = append(insertCols, san)
+			insertVals = append(insertVals, fmt.Sprintf("source.%s", san))
+			if !pkSet[col] {
+				updateClauses = append(updateClauses, fmt.Sprintf("%s = source.%s", san, san))
+			}
+		}
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("MERGE INTO %s AS target\n", sanitizedTarget))
+	sb.WriteString(fmt.Sprintf("USING %s AS source\n", sanitizedSource))
+	sb.WriteString(fmt.Sprintf("ON %s\n", strings.Join(onConditions, " AND ")))
+
+	hasOp := opCol != ""
+	var sanOp string
+	if hasOp {
+		var err error
+		sanOp, err = SanitizeIdentifier(opCol)
+		if err != nil {
+			return "", err
+		}
+		delValEscaped := strings.ReplaceAll(deleteOpVal, "'", "''")
+		sb.WriteString(fmt.Sprintf("WHEN MATCHED AND source.%s = '%s' THEN\n  DELETE\n", sanOp, delValEscaped))
+	}
+
+	if len(updateClauses) > 0 {
+		sb.WriteString(fmt.Sprintf("WHEN MATCHED THEN\n  UPDATE SET\n    %s\n", strings.Join(updateClauses, ",\n    ")))
+	}
+
+	if hasOp {
+		delValEscaped := strings.ReplaceAll(deleteOpVal, "'", "''")
+		sb.WriteString(fmt.Sprintf("WHEN NOT MATCHED AND source.%s <> '%s' THEN\n", sanOp, delValEscaped))
+	} else {
+		sb.WriteString("WHEN NOT MATCHED THEN\n")
+	}
+	sb.WriteString(fmt.Sprintf("  INSERT (%s)\n  VALUES (%s)", strings.Join(insertCols, ", "), strings.Join(insertVals, ", ")))
+
+	return sb.String(), nil
+}
+

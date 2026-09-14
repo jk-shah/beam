@@ -368,3 +368,60 @@ func TestSlotHealthCarriesTheCostFigures(t *testing.T) {
 		t.Errorf("XminHorizonAge = %d, want 4242; catalog bloat is invisible without it", report.XminHorizonAge)
 	}
 }
+
+func TestProvisioningScriptWithPublicationTableProjectionsAndFilters(t *testing.T) {
+	cfg := ProvisioningConfig{
+		Role:        "beam_cdc",
+		Database:    "finance",
+		Publication: "filtered_pub",
+		PublicationTables: []PublicationTableConfig{
+			{
+				TableName: "public.orders",
+				Columns:   []string{"order_id", "customer_id", "amount"},
+				RowFilter: "amount > 100.0 AND status = 'COMPLETED'",
+			},
+			{
+				TableName: "public.accounts",
+				Columns:   []string{"account_id", "balance"},
+			},
+		},
+	}
+
+	script, err := PostgresProvisioningScript(cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	expectedPubClause := `CREATE PUBLICATION "filtered_pub" FOR TABLE "public"."orders" ("order_id", "customer_id", "amount") WHERE (amount > 100.0 AND status = 'COMPLETED'), "public"."accounts" ("account_id", "balance");`
+	if !strings.Contains(script, expectedPubClause) {
+		t.Errorf("expected publication clause:\n  %s\ngot:\n%s", expectedPubClause, script)
+	}
+}
+
+func TestSanitizeRowFilter(t *testing.T) {
+	validFilters := []string{
+		"amount > 100",
+		"status = 'ACTIVE' AND category_id IN (1, 2, 3)",
+		"(dept_id = 10 OR salary >= 50000.00)",
+		"",
+	}
+	for _, f := range validFilters {
+		if err := SanitizeRowFilter(f); err != nil {
+			t.Errorf("unexpected error for valid filter %q: %v", f, err)
+		}
+	}
+
+	invalidFilters := []string{
+		"amount > 100; DROP TABLE users",
+		"status = 'A' -- comment",
+		"status = 'A' /* inline comment */",
+		"amount > 100 AND 1=1; COMMIT",
+		"amount > 100; TRUNCATE orders",
+	}
+	for _, f := range invalidFilters {
+		if err := SanitizeRowFilter(f); err == nil {
+			t.Errorf("expected error for dangerous filter %q, got nil", f)
+		}
+	}
+}
+

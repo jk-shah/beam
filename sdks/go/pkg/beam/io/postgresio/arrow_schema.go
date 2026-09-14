@@ -81,6 +81,8 @@ func InferArrowType(val any) arrow.DataType {
 		return arrow.BinaryTypes.Binary
 	case time.Time:
 		return arrow.FixedWidthTypes.Timestamp_us
+	case Vector, []float32:
+		return arrow.ListOf(arrow.PrimitiveTypes.Float32)
 	default:
 		return arrow.BinaryTypes.String
 	}
@@ -267,6 +269,24 @@ func AppendColumnValue(b array.Builder, val any) {
 			days := int32(v.Unix() / 86400)
 			builder.Append(arrow.Date32(days))
 		default:
+			builder.AppendNull()
+		}
+
+	case *array.ListBuilder:
+		vec, isVec := val.(Vector)
+		if !isVec {
+			if f32s, ok := val.([]float32); ok {
+				vec = Vector(f32s)
+				isVec = true
+			}
+		}
+		if isVec {
+			builder.Append(true)
+			valBuilder := builder.ValueBuilder().(*array.Float32Builder)
+			for _, elem := range vec {
+				valBuilder.Append(elem)
+			}
+		} else {
 			builder.AppendNull()
 		}
 

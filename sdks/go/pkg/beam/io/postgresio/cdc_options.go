@@ -25,8 +25,16 @@ import (
 
 var validSlotRegex = regexp.MustCompile(`^[a-z0-9_]{1,63}$`)
 
+// PublicationTableConfig specifies table-level column lists and row filter predicates (PostgreSQL 15+).
+type PublicationTableConfig struct {
+	TableName string   `json:"table_name" beam:"table_name"`
+	Columns   []string `json:"columns" beam:"columns"`
+	RowFilter string   `json:"row_filter" beam:"row_filter"`
+}
+
 // CDCOptions configures the PostgreSQL CDC replication source.
 type CDCOptions struct {
+	PublicationTables []PublicationTableConfig
 	Host              string
 	Port              int
 	Database          string
@@ -538,5 +546,12 @@ func WithCDCAllowPublisherRowSecurity(allow bool) CDCOption {
 func WithCDCSlotLagCheckInterval(d time.Duration) CDCOption {
 	return func(o *CDCOptions) {
 		o.SlotLagCheckInterval = d
+	}
+}
+
+// WithCDCPublicationTables configures table-specific column projections and row filters for the publication (PostgreSQL 15+).
+func WithCDCPublicationTables(configs ...PublicationTableConfig) CDCOption {
+	return func(o *CDCOptions) {
+		o.PublicationTables = append(o.PublicationTables, configs...)
 	}
 }
