@@ -1,0 +1,104 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# Real-Time Streaming Local ML Inference Pipeline with PostgreSQL Source and Sink
+#
+# Pipeline Architecture:
+# 1. Source (PostgreSQL CDC):
+#    Captures incoming transactions continuously via PostgreSQL logical replication.
+#
+# 2. Local In-Memory Inference (Worker-Embedded ML Model):
+#    Evaluates fraud risk probability locally within worker process memory without
+#    external RPCs, classifying risk tiers into 'LOW', 'MEDIUM', 'HIGH', or 'CRITICAL'.
+#
+# 3. Sink (PostgreSQL):
+#    Sinks the real-time inference scores into `public.payment_fraud_predictions`
+#    using staged COPY upsert (ON CONFLICT (payment_id) DO UPDATE).
+
+pipeline:
+  type: chain
+  transforms:
+    # 1. Source: Continuous CDC Replication Stream
+    - type: ReadFromPostgreSQLCDC
+      name: IngestPaymentsCDC
+      config:
+        host: "localhost"
+        port: 5432
+        database: "postgres"
+        slot_name: "fraud_inference_slot"
+        publication: "fraud_inference_pub"
+        username: "beam_test"
+        password: "beam_password"
+        output_format: "row"
+
+    # 2. Filter Active Payment Records
+    - type: Filter
+      name: FilterValidPayments
+      config:
+        language: "python"
+        keep: "operation in ('INSERT', 'UPDATE') and amount > 0"
+
+    # 3. Local Model Scoring & Featurization via Beam SQL
+    - type: Sql
+      name: EvaluateFraudRiskModel
+      config:
+        query: >
+          SELECT
+            payment_id,
+            account_id,
+            amount,
+            1.0 / (1.0 + EXP(-(
+              -3.20 +
+              (0.0012 * amount) +
+              (0.0035 * distance_from_home_km) +
+              (CASE WHEN is_international THEN 1.45 ELSE 0.0 END) +
+              (0.85 * previous_fraud_count) +
+              (CASE merchant_category
+                 WHEN 'CRYPTO' THEN 1.50
+                 WHEN 'JEWELRY' THEN 1.10
+                 WHEN 'ELECTRONICS' THEN 0.80
+                 ELSE 0.0
+               END)
+            ))) AS fraud_probability,
+            CASE
+              WHEN (amount > 2000.0 AND is_international) OR previous_fraud_count >= 2 THEN 'CRITICAL'
+              WHEN amount > 1000.0 OR distance_from_home_km > 100.0 THEN 'HIGH'
+              WHEN amount > 200.0 THEN 'MEDIUM'
+              ELSE 'LOW'
+            END AS risk_tier,
+            CASE
+              WHEN (amount > 2000.0 AND is_international) OR previous_fraud_count >= 2 OR amount > 1000.0
+              THEN TRUE
+              ELSE FALSE
+            END AS is_flagged,
+            'fraud-detector-v1.4' AS model_version,
+            CURRENT_TIMESTAMP AS predicted_at
+          FROM payments
+
+    # 4. Sink: Idempotent Atomic Upsert into PostgreSQL Predictions Table
+    - type: WriteToPostgreSQL
+      name: SinkFraudPredictions
+      config:
+        host: "localhost"
+        port: 5432
+        database: "postgres"
+        table: "public.payment_fraud_predictions"
+        username: "beam_test"
+        password: "beam_password"
+        write_mode: "upsert"
+        primary_key_cols: ["payment_id"]
+        batch_size: 2000
