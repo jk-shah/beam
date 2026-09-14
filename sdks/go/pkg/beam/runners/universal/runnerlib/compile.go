@@ -58,7 +58,14 @@ func BuildTempWorkerBinary(ctx context.Context, opts CompileOpts) (string, error
 	return filename, nil
 }
 
-// buildWorkerBinary creates a local worker binary for the target platform using stager.
+// buildWorkerBinary creates a local worker binary for the target platform via
+// the stager's static build helper. It finds the filename by examining the call
+// stack. We want the user entry (*), for example:
+//
+//	  /Users/herohde/go/src/github.com/apache/beam/sdks/go/pkg/beam/runners/beamexec/main.go (skip: 2)
+//	* /Users/herohde/go/src/github.com/apache/beam/sdks/go/examples/wordcount/wordcount.go (skip: 3)
+//	  /usr/local/go/src/runtime/proc.go (skip: 4)      // not always present
+//	  /usr/local/go/src/runtime/asm_amd64.s (skip: 4 or 5)
 func buildWorkerBinary(ctx context.Context, filename string, opts CompileOpts) error {
 	program := ""
 	var isTest bool
