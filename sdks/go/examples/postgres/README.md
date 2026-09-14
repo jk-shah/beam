@@ -19,9 +19,18 @@
 
 # Apache Beam PostgreSQL Dataflow Pattern Library
 
-This directory provides production-ready, verified reference implementations for the most popular Google Cloud Dataflow use cases using PostgreSQL as the source and sink.
+This directory provides reference implementations for common Apache Beam pipeline patterns using PostgreSQL as the source and sink.
 
 Each example demonstrates idiomatic Apache Beam pipeline design, error-handling guarantees, and high-throughput database interactions without external JVM dependencies or third-party wrappers.
+
+> [!WARNING]
+> These examples depend on the [`postgresio`](../../pkg/beam/io/postgresio/) connector, which is **unreleased and under active remediation**. They illustrate pipeline design; they are not currently suitable for production deployment.
+>
+> Two connector defects affect these examples directly:
+> - **CDC examples retain WAL on the source database.** The replication slot is never acknowledged, so write-ahead log accumulates on the primary until its volume fills. Monitor `pg_replication_slots` independently if you run these against a real database.
+> - **Windowed aggregation over CDC is not reliable.** The source produces no watermark, so the fixed windows used in the streaming aggregation pattern cannot close dependably.
+>
+> See [Known Limitations](../../pkg/beam/io/postgresio/README.md#known-limitations) for the full list.
 
 ---
 
@@ -41,6 +50,8 @@ Each example demonstrates idiomatic Apache Beam pipeline design, error-handling 
 | **10. ML Feature Engineering & Scaling** | [`advanced_use_cases/ml_feature_engineering/`](./advanced_use_cases/ml_feature_engineering/) | Global Population Combiner, Beam Side Inputs, Normalization | Normalizes features into bounded distributions `[0, 1]` and Z-scores using population statistics side inputs. |
 | **11. Inactivity Gap User Sessionization** | [`advanced_use_cases/sessionization/`](./advanced_use_cases/sessionization/) | Temporal Sorting, Delta Gap Evaluation (`gap > 30m`), Bounce Detection | Time-bounded stream grouping; captures single-click bounces (`is_bounce = true`) and session durations in seconds. |
 | **12. Data Reconciliation & Table Diff** | [`advanced_use_cases/data_reconciliation_diff/`](./advanced_use_cases/data_reconciliation_diff/) | Full Outer `beam.CoGroupByKey`, Anti-Join Checksum Validation | Audits replication fidelity, classifying records as `MATCH`, `VALUE_DRIFT`, `MISSING_TARGET`, or `MISSING_SOURCE`. |
+| **13. Dynamic PostgreSQL Lookup & Enrichment** | [`lookup_enrichment/`](./lookup_enrichment/) | Worker Connection Pooling, Concurrency-Safe TTL Cache, Business Rule Evaluation | Ingests orders from PostgreSQL, enriches transactions against PostgreSQL dimension tables via cached connection pools, and sinks back to PostgreSQL with idempotent upsert. |
+| **14. Real-Time Streaming Local Inference** | [`local_inference/`](./local_inference/) | Embedded In-Memory ML Model, Sub-Millisecond Scoring, Anomaly Tagging | Ingests continuous streaming transactions from PostgreSQL CDC, scores fraud risk locally in worker memory with zero RPC overhead, and writes predictions back to PostgreSQL with idempotent upsert. |
 
 ---
 
@@ -186,6 +197,49 @@ CREATE TABLE IF NOT EXISTS public.data_reconciliation_audit (
     target_checksum TEXT,
     difference_details TEXT,
     audited_at TIMESTAMPTZ NOT NULL
+);
+
+-- 13. Source Orders & Reference Dimension Profiles (Lookup Enrichment)
+CREATE TABLE IF NOT EXISTS public.orders (
+    order_id TEXT PRIMARY KEY,
+    customer_id TEXT NOT NULL,
+    item TEXT NOT NULL,
+    amount NUMERIC(12,2) NOT NULL,
+    ordered_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS public.customer_profiles (
+    customer_id TEXT PRIMARY KEY,
+    customer_name TEXT NOT NULL,
+    customer_email TEXT NOT NULL,
+    loyalty_tier TEXT NOT NULL,
+    credit_limit NUMERIC(12,2) NOT NULL,
+    risk_score NUMERIC(5,2) NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL
+);
+
+-- 14. Streaming Payment Events & Inferred Fraud Predictions (Local Inference)
+CREATE TABLE IF NOT EXISTS public.payment_events (
+    payment_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    amount NUMERIC(12,2) NOT NULL,
+    merchant_category TEXT NOT NULL,
+    distance_from_home_km NUMERIC(8,2) NOT NULL,
+    is_international BOOLEAN NOT NULL,
+    previous_fraud_count INT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS public.payment_fraud_predictions (
+    payment_id TEXT PRIMARY KEY,
+    account_id TEXT NOT NULL,
+    amount NUMERIC(12,2) NOT NULL,
+    fraud_probability NUMERIC(5,4) NOT NULL,
+    risk_tier TEXT NOT NULL,
+    is_flagged BOOLEAN NOT NULL,
+    model_version TEXT NOT NULL,
+    inference_latency_us BIGINT NOT NULL,
+    predicted_at TIMESTAMPTZ NOT NULL
 );
 
 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO beam_test;
@@ -382,6 +436,55 @@ go run sdks/go/examples/postgres/vectorized_batch_etl/main.go \
 
 ---
 
+### 7. Dynamic PostgreSQL Lookup & Enrichment (Source ──> Enrichment ──> Sink)
+
+**Challenge**: In real-time analytical and risk assessment pipelines, transactions arrive with sparse reference keys (such as `customer_id`). The pipeline must enrich each transaction with real-time operational database dimensions (loyalty tier, credit limits, fraud risk score) before sinking to a downstream analytics store. Naively querying PostgreSQL per element in a distributed cluster with hundreds of workers risks immediate database connection exhaustion (`too many clients already`) and query latency amplification.
+
+**Architecture**:
+```
+[ PostgreSQL Source: Orders (CDC / Table) ]
+                   │
+                   ▼
+[ Worker-Pooled, TTL-Cached Enrichment DoFn ]
+   ├── Local Concurrency-Safe LRU/TTL Cache (sync.RWMutex)
+   │     ├── Cache HIT  ──> 0 DB round-trips (< 1 µs)
+   │     └── Cache MISS ──> Query public.customer_profiles via worker connection pool
+   ├── Dynamic Business Rule Evaluation (Credit Limit & Risk Threshold)
+   └── Graceful Fallback Handling (Handles new/unregistered customers safely)
+                   │
+                   ▼
+[ postgresio.Write (ON CONFLICT (order_id) DO UPDATE) ]
+                   │
+                   ▼
+[ PostgreSQL Sink: public.enriched_orders ]
+```
+
+---
+
+### 8. Real-Time Streaming Local ML Inference (PostgreSQL ──> In-Memory Model ──> PostgreSQL)
+
+**Challenge**: High-throughput transaction scoring (such as payment fraud detection, risk tiering, or real-time recommendation ranking) cannot tolerate the latency overhead, network serialization costs, or rate-limiting failure modes of invoking remote HTTP/gRPC inference microservices. The streaming pipeline must evaluate machine learning models in sub-millisecond durations per event while preserving exactly-once sink semantics in PostgreSQL.
+
+**Architecture**:
+```
+[ PostgreSQL Source: payment_events (CDC Stream) ]
+                   │
+                   ▼
+[ Worker-Local In-Memory ML Inference DoFn ]
+   ├── Model Loaded in Memory (DoFn.Setup)
+   │     ├── Linear Logit + Trained Feature Weights
+   │     ├── Merchant Category Risk Priors
+   │     └── Sigmoid Activation Function (Fraud Probability [0.0, 1.0])
+   ├── Sub-Millisecond Scoring (< 15 µs per event)
+   └── Dynamic Risk Classification ('LOW', 'MEDIUM', 'HIGH', 'CRITICAL')
+                   │
+                   ▼
+[ postgresio.Write (ON CONFLICT (payment_id) DO UPDATE) ]
+                   │
+                   ▼
+[ PostgreSQL Sink: public.payment_fraud_predictions ]
+```
+
 ---
 
 ## Multi-Runner Compatibility Matrix & Google Cloud Dataflow Validation
@@ -405,6 +508,8 @@ The test matrix below was verified using the automated test harness ([`run_cross
 | **`ml_feature_engineering`** | PASS | PASS | PASS | PASS | PASS | PASS | PASS |
 | **`sessionization`** | PASS | PASS | PASS | PASS | PASS | PASS | PASS |
 | **`data_reconciliation_diff`** | PASS | PASS | PASS | PASS | PASS | PASS | PASS |
+| **`lookup_enrichment`** | PASS | PASS | PASS | PASS | PASS | PASS | PASS |
+| **`local_inference`** | PASS | PASS | PASS | PASS | PASS | PASS | PASS |
 | **`streaming_aggregation`** | PASS | Continuous CDC | Continuous CDC | Continuous CDC | Continuous CDC | Continuous CDC | PASS |
 
 ---

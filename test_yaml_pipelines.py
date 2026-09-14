@@ -77,10 +77,12 @@ if __name__ == "__main__":
         base_dir / "postgres_filtering.yaml",
         base_dir / "postgres_transformation.yaml",
         base_dir / "postgres_streaming_materialized_view.yaml",
+        base_dir / "postgres_enrichment.yaml",
+        base_dir / "postgres_local_inference.yaml",
     ]
     for yf in yaml_files:
         if not yf.exists():
             print(f"ERROR: File not found: {yf}", file=sys.stderr)
             sys.exit(1)
         validate_yaml_pipeline(yf)
-    print("ALL 4 PostgreSQL Beam YAML pipelines validated successfully!")
+    print("ALL 6 PostgreSQL Beam YAML pipelines validated successfully!")

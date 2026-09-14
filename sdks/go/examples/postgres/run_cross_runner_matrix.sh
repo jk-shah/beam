@@ -52,6 +52,8 @@ BATCH_EXAMPLES=(
   "ml_feature_engineering:${BASE_DIR}/advanced_use_cases/ml_feature_engineering"
   "sessionization:${BASE_DIR}/advanced_use_cases/sessionization"
   "data_reconciliation_diff:${BASE_DIR}/advanced_use_cases/data_reconciliation_diff"
+  "lookup_enrichment:${BASE_DIR}/lookup_enrichment"
+  "local_inference:${BASE_DIR}/local_inference"
 )
 
 # Streaming example
