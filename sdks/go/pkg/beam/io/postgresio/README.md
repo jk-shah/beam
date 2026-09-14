@@ -21,6 +21,15 @@
 
 `postgresio` is a native Apache Beam Go SDK I/O connector providing high-throughput writing, upserts, Apache Arrow columnar processing, and Change Data Capture (CDC) streaming for PostgreSQL. It operates without Java Virtual Machine (JVM) dependencies or cross-language serialization overhead.
 
+> [!WARNING]
+> **Status: unreleased and under active remediation. Not ready for production use.**
+>
+> A security and correctness review identified defects that affect the *source database*, not only the pipeline. Two are worth knowing before you read further:
+> - The replication slot is never acknowledged in production, so **WAL accumulates without bound on the primary** until its volume fills.
+> - TLS is **off by default**, and SCRAM-SHA-256 is unsupported, so a default PostgreSQL 14+ server cannot be connected to at all.
+>
+> Read [Known Limitations](#known-limitations) and [Security & TLS Configuration](#security--tls-configuration) before running this against any database you care about.
+
 ---
 
 ## Table of Contents
@@ -41,6 +50,8 @@
    - [WriteOptions](#writeoptions)
    - [CDCOptions](#cdcoptions)
    - [ArrowBatchOptions](#arrowbatchoptions)
+   - [Security & TLS Configuration](#security--tls-configuration)
+   - [Known Limitations](#known-limitations)
 5. [Contributor Guide: Codebase Map & Invariants](#5-contributor-guide-codebase-map--invariants)
    - [File Inventory & Responsibilities](#file-inventory--responsibilities)
    - [Life of a Write Mutation](#life-of-a-write-mutation)
@@ -49,6 +60,7 @@
    - [Memory Model & Allocation Constraints](#memory-model--allocation-constraints)
 6. [Testing & Verification Runbook](#6-testing--verification-runbook)
    - [Unit Testing](#unit-testing)
+   - [Remediation Acceptance Suite](#remediation-acceptance-suite)
    - [Integration Testing against PostgreSQL 18](#integration-testing-against-postgresql-18)
    - [Benchmarks & Performance Profiling](#benchmarks--performance-profiling)
    - [Operational Troubleshooting & Slot Recovery](#operational-troubleshooting--slot-recovery)
@@ -195,8 +207,8 @@ sequenceDiagram
 ### B. Change Data Capture (CDC) Streaming Engine
 * **Pure Go `pgoutput` Binary Decoder with In-Flight Spooling**: Binary decoder implementing PostgreSQL's logical streaming replication protocol (`pgoutput`). Parses protocol frames directly into typed `ChangeEvent` structs. Uncommitted changes inside streamed transactions (`Stream Start 'S'`) are buffered in memory until `Stream Commit ('c')` and discarded on `Stream Abort ('A')`.
 * **Server-Side & Client-Side Origin Filtering**: Supports `WithCDCOriginFilter("none")`, negotiating `(origin 'none')` with PostgreSQL 16+ during `START_REPLICATION` and filtering non-local replication origin records on client workers.
-* **PostgreSQL Wire SSLRequest Negotiation**: Issues raw protocol handshake `80877103` prior to `StartupMessage`, dynamically establishing TLS via `tls.Client` before transmitting credentials or parameters. Supports PostgreSQL MD5 and cleartext authentication.
-* **Decoupled Keepalive Heartbeat & Monotonic LSN Advancement**: A dedicated background goroutine sends periodic `StandbyStatusUpdate` ('r') messages to prevent PostgreSQL's `wal_sender_timeout` (60s) drops during downstream backpressure. Advancing `FlushLSN` monotonically upon record consumption allows PostgreSQL to prune WAL segments and prevents replication slot disk exhaustion.
+* **PostgreSQL Wire SSLRequest Negotiation**: Issues raw protocol handshake `80877103` prior to `StartupMessage`, establishing TLS via `tls.Client` before transmitting credentials or parameters. Handles cleartext and MD5 authentication. **SCRAM-SHA-256 is not yet supported**, which means default PostgreSQL 14+ installations are rejected with `unsupported authentication type 10`; TLS negotiation is also skipped entirely when `sslmode` is unset. See [Security & TLS Configuration](#security--tls-configuration) and [Known Limitations](#known-limitations).
+* **Decoupled Keepalive Heartbeat**: A dedicated background goroutine sends periodic `StandbyStatusUpdate` ('r') messages to prevent PostgreSQL's `wal_sender_timeout` (60s) from dropping the connection during downstream backpressure. **The acknowledged LSN does not currently advance in production.** `FlushLSN` is only moved forward by a `BundleFinalization` callback, and because `ProcessElement` does not return, no bundle ever finalizes — so the slot's `confirmed_flush_lsn` stays pinned at its starting value and WAL is never pruned. This is the connector's most serious outstanding defect; see [Known Limitations](#known-limitations).
 * **Single-Consumer Slot Invariant with Auto-Partitioned Fanout**: Strictly maintains a single connection (`Parallelism = 1`) at the replication slot boundary (`active_pid` exclusivity), feeding downstream parallel worker clusters via `postgresio.PartitionByPrimaryKey` and `beam.Reshuffle`.
 * **Stateful Out-of-Line TOAST Reassembly**: Under `REPLICA IDENTITY DEFAULT`, unmodified large columns are omitted by PostgreSQL as `'u'`. `postgresio.ReassembleToast` uses Beam runner state (`state.Value[ChangeEvent]`) to cache baseline tuples and patch unmodified TOAST fields on `UPDATE` events.
 * **Dynamic Cloud IAM Token Renewal**: Integrates the `TokenProvider` interface to automatically refresh credentials across worker reconnects for AWS RDS IAM (15-min expiry) and Google Cloud SQL / AlloyDB (60-min expiry).
@@ -412,8 +424,47 @@ pipeline:
 | `WithCDCReplicaIdentityFull(bool)` | `false` | Signals source tables use `REPLICA IDENTITY FULL` |
 | `WithCDCTokenProvider(TokenProvider)` | `nil` | Dynamic credential refresh provider for IAM / OAuth2 |
 | `WithCDCDialFunc(DialFunc)` | `nil` | Custom network dialer |
+| `WithCDCSSLMode(string)` | `""` — see [Security](#security--tls-configuration) | `disable`, `require`, `verify-ca`, or `verify-full` |
+
+### Security & TLS Configuration
+
+> [!CAUTION]
+> The current `sslmode` default is **not secure**. `NewCDCOptions` leaves `SSLMode` empty and the dial path treats an empty value as "skip TLS entirely", so the default configuration transmits replication traffic — including the credentials in the startup packet — in cleartext. `NewWriteOptions` defaults to `disable`. Set `sslmode` explicitly on every pipeline until this is fixed.
+
+Supported modes and what each one actually guarantees:
+
+| `sslmode` | Encrypted | Chain verified | Hostname verified | Use when |
+| :--- | :---: | :---: | :---: | :--- |
+| `disable` | No | No | No | Unix socket, or an already-encrypted overlay network. Must be a deliberate choice. |
+| `require` | Yes | No | No | Encryption only. Does not authenticate the server, so it does not stop a man-in-the-middle. |
+| `verify-ca` | Yes | Yes | No | Hostname verification is impossible for topology reasons — private endpoints, connecting by IP, a proxy or PgBouncer presenting a different name, SSH tunnels, Kubernetes service names. |
+| `verify-full` | Yes | Yes | Yes | **Everything else. This is the correct default.** |
+
+**Why `verify-full` rather than `verify-ca`.** The two modes cost the same. Both perform the same handshake, key exchange, certificate chain validation, and symmetric bulk encryption; `verify-full` additionally matches the hostname against the certificate's SAN entries, which is one comparison performed once at handshake. PostgreSQL's own documentation assigns the two modes identical overhead. Because the CDC source holds a single replication connection for the lifetime of the pipeline, even that one-time cost amortizes to nothing.
+
+The security difference is not small. Managed PostgreSQL providers sign every tenant's server certificate with a shared regional CA, so under `verify-ca` a certificate issued to **any other customer of the same provider** passes validation. The PostgreSQL documentation states the case directly: *"If a public CA is used, `verify-ca` allows connections to a server that somebody else may have registered with the CA. In this case, `verify-full` should always be used."* Hostname verification is the control that closes this, and it is precisely the part `verify-ca` omits.
+
+Google Cloud SQL documents `sslmode=verify-full` and added per-instance CAs and custom SAN values specifically to support it. Azure Database for PostgreSQL recommends full certificate and hostname verification, offering `verify-ca` only where Private Endpoint DNS makes hostname matching impossible. The `prefer` default in libpq is inherited backwards compatibility, and upstream explicitly describes it as *"not recommended in secure deployments."*
+
+### Known Limitations
+
+The connector is unreleased and under active remediation. The defects below are confirmed and tracked; several affect database availability rather than only the pipeline.
+
+| Area | Limitation | Impact |
+| :--- | :--- | :--- |
+| **WAL retention** | The replication slot's `confirmed_flush_lsn` is not advanced in production. `ProcessElement` never returns, so the bundle never finalizes and the `BundleFinalization` callback that would advance the LSN never fires. | **WAL accumulates without bound on the primary.** The volume fills and the database PANICs. Do not point this at a production primary without independent monitoring of `pg_replication_slots`. |
+| **Transport security** | `sslmode` defaults to plaintext (see above). There is no `sslrootcert` option, so a private CA bundle cannot be supplied at all — certificate verification against AWS RDS or Cloud SQL is currently impossible, not merely disabled. | Credentials and replication data are exposed on the wire. |
+| **Authentication** | Only auth types 0 (ok), 3 (cleartext) and 5 (md5) are handled. SCRAM-SHA-256 returns `unsupported authentication type 10`. | Cannot connect to a default PostgreSQL 14+ installation. PostgreSQL 18 removes md5 entirely. |
+| **Watermarks** | The source declares no watermark estimator. | Downstream fixed and sliding windows cannot close reliably. Windowed aggregations over CDC output are not trustworthy. |
+| **Initial snapshot** | No slot creation and no snapshot bootstrap. `WithCDCCreateSlotIfMissing` is exported but inert. | Pre-existing table rows are never emitted, silently. Only changes occurring after startup appear. |
+| **Transaction ordering** | Events are spooled through an unordered `state.Bag` and emitted without sorting; the batch compactor resolves key collisions by arrival order rather than by LSN. | A replayed or reordered older change can overwrite a newer one, and the row is never corrected. |
+| **Type fidelity** | `NUMERIC` (OID 1700), `UUID` (2950) and `INTERVAL` (1186) have no binary-mode decoder. | These columns are emitted as raw `[]byte`. |
+| **TOAST** | Unchanged TOAST columns are represented by the literal string `"<unchanged_toast>"`; a cold-start cache miss converts it to `nil`. | Large column values can be silently nulled in the target. |
+
+Each item has a test in the [remediation acceptance suite](#remediation-acceptance-suite) that fails until it is fixed.
 
 ---
+
 
 ## 5. Contributor Guide: Codebase Map & Invariants
 
@@ -552,6 +603,22 @@ Run the full package unit test suite with the Go race detector enabled:
 cd sdks/go/pkg/beam/io/postgresio
 go test -v -race -count=1 ./...
 ```
+
+This includes `remediation_invariants_test.go`, which locks in guarantees that already hold and must not regress: identifier sanitization against SQL injection, replication slot name and heartbeat validation, credential redaction in `CDCOptions.String()` and `SanitizeErrorMessage`, batch compaction collapse and deadlock-avoiding sort order, and `PrimaryKeyString` determinism. A failure there means a change has broken an existing guarantee.
+
+### Remediation Acceptance Suite
+
+A second suite encodes behavior the connector must have once the outstanding defects in [Known Limitations](#known-limitations) are fixed. It is gated behind a build tag because it is **expected to fail** against the current tree:
+
+```bash
+go test -v -tags postgresio_remediation ./pkg/beam/io/postgresio/
+```
+
+The suite is hermetic — no containers, no ports, runs in milliseconds. It combines wire-level tests over `net.Pipe` (for example, asserting that the first bytes sent on a new connection are the `SSLRequest` packet rather than a cleartext startup packet), behavioral tests (asserting LSN-aware conflict resolution in the compactor), and source-level guards for defects that no behavioral test can reach.
+
+> [!IMPORTANT]
+> A test in the acceptance suite is retired only by being made to pass and folded into the default suite. Weakening an assertion to get a green run reintroduces the defect the test was written to prevent.
+
 
 ### Integration Testing against PostgreSQL 18
 
