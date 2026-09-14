@@ -80,10 +80,28 @@ func (bc *BatchCompactor) Add(entityKey string, sortKey []any, data any, byteLen
 		byteLength = 64
 	}
 
-	// Last-Write-Wins deduplication
+	// Sort-key-aware last-write-wins deduplication.
+	//
+	// Beam provides no ordering guarantee between bundles, and an upstream
+	// shuffle or a replay can deliver an older mutation after a newer one.
+	// Overwriting unconditionally would discard the newer row and leave the
+	// sink holding a stale value that no later event corrects.
+	//
+	// A strictly older incoming record is therefore dropped. Equal sort keys
+	// still overwrite: the sink populates SortKey with the primary key for
+	// canonical flush ordering, so two updates to the same row carry the same
+	// key and carry no recency information, and plain arrival order remains
+	// the best available answer. When the CDC path populates SortKey with
+	// (LSN, intra-transaction sequence) the comparison becomes a true recency
+	// check.
 	if entityKey != "" {
 		if existingIdx, exists := bc.seenKeys[entityKey]; exists {
-			bc.currentBytes -= bc.buffer[existingIdx].ByteLength
+			existing := bc.buffer[existingIdx]
+			if compareSortKeys(sortKey, existing.SortKey) < 0 {
+				// The buffered record is strictly newer: keep it.
+				return
+			}
+			bc.currentBytes -= existing.ByteLength
 			bc.buffer[existingIdx] = RecordEntry{
 				EntityKey:  entityKey,
 				SortKey:    sortKey,

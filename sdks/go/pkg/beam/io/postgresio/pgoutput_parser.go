@@ -727,6 +727,20 @@ func parseBinaryValue(typeOID uint32, valBytes []byte) any {
 			days := int32(binary.BigEndian.Uint32(valBytes))
 			return pgEpoch.AddDate(0, 0, int(days))
 		}
+	case 1700: // numeric
+		// Arbitrary-precision decimal. Falling through to the default branch
+		// returned an opaque []byte, which silently corrupts monetary data.
+		if s, err := decodeBinaryNumeric(valBytes); err == nil {
+			return s
+		}
+	case 2950: // uuid
+		if s, err := decodeBinaryUUID(valBytes); err == nil {
+			return s
+		}
+	case 1186: // interval
+		if iv, err := decodeBinaryInterval(valBytes); err == nil {
+			return iv
+		}
 	case 600: // point
 		if len(valBytes) >= 16 {
 			xBits := binary.BigEndian.Uint64(valBytes[0:8])
@@ -736,6 +750,7 @@ func parseBinaryValue(typeOID uint32, valBytes []byte) any {
 				Y: math.Float64frombits(yBits),
 			}
 		}
+
 	default:
 		if isArrayOID(typeOID) {
 			if arr, err := DecodeBinaryArray(valBytes); err == nil {

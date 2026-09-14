@@ -20,7 +20,9 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"math/rand"
+
 	"os"
 	"reflect"
 	"strings"
@@ -280,8 +282,62 @@ func (fn *writeFn) flushBatch(ctx context.Context, emitSuccess func(beam.X), emi
 	return nil
 }
 
-// executeStagedCopy executes two-phase bulk upsert utilizing PostgreSQL COPY
-// into a temporary unlogged staging table followed by an atomic set-based ON CONFLICT merge.
+// buildCopyStatement returns a COPY ... FROM STDIN statement.
+//
+// This replaces the deprecated lib/pq copy-statement helper, which quoted the
+// table name itself. Because the caller has already quoted the identifier via
+// SanitizeTableIdentifier, that helper produced a doubly-quoted name such as
+// COPY """public"".""orders""", which PostgreSQL reads as a single table
+// literally named `"public"."orders"`.
+//
+// table must already be a quoted identifier; columns must already be quoted.
+func buildCopyStatement(table string, columns []string) (string, error) {
+	if table == "" {
+		return "", fmt.Errorf("postgresio: COPY target table must not be empty")
+	}
+	if len(columns) == 0 {
+		return "", fmt.Errorf("postgresio: COPY requires at least one column")
+	}
+	return fmt.Sprintf("COPY %s (%s) FROM STDIN", table, strings.Join(columns, ", ")), nil
+}
+
+// stagingTableName derives a stable per-target staging table name.
+//
+// The name must be deterministic so the table can be reused across batches on
+// the same session, and distinct per target table so that a worker writing to
+// several tables does not reuse a staging table with the wrong column layout.
+func stagingTableName(qualifiedTable string) string {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(qualifiedTable))
+	return fmt.Sprintf("beam_stage_%016x", h.Sum64())
+}
+
+// setupReplicationOrigin tags the transaction with a replication origin.
+//
+// The error is deliberately not discarded. Any failed statement inside a
+// transaction puts it into an aborted state (SQLSTATE 25P02), so swallowing
+// this error causes the *next* statement to fail with an unrelated message.
+// It also silently disables bidirectional loop prevention, which is the only
+// reason the origin is being set.
+func (fn *writeFn) setupReplicationOrigin(ctx context.Context, txn *sql.Tx) error {
+	if fn.Options.ReplicationOriginName == "" {
+		return nil
+	}
+
+	escapedOrigin := strings.ReplaceAll(fn.Options.ReplicationOriginName, "'", "''")
+	_, err := txn.ExecContext(ctx, fmt.Sprintf("SELECT pg_replication_origin_xact_setup('%s', '0/0')", escapedOrigin))
+	if err != nil {
+		return fmt.Errorf("postgresio: failed to set replication origin %q: %w\n"+
+			"pg_replication_origin_xact_setup requires superuser or membership in pg_checkpoint, "+
+			"and the origin must already exist (SELECT pg_replication_origin_create('%s')). "+
+			"Continuing without the origin would disable bidirectional loop prevention",
+			fn.Options.ReplicationOriginName, err, fn.Options.ReplicationOriginName)
+	}
+	return nil
+}
+
+// executeStagedCopy executes a two-phase bulk upsert: a PostgreSQL COPY into a
+// session-scoped staging table followed by an atomic set-based ON CONFLICT merge.
 func (fn *writeFn) executeStagedCopy(ctx context.Context, batch []any) error {
 	if len(fn.columns) == 0 {
 		return fmt.Errorf("postgresio: no columns discovered for type %v", fn.Type.T)
@@ -302,14 +358,17 @@ func (fn *writeFn) executeStagedCopy(ctx context.Context, batch []any) error {
 	}
 	defer txn.Rollback()
 
-	if fn.Options.ReplicationOriginName != "" {
-		escapedOrigin := strings.ReplaceAll(fn.Options.ReplicationOriginName, "'", "''")
-		_, _ = txn.ExecContext(ctx, fmt.Sprintf("SELECT pg_replication_origin_xact_setup('%s', '0/0')", escapedOrigin))
+	if err := fn.setupReplicationOrigin(ctx, txn); err != nil {
+		return err
 	}
 
 	// Append-only fast path
 	if fn.Options.WriteMode == WriteModeInsert && len(fn.PrimaryKeyCols) == 0 {
-		stmt, err := txn.PrepareContext(ctx, pq.CopyIn(fn.Table, fn.columns...))
+		copyStmt, err := buildCopyStatement(fn.Table, sanitizedCols)
+		if err != nil {
+			return err
+		}
+		stmt, err := txn.PrepareContext(ctx, copyStmt)
 		if err != nil {
 			return err
 		}
@@ -330,14 +389,33 @@ func (fn *writeFn) executeStagedCopy(ctx context.Context, batch []any) error {
 		return txn.Commit()
 	}
 
-	// Upsert fast path via temp table staging
-	tempTable := fmt.Sprintf("stage_%d", rand.Int63()&0x7FFFFFFFFFFFFFFF)
-	createSql := fmt.Sprintf("CREATE TEMP TABLE %s (LIKE %s INCLUDING DEFAULTS) ON COMMIT DROP", tempTable, fn.Table)
-	if _, err := txn.ExecContext(ctx, createSql); err != nil {
+	// Upsert path via a session-scoped staging table.
+	//
+	// The staging table is created once per session under a stable name and
+	// reused. Creating and dropping a temporary table on every micro-batch
+	// inserts and deletes rows in pg_class, pg_attribute, pg_type and
+	// pg_depend at the flush rate, which autovacuum on the catalogs cannot
+	// keep up with; catalog bloat then slows query planning for every session
+	// on the instance, not just this pipeline.
+	//
+	// ON COMMIT DELETE ROWS empties the table at each commit while keeping the
+	// definition, so steady-state flushes perform no catalog DDL at all.
+	tempTable := stagingTableName(fn.Table)
+	createSQL := fmt.Sprintf("CREATE TEMP TABLE IF NOT EXISTS %s (LIKE %s INCLUDING DEFAULTS) ON COMMIT DELETE ROWS", tempTable, fn.Table)
+	if _, err := txn.ExecContext(ctx, createSQL); err != nil {
+		return err
+	}
+	// Defensive: a prior transaction on this connection may have left rows
+	// behind if it did not reach commit.
+	if _, err := txn.ExecContext(ctx, fmt.Sprintf("TRUNCATE %s", tempTable)); err != nil {
 		return err
 	}
 
-	stmt, err := txn.PrepareContext(ctx, pq.CopyIn(tempTable, fn.columns...))
+	copyStmt, err := buildCopyStatement(tempTable, sanitizedCols)
+	if err != nil {
+		return err
+	}
+	stmt, err := txn.PrepareContext(ctx, copyStmt)
 	if err != nil {
 		return err
 	}
