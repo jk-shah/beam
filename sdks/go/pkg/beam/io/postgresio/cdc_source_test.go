@@ -150,6 +150,10 @@ func TestCDCSourceFnExecutionWithMockStream(t *testing.T) {
 	)
 
 	fn := newCDCSourceFn(opts)
+	fn.preflightDone = true
+	fn.newSlotQuerier = func(CDCOptions) (slotRetentionQuerier, error) {
+		return newFakeSlotQuerier(fakeSlotResponse{retention: reserved(0)}), nil
+	}
 	defer func() { _ = fn.Teardown() }()
 	bf := &mockBundleFinalizer{}
 

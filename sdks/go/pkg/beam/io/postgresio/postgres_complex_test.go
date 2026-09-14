@@ -154,10 +154,13 @@ func TestGoComplexPipeline_PostgresToPostgres(t *testing.T) {
 		t.Skipf("skipping: postgres unreachable: %v", err)
 	}
 
-	// 1. Truncate target tables before test
-	if _, err := db.Exec("TRUNCATE TABLE test_pipelines.target_orders_transformed; TRUNCATE TABLE test_pipelines.target_orders_filtered;"); err != nil {
-		t.Fatalf("failed to truncate target tables: %v", err)
+	// 1. Truncate target tables before test and clean up stray test rows in source_orders
+	if _, err := db.Exec("TRUNCATE TABLE test_pipelines.target_orders_transformed; TRUNCATE TABLE test_pipelines.target_orders_filtered; DELETE FROM test_pipelines.source_orders WHERE order_id >= 90000;"); err != nil {
+		t.Fatalf("failed to prepare tables for test: %v", err)
 	}
+	t.Cleanup(func() {
+		_, _ = db.Exec("DELETE FROM test_pipelines.source_orders WHERE order_id >= 90000;")
+	})
 
 	// 2. Build and run Beam Go Pipeline
 	p, s := beam.NewPipelineWithRoot()
@@ -204,14 +207,14 @@ func TestGoComplexPipeline_PostgresToPostgres(t *testing.T) {
 		t.Fatalf("failed to query transformed count: %v", err)
 	}
 	if transformedCount != 20 {
-		t.Errorf("expected 20 transformed rows, got %d", transformedCount)
+		t.Fatalf("expected 20 transformed rows, got %d", transformedCount)
 	}
 
 	if err := db.QueryRow("SELECT count(*) FROM test_pipelines.target_orders_transformed WHERE customer_tier = 'VIP'").Scan(&vipCount); err != nil {
 		t.Fatalf("failed to query vip count: %v", err)
 	}
 	if vipCount != 7 {
-		t.Errorf("expected 7 VIP rows, got %d", vipCount)
+		t.Fatalf("expected 7 VIP rows, got %d", vipCount)
 	}
 
 	// 4. Verify target_orders_filtered
@@ -220,7 +223,7 @@ func TestGoComplexPipeline_PostgresToPostgres(t *testing.T) {
 		t.Fatalf("failed to query filtered count: %v", err)
 	}
 	if filteredCount != 13 {
-		t.Errorf("expected 13 filtered rows, got %d", filteredCount)
+		t.Fatalf("expected 13 filtered rows, got %d", filteredCount)
 	}
 
 	t.Logf("Go Pipeline Verification Passed: %d transformed rows (%d VIP), %d filtered rows", transformedCount, vipCount, filteredCount)

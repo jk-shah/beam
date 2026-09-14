@@ -74,6 +74,10 @@ func newSDFHarness(t *testing.T, idleWhenDrained bool, messages ...[]byte) *sdfH
 	)
 
 	fn := newCDCSourceFn(opts)
+	fn.preflightDone = true
+	fn.newSlotQuerier = func(CDCOptions) (slotRetentionQuerier, error) {
+		return newFakeSlotQuerier(fakeSlotResponse{retention: reserved(0)}), nil
+	}
 	t.Cleanup(func() { _ = fn.Teardown() })
 
 	// A transaction that never commits is a deliberate scenario in a few tests

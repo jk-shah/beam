@@ -494,15 +494,17 @@ func (m *slotMonitor) close() error {
 	m.closeOnce.Do(func() {
 		if m.cancel != nil {
 			m.cancel()
+			select {
+			case <-m.done:
+			case <-time.After(slotMonitorCloseTimeout):
+				// The poll is bounded by slotLagQueryTimeout, so reaching this is
+				// unexpected. Closing the connection anyway is better than blocking
+				// teardown indefinitely.
+			}
 		}
-		select {
-		case <-m.done:
-		case <-time.After(slotMonitorCloseTimeout):
-			// The poll is bounded by slotLagQueryTimeout, so reaching this is
-			// unexpected. Closing the connection anyway is better than blocking
-			// teardown indefinitely.
+		if m.querier != nil {
+			err = m.querier.Close()
 		}
-		err = m.querier.Close()
 	})
 	return err
 }
