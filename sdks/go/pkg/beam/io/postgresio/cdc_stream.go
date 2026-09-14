@@ -253,6 +253,15 @@ func (s *NativeReplicationStream) handshake(ctx context.Context) error {
 		"database":    s.opts.Database,
 		"replication": "database",
 	}
+	if !s.opts.AllowPublisherRowSecurity {
+		// Logical decoding evaluates publisher row security policies unless the
+		// role is SUPERUSER or BYPASSRLS. A least-privilege replication role is
+		// neither, so without this a table owner can cause policy expressions
+		// to run inside the replication session. With row_security=off,
+		// PostgreSQL halts replication instead, which is loud and recoverable
+		// rather than silent.
+		params["options"] = "-c row_security=off"
+	}
 	for k, v := range params {
 		body = append(body, []byte(k)...)
 		body = append(body, 0)

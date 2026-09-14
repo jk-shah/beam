@@ -46,13 +46,13 @@ var (
 
 	// cdcServerWALEnd is the primary's current WAL write position, learned from
 	// server keepalives.
+	//
+	// It only advances when ProcessElement reads a frame off the replication
+	// socket. A pipeline that is stalled, drained or suspended reads nothing, so
+	// this gauge freezes. Do not use it, or any quantity derived from it, to
+	// detect a stall: cdc_slot_retained_bytes is measured independently and is
+	// the signal that keeps moving. See cdc_slot_monitor.go.
 	cdcServerWALEnd = beam.NewGauge("postgresio", "cdc_server_wal_end_lsn")
-
-	// cdcSlotLagBytes is cdcServerWALEnd minus cdcConfirmedFlushLSN: the number
-	// of WAL bytes the primary is retaining on this slot's behalf. This is the
-	// single number a DBA needs to decide whether a pipeline is endangering the
-	// database.
-	cdcSlotLagBytes = beam.NewGauge("postgresio", "cdc_slot_lag_bytes")
 )
 
 const (
@@ -147,6 +147,15 @@ type cdcSourceFn struct {
 
 	// newSlotQuerier is a test seam. Nil means the production SQL querier.
 	newSlotQuerier func(CDCOptions) (slotRetentionQuerier, error)
+
+	// newPreflightQuerier is a test seam. Nil means the production SQL querier.
+	newPreflightQuerier func(CDCOptions) (preflightQuerier, error)
+
+	// preflightDone records that preflight has already passed on this worker,
+	// so a session reopened after a dropped connection does not re-query the
+	// catalog. A failed preflight deliberately does not set it: an operator who
+	// corrects the setting should see the retry succeed.
+	preflightDone bool
 }
 
 func newCDCSourceFn(opts CDCOptions) *cdcSourceFn {
@@ -280,14 +289,20 @@ func (fn *cdcSourceFn) Teardown() error {
 	return err
 }
 
-// startMonitorLocked starts the slot monitor if the circuit breaker is
-// configured and it is not already running. fn.mu must be held.
+// startMonitorLocked starts the slot monitor unless monitoring is disabled and
+// it is not already running. fn.mu must be held.
 //
-// A failure to start the monitor is logged rather than returned. The breaker is
+// The monitor runs independently of the circuit breaker. Enforcement is gated
+// separately, on MaxSlotLagBytes, inside check: with no budget every
+// measurement classifies as under budget and nothing is ever latched. Starting
+// it regardless is what makes cdc_slot_retained_bytes present by default, and
+// that metric is the only accurate view of what the slot is retaining.
+//
+// A failure to start the monitor is logged rather than returned. Monitoring is
 // a safety net; refusing to run the pipeline because the net could not be hung
 // would make the protective feature an availability risk in its own right.
 func (fn *cdcSourceFn) startMonitorLocked(ctx context.Context) {
-	if fn.Options.MaxSlotLagBytes == 0 || fn.monitor != nil {
+	if fn.Options.DisableSlotMonitoring || fn.monitor != nil {
 		return
 	}
 
@@ -614,6 +629,53 @@ type cdcSession struct {
 	closeErr  error
 }
 
+// runPreflightOnce validates the server configuration the first time this
+// worker successfully opens a session.
+//
+// It runs here, and not in Setup, deliberately. Setup executes on every worker
+// the runner initializes, so validating there produces a burst of concurrent
+// connections to the primary proportional to the worker count, which can
+// exhaust max_connections on a server that is also serving production traffic.
+// ensureSession is reached only from ProcessElement, and the LSN restriction is
+// never split, so exactly one worker arrives here however wide the pipeline is.
+//
+// Failure to open the diagnostic connection is not itself fatal. The
+// replication connection opened immediately afterwards will report the
+// underlying problem with better context.
+func (fn *cdcSourceFn) runPreflightOnce(ctx context.Context, opts CDCOptions) error {
+	fn.mu.Lock()
+	done := fn.preflightDone
+	fn.mu.Unlock()
+	if done {
+		return nil
+	}
+
+	newQuerier := fn.newPreflightQuerier
+	if newQuerier == nil {
+		newQuerier = func(o CDCOptions) (preflightQuerier, error) {
+			return newSQLPreflightQuerier(o)
+		}
+	}
+	querier, err := newQuerier(opts)
+	if err != nil {
+		log.Warnf(ctx, "postgresio: skipping preflight validation for slot %q, "+
+			"could not open a diagnostic connection: %v", opts.SlotName, err)
+		return nil
+	}
+	defer querier.Close()
+
+	results := runPreflight(ctx, querier, opts)
+	logPreflight(ctx, results)
+	if err := preflightError(results); err != nil {
+		return err
+	}
+
+	fn.mu.Lock()
+	fn.preflightDone = true
+	fn.mu.Unlock()
+	return nil
+}
+
 func (fn *cdcSourceFn) ensureSession(ctx context.Context, resumeLSN uint64) (*cdcSession, error) {
 	fn.mu.Lock()
 	if fn.session != nil {
@@ -627,6 +689,12 @@ func (fn *cdcSourceFn) ensureSession(ctx context.Context, resumeLSN uint64) (*cd
 	// Resume where the restriction says, not where the pipeline was originally
 	// configured to start. On a retry after a checkpoint these differ.
 	opts.StartLSN = resumeLSN
+
+	// Validate before dialing the replication protocol, so a misconfigured
+	// server is reported by name rather than as a protocol-level error.
+	if err := fn.runPreflightOnce(ctx, opts); err != nil {
+		return nil, err
+	}
 
 	var stream ReplicationStream
 	var err error
@@ -774,11 +842,6 @@ func (s *cdcSession) publishMetrics(ctx context.Context) {
 	walEnd := s.serverWALEnd.Load()
 	cdcConfirmedFlushLSN.Set(ctx, int64(confirmed))
 	cdcServerWALEnd.Set(ctx, int64(walEnd))
-	lag := int64(0)
-	if walEnd > confirmed {
-		lag = int64(walEnd - confirmed)
-	}
-	cdcSlotLagBytes.Set(ctx, lag)
 }
 
 // close shuts the connection down before waiting for the keepalive goroutine.
@@ -819,6 +882,13 @@ func ReadCDC(s beam.Scope, opts ...CDCOption) beam.PCollection {
 	cdcOpts := NewCDCOptions(opts...)
 	if err := cdcOpts.Validate(); err != nil {
 		panic(fmt.Sprintf("invalid postgresio.CDCOptions: %v", err))
+	}
+	if cdcOpts.PreflightAtConstruction {
+		// Opt-in, and it panics for the same reason Validate does: a pipeline
+		// built against a server that cannot serve it should not be submitted.
+		if err := Preflight(context.Background(), cdcOpts); err != nil {
+			panic(err.Error())
+		}
 	}
 
 	// Singleton impulse to ensure exactly one worker connects to the replication slot

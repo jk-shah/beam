@@ -53,6 +53,7 @@
    - [Security & TLS Configuration](#security--tls-configuration)
    - [Failover slots](#failover-slots)
    - [WAL retention circuit breaker](#wal-retention-circuit-breaker)
+   - [DBA operational surface](#dba-operational-surface)
    - [Known Limitations](#known-limitations)
 5. [Contributor Guide: Codebase Map & Invariants](#5-contributor-guide-codebase-map--invariants)
    - [File Inventory & Responsibilities](#file-inventory--responsibilities)
@@ -572,13 +573,167 @@ cannot be read the monitor continues without the startup comparison.
 > outside. The breaker severs the replication session and reports on the next
 > scheduling boundary, but it cannot force a wedged bundle to return.
 
+### DBA operational surface
+
+Running CDC against a production primary requires a role, a publication, a way
+to watch what the slot costs the server, and a way to find out that the server
+is misconfigured before the pipeline is submitted. This section covers all four.
+
+#### Provisioning script
+
+`PostgresProvisioningScript` renders the SQL a DBA runs once. The connector
+never executes it: it is returned as text so it can be reviewed, edited and
+applied through whatever change process the database is under. Nothing in the
+connector issues DDL except replication slot creation, which is separately
+gated behind `WithCDCCreateSlotIfMissing`.
+
+```go
+script, err := postgresio.PostgresProvisioningScript(postgresio.ProvisioningConfig{
+    Role:        "beam_cdc",
+    Database:    "orders_db",
+    Publication: "beam_orders_pub",
+    Tables:      []string{"public.orders", "public.order_items"},
+})
+```
+
+The script creates the login role, grants `CONNECT`, creates the publication
+over the named tables, and creates the monitoring view described below. The
+password is emitted as a `psql` variable rather than a literal, so the output
+can be committed to a runbook:
+
+```
+psql -v cdc_password="$(cat secret)" -f provision.sql
+```
+
+`SELECT` on the published tables is **not** granted. Logical decoding reads WAL
+through the walsender rather than reading tables through the executor;
+PostgreSQL requires `SELECT` only to copy the initial table data, and this
+connector performs no initial backfill. The `USAGE` and `SELECT` statements are
+emitted commented out, as a pair, for the case where the same role will run a
+backfill by other means — one without the other grants nothing usable. Set
+`IncludeBackfillGrants: true` to emit them uncommented.
+
+#### `beam_cdc_health` view
+
+The script creates a view over `pg_replication_slots`. `pg_replication_slots`
+carries no privilege restriction, so the view is readable without additional
+grants, and it is cluster-wide, so one view covers every logical slot on the
+server.
+
+```sql
+SELECT slot_name, health, retained_pretty, xmin_horizon_age
+FROM beam_cdc_health
+WHERE health <> 'ok';
+```
+
+> [!IMPORTANT]
+> Alert on `health`, not on `retained_bytes`. Slot invalidation clears
+> `restart_lsn`, `pg_wal_lsn_diff` of NULL is NULL, so an alert written as
+> `retained_bytes > threshold` stops firing at the moment the slot becomes
+> unrecoverable. `health` is never NULL and distinguishes `ok`, `inactive`,
+> `unreserved` and `lost`.
+
+The same classification is available to a Go program without SQL:
+
+```go
+report, err := postgresio.SlotHealth(ctx, opts)
+if report.Status == postgresio.SlotStatusLost {
+    // Terminal: the server has discarded WAL the slot required.
+}
+```
+
+`SlotHealth` is a package-level function, not a method on the source, because a
+driver program cannot call methods on a DoFn that is serialized and executing on
+a worker. It opens a short-lived connection and closes it before returning.
+
+#### Preflight validation
+
+Before the replication protocol is dialled, the connector checks that the server
+can actually serve the pipeline, and reports what is wrong by name rather than
+letting the handshake fail with a protocol error.
+
+| Check | Outcome if wrong |
+| :--- | :--- |
+| `wal_level = logical` | **Fails** the pipeline, naming the setting and that it needs a restart. |
+| `max_replication_slots` headroom | **Fails** if the slot does not exist and the table is full. Passes when the slot already exists, which consumes no headroom. |
+| Publication exists | **Fails**, naming the publication and the `CREATE PUBLICATION` statement. |
+| Publication has tables | **Warns**. An empty `FOR ALL TABLES` publication is legal on a schema whose tables are created later. |
+| `REPLICA IDENTITY` is usable | **Warns**, naming the tables. It constrains only `UPDATE` and `DELETE`, and the connector cannot know whether the pipeline consumes them. |
+
+A check that cannot be completed — the query errors, the role cannot read the
+catalog, or the whole sequence exceeds its timeout — is logged and the pipeline
+proceeds. A diagnostic must not become an availability dependency: a catalog
+read stuck behind unrelated DDL should not stop a pipeline that would otherwise
+run. Every check logs one line whether it passes or fails, because a silent
+preflight cannot be distinguished from one that never ran.
+
+Preflight runs on the single worker that opens the replication stream, not in
+`Setup`. `Setup` executes on every worker the runner initialises, so validating
+there would open one connection per worker against the primary at the same
+instant and can exhaust `max_connections`.
+
+`WithCDCPreflight(true)` additionally runs the same checks on the machine that
+builds the pipeline, before submission. It is off by default because that
+requires the submitting machine to reach the database, which a Dataflow Flex
+Template and `TokenProvider` both assume it cannot.
+
+#### Publisher row security
+
+The replication connection sends `row_security=off` by default.
+
+A replication role that is neither `SUPERUSER` nor `BYPASSRLS` — which is what
+least privilege produces — evaluates row security policies during logical
+decoding, so a table owner can cause expressions to run inside the replication
+session. With `row_security=off`, PostgreSQL halts replication rather than
+executing such a policy.
+
+> [!WARNING]
+> This means a pipeline reading a table whose owner later adds an RLS policy
+> stops, loudly, instead of continuing under the policy.
+> `WithCDCAllowPublisherRowSecurity(true)` restores the permissive behaviour.
+> Use it only where every table owner in the publication is trusted, or where a
+> published table legitimately carries a policy and halting is unacceptable.
+
+#### Metrics
+
+Metrics are published in the `postgresio` namespace with snake_case names.
+
+| Metric | Kind | Meaning |
+| :--- | :--- | :--- |
+| `cdc_processed_records` | counter | Change events emitted downstream. |
+| `cdc_filtered_origin_records` | counter | Events dropped by `WithCDCOriginFilter`. |
+| `cdc_confirmed_flush_lsn` | gauge | Last position acknowledged to the server. |
+| `cdc_server_wal_end_lsn` | gauge | Server WAL position as last reported on the replication connection. |
+| `cdc_slot_retained_bytes` | gauge | WAL the server is holding for this slot, measured from `restart_lsn`. |
+| `cdc_slot_wal_status` | gauge | Slot `wal_status` as an ordinal: reserved, extended, unreserved, lost. |
+| `cdc_slot_xmin_horizon_age` | gauge | Transactions elapsed since the oldest catalog transaction the slot pins. |
+| `cdc_slot_lag_check_failures` | counter | Retention measurements that could not be taken. |
+| `cdc_slot_lag_breaches` | counter | Times the configured budget was exceeded. |
+| `sink_written_rows` | counter | Rows committed by the sink. |
+| `sink_failed_rows` | counter | Rows routed to the dead-letter output. |
+| `sink_deadlock_retries` | counter | Sink transactions retried after SQLState 40P01. |
+
+`cdc_slot_retained_bytes` and `cdc_slot_xmin_horizon_age` come from the slot
+monitor, which runs **by default** and is independent of the circuit breaker:
+measuring what the slot costs is useful even when nothing enforces a budget.
+`WithCDCSlotMonitoring(false)` turns it off, at the cost of losing both.
+Monitoring costs one connection per pipeline, not per worker — it starts on the
+single worker that reads the stream and caps itself at one open connection.
+
+> [!NOTE]
+> `cdc_server_wal_end_lsn` only advances while a bundle is executing, because
+> frames are read from the replication connection only inside `ProcessElement`.
+> It freezes when a pipeline stalls and must not be used to detect one. Use
+> `cdc_slot_retained_bytes`, which is measured on a separate connection, or the
+> `health` column of the view.
+
 ### Known Limitations
 
 The connector is unreleased and experimental. The list below is what is still open; the [remediation acceptance suite](#remediation-acceptance-suite) covers the items that have been fixed and fails if any of them regresses.
 
 | Area | Limitation | Impact |
 | :--- | :--- | :--- |
-| **Slot lag** | The [circuit breaker](#wal-retention-circuit-breaker) bounds retention, but it is off by default and it does not drop the slot, so WAL is not reclaimed by the breach itself. A bundle already blocked inside a downstream `emit` cannot be interrupted from outside. | Without a configured budget the database can still run out of WAL volume if a stalled pipeline is left unattended. Set `WithCDCMaxSlotLagBytes`, and configure `max_slot_wal_keep_size` server-side as a backstop. |
+| **Slot lag** | Retention is measured and published by default, but enforcement is not: the [circuit breaker](#wal-retention-circuit-breaker) is off until a budget is set, and it does not drop the slot, so WAL is not reclaimed by the breach itself. A bundle already blocked inside a downstream `emit` cannot be interrupted from outside. | Without a configured budget the database can still run out of WAL volume if a stalled pipeline is left unattended. Alert on `cdc_slot_retained_bytes` or the [health view](#beam_cdc_health-view), set `WithCDCMaxSlotLagBytes`, and configure `max_slot_wal_keep_size` server-side as a backstop. |
 | **Long transactions** | A checkpoint cannot land partway through a transaction, so `WithCDCCheckpointInterval` is advisory while one is open. A single very large transaction extends the invocation until its `COMMIT` frame arrives. | Acknowledgment latency, and the memory the parser holds for a streamed transaction, both scale with the largest transaction on the source. A connection that stops delivering mid-transaction is dropped after two minutes of silence and the bundle is retried. |
 | **Initial backfill** | Slot creation exports a consistent snapshot and `SlotCreationResult.SnapshotIsolationStatements` returns the statements needed to read it, but the connector does not run the backfill. | Pre-existing table rows require a separate read. Only changes after the slot's creation point arrive through CDC. |
 | **Replication origin on the write path** | The staged `COPY` path sets a replication origin; the `UNNEST` fallback does not. | In a bi-directional topology, rows written through the fallback path are not distinguishable from user writes and can be replicated back. |
@@ -789,10 +944,21 @@ Target benchmark metrics:
 ### Operational Troubleshooting & Slot Recovery
 
 1. **Replication Slot Lag Accumulation**:
-   Check if a slot is unconsumed using:
+   Query the [health view](#beam_cdc_health-view) the provisioning script
+   creates, which classifies every logical slot and does not go NULL when a slot
+   is lost:
    ```sql
-   SELECT slot_name, active,
-          pg_wal_lsn_diff(pg_current_wal_lsn(), confirmed_flush_lsn) AS lag_bytes
+   SELECT slot_name, health, retained_pretty, xmin_horizon_age
+   FROM beam_cdc_health
+   WHERE health <> 'ok';
+   ```
+   Without the view, measure from `restart_lsn` rather than
+   `confirmed_flush_lsn`. `restart_lsn` is the oldest WAL the server must keep
+   for the slot, which is what determines disk consumption;
+   `confirmed_flush_lsn` runs ahead of it and understates the cost:
+   ```sql
+   SELECT slot_name, active, wal_status,
+          pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) AS retained_bytes
    FROM pg_replication_slots;
    ```
 2. **Manually Advancing Confirmed LSN**:

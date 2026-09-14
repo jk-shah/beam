@@ -16,6 +16,7 @@
 package postgresio
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"io"
@@ -34,15 +35,121 @@ var (
 )
 
 // readStartupMessage consumes the length-prefixed startup packet, which unlike
-// every later message carries no leading type byte.
-func readStartupMessage(conn net.Conn) error {
+// every later message carries no leading type byte, and returns the parameters
+// it carried.
+func readStartupMessage(conn net.Conn) (map[string]string, error) {
 	var lenBuf [4]byte
 	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
-		return err
+		return nil, err
 	}
 	body := make([]byte, binary.BigEndian.Uint32(lenBuf[:])-4)
-	_, err := io.ReadFull(conn, body)
-	return err
+	if _, err := io.ReadFull(conn, body); err != nil {
+		return nil, err
+	}
+	return parseStartupParams(body), nil
+}
+
+// parseStartupParams reads the NUL-separated key/value pairs that follow the
+// four-byte protocol version.
+func parseStartupParams(body []byte) map[string]string {
+	params := map[string]string{}
+	if len(body) < 4 {
+		return params
+	}
+	fields := bytes.Split(body[4:], []byte{0})
+	for i := 0; i+1 < len(fields); i += 2 {
+		key := string(fields[i])
+		if key == "" {
+			break
+		}
+		params[key] = string(fields[i+1])
+	}
+	return params
+}
+
+// captureStartupParams drives a real connection attempt far enough to read the
+// startup packet, then abandons it. The handshake is expected not to complete;
+// the parameters are what the test is after.
+func captureStartupParams(t *testing.T, extra ...CDCOption) map[string]string {
+	t.Helper()
+
+	clientConn, serverConn := net.Pipe()
+	defer clientConn.Close()
+
+	got := make(chan map[string]string, 1)
+	go func() {
+		params, err := readStartupMessage(serverConn)
+		if err != nil {
+			close(got)
+		} else {
+			got <- params
+		}
+		serverConn.Close()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	opts := []CDCOption{
+		WithCDCHost("localhost"),
+		WithCDCPort(5432),
+		WithCDCDatabase("testdb"),
+		WithCDCUsername("beam_test"),
+		WithCDCSlotName("beam_slot"),
+		WithCDCPublication("test_pub"),
+		WithCDCSSLMode("disable"),
+		WithCDCDialFunc(func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return clientConn, nil
+		}),
+	}
+	opts = append(opts, extra...)
+
+	// Expected to fail: the stub closes the connection after the startup packet.
+	if stream, err := NewNativeReplicationStream(ctx, NewCDCOptions(opts...)); err == nil {
+		stream.Close()
+	}
+
+	select {
+	case params, ok := <-got:
+		if !ok {
+			t.Fatal("the startup packet was never read")
+		}
+		return params
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the startup packet")
+		return nil
+	}
+}
+
+// TestReplicationConnectionDisablesRowSecurity covers the default.
+//
+// Logical decoding evaluates publisher row security policies unless the role is
+// SUPERUSER or BYPASSRLS. The least-privilege role this connector documents is
+// neither, so without row_security=off a table owner can cause policy
+// expressions to execute inside the replication session. With it, PostgreSQL
+// halts replication instead, which is loud and recoverable.
+func TestReplicationConnectionDisablesRowSecurity(t *testing.T) {
+	params := captureStartupParams(t)
+
+	got, ok := params["options"]
+	if !ok {
+		t.Fatalf("the startup packet carried no options parameter, so publisher row security policies "+
+			"will execute under the replication role; params=%v", params)
+	}
+	if !strings.Contains(got, "row_security=off") {
+		t.Errorf("options = %q, want it to contain row_security=off", got)
+	}
+}
+
+// TestReplicationConnectionCanAllowRowSecurity checks the escape hatch, for a
+// published table that legitimately carries a policy and where halting is worse
+// than evaluating it.
+func TestReplicationConnectionCanAllowRowSecurity(t *testing.T) {
+	params := captureStartupParams(t, WithCDCAllowPublisherRowSecurity(true))
+
+	if got, ok := params["options"]; ok && strings.Contains(got, "row_security=off") {
+		t.Errorf("options = %q, but row security was explicitly allowed", got)
+	}
 }
 
 // readSimpleQuery consumes one 'Q' message and returns the SQL text without
@@ -126,7 +233,7 @@ func runSlotStubServer(t *testing.T, conn net.Conn, resp *slotStubResponse, quer
 	go func() {
 		defer close(done)
 
-		if err := readStartupMessage(conn); err != nil {
+		if _, err := readStartupMessage(conn); err != nil {
 			return
 		}
 		if _, err := conn.Write(pgAuthOk); err != nil {

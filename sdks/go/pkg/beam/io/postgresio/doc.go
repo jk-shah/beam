@@ -49,6 +49,23 @@
 //     runs and so goes blind in exactly that situation. Off by default; set
 //     WithCDCMaxSlotLagBytes to enable it. It does not drop the slot, so
 //     max_slot_wal_keep_size remains the server-side backstop.
+//   - Retention is measured and published by default, independently of that
+//     budget, as cdc_slot_retained_bytes and cdc_slot_xmin_horizon_age. The
+//     catalog xmin horizon is reported because a stalled slot blocks VACUUM
+//     of the system catalogs, which is a failure mode independent of WAL
+//     volume. WithCDCSlotMonitoring(false) opts out.
+//   - PostgresProvisioningScript renders the role, grants, publication and a
+//     beam_cdc_health view for a DBA to review and apply. The connector never
+//     executes it. SlotHealth reports the same classification to a Go program.
+//   - The server configuration is validated before the replication protocol is
+//     dialled -- wal_level, slot headroom, the publication and replica
+//     identity -- so a misconfiguration is reported by name. It runs on the
+//     one worker that reads the stream, not in Setup, which would open a
+//     connection per worker. WithCDCPreflight(true) also checks at
+//     construction time.
+//   - The replication connection sends row_security=off, so a publisher row
+//     security policy halts replication rather than executing inside the
+//     replication session of a least-privilege role.
 //
 // Known open items include the UNNEST write path not setting a replication
 // origin, no initial backfill, and the connector being built on lib/pq rather

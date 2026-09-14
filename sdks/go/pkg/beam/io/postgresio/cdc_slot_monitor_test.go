@@ -417,11 +417,60 @@ func TestSlotLagCheckIntervalDefaults(t *testing.T) {
 
 // --- Integration with the source ---
 
-// TestCircuitBreakerIsOffByDefault ensures the connector opens no extra
-// connection unless a budget is configured.
-func TestCircuitBreakerIsOffByDefault(t *testing.T) {
+// TestSlotMonitoringIsOnByDefault checks that retention is measured without any
+// circuit breaker configuration.
+//
+// The monitor publishes cdc_slot_retained_bytes, which is the only accurate
+// view of what the slot is costing the server: the in-process alternative was
+// removed because it freezes during the stall it claims to detect. If
+// monitoring were gated on the breaker, which is off by default, a default
+// deployment would emit no retention signal at all.
+func TestSlotMonitoringIsOnByDefault(t *testing.T) {
 	h := newSDFHarness(t, true, keepalivePayload(100, false))
 
+	q := newFakeSlotQuerier(fakeSlotResponse{retention: reserved(int64(4 * MiB))})
+	created := false
+	h.fn.newSlotQuerier = func(CDCOptions) (slotRetentionQuerier, error) {
+		created = true
+		return q, nil
+	}
+
+	h.run(context.Background(), t)
+
+	if !created {
+		t.Fatal("no slot monitor was started with default options, so the pipeline publishes no retention metric")
+	}
+	q.waitForChecks(t, 1)
+}
+
+// TestEnforcementIsOffWithoutABudget separates measuring from acting.
+//
+// Monitoring defaults on, but nothing may be enforced until the operator sets a
+// budget. A slot far above any plausible threshold must still not fail a
+// pipeline that never asked for a breaker.
+func TestEnforcementIsOffWithoutABudget(t *testing.T) {
+	h := newSDFHarness(t, true, keepalivePayload(100, false))
+
+	q := newFakeSlotQuerier(fakeSlotResponse{retention: reserved(int64(512 * GiB))})
+	h.fn.newSlotQuerier = func(CDCOptions) (slotRetentionQuerier, error) { return q, nil }
+
+	h.run(context.Background(), t)
+	q.waitForChecks(t, 1)
+
+	if breach := h.fn.latchedBreach(); breach != nil {
+		t.Errorf("a breach was latched with no budget configured: %v", breach)
+	}
+	if h.fn.currentSession() == nil {
+		t.Error("the replication session was severed with no budget configured")
+	}
+}
+
+// TestSlotMonitoringCanBeDisabled checks the opt-out, which is the only way to
+// avoid the monitor's extra connection.
+func TestSlotMonitoringCanBeDisabled(t *testing.T) {
+	h := newSDFHarness(t, true, keepalivePayload(100, false))
+
+	h.fn.Options.DisableSlotMonitoring = true
 	created := false
 	h.fn.newSlotQuerier = func(CDCOptions) (slotRetentionQuerier, error) {
 		created = true
@@ -431,10 +480,23 @@ func TestCircuitBreakerIsOffByDefault(t *testing.T) {
 	h.run(context.Background(), t)
 
 	if created {
-		t.Error("a slot monitor connection was opened without a configured retention budget")
+		t.Error("a slot monitor connection was opened although monitoring was disabled")
 	}
-	if h.fn.latchedBreach() != nil {
-		t.Error("a breach was reported with the circuit breaker disabled")
+}
+
+// TestSlotMonitoringOptionReadsInThePositive guards the negated struct field.
+//
+// DisableSlotMonitoring is negated so the zero value leaves monitoring on. The
+// option is phrased positively, so the two must not drift apart.
+func TestSlotMonitoringOptionReadsInThePositive(t *testing.T) {
+	if opts := NewCDCOptions(WithCDCSlotMonitoring(false)); !opts.DisableSlotMonitoring {
+		t.Error("WithCDCSlotMonitoring(false) left monitoring enabled")
+	}
+	if opts := NewCDCOptions(WithCDCSlotMonitoring(true)); opts.DisableSlotMonitoring {
+		t.Error("WithCDCSlotMonitoring(true) disabled monitoring")
+	}
+	if opts := NewCDCOptions(); opts.DisableSlotMonitoring {
+		t.Error("monitoring is off by default; the zero value must leave it on")
 	}
 }
 
@@ -577,6 +639,22 @@ func TestSlotRetentionQueryToleratesNullRestartLSN(t *testing.T) {
 func TestSlotRetentionQueryIsSchemaQualified(t *testing.T) {
 	if !strings.Contains(slotRetentionQuery, "pg_catalog.pg_replication_slots") {
 		t.Error("the retention query does not schema-qualify pg_replication_slots")
+	}
+}
+
+// TestSlotRetentionQueryReportsTheXminHorizon covers the failure mode that is
+// independent of WAL volume: a slot that stops advancing also pins
+// catalog_xmin, and VACUUM cannot remove catalog tuples deleted by any later
+// transaction. A database can therefore suffer catalog bloat and wraparound
+// pressure from a stalled slot that has retained very little WAL.
+func TestSlotRetentionQueryReportsTheXminHorizon(t *testing.T) {
+	if !strings.Contains(slotRetentionQuery, "catalog_xmin") {
+		t.Error("the retention query does not read catalog_xmin, so catalog bloat caused by a " +
+			"stalled slot is invisible")
+	}
+	if !strings.Contains(slotRetentionQuery, "pg_catalog.age(") {
+		t.Error("the retention query does not convert catalog_xmin to an age, so the value is a " +
+			"raw transaction id rather than a distance that can be alerted on")
 	}
 }
 

@@ -39,6 +39,17 @@ var (
 	// 0 reserved, 1 extended, 2 unreserved, 3 lost, -1 unknown.
 	cdcSlotWALStatus = beam.NewGauge("postgresio", "cdc_slot_wal_status")
 
+	// cdcSlotXminHorizonAge is how many transactions have elapsed since the
+	// oldest catalog transaction this slot forces the server to retain.
+	//
+	// WAL volume is not the only cost of a stalled slot. A logical slot also
+	// pins catalog_xmin, and VACUUM cannot remove catalog tuples deleted by any
+	// later transaction. A slot that stops advancing therefore produces catalog
+	// bloat and contributes to transaction ID wraparound pressure, on a clock
+	// that is independent of how much WAL has been written. A low-traffic
+	// database can be in trouble here while retained bytes still look fine.
+	cdcSlotXminHorizonAge = beam.NewGauge("postgresio", "cdc_slot_xmin_horizon_age")
+
 	// cdcSlotLagCheckFailures counts monitoring queries that failed.
 	//
 	// A non-zero value means the circuit breaker is not protecting anything.
@@ -137,13 +148,19 @@ SELECT
         0)::bigint AS retained_bytes,
     restart_lsn IS NULL AS restart_lsn_unset,
     COALESCE(wal_status, 'unknown') AS wal_status,
-    active
+    active,
+    COALESCE(pg_catalog.age(catalog_xmin), 0)::bigint AS xmin_horizon_age
 FROM pg_catalog.pg_replication_slots
 WHERE slot_name = $1`
 
 // slotRetention is one measurement.
 type slotRetention struct {
-	RetainedBytes   int64
+	RetainedBytes int64
+	// XminHorizonAge is transactions elapsed since catalog_xmin, or zero when
+	// the slot pins no catalog transaction. Reported but not enforced: the
+	// budget is expressed in bytes, and a sensible transaction-age threshold is
+	// installation-specific.
+	XminHorizonAge  int64
 	RestartLSNUnset bool
 	WALStatus       string
 	Active          bool
@@ -192,7 +209,7 @@ func newSQLSlotQuerier(opts CDCOptions) (*sqlSlotQuerier, error) {
 func (q *sqlSlotQuerier) QuerySlotRetention(ctx context.Context, slotName string) (slotRetention, error) {
 	var out slotRetention
 	row := q.db.QueryRowContext(ctx, slotRetentionQuery, slotName)
-	if err := row.Scan(&out.RetainedBytes, &out.RestartLSNUnset, &out.WALStatus, &out.Active); err != nil {
+	if err := row.Scan(&out.RetainedBytes, &out.RestartLSNUnset, &out.WALStatus, &out.Active, &out.XminHorizonAge); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return slotRetention{}, errSlotNotFound
 		}
@@ -410,6 +427,7 @@ func (m *slotMonitor) check(parent context.Context) slotCheckOutcome {
 
 	cdcSlotRetainedBytes.Set(ctx, retention.RetainedBytes)
 	cdcSlotWALStatus.Set(ctx, walStatusCode(retention.WALStatus))
+	cdcSlotXminHorizonAge.Set(ctx, retention.XminHorizonAge)
 
 	// Checked before the unreserved case: invalidation also nulls restart_lsn,
 	// so a lost slot presents as unreserved and would otherwise be reported as

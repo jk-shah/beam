@@ -95,6 +95,54 @@ type CDCOptions struct {
 	// SlotLagCheckInterval is how often retention is measured. Defaults to
 	// DefaultSlotLagCheckInterval and is clamped to at least one second.
 	SlotLagCheckInterval time.Duration
+
+	// DisableSlotMonitoring turns off the slot retention monitor entirely.
+	//
+	// The monitor publishes cdc_slot_retained_bytes and
+	// cdc_slot_xmin_horizon_age, which are the only accurate views of what this
+	// slot is costing the server. It runs by default, independently of the
+	// circuit breaker: measuring is useful even when nothing enforces a budget.
+	//
+	// The field is negated so that the zero value leaves monitoring enabled.
+	// Set it through WithCDCSlotMonitoring(false), which reads in the positive.
+	//
+	// Cost when enabled: one additional connection per pipeline. The monitor
+	// starts on the single worker that reads the replication stream, not on
+	// every worker, and limits itself to one open connection.
+	DisableSlotMonitoring bool
+
+	// AllowPublisherRowSecurity permits publisher row security policies to
+	// execute inside the replication session.
+	//
+	// A replication role that is neither SUPERUSER nor BYPASSRLS -- which is
+	// what least privilege produces -- will evaluate row security policies
+	// during logical decoding. A table owner can therefore cause expressions to
+	// run in the replication session. By default the connector sends
+	// row_security=off, which makes PostgreSQL halt replication rather than
+	// execute such a policy.
+	//
+	// Setting this to true restores the permissive behavior. Do so only where
+	// every table owner in the publication is trusted, or where a published
+	// table legitimately carries a policy and halting is unacceptable.
+	//
+	// The field is phrased so that the zero value is the safe setting.
+	AllowPublisherRowSecurity bool
+
+	// PreflightAtConstruction additionally validates the server configuration
+	// on the machine that builds the pipeline, before submission.
+	//
+	// Worker-side preflight always runs, on the single worker that opens the
+	// replication stream. This option moves a copy of the same checks earlier,
+	// which gives the fastest possible feedback but requires the submitting
+	// machine to reach the database.
+	//
+	// Off by default because that requirement breaks two supported shapes: a
+	// Dataflow Flex Template builds the graph without credentials or network
+	// reachability to the primary, and TokenProvider exists precisely so
+	// credentials resolve on the worker rather than at construction.
+	//
+	// Set it through WithCDCPreflight(true).
+	PreflightAtConstruction bool
 }
 
 // CDCOption defines a functional option for configuring CDCOptions.
@@ -424,6 +472,47 @@ func WithCDCSlotLagPolicy(p SlotLagPolicy) CDCOption {
 // Defaults to DefaultSlotLagCheckInterval. Values below one second are clamped:
 // the query is cheap but not free, and a primary that is accumulating WAL may
 // already be under pressure.
+// WithCDCSlotMonitoring enables or disables the slot retention monitor.
+//
+// Monitoring is on by default and is independent of the circuit breaker: with
+// no budget configured the monitor measures and publishes
+// cdc_slot_retained_bytes and cdc_slot_xmin_horizon_age but never intervenes.
+// Those are the only accurate retention signals the connector emits, so
+// disabling monitoring leaves WAL growth unobservable from the pipeline.
+//
+// Disabling it saves one connection per pipeline.
+func WithCDCSlotMonitoring(enabled bool) CDCOption {
+	return func(o *CDCOptions) {
+		o.DisableSlotMonitoring = !enabled
+	}
+}
+
+// WithCDCPreflight validates the server configuration at pipeline construction
+// time, in addition to the worker-side validation that always runs.
+//
+// Enable it where the submitting machine can reach the database and you want a
+// misconfigured wal_level or a missing publication reported before the job is
+// submitted. See the PreflightAtConstruction field for why it is off by
+// default.
+func WithCDCPreflight(enabled bool) CDCOption {
+	return func(o *CDCOptions) {
+		o.PreflightAtConstruction = enabled
+	}
+}
+
+// WithCDCAllowPublisherRowSecurity permits publisher row security policies to
+// execute inside the replication session.
+//
+// The default is to send row_security=off, which makes PostgreSQL halt
+// replication if a published table carries a row security policy, rather than
+// evaluating the policy under the replication role. See the
+// AllowPublisherRowSecurity field for why that default is the safe one.
+func WithCDCAllowPublisherRowSecurity(allow bool) CDCOption {
+	return func(o *CDCOptions) {
+		o.AllowPublisherRowSecurity = allow
+	}
+}
+
 func WithCDCSlotLagCheckInterval(d time.Duration) CDCOption {
 	return func(o *CDCOptions) {
 		o.SlotLagCheckInterval = d
