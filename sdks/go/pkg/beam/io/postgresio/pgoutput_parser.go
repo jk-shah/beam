@@ -198,18 +198,21 @@ func (p *PgOutputParser) ParseMessages(data []byte) ([]*ChangeEvent, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse Insert tuple: %w", err)
 		}
+		afterMap, unchanged := valuesToMap(values)
 		ev := &ChangeEvent{
-			Operation:     OpInsert,
-			Schema:        rel.Namespace,
-			Table:         rel.RelationName,
-			CommitTime:    p.currentTxTime,
-			LSN:           p.currentLSN,
-			TransactionID: p.currentXID,
-			PrimaryKeys:   rel.PrimaryKeys,
-			Origin:        p.currentOrigin,
-			After:         valuesToMap(values),
-			ColumnTypes:   valuesToColumnTypes(values),
+			Operation:        OpInsert,
+			Schema:           rel.Namespace,
+			Table:            rel.RelationName,
+			CommitTime:       p.currentTxTime,
+			LSN:              p.currentLSN,
+			TransactionID:    p.currentXID,
+			PrimaryKeys:      rel.PrimaryKeys,
+			Origin:           p.currentOrigin,
+			After:            afterMap,
+			UnchangedColumns: unchanged,
+			ColumnTypes:      valuesToColumnTypes(values),
 		}
+
 		return p.emitOrSpool(ev), nil
 
 	case 'U': // Update
@@ -249,22 +252,25 @@ func (p *PgOutputParser) ParseMessages(data []byte) ([]*ChangeEvent, error) {
 
 		var beforeMap map[string]any
 		if len(beforeVals) > 0 {
-			beforeMap = valuesToMap(beforeVals)
+			beforeMap, _ = valuesToMap(beforeVals)
 		}
 
+		afterMap, unchanged := valuesToMap(afterVals)
 		ev := &ChangeEvent{
-			Operation:     OpUpdate,
-			Schema:        rel.Namespace,
-			Table:         rel.RelationName,
-			CommitTime:    p.currentTxTime,
-			LSN:           p.currentLSN,
-			TransactionID: p.currentXID,
-			PrimaryKeys:   rel.PrimaryKeys,
-			Origin:        p.currentOrigin,
-			Before:        beforeMap,
-			After:         valuesToMap(afterVals),
-			ColumnTypes:   valuesToColumnTypes(afterVals),
+			Operation:        OpUpdate,
+			Schema:           rel.Namespace,
+			Table:            rel.RelationName,
+			CommitTime:       p.currentTxTime,
+			LSN:              p.currentLSN,
+			TransactionID:    p.currentXID,
+			PrimaryKeys:      rel.PrimaryKeys,
+			Origin:           p.currentOrigin,
+			Before:           beforeMap,
+			After:            afterMap,
+			UnchangedColumns: unchanged,
+			ColumnTypes:      valuesToColumnTypes(afterVals),
 		}
+
 		return p.emitOrSpool(ev), nil
 
 	case 'D': // Delete
@@ -287,7 +293,9 @@ func (p *PgOutputParser) ParseMessages(data []byte) ([]*ChangeEvent, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse Delete tuple: %w", err)
 		}
+		beforeMap, _ := valuesToMap(values)
 		ev := &ChangeEvent{
+
 			Operation:     OpDelete,
 			Schema:        rel.Namespace,
 			Table:         rel.RelationName,
@@ -296,7 +304,7 @@ func (p *PgOutputParser) ParseMessages(data []byte) ([]*ChangeEvent, error) {
 			TransactionID: p.currentXID,
 			PrimaryKeys:   rel.PrimaryKeys,
 			Origin:        p.currentOrigin,
-			Before:        valuesToMap(values),
+			Before:        beforeMap,
 			ColumnTypes:   valuesToColumnTypes(values),
 		}
 		return p.emitOrSpool(ev), nil
@@ -579,18 +587,29 @@ func readNullTerminatedString(r *bytes.Reader) (string, error) {
 	return string(b), nil
 }
 
-func valuesToMap(values []ColumnValue) map[string]any {
+// valuesToMap converts decoded column values into a map.
+//
+// Columns whose TOASTed value was not modified by the UPDATE are omitted
+// entirely rather than given a placeholder. The server does not transmit
+// these values at all, and inventing one is unsafe: a sentinel string is a
+// type violation for a JSONB, NUMERIC or BIGINT column, while NULL would
+// instruct the sink to erase a value the source still holds. Callers learn
+// which columns were withheld from the second return value.
+func valuesToMap(values []ColumnValue) (map[string]any, []string) {
 	m := make(map[string]any, len(values))
+	var unchanged []string
+
 	for _, v := range values {
-		if v.IsNull {
+		switch {
+		case v.IsToastUnchanged:
+			unchanged = append(unchanged, v.Name)
+		case v.IsNull:
 			m[v.Name] = nil
-		} else if v.IsToastUnchanged {
-			m[v.Name] = "<unchanged_toast>"
-		} else {
+		default:
 			m[v.Name] = v.Value
 		}
 	}
-	return m
+	return m, unchanged
 }
 
 func valuesToColumnTypes(values []ColumnValue) map[string]uint32 {

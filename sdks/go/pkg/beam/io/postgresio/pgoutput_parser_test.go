@@ -189,8 +189,11 @@ func TestPgOutputParserLifecycle(t *testing.T) {
 	if event.After["username"] != "alice_new" {
 		t.Errorf("expected username to be alice_new, got %v", event.After["username"])
 	}
-	if event.After["bio"] != unchangedToastMarker {
-		t.Errorf("expected unchanged toast marker for bio, got %v", event.After["bio"])
+	if _, present := event.After["bio"]; present {
+		t.Errorf("unchanged TOAST column bio must be omitted from After, got %v", event.After["bio"])
+	}
+	if !containsString(event.UnchangedColumns, "bio") {
+		t.Errorf("expected bio in UnchangedColumns, got %v", event.UnchangedColumns)
 	}
 
 	// 5. Delete message

@@ -50,28 +50,39 @@ func (fn *toastReassemblyFn) ProcessElement(sp state.Provider, key string, event
 
 	case OpUpdate:
 		cached, ok, err := fn.RowState.Read(sp)
-		if err == nil && ok {
-			hasToast := false
-			for colName, val := range event.After {
-				if s, isStr := val.(string); isStr && s == unchangedToastMarker {
-					hasToast = true
-					if cachedVal, found := cached.After[colName]; found {
-						event.After[colName] = cachedVal
-					} else {
-						event.After[colName] = nil
+		if err == nil && ok && len(event.UnchangedColumns) > 0 {
+			// Unchanged TOAST columns are absent from After. Patch in the
+			// last value this pipeline observed for the row where one exists.
+			//
+			// A column with no cached value is deliberately left absent
+			// rather than set to nil: on a cold start the pipeline has never
+			// seen the row, and writing NULL would erase a value the source
+			// still holds. Leaving it absent lets the sink omit it from the
+			// generated UPDATE.
+			var stillUnknown []string
+			patched := false
+
+			for _, colName := range event.UnchangedColumns {
+				if cachedVal, found := cached.After[colName]; found {
+					if event.After == nil {
+						event.After = make(map[string]any, len(event.UnchangedColumns))
 					}
+					event.After[colName] = cachedVal
+					patched = true
+				} else {
+					stillUnknown = append(stillUnknown, colName)
 				}
 			}
-			if hasToast {
-				// Also update Before map if not present
-				if len(event.Before) == 0 && len(cached.After) > 0 {
-					event.Before = make(map[string]any, len(cached.After))
-					for k, v := range cached.After {
-						event.Before[k] = v
-					}
+			event.UnchangedColumns = stillUnknown
+
+			if patched && len(event.Before) == 0 && len(cached.After) > 0 {
+				event.Before = make(map[string]any, len(cached.After))
+				for k, v := range cached.After {
+					event.Before[k] = v
 				}
 			}
 		}
+
 		_ = fn.RowState.Write(sp, event)
 		emit(key, event)
 

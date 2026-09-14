@@ -118,9 +118,10 @@ func TestToastReassemblyLifecycle(t *testing.T) {
 		After: map[string]any{
 			"id":       int64(42),
 			"title":    "Apache Beam in Go (Updated Title)",
-			"body":     unchangedToastMarker,
 			"view_cnt": int64(10),
 		},
+		// "body" is a TOASTed column the server did not retransmit.
+		UnchangedColumns: []string{"body"},
 	}
 
 	if err := fn.ProcessElement(sp, key, updateEvent, emit); err != nil {

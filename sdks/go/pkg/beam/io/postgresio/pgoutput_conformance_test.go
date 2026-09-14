@@ -61,9 +61,16 @@ func TestUpstreamToastSemantics_UnchangedAndModified(t *testing.T) {
 	if event.After["name"] != "Alpha_Updated" {
 		t.Errorf("expected updated name Alpha_Updated, got %v", event.After["name"])
 	}
-	if event.After["toast_payload"] != unchangedToastMarker {
-		t.Errorf("expected unchanged toast marker, got %v", event.After["toast_payload"])
+	// An unchanged TOASTed column is not transmitted by the server, so it must
+	// be absent from After and reported in UnchangedColumns rather than
+	// carrying a placeholder value that would violate the column's type.
+	if _, present := event.After["toast_payload"]; present {
+		t.Errorf("unchanged TOAST column must be omitted from After, got %v", event.After["toast_payload"])
 	}
+	if !containsString(event.UnchangedColumns, "toast_payload") {
+		t.Errorf("expected toast_payload in UnchangedColumns, got %v", event.UnchangedColumns)
+	}
+
 }
 
 // Replicates upstream PostgreSQL truncate.sql multi-table and cascade semantics.

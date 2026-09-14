@@ -126,6 +126,16 @@ type ChangeEvent struct {
 	Before        map[string]any    `beam:"before" json:"before,omitempty"`
 	After         map[string]any    `beam:"after" json:"after,omitempty"`
 	ColumnTypes   map[string]uint32 `beam:"column_types" json:"column_types,omitempty"`
+
+	// UnchangedColumns lists columns the server did not transmit because the
+	// row's TOASTed value was not modified by this UPDATE.
+	//
+	// Such a column is absent from After rather than carrying a placeholder:
+	// a placeholder string is a type violation for a JSONB, NUMERIC or BIGINT
+	// column, and writing NULL would erase the stored value. The sink must
+	// omit these columns from the generated UPDATE so the existing value is
+	// preserved.
+	UnchangedColumns []string `beam:"unchanged_columns" json:"unchanged_columns,omitempty"`
 }
 
 // FullTableName returns the fully qualified schema.table name.
