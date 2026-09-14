@@ -22,7 +22,7 @@ limitations under the License.
 The PostgreSQL I/O connector provides high-throughput reading, writing, and streaming Change Data Capture (CDC) replication for PostgreSQL databases across Apache Beam SDKs (Go, Python, and Beam YAML).
 
 {{< paragraph class="note" >}}
-**Go SDK status: experimental.** The Go `postgresio` connector is unreleased and under active remediation. It has open defects that affect the source database, including a replication slot that is not acknowledged (write-ahead log accumulates on the primary) and TLS that is disabled by default. Review the [Known Limitations](https://github.com/apache/beam/blob/master/sdks/go/pkg/beam/io/postgresio/README.md#known-limitations) before using it. The Go examples below set `sslmode` explicitly because the connector does not enable TLS on its own.
+**Go SDK status: experimental.** The Go `postgresio` connector is unreleased. The defects that affected the source database have been addressed: the replication slot is acknowledged through bundle finalization, TLS is enabled by default (`sslmode=verify-full`), and SCRAM-SHA-256 authentication is supported. Open items remain, including the absence of a circuit breaker on replication slot lag and the lack of an automated initial backfill. Review the [Known Limitations](https://github.com/apache/beam/blob/master/sdks/go/pkg/beam/io/postgresio/README.md#known-limitations) before using it.
 {{< /paragraph >}}
 
 ## Supported Capabilities
@@ -65,9 +65,8 @@ func WriteOrders(s beam.Scope, orders beam.PCollection) {
         postgresio.WithDatabase("postgres"),
         postgresio.WithUsername("beam_test"),
         postgresio.WithPassword("beam_password"),
-        // TLS is only negotiated when sslmode is set. Use "verify-full" for any
-        // database reachable over a network; "disable" is acceptable only for a
-        // throwaway local instance.
+        // verify-full is the default. Set it explicitly only to weaken it,
+        // which is acceptable only for a throwaway local instance.
         postgresio.WithSSLMode("verify-full"),
         postgresio.WithPrimaryKeyColumns("order_id"),
         postgresio.WithWriteMode(postgresio.WriteModeUpsert),
@@ -114,8 +113,9 @@ changes := postgresio.ReadCDC(s,
     postgresio.WithCDCDatabase("postgres"),
     postgresio.WithCDCUsername("beam_test"),
     postgresio.WithCDCPassword("beam_password"),
-    // Without this the replication stream, including every row value in the
-    // write-ahead log, is sent in cleartext.
+    // verify-full is the default. Stated explicitly here because it is the
+    // setting that keeps row values from the write-ahead log off the wire in
+    // cleartext.
     postgresio.WithCDCSSLMode("verify-full"),
     postgresio.WithCDCSlotName("beam_cdc_slot"),
     postgresio.WithCDCPublication("beam_orders_pub"),

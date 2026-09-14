@@ -26,20 +26,31 @@ var validSlotRegex = regexp.MustCompile(`^[a-z0-9_]{1,63}$`)
 
 // CDCOptions configures the PostgreSQL CDC replication source.
 type CDCOptions struct {
-	Host                string
-	Port                int
-	Database            string
-	Username            string
-	Password            string `json:"password,omitempty"`
-	SSLMode             string
-	SSLRootCert         string
-	SSLCert             string
-	SSLKey              string
-	SlotName            string
-	Publication         string
-	StartLSN            uint64
-	HeartbeatInterval   time.Duration
-	StatusInterval      time.Duration
+	Host              string
+	Port              int
+	Database          string
+	Username          string
+	Password          string `json:"password,omitempty"`
+	SSLMode           string
+	SSLRootCert       string
+	SSLCert           string
+	SSLKey            string
+	SlotName          string
+	Publication       string
+	StartLSN          uint64
+	HeartbeatInterval time.Duration
+	StatusInterval    time.Duration
+
+	// CheckpointInterval bounds how long the source reads before returning
+	// from ProcessElement.
+	//
+	// Returning is what allows a bundle to finalize, and only a finalized
+	// bundle advances the replication slot, so this is the upper bound on
+	// acknowledgment latency on an idle database. Lowering it shortens the
+	// window in which the primary retains WAL; raising it reduces per-bundle
+	// overhead. Defaults to DefaultCheckpointInterval.
+	CheckpointInterval time.Duration
+
 	CreateSlotIfMissing bool
 	ReplicaIdentityFull bool
 	TokenProvider       TokenProvider `beam:"-" json:"-"`
@@ -58,10 +69,11 @@ type CDCOption func(*CDCOptions)
 // NewCDCOptions returns a CDCOptions struct initialized with production defaults.
 func NewCDCOptions(opts ...CDCOption) CDCOptions {
 	co := CDCOptions{
-		Port:              5432,
-		SSLMode:           DefaultSSLMode,
-		HeartbeatInterval: 10 * time.Second,
-		StatusInterval:    10 * time.Second,
+		Port:               5432,
+		SSLMode:            DefaultSSLMode,
+		HeartbeatInterval:  10 * time.Second,
+		StatusInterval:     10 * time.Second,
+		CheckpointInterval: DefaultCheckpointInterval,
 	}
 	for _, opt := range opts {
 		opt(&co)
@@ -69,6 +81,9 @@ func NewCDCOptions(opts ...CDCOption) CDCOptions {
 	// An option that explicitly clears the mode must not be read as "plaintext".
 	if co.SSLMode == "" {
 		co.SSLMode = DefaultSSLMode
+	}
+	if co.CheckpointInterval <= 0 {
+		co.CheckpointInterval = DefaultCheckpointInterval
 	}
 
 	if co.Password != "" && co.TokenProvider == nil {
@@ -214,9 +229,14 @@ func WithCDCStartLSN(lsn uint64) CDCOption {
 
 // WithCDCHeartbeatInterval sets the frequency at which keepalive status updates are sent.
 // Must be strictly less than wal_sender_timeout (default 60s).
+//
+// Both fields are set because the session prefers StatusInterval when
+// selecting its ticker period, and StatusInterval is non-zero by default.
+// Setting HeartbeatInterval alone would therefore have no effect.
 func WithCDCHeartbeatInterval(interval time.Duration) CDCOption {
 	return func(o *CDCOptions) {
 		o.HeartbeatInterval = interval
+		o.StatusInterval = interval
 	}
 }
 
@@ -226,6 +246,19 @@ func WithCDCStatusInterval(interval time.Duration) CDCOption {
 	return func(o *CDCOptions) {
 		o.StatusInterval = interval
 		o.HeartbeatInterval = interval
+	}
+}
+
+// WithCDCCheckpointInterval sets how long the source reads before returning
+// from ProcessElement so the bundle can finalize.
+//
+// This is the upper bound on how long the replication slot goes
+// unacknowledged when the database is idle, and therefore on how long the
+// primary retains WAL that the pipeline has already durably consumed. A
+// shorter interval reduces WAL retention at the cost of more, smaller bundles.
+func WithCDCCheckpointInterval(interval time.Duration) CDCOption {
+	return func(o *CDCOptions) {
+		o.CheckpointInterval = interval
 	}
 }
 

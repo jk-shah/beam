@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/apache/beam/sdks/v2/go/pkg/beam"
+	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/graph"
 )
 
 type mockBundleFinalizer struct {
@@ -65,6 +66,32 @@ func TestReadCDCPipelineGraphConstruction(t *testing.T) {
 	_ = p
 }
 
+// TestCDCSourceRegistersAsASplittableDoFn asserts the property directly rather
+// than inferring it from the absence of a panic during graph construction.
+//
+// If the SDK classified this as an ordinary DoFn, ProcessElement's
+// ProcessContinuation would be ignored, the source would run once to
+// completion, and the watermark estimator would never be consulted.
+func TestCDCSourceRegistersAsASplittableDoFn(t *testing.T) {
+	fn, err := graph.NewDoFn(
+		newCDCSourceFn(NewCDCOptions(
+			WithCDCSlotName("beam_test_slot"),
+			WithCDCPublication("test_pub"),
+		)),
+		graph.NumMainInputs(graph.MainSingle),
+	)
+	if err != nil {
+		t.Fatalf("the SDK rejected the CDC source as a DoFn: %v", err)
+	}
+	if !fn.IsSplittable() {
+		t.Error("the CDC source is not recognized as splittable; its ProcessContinuation would be ignored and it would never self-checkpoint")
+	}
+	sdfn := (*graph.SplittableDoFn)(fn)
+	if !sdfn.IsWatermarkEstimating() {
+		t.Error("the CDC source declares no watermark estimator to the SDK; downstream windows would never close")
+	}
+}
+
 func TestReadCDCPanicsOnInvalidSlotName(t *testing.T) {
 	defer func() {
 		if r := recover(); r == nil {
@@ -102,31 +129,42 @@ func TestCDCSourceFnExecutionWithMockStream(t *testing.T) {
 		beginPayload,
 		relPayload,
 		insertPayload,
+		// The Commit closes the transaction. Without it the source has only
+		// part of a transaction and is not permitted to acknowledge anything.
+		buildMockCommitPayload(500, 500, fixedTime),
 		keepAliveBuf.Bytes(),
 	)
+	// Stay connected once the scripted messages run out, so the source returns
+	// on its checkpoint interval rather than on end of stream. That keeps the
+	// session open for the acknowledgment assertions below.
+	mockStream.SetIdleWhenDrained(true)
 
 	opts := NewCDCOptions(
 		WithCDCSlotName("test_slot"),
 		WithCDCPublication("test_pub"),
 		WithCDCHeartbeatInterval(50*time.Millisecond),
+		WithCDCCheckpointInterval(150*time.Millisecond),
 		WithCDCStreamFactory(func(ctx context.Context, o CDCOptions) (ReplicationStream, error) {
 			return mockStream, nil
 		}),
 	)
 
 	fn := newCDCSourceFn(opts)
+	defer func() { _ = fn.Teardown() }()
 	bf := &mockBundleFinalizer{}
 
 	var emitted []ChangeEvent
-	emit := func(e ChangeEvent) {
+	emit := func(_ beam.EventTime, e ChangeEvent) {
 		emitted = append(emitted, e)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	err := fn.ProcessElement(ctx, bf, 1, emit)
-	if err != nil {
+	we := fn.CreateWatermarkEstimator()
+	rt := fn.CreateTracker(fn.CreateInitialRestriction(1))
+
+	if _, err := fn.ProcessElement(ctx, we, bf, rt, 1, emit); err != nil {
 		t.Fatalf("unexpected error executing cdcSourceFn: %v", err)
 	}
 
@@ -145,9 +183,23 @@ func TestCDCSourceFnExecutionWithMockStream(t *testing.T) {
 		t.Errorf("ChangeEventKeyFn mismatch: got %q, want %q", ChangeEventKeyFn(evt), evt.EventID)
 	}
 
-	// Finalize bundle: triggers callback advancing confirmedCommittedLSN
+	// The slot must not be acknowledged before the bundle's output is durable.
+	session := fn.currentSession()
+	if session == nil {
+		t.Fatal("expected the source to hold a session after ProcessElement")
+	}
+	if got := session.confirmedFlushLSN.Load(); got != 0 {
+		t.Fatalf("confirmed LSN advanced to %d before bundle finalization; "+
+			"acknowledging ahead of a durable commit loses data on restart", got)
+	}
+
+	// Finalize bundle: triggers callback advancing confirmedFlushLSN
 	if err := bf.FinalizeBundle(); err != nil {
 		t.Fatalf("failed to finalize bundle: %v", err)
+	}
+	if got := session.confirmedFlushLSN.Load(); got == 0 {
+		t.Fatal("confirmed LSN did not advance after bundle finalization; " +
+			"the replication slot would never be acknowledged and WAL would grow without bound")
 	}
 
 	// Verify that mockStream received status updates (both from keepalive reply and ticker)

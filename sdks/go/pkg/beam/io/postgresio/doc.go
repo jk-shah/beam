@@ -19,22 +19,28 @@
 //
 // # Status
 //
-// This package is unreleased and under active remediation. It is not ready for
-// production use. A security and correctness review identified defects that affect
-// the source database rather than only the pipeline:
+// This package is unreleased and experimental. The defects that affected the
+// source database rather than only the pipeline have been addressed:
 //
-//   - The replication slot is not acknowledged in production. ProcessElement does not
-//     return, so no bundle finalizes and the BundleFinalization callback that advances
-//     confirmed_flush_lsn never runs. Write-ahead log accumulates on the primary until
-//     its volume fills.
-//   - TLS is disabled by default. An unset sslmode skips negotiation entirely, so
-//     credentials are sent in cleartext, and no option exists for supplying a CA bundle.
-//   - SCRAM-SHA-256 is unsupported, so a default PostgreSQL 14+ server cannot be reached.
-//   - No watermark is produced, so downstream windows cannot close reliably.
-//   - There is no initial snapshot, so pre-existing rows are never emitted.
+//   - The replication slot is acknowledged. The source is an unbounded
+//     splittable DoFn that returns a ProcessContinuation at a bounded interval,
+//     so bundles finalize and the BundleFinalization callback advances
+//     confirmed_flush_lsn. A slot whose publication covers only quiet tables
+//     also advances on server keepalives, provided no transaction is partially
+//     received.
+//   - TLS is on by default (sslmode=verify-full) with options for a CA bundle
+//     and client certificates.
+//   - SCRAM-SHA-256 is supported, including channel binding.
+//   - A watermark is produced from transaction commit timestamps, and elements
+//     carry that timestamp as their event time, so downstream windows close.
+//   - Slot creation exports a consistent snapshot and publishes the isolation
+//     statements a backfill needs. Running that backfill is not yet part of
+//     the connector, so pre-existing rows still require a separate read.
 //
-// See the Known Limitations section of the package README for the full list and the
-// current state of each item.
+// Known open items include the UNNEST write path not setting a replication
+// origin, no circuit breaker on replication slot lag, and the connector being
+// built on lib/pq rather than pgx. See the Known Limitations section of the
+// package README for the full list and the current state of each item.
 //
 // # Key Capabilities
 //
@@ -55,12 +61,22 @@
 // (INSERT, UPDATE, DELETE, TRUNCATE) from PostgreSQL logical replication slots using a
 // native binary pgoutput wire decoder, eliminating Debezium and external JVM processes.
 //
-// 5. Decoupled Heartbeat & Checkpointing Design: Implements an asynchronous keepalive
-// goroutine sending StandbyStatusUpdate messages to prevent PostgreSQL wal_sender_timeout
-// (60s) drops during downstream backpressure. Confirmed FlushLSN is coordinated strictly
-// via Beam's BundleFinalizer so that no LSN is acknowledged for data Beam has not durably
-// committed. Note that this is the intended design; see Status above for the defect that
-// currently prevents the acknowledgment from advancing at all.
+// 5. Self-Checkpointing Source with Decoupled Heartbeat: The source is an unbounded
+// splittable DoFn whose ProcessElement returns a ProcessContinuation on a configurable
+// interval, so bundles finalize and the replication slot is acknowledged. An asynchronous
+// keepalive goroutine sends StandbyStatusUpdate messages to prevent PostgreSQL
+// wal_sender_timeout (60s) drops during downstream backpressure. The confirmed FlushLSN it
+// reports is advanced only from Beam's BundleFinalization callback, so no LSN is
+// acknowledged for data Beam has not durably committed.
+//
+// Checkpoints land only on transaction boundaries. pgoutput stamps every change in a
+// transaction with the LSN of its Begin record, and the restriction tracker addresses
+// positions as a single LSN, so a residual restriction created partway through a
+// transaction would resume past that shared LSN and PostgreSQL would not redeliver the
+// remainder. The checkpoint interval is therefore advisory while a transaction is open:
+// the invocation reads on to the Commit frame, bounded by a stall timeout that every
+// received frame resets. For the same reason, a transaction that is only partly received
+// is excluded from the acknowledgment candidate.
 //
 // 6. Stateful TOAST Reassembly (ReassembleToast): Automatically caches baseline tuples
 // in Beam runner state (state.Value[ChangeEvent]) and reassembles unmodified out-of-line

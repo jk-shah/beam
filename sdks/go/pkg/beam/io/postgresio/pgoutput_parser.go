@@ -70,11 +70,19 @@ type ColumnDef struct {
 
 // PgOutputParser parses binary pgoutput protocol messages into ChangeEvent objects.
 type PgOutputParser struct {
-	relations           map[uint32]*RelationDef
-	currentXID          uint32
-	currentLSN          uint64
-	currentTxTime       time.Time
-	currentOrigin       string
+	relations     map[uint32]*RelationDef
+	currentXID    uint32
+	currentLSN    uint64
+	currentTxTime time.Time
+	currentOrigin string
+	// inTransaction is true between a Begin ('B') and its matching Commit
+	// ('C') for an ordinary, non-streamed transaction.
+	//
+	// This is distinct from inStream, which covers streamed (in-progress)
+	// transactions only. Both conditions mean the parser has seen part of a
+	// transaction and not all of it, which is what determines whether the
+	// stream position is safe to acknowledge to the server.
+	inTransaction       bool
 	inStream            bool
 	spooledTransactions map[uint32][]*ChangeEvent
 	mu                  sync.RWMutex
@@ -124,6 +132,28 @@ func (p *PgOutputParser) GetRelation(relID uint32) (*RelationDef, bool) {
 	return rel, ok
 }
 
+// HasBufferedTransaction reports whether the parser has seen part of a
+// transaction but not all of it.
+//
+// Three cases qualify: an ordinary transaction whose Begin has arrived but
+// whose Commit has not, a streamed transaction that is open ('S' seen, no
+// commit or abort yet), and spooled events held for streamed transactions
+// that have not committed.
+//
+// The source consults this before treating a server keepalive's WAL position
+// as acknowledgeable. pgoutput transmits a non-streamed transaction only after
+// it commits, as Begin, changes, Commit, and the walsender can interleave a
+// keepalive between those frames. The keepalive's position is at or beyond the
+// transaction's commit LSN, so acknowledging it mid-transaction would tell the
+// server the transaction is consumed. If the worker then restarts before
+// receiving the remaining changes, the server does not resend them and those
+// rows are lost.
+func (p *PgOutputParser) HasBufferedTransaction() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.inTransaction || p.inStream || len(p.spooledTransactions) > 0
+}
+
 // ParseMessage decodes a single pgoutput frame payload.
 // If the message is part of a streamed transaction, mutations are buffered until
 // Stream Commit ('c'). Use ParseMessages for full multi-event streaming support.
@@ -166,6 +196,9 @@ func (p *PgOutputParser) ParseMessages(data []byte) ([]*ChangeEvent, error) {
 		p.currentLSN = finalLSN
 		p.currentTxTime = PgTimeToGo(commitTimeMicros)
 		p.txSeqByXID[xid] = 0
+		// The transaction is now partially received. Nothing between here and
+		// the matching Commit may be acknowledged to the server.
+		p.inTransaction = true
 		return nil, nil
 
 	case 'C': // Commit
@@ -188,6 +221,7 @@ func (p *PgOutputParser) ParseMessages(data []byte) ([]*ChangeEvent, error) {
 		// Release the counter; a long-lived stream would otherwise accumulate
 		// one map entry per transaction.
 		delete(p.txSeqByXID, p.currentXID)
+		p.inTransaction = false
 		return nil, nil
 
 	case 'R': // Relation

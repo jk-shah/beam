@@ -22,11 +22,11 @@
 `postgresio` is a native Apache Beam Go SDK I/O connector providing high-throughput writing, upserts, Apache Arrow columnar processing, and Change Data Capture (CDC) streaming for PostgreSQL. It operates without Java Virtual Machine (JVM) dependencies or cross-language serialization overhead.
 
 > [!WARNING]
-> **Status: unreleased and under active remediation. Not ready for production use.**
+> **Status: unreleased and experimental.**
 >
-> A security and correctness review identified defects that affect the *source database*, not only the pipeline. Two are worth knowing before you read further:
-> - The replication slot is never acknowledged in production, so **WAL accumulates without bound on the primary** until its volume fills.
-> - TLS is **off by default**, and SCRAM-SHA-256 is unsupported, so a default PostgreSQL 14+ server cannot be connected to at all.
+> The defects that affected the *source database* rather than only the pipeline have been fixed: the replication slot is acknowledged, TLS is on by default, and SCRAM-SHA-256 is supported. What remains open is narrower but still relevant to an operator:
+> - There is no circuit breaker on replication slot lag. A pipeline that stalls still causes the primary to retain WAL; the connector reports the lag as a metric but takes no action.
+> - The connector creates the slot and exports a consistent snapshot, but does not run the initial backfill itself, so pre-existing rows require a separate read.
 >
 > Read [Known Limitations](#known-limitations) and [Security & TLS Configuration](#security--tls-configuration) before running this against any database you care about.
 
@@ -206,8 +206,8 @@ sequenceDiagram
 ### B. Change Data Capture (CDC) Streaming Engine
 * **Pure Go `pgoutput` Binary Decoder with In-Flight Spooling**: Binary decoder implementing PostgreSQL's logical streaming replication protocol (`pgoutput`). Parses protocol frames directly into typed `ChangeEvent` structs. Uncommitted changes inside streamed transactions (`Stream Start 'S'`) are buffered in memory until `Stream Commit ('c')` and discarded on `Stream Abort ('A')`.
 * **Server-Side & Client-Side Origin Filtering**: Supports `WithCDCOriginFilter("none")`, negotiating `(origin 'none')` with PostgreSQL 16+ during `START_REPLICATION` and filtering non-local replication origin records on client workers.
-* **PostgreSQL Wire SSLRequest Negotiation**: Issues raw protocol handshake `80877103` prior to `StartupMessage`, establishing TLS via `tls.Client` before transmitting credentials or parameters. Handles cleartext and MD5 authentication. **SCRAM-SHA-256 is not yet supported**, which means default PostgreSQL 14+ installations are rejected with `unsupported authentication type 10`; TLS negotiation is also skipped entirely when `sslmode` is unset. See [Security & TLS Configuration](#security--tls-configuration) and [Known Limitations](#known-limitations).
-* **Decoupled Keepalive Heartbeat**: A dedicated background goroutine sends periodic `StandbyStatusUpdate` ('r') messages to prevent PostgreSQL's `wal_sender_timeout` (60s) from dropping the connection during downstream backpressure. **The acknowledged LSN does not currently advance in production.** `FlushLSN` is only moved forward by a `BundleFinalization` callback, and because `ProcessElement` does not return, no bundle ever finalizes — so the slot's `confirmed_flush_lsn` stays pinned at its starting value and WAL is never pruned. This is the connector's most serious outstanding defect; see [Known Limitations](#known-limitations).
+* **PostgreSQL Wire SSLRequest Negotiation**: Issues raw protocol handshake `80877103` prior to `StartupMessage`, establishing TLS via `tls.Client` before transmitting credentials or parameters. Handles cleartext, MD5, and SCRAM-SHA-256 authentication, including channel binding, so default PostgreSQL 14+ installations connect without configuration changes. `sslmode` defaults to `verify-full`. See [Security & TLS Configuration](#security--tls-configuration).
+* **Decoupled Keepalive Heartbeat**: A dedicated background goroutine sends periodic `StandbyStatusUpdate` ('r') messages to prevent PostgreSQL's `wal_sender_timeout` (60s) from dropping the connection during downstream backpressure. The goroutine is owned by the replication session, so it survives across `ProcessElement` calls and does not reconnect on every checkpoint. The `FlushLSN` it reports is advanced only from a `BundleFinalization` callback, and `ProcessElement` returns on a bounded interval so those bundles finalize. See [Checkpointing & Acknowledgment](#checkpointing--acknowledgment).
 * **Single-Consumer Slot Invariant with Auto-Partitioned Fanout**: Strictly maintains a single connection (`Parallelism = 1`) at the replication slot boundary (`active_pid` exclusivity), feeding downstream parallel worker clusters via `postgresio.PartitionByPrimaryKey` and `beam.Reshuffle`.
 * **Stateful Out-of-Line TOAST Reassembly**: Under `REPLICA IDENTITY DEFAULT`, unmodified large columns are omitted by PostgreSQL as `'u'`. `postgresio.ReassembleToast` uses Beam runner state (`state.Value[ChangeEvent]`) to cache baseline tuples and patch unmodified TOAST fields on `UPDATE` events.
 * **Dynamic Cloud IAM Token Renewal**: Integrates the `TokenProvider` interface to automatically refresh credentials across worker reconnects for AWS RDS IAM (15-min expiry) and Google Cloud SQL / AlloyDB (60-min expiry).
@@ -419,16 +419,48 @@ pipeline:
 | `WithCDCSlotName(string)` | `""` | Replication slot name (`^[a-z0-9_]{1,63}$`) |
 | `WithCDCPublication(string)` | `""` | Publication name |
 | `WithCDCStartLSN(uint64)` | `0` | Starting Log Sequence Number (LSN) |
-| `WithCDCHeartbeatInterval(Duration)` | `10s` | Frequency of StandbyStatusUpdate keepalives (<60s) |
+| `WithCDCHeartbeatInterval(Duration)` | `10s` | Frequency of StandbyStatusUpdate keepalives (`<60s`) |
+| `WithCDCCheckpointInterval(Duration)` | `5s` | How long the source reads before returning so the bundle can finalize. Upper bound on how long the slot goes unacknowledged when idle. Advisory while a transaction is open — see [Checkpointing](#checkpointing--acknowledgment). |
 | `WithCDCReplicaIdentityFull(bool)` | `false` | Signals source tables use `REPLICA IDENTITY FULL` |
 | `WithCDCTokenProvider(TokenProvider)` | `nil` | Dynamic credential refresh provider for IAM / OAuth2 |
 | `WithCDCDialFunc(DialFunc)` | `nil` | Custom network dialer |
-| `WithCDCSSLMode(string)` | `""` — see [Security](#security--tls-configuration) | `disable`, `require`, `verify-ca`, or `verify-full` |
+| `WithCDCSSLMode(string)` | `verify-full` — see [Security](#security--tls-configuration) | `disable`, `require`, `verify-ca`, or `verify-full` |
+
+### Checkpointing & Acknowledgment
+
+The source is an unbounded splittable DoFn. `ProcessElement` returns a
+`ProcessContinuation` so the bundle can finalize, and the replication slot's
+`confirmed_flush_lsn` is advanced only from the `BundleFinalization` callback.
+Nothing is acknowledged before the runner reports the corresponding output
+durable.
+
+Checkpoints land only on transaction boundaries. pgoutput stamps every change
+in a transaction with the LSN of its `BEGIN` record, and the restriction
+tracker addresses positions as a single LSN, so a residual restriction created
+partway through a transaction would resume past that shared LSN. PostgreSQL
+does not redeliver a transaction whose commit LSN precedes the requested start
+position, so the remainder would be lost.
+
+Two consequences:
+
+- `WithCDCCheckpointInterval` is advisory while a transaction is open. The
+  invocation reads on to the `COMMIT` frame. A stall timeout of two minutes
+  bounds this, and every frame received resets it, so a transaction of any
+  size completes as long as it keeps arriving.
+- A transaction that is only partly received — because the server ended the
+  copy stream, or the connection failed — is excluded from the acknowledgment
+  candidate. The slot stays at the last completed transaction and the server
+  redelivers the incomplete one.
+
+Server keepalives are acknowledgeable only when no transaction is open. This is
+what lets a slot whose publication covers only quiet tables keep up with global
+WAL, without acknowledging a position past records the parser is still holding.
 
 ### Security & TLS Configuration
 
-> [!CAUTION]
-> The current `sslmode` default is **not secure**. `NewCDCOptions` leaves `SSLMode` empty and the dial path treats an empty value as "skip TLS entirely", so the default configuration transmits replication traffic — including the credentials in the startup packet — in cleartext. `NewWriteOptions` defaults to `disable`. Set `sslmode` explicitly on every pipeline until this is fixed.
+`NewCDCOptions` defaults `sslmode` to `verify-full`. `verify-ca` is available
+for deployments whose DNS topology makes hostname verification impractical,
+such as private endpoints; it is not a performance optimization.
 
 Supported modes and what each one actually guarantees:
 
@@ -447,20 +479,21 @@ Google Cloud SQL documents `sslmode=verify-full` and added per-instance CAs and 
 
 ### Known Limitations
 
-The connector is unreleased and under active remediation. The defects below are confirmed and tracked; several affect database availability rather than only the pipeline.
+The connector is unreleased and experimental. The list below is what is still open; the [remediation acceptance suite](#remediation-acceptance-suite) covers the items that have been fixed and fails if any of them regresses.
 
 | Area | Limitation | Impact |
 | :--- | :--- | :--- |
-| **WAL retention** | The replication slot's `confirmed_flush_lsn` is not advanced in production. `ProcessElement` never returns, so the bundle never finalizes and the `BundleFinalization` callback that would advance the LSN never fires. | **WAL accumulates without bound on the primary.** The volume fills and the database PANICs. Do not point this at a production primary without independent monitoring of `pg_replication_slots`. |
-| **Transport security** | `sslmode` defaults to plaintext (see above). There is no `sslrootcert` option, so a private CA bundle cannot be supplied at all — certificate verification against AWS RDS or Cloud SQL is currently impossible, not merely disabled. | Credentials and replication data are exposed on the wire. |
-| **Authentication** | Only auth types 0 (ok), 3 (cleartext) and 5 (md5) are handled. SCRAM-SHA-256 returns `unsupported authentication type 10`. | Cannot connect to a default PostgreSQL 14+ installation. PostgreSQL 18 removes md5 entirely. |
-| **Watermarks** | The source declares no watermark estimator. | Downstream fixed and sliding windows cannot close reliably. Windowed aggregations over CDC output are not trustworthy. |
-| **Initial snapshot** | No slot creation and no snapshot bootstrap. `WithCDCCreateSlotIfMissing` is exported but inert. | Pre-existing table rows are never emitted, silently. Only changes occurring after startup appear. |
-| **Transaction ordering** | Events are spooled through an unordered `state.Bag` and emitted without sorting; the batch compactor resolves key collisions by arrival order rather than by LSN. | A replayed or reordered older change can overwrite a newer one, and the row is never corrected. |
-| **Type fidelity** | `NUMERIC` (OID 1700), `UUID` (2950) and `INTERVAL` (1186) have no binary-mode decoder. | These columns are emitted as raw `[]byte`. |
-| **TOAST** | Unchanged TOAST columns are represented by the literal string `"<unchanged_toast>"`; a cold-start cache miss converts it to `nil`. | Large column values can be silently nulled in the target. |
+| **Slot lag** | Replication slot lag is reported as the `cdc_slot_lag_bytes` metric, but nothing acts on it. A pipeline that stalls or is suspended keeps its slot, and the primary keeps retaining WAL. | The database can still run out of WAL volume if a stalled pipeline is left unattended. Alert on `pg_replication_slots` independently. |
+| **Long transactions** | A checkpoint cannot land partway through a transaction, so `WithCDCCheckpointInterval` is advisory while one is open. A single very large transaction extends the invocation until its `COMMIT` frame arrives. | Acknowledgment latency, and the memory the parser holds for a streamed transaction, both scale with the largest transaction on the source. A connection that stops delivering mid-transaction is dropped after two minutes of silence and the bundle is retried. |
+| **Initial backfill** | Slot creation exports a consistent snapshot and `SlotCreationResult.SnapshotIsolationStatements` returns the statements needed to read it, but the connector does not run the backfill. | Pre-existing table rows require a separate read. Only changes after the slot's creation point arrive through CDC. |
+| **Replication origin on the write path** | The staged `COPY` path sets a replication origin; the `UNNEST` fallback does not. | In a bi-directional topology, rows written through the fallback path are not distinguishable from user writes and can be replicated back. |
+| **Driver** | Built on `lib/pq`. The CDC path implements the replication protocol directly rather than through `pgx` / `pglogrepl`. | Protocol features not implemented here are unavailable, and the wire decoder is maintained in-tree. |
+| **DSN construction** | A password containing a space, single quote or backslash is not escaped when the DSN is assembled. | Such a password produces a connection failure or a misparsed DSN. |
+| **`search_path`** | The write path pins `search_path=pg_catalog,pg_temp` on every pooled connection to close CVE-2018-1058. | An unqualified table name in configuration will not resolve. Qualify table names as `schema.table`. |
+| **Failover slots** | `CREATE_REPLICATION_SLOT` does not request `failover 'true'`. | On PostgreSQL 17 and later the slot is not synchronized to a standby, so a failover loses the slot and its position. |
+| **Single consumer** | PostgreSQL admits one connection per replication slot, so the LSN restriction is never split. | Read throughput is bounded by one worker. Parallelism comes from `PartitionByPrimaryKey` downstream, not from the source. |
+| **Delivery semantics** | At-least-once. After a restart the server resumes from `confirmed_flush_lsn`, which can replay records the pipeline already emitted. | Downstream consumers must deduplicate. Each event carries a deterministic `EventID` for that purpose. |
 
-Each item has a test in the [remediation acceptance suite](#remediation-acceptance-suite) that fails until it is fixed.
 
 ---
 

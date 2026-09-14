@@ -26,6 +26,7 @@ import (
 
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -34,6 +35,29 @@ import (
 	"sync"
 	"time"
 )
+
+var (
+	// frameReadTimeout bounds how long a partially read protocol frame may
+	// take to complete. It is a transport-level failure detector, not an idle
+	// budget: the server has already begun a frame, so silence past this point
+	// means the connection is gone rather than quiet.
+	//
+	// A variable rather than a constant so tests can exercise the expiry
+	// without waiting a minute.
+	frameReadTimeout = 60 * time.Second
+
+	// standbyWriteTimeout bounds a standby status write. Without it, a write
+	// to an unresponsive primary blocks for the kernel's TCP retransmission
+	// budget, which stalls the keepalive goroutine and, through it, worker
+	// teardown.
+	standbyWriteTimeout = 10 * time.Second
+)
+
+// errStreamDesynchronized reports that a protocol frame was begun but not
+// completed. The connection cannot be reused: the unread remainder of the
+// frame would be misread as the next frame's header. Callers must treat this
+// as a connection failure and reconnect, never as an idle stream.
+var errStreamDesynchronized = errors.New("postgresio: replication frame did not complete")
 
 // ReplicationStream defines the abstraction for reading raw CopyData replication
 // frames and sending client keepalive acknowledgements.
@@ -54,6 +78,12 @@ type MockReplicationStream struct {
 	mu         sync.Mutex
 	closed     bool
 	blockUntil chan struct{}
+
+	// idleWhenDrained makes NextMessage block until the caller's deadline once
+	// the scripted messages are exhausted, instead of reporting end of stream.
+	// That models a connected but quiet database, which is the condition under
+	// which a source must still return so its bundle can finalize.
+	idleWhenDrained bool
 }
 
 // NewMockReplicationStream creates a mock replication stream initialized with the given messages.
@@ -64,18 +94,33 @@ func NewMockReplicationStream(messages ...[]byte) *MockReplicationStream {
 	}
 }
 
+// SetIdleWhenDrained controls what the stream does after its scripted messages
+// run out: block until the read deadline (true) or report io.EOF (false).
+func (m *MockReplicationStream) SetIdleWhenDrained(idle bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.idleWhenDrained = idle
+}
+
 // NextMessage returns the next configured message or io.EOF.
 func (m *MockReplicationStream) NextMessage(ctx context.Context) ([]byte, error) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.closed {
+		m.mu.Unlock()
 		return nil, io.EOF
 	}
 	if m.msgIdx >= len(m.messages) {
-		return nil, io.EOF
+		idle := m.idleWhenDrained
+		m.mu.Unlock()
+		if !idle {
+			return nil, io.EOF
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
 	}
 	msg := m.messages[m.msgIdx]
 	m.msgIdx++
+	m.mu.Unlock()
 	return msg, nil
 }
 
@@ -631,10 +676,51 @@ func sanitizeErrorPayload(payload []byte) string {
 }
 
 func (s *NativeReplicationStream) readRawMessage() (byte, []byte, error) {
+	return s.readRawMessageBefore(time.Time{})
+}
+
+// readRawMessageBefore reads one protocol frame, waiting no later than
+// idleDeadline for the frame to begin.
+//
+// idleDeadline covers only the frame's first byte, and a zero value means wait
+// indefinitely, which is the behaviour the handshake path requires. Expiry
+// there is benign: no bytes were consumed, so the connection is still framed on
+// a message boundary and the caller can come back later.
+//
+// Once the first byte has been consumed the deadline changes meaning. It
+// becomes frameReadTimeout, a hard transport timeout, for two reasons. It must
+// not remain at idleDeadline, because a read that expires midway through a
+// frame leaves the connection desynchronized: the unread tail would be parsed
+// as the next frame's header. It must also not be cleared, because io.ReadFull
+// does not observe context cancellation, so a silently dropped TCP connection
+// would block the read, and therefore ProcessElement, forever.
+//
+// A mid-frame expiry is reported as errStreamDesynchronized so callers do not
+// mistake it for an idle stream. The connection is unusable at that point and
+// the only correct recovery is to drop it and reconnect.
+func (s *NativeReplicationStream) readRawMessageBefore(idleDeadline time.Time) (byte, []byte, error) {
 	header := make([]byte, 5)
-	if _, err := io.ReadFull(s.conn, header); err != nil {
+
+	if !idleDeadline.IsZero() {
+		if err := s.conn.SetReadDeadline(idleDeadline); err != nil {
+			return 0, nil, err
+		}
+		if _, err := io.ReadFull(s.conn, header[:1]); err != nil {
+			_ = s.conn.SetReadDeadline(time.Time{})
+			return 0, nil, err
+		}
+	} else if _, err := io.ReadFull(s.conn, header[:1]); err != nil {
 		return 0, nil, err
 	}
+
+	defer func() { _ = s.conn.SetReadDeadline(time.Time{}) }()
+	if err := s.conn.SetReadDeadline(time.Now().Add(frameReadTimeout)); err != nil {
+		return 0, nil, err
+	}
+	if _, err := io.ReadFull(s.conn, header[1:]); err != nil {
+		return 0, nil, fmt.Errorf("%w: header incomplete: %v", errStreamDesynchronized, err)
+	}
+
 	msgType := header[0]
 	msgLen := binary.BigEndian.Uint32(header[1:5])
 	if msgLen < 4 {
@@ -643,18 +729,32 @@ func (s *NativeReplicationStream) readRawMessage() (byte, []byte, error) {
 	payloadLen := int(msgLen - 4)
 	payload := make([]byte, payloadLen)
 	if _, err := io.ReadFull(s.conn, payload); err != nil {
-		return 0, nil, err
+		return 0, nil, fmt.Errorf("%w: payload of %d bytes incomplete: %v", errStreamDesynchronized, payloadLen, err)
 	}
 	return msgType, payload, nil
 }
 
 // NextMessage reads the next CopyData ('d') replication message.
+//
+// A deadline on ctx bounds how long this blocks waiting for data. The source
+// relies on that: it is a self-checkpointing splittable DoFn, and a read that
+// blocked indefinitely would stop ProcessElement from ever returning, which in
+// turn would stop bundles from finalizing and the replication slot from being
+// acknowledged.
 func (s *NativeReplicationStream) NextMessage(ctx context.Context) ([]byte, error) {
 	s.readMu.Lock()
 	defer s.readMu.Unlock()
 
+	var idleDeadline time.Time
+	if dl, ok := ctx.Deadline(); ok {
+		idleDeadline = dl
+	}
+
 	for {
-		msgType, payload, err := s.readRawMessage()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		msgType, payload, err := s.readRawMessageBefore(idleDeadline)
 		if err != nil {
 			return nil, err
 		}
@@ -680,6 +780,16 @@ func (s *NativeReplicationStream) SendStandbyStatus(ctx context.Context, status 
 	packet[0] = 'd'
 	binary.BigEndian.PutUint32(packet[1:5], uint32(len(packet)-1))
 	copy(packet[5:], body)
+
+	// The write deadline is what keeps worker shutdown bounded. This is called
+	// from the session's keepalive goroutine, and a bare Write on an
+	// unresponsive TCP connection blocks until the kernel gives up, which can
+	// exceed ten minutes. Teardown waits for that goroutine, so without a
+	// deadline an unreachable primary stalls the whole worker.
+	if err := s.conn.SetWriteDeadline(time.Now().Add(standbyWriteTimeout)); err != nil {
+		return err
+	}
+	defer func() { _ = s.conn.SetWriteDeadline(time.Time{}) }()
 
 	_, err := s.conn.Write(packet)
 	return err
