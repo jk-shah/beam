@@ -45,7 +45,6 @@
    - [Native Go Write & Upsert](#native-go-write--upsert)
    - [Native Go CDC Streaming](#native-go-cdc-streaming)
    - [Declarative Beam YAML Pipelines](#declarative-beam-yaml-pipelines)
-   - [Multi-Language Python & Java Integration](#multi-language-python--java-integration)
 4. [Configuration Reference](#4-configuration-reference)
    - [WriteOptions](#writeoptions)
    - [CDCOptions](#cdcoptions)
@@ -98,7 +97,7 @@
 |                     Beam Go SchemaTransform & Expansion Service                   |
 |  - URN: beam:schematransform:org.apache.beam:postgres_write:v1                    |
 |  - URN: beam:schematransform:org.apache.beam:postgres_read:v1                     |
-|  - Cross-Language Portability (Beam YAML, Python SDK, Java SDK)                   |
+|  - Cross-Language Portability (Beam YAML, Python SDK)                             |
 +-----------------------------------------------------------------------------------+
 ```
 
@@ -223,7 +222,7 @@ sequenceDiagram
 * **Standard URNs**:
   * Write: `beam:schematransform:org.apache.beam:postgres_write:v1`
   * Read (CDC): `beam:schematransform:org.apache.beam:postgres_read:v1`
-* **Expansion Service**: Serves the gRPC `ExpansionService` protocol, allowing Beam YAML, Python, and Java pipelines to execute Go-native PostgreSQL transforms.
+* **Expansion Service**: Serves the gRPC `ExpansionService` protocol, allowing Beam YAML and Python pipelines to execute Go-native PostgreSQL transforms. Any Beam SDK that speaks the expansion protocol can connect, but only the YAML and Python paths are covered by tests in this contribution.
 
 ### E. Multi-Architecture Toolchain & Cross-Platform Stager
 * **Static Pure Go Compiler**: Enforces `CGO_ENABLED=0`, `-tags "netgo osusergo static_build"`, and `-ldflags "-s -w -extldflags '-static'"`.

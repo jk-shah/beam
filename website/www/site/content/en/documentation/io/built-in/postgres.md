@@ -19,7 +19,7 @@ limitations under the License.
 
 # PostgreSQL I/O
 
-The PostgreSQL I/O connector provides high-throughput reading, writing, and streaming Change Data Capture (CDC) replication for PostgreSQL databases across Apache Beam SDKs (Go, Java, Python, and Beam YAML).
+The PostgreSQL I/O connector provides high-throughput reading, writing, and streaming Change Data Capture (CDC) replication for PostgreSQL databases across Apache Beam SDKs (Go, Python, and Beam YAML).
 
 {{< paragraph class="note" >}}
 **Go SDK status: experimental.** The Go `postgresio` connector is unreleased and under active remediation. It has open defects that affect the source database, including a replication slot that is not acknowledged (write-ahead log accumulates on the primary) and TLS that is disabled by default. Review the [Known Limitations](https://github.com/apache/beam/blob/master/sdks/go/pkg/beam/io/postgresio/README.md#known-limitations) before using it. The Go examples below set `sslmode` explicitly because the connector does not enable TLS on its own.
@@ -27,13 +27,16 @@ The PostgreSQL I/O connector provides high-throughput reading, writing, and stre
 
 ## Supported Capabilities
 
-| Capability | Go SDK | Java SDK | Python SDK (Cross-Language) | Beam YAML |
-| :--- | :--- | :--- | :--- | :--- |
-| **Batch Reading** | Experimental | Supported | Supported | Supported |
-| **Batch / Streaming Upsert** | Experimental (`UNNEST` array upsert) | Supported (Staged `COPY` / `UNNEST`) | Supported | Supported |
-| **Change Data Capture (CDC)** | Experimental (Pure Go `pgoutput`) | Supported (`pgoutput` via JDBC) | Supported | Supported |
-| **Vectorized Columnar Engine**| Experimental (Apache Arrow) | Supported (SIMD VarHandle) | Supported | N/A |
-| **Dead-Letter Queue (DLQ)** | Experimental (`FailedRow`) | Supported (`TupleTag`) | Supported (`TaggedOutput`) | Supported |
+The Python and Beam YAML surfaces call the Go connector through the Go
+expansion service, so their maturity is bounded by the Go implementation's.
+
+| Capability | Go SDK | Python SDK (Cross-Language) | Beam YAML |
+| :--- | :--- | :--- | :--- |
+| **Batch Reading** | Experimental | Experimental | Experimental |
+| **Batch / Streaming Upsert** | Experimental (`UNNEST` array upsert) | Experimental | Experimental |
+| **Change Data Capture (CDC)** | Experimental (Pure Go `pgoutput`) | Experimental | Experimental |
+| **Vectorized Columnar Engine**| Experimental (Apache Arrow) | Experimental | N/A |
+| **Dead-Letter Queue (DLQ)** | Experimental (`FailedRow`) | Experimental (`TaggedOutput`) | Experimental |
 
 ---
 
