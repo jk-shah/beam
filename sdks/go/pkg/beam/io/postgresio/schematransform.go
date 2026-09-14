@@ -18,6 +18,7 @@ package postgresio
 import (
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/apache/beam/sdks/v2/go/pkg/beam"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/schematransform"
@@ -41,7 +42,7 @@ type PostgreSqlWriteConfig struct {
 	Host              string   `beam:"host" doc:"PostgreSQL database server hostname or IP address."`
 	Port              int32    `beam:"port" doc:"PostgreSQL database server port (default: 5432)."`
 	Database          string   `beam:"database" doc:"Target PostgreSQL database name."`
-	Table             string   `beam:"table" doc:"Target PostgreSQL table name."`
+	Table             string   `beam:"table" doc:"Target PostgreSQL table, schema-qualified (for example public.orders)."`
 	Username          string   `beam:"username" doc:"Authentication username."`
 	Password          string   `beam:"password,secret" doc:"Authentication password."`
 	SSLMode           string   `beam:"sslmode" doc:"SSL mode (e.g. disable, require, verify-ca, verify-full)."`
@@ -66,6 +67,13 @@ func (c PostgreSqlWriteConfig) Validate() error {
 	}
 	if c.Table == "" {
 		return errors.New("table cannot be empty")
+	}
+	// The sink pins search_path to pg_catalog,pg_temp on every pooled
+	// connection, so an unqualified name cannot resolve to a user table.
+	// Reporting it here returns a structured error to the calling SDK rather
+	// than letting the native Write panic during expansion.
+	if !strings.Contains(c.Table, ".") {
+		return fmt.Errorf("table %q must be schema-qualified, for example %q", c.Table, "public."+c.Table)
 	}
 	if c.Username == "" {
 		return errors.New("username cannot be empty")

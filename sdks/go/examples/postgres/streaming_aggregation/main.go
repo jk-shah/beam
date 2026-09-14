@@ -22,12 +22,12 @@
 // commands that scan whole tables, spike database CPU, and cause write lock contention.
 //
 // This pipeline acts as an off-database incremental computation engine:
-// 1. Ingests financial transactions from a PostgreSQL CDC stream (ReadCDC).
-// 2. Windows events into 1-minute fixed intervals.
-// 3. Computes rolling aggregates (count, total amount, max amount) while tracking the maximum LSN.
-// 4. Sinks the rollups into an analytics table using staged COPY upsert (Write).
-// 5. Stores `last_applied_lsn` (PG_LSN) and `last_tx_time`, allowing dashboard queries to verify
-//    data freshness and calculate replication lag using `pg_wal_lsn_diff(pg_current_wal_lsn(), last_applied_lsn)`.
+//  1. Ingests financial transactions from a PostgreSQL CDC stream (ReadCDC).
+//  2. Windows events into 1-minute fixed intervals.
+//  3. Computes rolling aggregates (count, total amount, max amount) while tracking the maximum LSN.
+//  4. Sinks the rollups into an analytics table using staged COPY upsert (Write).
+//  5. Stores `last_applied_lsn` (PG_LSN) and `last_tx_time`, allowing dashboard queries to verify
+//     data freshness and calculate replication lag using `pg_wal_lsn_diff(pg_current_wal_lsn(), last_applied_lsn)`.
 //
 // Target PostgreSQL Schema:
 //

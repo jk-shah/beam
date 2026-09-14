@@ -190,7 +190,7 @@ func main() {
 		PrimaryKeyCols: []string{"payment_id"},
 		BatchSize:      1000,
 	}
-	cleanResult := postgresio.Write(s, "clean_payments", cleanWriteOpts, validPCol)
+	cleanResult := postgresio.Write(s, "public.clean_payments", cleanWriteOpts, validPCol)
 	_ = cleanResult.FailedRows
 
 	// Sink 2: Rejected records routed to PostgreSQL Dead-Letter Queue table
@@ -204,7 +204,7 @@ func main() {
 		PrimaryKeyCols: []string{"payment_id"},
 		BatchSize:      1000,
 	}
-	dlqResult := postgresio.Write(s, "dead_letter_payments", dlqWriteOpts, dlqPCol)
+	dlqResult := postgresio.Write(s, "public.dead_letter_payments", dlqWriteOpts, dlqPCol)
 	_ = dlqResult.FailedRows
 
 	if err := beamx.Run(ctx, p); err != nil {

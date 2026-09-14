@@ -160,9 +160,9 @@ func main() {
 
 	// Target Table Records (e.g. Downstream Reporting Warehouse)
 	targetData := []TableRecord{
-		{RecordID: "REC-101", Checksum: "a1b2c3d4", Payload: `{"tier":"GOLD","credit":5000}`},        // Match
+		{RecordID: "REC-101", Checksum: "a1b2c3d4", Payload: `{"tier":"GOLD","credit":5000}`},         // Match
 		{RecordID: "REC-102", Checksum: "DIFFERENT_HASH", Payload: `{"tier":"SILVER","credit":1500}`}, // Value Drift
-		{RecordID: "REC-103", Checksum: "i9j0k1l2", Payload: `{"tier":"PLATINUM","credit":10000}`},   // Match
+		{RecordID: "REC-103", Checksum: "i9j0k1l2", Payload: `{"tier":"PLATINUM","credit":10000}`},    // Match
 		{RecordID: "REC-105", Checksum: "q7r8s9t0", Payload: `{"tier":"GUEST","credit":500}`},         // Missing in Source
 	}
 	targetCol := beam.CreateList(s, targetData)

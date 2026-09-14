@@ -255,6 +255,34 @@ func WithReplicationOriginName(originName string) Option {
 	}
 }
 
+// quoteDSNValue renders a value for a libpq keyword/value connection string.
+//
+// libpq requires a value to be single-quoted when it is empty or contains
+// whitespace, and requires a backslash before any single quote or backslash
+// within it. Quoting unconditionally is simpler and equally valid, because an
+// unquoted value and its quoted form parse identically.
+//
+// Leaving a value unquoted has two consequences. The value is truncated at its
+// first space, so a password containing a space authenticates with the wrong
+// credential and the operator sees an authentication failure rather than a
+// configuration error. The discarded remainder is then parsed as further
+// connection keywords, which lets a value introduce settings the caller never
+// asked for, such as sslrootcert. Redirecting the trust anchor defeats
+// certificate verification even under sslmode=verify-full.
+func quoteDSNValue(v string) string {
+	var b strings.Builder
+	b.Grow(len(v) + 2)
+	b.WriteByte('\'')
+	for i := 0; i < len(v); i++ {
+		if v[i] == '\\' || v[i] == '\'' {
+			b.WriteByte('\\')
+		}
+		b.WriteByte(v[i])
+	}
+	b.WriteByte('\'')
+	return b.String()
+}
+
 // SanitizeIdentifier validates that an identifier conforms to PostgreSQL naming rules,
 // rejects null bytes (\0) and quotation marks to prevent SQL injection, and wraps the
 // identifier in double quotes.

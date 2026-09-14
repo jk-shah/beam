@@ -36,6 +36,13 @@
 //   - Slot creation exports a consistent snapshot and publishes the isolation
 //     statements a backfill needs. Running that backfill is not yet part of
 //     the connector, so pre-existing rows still require a separate read.
+//   - Connection string values are escaped, so a credential containing a
+//     space, quote or backslash is transmitted intact and cannot introduce
+//     connection keywords the caller did not set.
+//   - Slots can be created with FAILOVER on PostgreSQL 17 and later via
+//     WithCDCFailoverSlot, so a logical consumer keeps its position across a
+//     failover. It is off by default because it makes pipeline latency
+//     depend on physical standby replication.
 //
 // Known open items include the UNNEST write path not setting a replication
 // origin, no circuit breaker on replication slot lag, and the connector being
@@ -47,6 +54,12 @@
 // 1. Parameterized UNNEST Array Upserts: Executes high-throughput bulk inserts
 // and idempotent upserts (INSERT INTO ... ON CONFLICT DO UPDATE) using vectorized
 // array parameters, eliminating system catalog lock contention (pg_class, pg_attribute).
+//
+// Every pooled connection pins search_path to pg_catalog,pg_temp to close
+// CVE-2018-1058, so an unqualified relation name cannot resolve to a user
+// table. Table names must be given as schema.table; Write rejects an
+// unqualified name when the pipeline is constructed rather than letting a
+// worker fail later with "relation does not exist".
 //
 // 2. Deadlock Elimination (Anti-40P01): Employs an in-memory BatchCompactor that
 // deduplicates micro-batches via Last-Write-Wins (LWW) and sorts records canonically

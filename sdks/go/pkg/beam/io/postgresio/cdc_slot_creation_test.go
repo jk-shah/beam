@@ -28,7 +28,13 @@ func TestBuildCreateSlotQuery(t *testing.T) {
 		plugin         string
 		exportSnapshot bool
 		twoPhase       bool
-		want           string
+		failover       bool
+
+		// serverMajorVersion only matters when failover is requested; the
+		// legacy syntax is accepted by every supported server.
+		serverMajorVersion int
+
+		want string
 	}{
 		{
 			name:           "default plugin with exported snapshot",
@@ -59,11 +65,30 @@ func TestBuildCreateSlotQuery(t *testing.T) {
 			exportSnapshot: false,
 			want:           "CREATE_REPLICATION_SLOT wal2json_slot LOGICAL wal2json NOEXPORT_SNAPSHOT",
 		},
+		{
+			name:               "failover uses the parenthesized option list",
+			slot:               "beam_failover",
+			plugin:             "pgoutput",
+			exportSnapshot:     true,
+			failover:           true,
+			serverMajorVersion: 17,
+			want:               "CREATE_REPLICATION_SLOT beam_failover LOGICAL pgoutput (FAILOVER, SNAPSHOT 'export')",
+		},
+		{
+			name:               "failover combines with two phase",
+			slot:               "beam_failover_2pc",
+			plugin:             "pgoutput",
+			exportSnapshot:     false,
+			twoPhase:           true,
+			failover:           true,
+			serverMajorVersion: 18,
+			want:               "CREATE_REPLICATION_SLOT beam_failover_2pc LOGICAL pgoutput (FAILOVER, TWO_PHASE, SNAPSHOT 'nothing')",
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := buildCreateSlotQuery(tc.slot, tc.plugin, tc.exportSnapshot, tc.twoPhase)
+			got, err := buildCreateSlotQuery(tc.slot, tc.plugin, tc.exportSnapshot, tc.twoPhase, tc.failover, tc.serverMajorVersion)
 			if err != nil {
 				t.Fatalf("buildCreateSlotQuery returned error: %v", err)
 			}
@@ -93,7 +118,7 @@ func TestBuildCreateSlotQueryRejectsInjection(t *testing.T) {
 
 	for _, slot := range bad {
 		t.Run(slot, func(t *testing.T) {
-			if _, err := buildCreateSlotQuery(slot, "pgoutput", true, false); err == nil {
+			if _, err := buildCreateSlotQuery(slot, "pgoutput", true, false, false, 0); err == nil {
 				t.Errorf("buildCreateSlotQuery(%q) accepted an invalid slot name; "+
 					"the name is interpolated unquoted, so this is a command injection vector", slot)
 			}
@@ -101,14 +126,14 @@ func TestBuildCreateSlotQueryRejectsInjection(t *testing.T) {
 	}
 
 	// A 63-character name is exactly at the limit and must be accepted.
-	if _, err := buildCreateSlotQuery(strings.Repeat("a", 63), "pgoutput", true, false); err != nil {
+	if _, err := buildCreateSlotQuery(strings.Repeat("a", 63), "pgoutput", true, false, false, 0); err != nil {
 		t.Errorf("63-character slot name was rejected: %v", err)
 	}
 }
 
 func TestBuildCreateSlotQueryRejectsInvalidPlugin(t *testing.T) {
 	for _, plugin := range []string{"pgoutput; DROP TABLE t", "pg output", "1plugin", "plug\"in"} {
-		if _, err := buildCreateSlotQuery("beam_slot", plugin, true, false); err == nil {
+		if _, err := buildCreateSlotQuery("beam_slot", plugin, true, false, false, 0); err == nil {
 			t.Errorf("buildCreateSlotQuery accepted invalid output plugin %q", plugin)
 		}
 	}
@@ -258,5 +283,26 @@ func TestEscapeSQLLiteral(t *testing.T) {
 		if got := escapeSQLLiteral(tc.in); got != tc.want {
 			t.Errorf("escapeSQLLiteral(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// TestFailoverSlotRequiresPostgres17 checks that an unsupported server is an
+// error rather than a silent downgrade.
+//
+// The point of the option is a slot that survives failover. Creating a slot
+// that does not, and reporting success, would leave the operator believing in
+// a guarantee they do not have — and they would only discover otherwise during
+// the failover itself.
+func TestFailoverSlotRequiresPostgres17(t *testing.T) {
+	for _, version := range []int{13, 14, 15, 16} {
+		_, err := buildCreateSlotQuery("beam_slot", "pgoutput", true, false, true, version)
+		if err == nil {
+			t.Errorf("buildCreateSlotQuery accepted a failover slot on PostgreSQL %d; "+
+				"the server would reject the option and the slot would silently not survive a failover", version)
+		}
+	}
+
+	if _, err := buildCreateSlotQuery("beam_slot", "pgoutput", true, false, true, 17); err != nil {
+		t.Errorf("buildCreateSlotQuery rejected a failover slot on PostgreSQL 17: %v", err)
 	}
 }

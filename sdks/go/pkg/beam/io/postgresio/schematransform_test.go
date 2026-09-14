@@ -35,7 +35,7 @@ func TestPostgreSqlWriteConfig_Validation(t *testing.T) {
 				Host:     "localhost",
 				Port:     5432,
 				Database: "testdb",
-				Table:    "users",
+				Table:    "public.users",
 				Username: "testuser",
 			},
 			expectErr: false,
@@ -44,7 +44,7 @@ func TestPostgreSqlWriteConfig_Validation(t *testing.T) {
 			name: "missing host",
 			cfg: PostgreSqlWriteConfig{
 				Database: "testdb",
-				Table:    "users",
+				Table:    "public.users",
 				Username: "testuser",
 			},
 			expectErr: true,
@@ -53,7 +53,7 @@ func TestPostgreSqlWriteConfig_Validation(t *testing.T) {
 			name: "missing database",
 			cfg: PostgreSqlWriteConfig{
 				Host:     "localhost",
-				Table:    "users",
+				Table:    "public.users",
 				Username: "testuser",
 			},
 			expectErr: true,
@@ -72,7 +72,21 @@ func TestPostgreSqlWriteConfig_Validation(t *testing.T) {
 			cfg: PostgreSqlWriteConfig{
 				Host:     "localhost",
 				Database: "testdb",
+				Table:    "public.users",
+			},
+			expectErr: true,
+		},
+		{
+			// The sink pins search_path to pg_catalog,pg_temp, so an
+			// unqualified name cannot resolve to a user table. Rejecting it
+			// during validation keeps the failure inside the SchemaTransform
+			// error channel instead of surfacing as a panic during expansion.
+			name: "unqualified table",
+			cfg: PostgreSqlWriteConfig{
+				Host:     "localhost",
+				Database: "testdb",
 				Table:    "users",
+				Username: "testuser",
 			},
 			expectErr: true,
 		},
@@ -225,7 +239,7 @@ func TestPostgreSqlWriteTransform_BuildTransform(t *testing.T) {
 		Host:         "localhost",
 		Port:         5432,
 		Database:     "testdb",
-		Table:        "users",
+		Table:        "public.users",
 		Username:     "testuser",
 		ConflictKeys: []string{"id"},
 	}
@@ -306,7 +320,7 @@ func TestPostgreSqlSchemaTransformProviders_MetadataAndFactory(t *testing.T) {
 	writeCfg := PostgreSqlWriteConfig{
 		Host:     "localhost",
 		Database: "testdb",
-		Table:    "users",
+		Table:    "public.users",
 		Username: "beam_test",
 	}
 	tf, err := wp.CreateTransform(writeCfg)

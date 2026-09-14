@@ -53,13 +53,27 @@ func (r SlotCreationResult) SnapshotIsolationStatements() []string {
 	}
 }
 
+// minFailoverSlotVersion is the first PostgreSQL major version whose
+// CREATE_REPLICATION_SLOT accepts the FAILOVER option.
+const minFailoverSlotVersion = 17
+
 // buildCreateSlotQuery returns the CREATE_REPLICATION_SLOT command.
 //
 // EXPORT_SNAPSHOT asks the server to retain a snapshot at the slot's starting
 // LSN so an initial backfill can read a consistent view of the tables. The
 // TWO_PHASE option is only emitted when requested, because it requires
 // PostgreSQL 15 or newer.
-func buildCreateSlotQuery(slotName, plugin string, exportSnapshot, twoPhase bool) (string, error) {
+//
+// Two command syntaxes exist. The legacy positional form is used by default
+// because every supported server accepts it. PostgreSQL 15 introduced a
+// parenthesized option list, and the FAILOVER option added in PostgreSQL 17
+// exists only there, so requesting failover selects that form.
+//
+// A failover request against an older server is an error rather than a silent
+// downgrade. The whole point of the option is that the slot survives a
+// failover; creating a slot that does not, and reporting success, would leave
+// the operator believing in a guarantee they do not have.
+func buildCreateSlotQuery(slotName, plugin string, exportSnapshot, twoPhase, failover bool, serverMajorVersion int) (string, error) {
 	if !validSlotRegex.MatchString(slotName) {
 		return "", fmt.Errorf("invalid replication slot name %q: must match ^[a-z0-9_]{1,63}$", slotName)
 	}
@@ -76,14 +90,36 @@ func buildCreateSlotQuery(slotName, plugin string, exportSnapshot, twoPhase bool
 	sb.WriteString(" LOGICAL ")
 	sb.WriteString(plugin)
 
+	if !failover {
+		if twoPhase {
+			sb.WriteString(" TWO_PHASE")
+		}
+		if exportSnapshot {
+			sb.WriteString(" EXPORT_SNAPSHOT")
+		} else {
+			sb.WriteString(" NOEXPORT_SNAPSHOT")
+		}
+		return sb.String(), nil
+	}
+
+	if serverMajorVersion < minFailoverSlotVersion {
+		return "", fmt.Errorf(
+			"failover replication slots require PostgreSQL %d or newer, server reports major version %d",
+			minFailoverSlotVersion, serverMajorVersion)
+	}
+
+	opts := []string{"FAILOVER"}
 	if twoPhase {
-		sb.WriteString(" TWO_PHASE")
+		opts = append(opts, "TWO_PHASE")
 	}
 	if exportSnapshot {
-		sb.WriteString(" EXPORT_SNAPSHOT")
+		opts = append(opts, "SNAPSHOT 'export'")
 	} else {
-		sb.WriteString(" NOEXPORT_SNAPSHOT")
+		opts = append(opts, "SNAPSHOT 'nothing'")
 	}
+	sb.WriteString(" (")
+	sb.WriteString(strings.Join(opts, ", "))
+	sb.WriteString(")")
 
 	return sb.String(), nil
 }

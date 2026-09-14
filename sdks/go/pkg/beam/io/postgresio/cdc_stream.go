@@ -596,7 +596,8 @@ func (s *NativeReplicationStream) SlotCreation() *SlotCreationResult {
 // only produced at creation time. Callers must therefore not assume
 // SlotCreation() is non-nil.
 func (s *NativeReplicationStream) ensureReplicationSlot() error {
-	query, err := buildCreateSlotQuery(s.opts.SlotName, "pgoutput", true, s.opts.TwoPhaseCommit)
+	query, err := buildCreateSlotQuery(s.opts.SlotName, "pgoutput", true, s.opts.TwoPhaseCommit,
+		s.opts.FailoverSlot, s.serverMajorVersion)
 	if err != nil {
 		return err
 	}

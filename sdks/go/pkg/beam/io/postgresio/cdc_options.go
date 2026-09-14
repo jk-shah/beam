@@ -61,6 +61,19 @@ type CDCOptions struct {
 	BinaryMode          *bool
 	StreamingMode       string
 	TwoPhaseCommit      bool
+
+	// FailoverSlot requests that the replication slot be synchronized to
+	// standbys, so it survives a failover. Requires PostgreSQL 17 or newer;
+	// slot creation fails rather than silently downgrading on an older
+	// server.
+	//
+	// Off by default. On a primary that has synchronized_standby_slots
+	// configured, a failover-enabled logical slot withholds changes until the
+	// listed physical standbys have received the corresponding WAL, which
+	// couples the pipeline's latency to standby replication. That is the
+	// correct trade for a slot that must survive failover, but it is not a
+	// trade to make on a user's behalf.
+	FailoverSlot bool
 }
 
 // CDCOption defines a functional option for configuring CDCOptions.
@@ -266,6 +279,23 @@ func WithCDCCheckpointInterval(interval time.Duration) CDCOption {
 func WithCDCCreateSlotIfMissing(create bool) CDCOption {
 	return func(o *CDCOptions) {
 		o.CreateSlotIfMissing = create
+	}
+}
+
+// WithCDCFailoverSlot requests a replication slot that is synchronized to
+// standbys and therefore survives a failover. Requires PostgreSQL 17 or newer.
+//
+// Only meaningful together with WithCDCCreateSlotIfMissing: the flag is set
+// when the slot is created and this connector does not alter an existing slot.
+// A slot created without it keeps its position on the primary only, so a
+// failover loses the slot and the pipeline restarts from whatever position the
+// new primary's slot has, if any.
+//
+// See the FailoverSlot field for the latency trade this implies on a primary
+// with synchronized_standby_slots configured.
+func WithCDCFailoverSlot(failover bool) CDCOption {
+	return func(o *CDCOptions) {
+		o.FailoverSlot = failover
 	}
 }
 

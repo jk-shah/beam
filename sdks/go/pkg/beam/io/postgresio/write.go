@@ -78,6 +78,18 @@ type WriteResult struct {
 func Write(s beam.Scope, table string, opts WriteOptions, col beam.PCollection) WriteResult {
 	s = s.Scope("postgresio.Write")
 
+	// The write path pins search_path to pg_catalog,pg_temp on every pooled
+	// connection to close CVE-2018-1058, so an unqualified name cannot resolve
+	// to a user table. Rejecting it here turns a runtime "relation does not
+	// exist" surfacing from a distributed worker into a pipeline construction
+	// error that names the fix.
+	if !strings.Contains(table, ".") {
+		panic(fmt.Sprintf("postgresio.Write: table name %q must be schema-qualified, for example %q. "+
+			"Every connection in the write pool pins search_path to pg_catalog,pg_temp to close "+
+			"CVE-2018-1058, so an unqualified name does not resolve to a user table.",
+			table, "public."+table))
+	}
+
 	sanitizedTable, err := SanitizeTableIdentifier(table)
 	if err != nil {
 		panic(fmt.Sprintf("postgresio.Write: invalid table name %q: %v", table, err))
@@ -97,6 +109,29 @@ func Write(s beam.Scope, table string, opts WriteOptions, col beam.PCollection) 
 		SuccessfulRows: success,
 		FailedRows:     failed,
 	}
+}
+
+// buildWriteDSN renders the libpq keyword/value connection string for the sink.
+//
+// search_path is pinned in the DSN rather than issued as a later SET so that
+// every connection the pool opens is isolated from CVE-2018-1058, including
+// connections created when a pool member is recycled mid-bundle. Its value is
+// a compile-time literal rather than configuration, so it is left unquoted.
+//
+// Every value that can originate from configuration is quoted, because an
+// unquoted value ends at the first space and libpq reads the remainder as
+// further keywords. Quoting keeps a credential that legitimately contains a
+// space intact, and stops any configured value from introducing a keyword the
+// caller never set.
+//
+// Keyword order is load-bearing as a second layer of defence. libpq lets a
+// later duplicate keyword win, so the two settings that carry the security
+// properties, sslmode and the pinned search_path, are emitted last and cannot
+// be displaced by anything injected from an earlier value.
+func buildWriteDSN(host string, port int, database, username, password, sslMode string) string {
+	return fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=%s search_path=pg_catalog,pg_temp",
+		quoteDSNValue(host), port, quoteDSNValue(database),
+		quoteDSNValue(username), quoteDSNValue(password), quoteDSNValue(sslMode))
 }
 
 type writeFn struct {
@@ -119,9 +154,8 @@ func (fn *writeFn) Setup(ctx context.Context) error {
 	if password == "" {
 		password = os.Getenv("PGPASSWORD")
 	}
-	// Pin search_path directly in DSN so EVERY connection in the pool is isolated (CVE-2018-1058)
-	dsn := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=%s search_path=pg_catalog,pg_temp",
-		fn.Options.Host, fn.Options.Port, fn.Options.Database, fn.Options.Username, password, sslMode)
+	dsn := buildWriteDSN(fn.Options.Host, fn.Options.Port, fn.Options.Database,
+		fn.Options.Username, password, sslMode)
 
 	var db *sql.DB
 	var err error

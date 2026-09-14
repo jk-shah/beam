@@ -44,6 +44,8 @@ expansion service, so their maturity is bounded by the Go implementation's.
 
 PostgreSQL I/O provides idempotent batch upserts using `INSERT INTO ... ON CONFLICT (primary_keys) DO UPDATE`.
 
+In the Go SDK, every connection the sink opens pins `search_path` to `pg_catalog,pg_temp` to close [CVE-2018-1058](https://www.postgresql.org/support/security/CVE-2018-1058/). An unqualified relation name therefore cannot resolve to a user table, so table names must be written as `schema.table`. `postgresio.Write` reports an unqualified name when the pipeline is constructed.
+
 ### Go SDK Example
 ```go
 import (

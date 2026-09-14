@@ -49,7 +49,9 @@
    - [WriteOptions](#writeoptions)
    - [CDCOptions](#cdcoptions)
    - [ArrowBatchOptions](#arrowbatchoptions)
+   - [Checkpointing & Acknowledgment](#checkpointing--acknowledgment)
    - [Security & TLS Configuration](#security--tls-configuration)
+   - [Failover slots](#failover-slots)
    - [Known Limitations](#known-limitations)
 5. [Contributor Guide: Codebase Map & Invariants](#5-contributor-guide-codebase-map--invariants)
    - [File Inventory & Responsibilities](#file-inventory--responsibilities)
@@ -425,6 +427,7 @@ pipeline:
 | `WithCDCTokenProvider(TokenProvider)` | `nil` | Dynamic credential refresh provider for IAM / OAuth2 |
 | `WithCDCDialFunc(DialFunc)` | `nil` | Custom network dialer |
 | `WithCDCSSLMode(string)` | `verify-full` — see [Security](#security--tls-configuration) | `disable`, `require`, `verify-ca`, or `verify-full` |
+| `WithCDCFailoverSlot(bool)` | `false` | Creates the slot with `FAILOVER` so PostgreSQL 17 and later synchronize it to a standby. Requires server major version 17; slot creation fails on an older server rather than downgrading. See [Failover slots](#failover-slots). |
 
 ### Checkpointing & Acknowledgment
 
@@ -477,6 +480,30 @@ The security difference is not small. Managed PostgreSQL providers sign every te
 
 Google Cloud SQL documents `sslmode=verify-full` and added per-instance CAs and custom SAN values specifically to support it. Azure Database for PostgreSQL recommends full certificate and hostname verification, offering `verify-ca` only where Private Endpoint DNS makes hostname matching impossible. The `prefer` default in libpq is inherited backwards compatibility, and upstream explicitly describes it as *"not recommended in secure deployments."*
 
+### Failover slots
+
+PostgreSQL 17 added `FAILOVER` to `CREATE_REPLICATION_SLOT`. A slot created with
+it is synchronized to physical standbys, so a logical consumer keeps its
+position across a failover instead of restarting from the new primary's state.
+
+The option is off by default. On a primary that lists standbys in
+`synchronized_standby_slots`, a failover-enabled logical slot withholds changes
+until those standbys have received the WAL. That makes end-to-end pipeline
+latency a function of physical replication lag, which is a change most existing
+deployments would not expect.
+
+```go
+opts := postgresio.NewCDCOptions(
+    postgresio.WithCDCSlotName("beam_streaming_slot"),
+    postgresio.WithCDCCreateSlotIfMissing(true),
+    postgresio.WithCDCFailoverSlot(true),
+)
+```
+
+Enabling the option against a server older than 17 is an error rather than a
+silent downgrade. Reporting success for a slot that is not actually
+failover-safe would leave the operator relying on a guarantee they do not have.
+
 ### Known Limitations
 
 The connector is unreleased and experimental. The list below is what is still open; the [remediation acceptance suite](#remediation-acceptance-suite) covers the items that have been fixed and fails if any of them regresses.
@@ -488,9 +515,8 @@ The connector is unreleased and experimental. The list below is what is still op
 | **Initial backfill** | Slot creation exports a consistent snapshot and `SlotCreationResult.SnapshotIsolationStatements` returns the statements needed to read it, but the connector does not run the backfill. | Pre-existing table rows require a separate read. Only changes after the slot's creation point arrive through CDC. |
 | **Replication origin on the write path** | The staged `COPY` path sets a replication origin; the `UNNEST` fallback does not. | In a bi-directional topology, rows written through the fallback path are not distinguishable from user writes and can be replicated back. |
 | **Driver** | Built on `lib/pq`. The CDC path implements the replication protocol directly rather than through `pgx` / `pglogrepl`. | Protocol features not implemented here are unavailable, and the wire decoder is maintained in-tree. |
-| **DSN construction** | A password containing a space, single quote or backslash is not escaped when the DSN is assembled. | Such a password produces a connection failure or a misparsed DSN. |
-| **`search_path`** | The write path pins `search_path=pg_catalog,pg_temp` on every pooled connection to close CVE-2018-1058. | An unqualified table name in configuration will not resolve. Qualify table names as `schema.table`. |
-| **Failover slots** | `CREATE_REPLICATION_SLOT` does not request `failover 'true'`. | On PostgreSQL 17 and later the slot is not synchronized to a standby, so a failover loses the slot and its position. |
+| **`search_path`** | The write path pins `search_path=pg_catalog,pg_temp` on every pooled connection to close CVE-2018-1058, so an unqualified table name cannot resolve. | Table names must be written as `schema.table`. `postgresio.Write` rejects an unqualified name when the pipeline is constructed, and the `postgres_write` SchemaTransform rejects it during configuration validation. |
+| **Failover slots** | Slots are created without `FAILOVER` unless `WithCDCFailoverSlot(true)` is set, because enabling it couples pipeline latency to standby replication. | With the default, a failover loses the slot and its position, and the pipeline restarts from whatever the new primary has. See [Failover slots](#failover-slots). |
 | **Single consumer** | PostgreSQL admits one connection per replication slot, so the LSN restriction is never split. | Read throughput is bounded by one worker. Parallelism comes from `PartitionByPrimaryKey` downstream, not from the source. |
 | **Delivery semantics** | At-least-once. After a restart the server resumes from `confirmed_flush_lsn`, which can replay records the pipeline already emitted. | Downstream consumers must deduplicate. Each event carries a deterministic `EventID` for that purpose. |
 

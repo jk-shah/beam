@@ -63,12 +63,12 @@ type SourceRecord struct {
 
 // TargetRecord represents normalized, typed records ready for high-throughput batch loading.
 type TargetRecord struct {
-	ID        int64     `json:"id" db:"id" beam:"id"`
-	Code      string    `json:"code" db:"code" beam:"code"`
-	Amount    float64   `json:"amount" db:"amount" beam:"amount"`
-	Region    string    `json:"region" db:"region" beam:"region"`
-	Tier      string    `json:"tier" db:"tier" beam:"tier"`
-	LoadedAt  time.Time `json:"loaded_at" db:"loaded_at" beam:"loaded_at"`
+	ID       int64     `json:"id" db:"id" beam:"id"`
+	Code     string    `json:"code" db:"code" beam:"code"`
+	Amount   float64   `json:"amount" db:"amount" beam:"amount"`
+	Region   string    `json:"region" db:"region" beam:"region"`
+	Tier     string    `json:"tier" db:"tier" beam:"tier"`
+	LoadedAt time.Time `json:"loaded_at" db:"loaded_at" beam:"loaded_at"`
 }
 
 // generateBatchRecordsFn generates synthetic source records for high-speed benchmark demonstration.
