@@ -117,7 +117,7 @@ type Option func(*WriteOptions)
 func NewWriteOptions(opts ...Option) WriteOptions {
 	wo := WriteOptions{
 		Port:           5432,
-		SSLMode:        "disable",
+		SSLMode:        DefaultSSLMode,
 		WriteMode:      WriteModeUpsert,
 		WriteMethod:    WriteMethodStagedCopy,
 		BatchSize:      5000,
@@ -128,7 +128,12 @@ func NewWriteOptions(opts ...Option) WriteOptions {
 	for _, opt := range opts {
 		opt(&wo)
 	}
+	// An option that explicitly clears the mode must not be read as "plaintext".
+	if wo.SSLMode == "" {
+		wo.SSLMode = DefaultSSLMode
+	}
 	return wo
+
 }
 
 // WithHost sets the target PostgreSQL server hostname or IP address.

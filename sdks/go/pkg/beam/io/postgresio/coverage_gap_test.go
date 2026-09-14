@@ -861,6 +861,7 @@ func TestCDCStream_AuthCleartextAndMD5(t *testing.T) {
 			WithCDCPassword("secret123"),
 			WithCDCSlotName("test_slot"),
 			WithCDCPublication("test_pub"),
+			WithCDCSSLMode("disable"), // stub server speaks plaintext
 			WithCDCDialFunc(func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return clientConn, nil
 			}),
@@ -972,6 +973,7 @@ func TestCDCStream_AuthCleartextAndMD5(t *testing.T) {
 			WithCDCPassword("secret123"),
 			WithCDCSlotName("test_slot"),
 			WithCDCPublication("test_pub"),
+			WithCDCSSLMode("disable"), // stub server speaks plaintext
 			WithCDCDialFunc(func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return clientConn, nil
 			}),
@@ -1019,6 +1021,7 @@ func TestCDCStream_StartupErrorResponse(t *testing.T) {
 		WithCDCUsername("beam_test"),
 		WithCDCSlotName("test_slot"),
 		WithCDCPublication("test_pub"),
+		WithCDCSSLMode("disable"), // stub server speaks plaintext
 		WithCDCDialFunc(func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return clientConn, nil
 		}),
@@ -1481,6 +1484,7 @@ func TestCDCStream_ParameterStatus_WireNegotiation(t *testing.T) {
 			WithCDCUsername("beam_test"),
 			WithCDCSlotName("test_slot"),
 			WithCDCPublication("test_pub"),
+			WithCDCSSLMode("disable"), // stub server speaks plaintext
 			WithCDCDialFunc(func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return clientConn, nil
 			}),
@@ -1595,6 +1599,7 @@ func TestCDCStream_ParameterStatus_WireNegotiation(t *testing.T) {
 			WithCDCUsername("beam_test"),
 			WithCDCSlotName("test_slot"),
 			WithCDCPublication("test_pub"),
+			WithCDCSSLMode("disable"), // stub server speaks plaintext
 			WithCDCDialFunc(func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return clientConn, nil
 			}),

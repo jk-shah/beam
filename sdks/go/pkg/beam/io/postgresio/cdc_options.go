@@ -32,6 +32,9 @@ type CDCOptions struct {
 	Username            string
 	Password            string `json:"password,omitempty"`
 	SSLMode             string
+	SSLRootCert         string
+	SSLCert             string
+	SSLKey              string
 	SlotName            string
 	Publication         string
 	StartLSN            uint64
@@ -56,12 +59,18 @@ type CDCOption func(*CDCOptions)
 func NewCDCOptions(opts ...CDCOption) CDCOptions {
 	co := CDCOptions{
 		Port:              5432,
+		SSLMode:           DefaultSSLMode,
 		HeartbeatInterval: 10 * time.Second,
 		StatusInterval:    10 * time.Second,
 	}
 	for _, opt := range opts {
 		opt(&co)
 	}
+	// An option that explicitly clears the mode must not be read as "plaintext".
+	if co.SSLMode == "" {
+		co.SSLMode = DefaultSSLMode
+	}
+
 	if co.Password != "" && co.TokenProvider == nil {
 		co.TokenProvider = NewStaticTokenProvider(co.Password)
 	}
@@ -82,9 +91,16 @@ func (o *CDCOptions) Validate() error {
 	if _, err := SanitizeIdentifier(o.Publication); err != nil {
 		return fmt.Errorf("invalid publication name %q: %w", o.Publication, err)
 	}
+	if err := validateSSLMode(o.SSLMode); err != nil {
+		return err
+	}
+	if (o.SSLCert == "") != (o.SSLKey == "") {
+		return fmt.Errorf("sslcert and sslkey must be supplied together")
+	}
 	if o.HeartbeatInterval <= 0 {
 		return fmt.Errorf("heartbeat interval must be positive")
 	}
+
 	if o.HeartbeatInterval >= 60*time.Second {
 		return fmt.Errorf("heartbeat interval (%v) must be less than default wal_sender_timeout (60s)", o.HeartbeatInterval)
 	}
@@ -138,9 +154,40 @@ func WithCDCPassword(password string) CDCOption {
 }
 
 // WithCDCSSLMode sets the SSL/TLS mode (disable, require, verify-ca, verify-full).
+//
+// The default is verify-full. An unrecognized value is rejected by Validate
+// rather than being treated as a weaker mode.
 func WithCDCSSLMode(sslMode string) CDCOption {
 	return func(o *CDCOptions) {
 		o.SSLMode = sslMode
+	}
+}
+
+// WithCDCSSLRootCert sets the path to a PEM CA bundle used to verify the
+// server certificate.
+//
+// Managed PostgreSQL services present certificates signed by CAs that are not
+// present in the system trust store, so this is normally required when using
+// verify-ca or verify-full against Cloud SQL, RDS or Azure Database.
+func WithCDCSSLRootCert(path string) CDCOption {
+	return func(o *CDCOptions) {
+		o.SSLRootCert = path
+	}
+}
+
+// WithCDCSSLCert sets the client certificate path for certificate
+// authentication. Must be supplied together with WithCDCSSLKey.
+func WithCDCSSLCert(path string) CDCOption {
+	return func(o *CDCOptions) {
+		o.SSLCert = path
+	}
+}
+
+// WithCDCSSLKey sets the client private key path for certificate
+// authentication. Must be supplied together with WithCDCSSLCert.
+func WithCDCSSLKey(path string) CDCOption {
+	return func(o *CDCOptions) {
+		o.SSLKey = path
 	}
 }
 

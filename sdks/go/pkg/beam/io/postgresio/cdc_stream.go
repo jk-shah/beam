@@ -19,7 +19,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/tls"
+	"crypto/x509"
+
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -131,8 +135,24 @@ func NewNativeReplicationStream(ctx context.Context, opts CDCOptions) (*NativeRe
 		return nil, fmt.Errorf("failed to dial postgres host %s: %w", addr, err)
 	}
 
-	// Negotiate SSL/TLS via PostgreSQL SSLRequest protocol if sslmode is not disable
-	if opts.SSLMode != "disable" && opts.SSLMode != "" {
+	// Negotiate SSL/TLS via the PostgreSQL SSLRequest protocol.
+	//
+	// buildTLSConfig returns a nil config only for sslmode=disable, so an unset
+	// or empty mode negotiates TLS rather than silently falling back to
+	// cleartext.
+	tlsConfig, err := buildTLSConfig(tlsSettings{
+		Mode:     opts.SSLMode,
+		Host:     opts.Host,
+		RootCert: opts.SSLRootCert,
+		Cert:     opts.SSLCert,
+		Key:      opts.SSLKey,
+	})
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+
+	if tlsConfig != nil {
 		sslReq := []byte{0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f}
 		if _, err := conn.Write(sslReq); err != nil {
 			_ = conn.Close()
@@ -144,19 +164,17 @@ func NewNativeReplicationStream(ctx context.Context, opts CDCOptions) (*NativeRe
 			return nil, fmt.Errorf("failed to read SSLRequest response: %w", err)
 		}
 		if sslResp[0] == 'S' {
-			tlsConfig := &tls.Config{
-				ServerName:         opts.Host,
-				InsecureSkipVerify: opts.SSLMode == "require",
-			}
 			tlsConn := tls.Client(conn, tlsConfig)
 			if err := tlsConn.HandshakeContext(ctx); err != nil {
 				_ = conn.Close()
 				return nil, fmt.Errorf("TLS handshake failed: %w", err)
 			}
 			conn = tlsConn
-		} else if opts.SSLMode == "verify-full" || opts.SSLMode == "verify-ca" || opts.SSLMode == "require" {
+		} else {
+			// The server refused TLS. Every mode that reaches this point asked
+			// for encryption, so this is a hard failure rather than a downgrade.
 			_ = conn.Close()
-			return nil, fmt.Errorf("postgresio: server does not support SSL but sslmode=%q is required", opts.SSLMode)
+			return nil, fmt.Errorf("postgresio: server does not support SSL but sslmode=%q requires it", opts.SSLMode)
 		}
 	}
 
@@ -239,9 +257,21 @@ func (s *NativeReplicationStream) handshake(ctx context.Context) error {
 				if err := s.sendPasswordMessage(token); err != nil {
 					return err
 				}
+			case 10: // AuthenticationSASL
+				pwd, err := s.resolvePassword(ctx)
+				if err != nil {
+					return err
+				}
+				if err := s.authenticateSASL(payload[4:], pwd); err != nil {
+					return err
+				}
+			case 11, 12:
+				// SASLContinue / SASLFinal are consumed inside authenticateSASL.
+				return fmt.Errorf("unexpected SASL message %d outside of a SASL exchange", authType)
 			default:
 				return fmt.Errorf("unsupported authentication type %d in replication mode", authType)
 			}
+
 		case 'E': // ErrorResponse
 			return fmt.Errorf("database error during startup: %s", string(payload))
 		}
@@ -318,6 +348,147 @@ func (s *NativeReplicationStream) sendPasswordMessage(password string) error {
 	copy(packet[5:], payload)
 	_, err := s.conn.Write(packet)
 	return err
+}
+
+// authenticateSASL runs the SASL exchange that follows AuthenticationSASL.
+//
+// mechanismList is the payload of the AuthenticationSASL message after the
+// auth-type word: a sequence of null-terminated mechanism names ended by an
+// empty name.
+func (s *NativeReplicationStream) authenticateSASL(mechanismList []byte, password string) error {
+	mechanisms := parseNullTerminatedList(mechanismList)
+
+	client, err := newSCRAMClient(s.opts.Username, password, mechanisms, s.channelBindingData())
+	if err != nil {
+		return err
+	}
+
+	// SASLInitialResponse: mechanism name, then an int32 length, then the
+	// client-first-message.
+	clientFirst := client.ClientFirst()
+	if err := s.sendSASLInitialResponse(client.Mechanism(), clientFirst); err != nil {
+		return fmt.Errorf("failed to send SASLInitialResponse: %w", err)
+	}
+
+	// Expect AuthenticationSASLContinue (11) carrying server-first-message.
+	serverFirst, err := s.readSASLMessage(11)
+	if err != nil {
+		return err
+	}
+
+	clientFinal, err := client.ClientFinal(serverFirst)
+	if err != nil {
+		return err
+	}
+
+	if err := s.sendSASLResponse(clientFinal); err != nil {
+		return fmt.Errorf("failed to send SASLResponse: %w", err)
+	}
+
+	// Expect AuthenticationSASLFinal (12) carrying the server signature.
+	serverFinal, err := s.readSASLMessage(12)
+	if err != nil {
+		return err
+	}
+
+	// Mutual authentication: prove the server also knows the password.
+	return client.VerifyServerFinal(serverFinal)
+}
+
+// sendSASLInitialResponse writes the 'p' message that opens a SASL exchange.
+func (s *NativeReplicationStream) sendSASLInitialResponse(mechanism, clientFirst string) error {
+	var payload []byte
+	payload = append(payload, mechanism...)
+	payload = append(payload, 0)
+	payload = binary.BigEndian.AppendUint32(payload, uint32(len(clientFirst)))
+	payload = append(payload, clientFirst...)
+
+	packet := make([]byte, 5+len(payload))
+	packet[0] = 'p'
+	binary.BigEndian.PutUint32(packet[1:5], uint32(len(packet)-1))
+	copy(packet[5:], payload)
+
+	_, err := s.conn.Write(packet)
+	return err
+}
+
+// sendSASLResponse writes a continuation 'p' message with a raw SASL payload.
+func (s *NativeReplicationStream) sendSASLResponse(data string) error {
+	packet := make([]byte, 5+len(data))
+	packet[0] = 'p'
+	binary.BigEndian.PutUint32(packet[1:5], uint32(len(packet)-1))
+	copy(packet[5:], data)
+
+	_, err := s.conn.Write(packet)
+	return err
+}
+
+// readSASLMessage reads one 'R' message and asserts the expected auth subtype.
+func (s *NativeReplicationStream) readSASLMessage(wantAuthType uint32) (string, error) {
+	msgType, payload, err := s.readRawMessage()
+	if err != nil {
+		return "", fmt.Errorf("failed to read SASL response: %w", err)
+	}
+	if msgType == 'E' {
+		return "", fmt.Errorf("database error during SASL authentication: %s", string(payload))
+	}
+	if msgType != 'R' {
+		return "", fmt.Errorf("expected an authentication message during SASL exchange, got %q", msgType)
+	}
+	if len(payload) < 4 {
+		return "", fmt.Errorf("malformed authentication message during SASL exchange")
+	}
+
+	gotAuthType := binary.BigEndian.Uint32(payload[0:4])
+	if gotAuthType != wantAuthType {
+		return "", fmt.Errorf("expected SASL auth type %d, got %d", wantAuthType, gotAuthType)
+	}
+
+	return string(payload[4:]), nil
+}
+
+// channelBindingData returns tls-server-end-point binding data when the
+// connection is TLS, and nil otherwise.
+//
+// RFC 5929 defines tls-server-end-point as the hash of the server
+// certificate, using the certificate's own signature hash algorithm, with
+// SHA-256 substituted when that algorithm is MD5 or SHA-1.
+func (s *NativeReplicationStream) channelBindingData() []byte {
+	tlsConn, ok := s.conn.(*tls.Conn)
+	if !ok {
+		return nil
+	}
+
+	certs := tlsConn.ConnectionState().PeerCertificates
+	if len(certs) == 0 {
+		return nil
+	}
+
+	var sum []byte
+	switch certs[0].SignatureAlgorithm {
+	case x509.SHA384WithRSA, x509.ECDSAWithSHA384, x509.SHA384WithRSAPSS:
+		h := sha512.Sum384(certs[0].Raw)
+		sum = h[:]
+	case x509.SHA512WithRSA, x509.ECDSAWithSHA512, x509.SHA512WithRSAPSS:
+		h := sha512.Sum512(certs[0].Raw)
+		sum = h[:]
+	default:
+		// Covers SHA-256 signatures and the MD5/SHA-1 substitution rule.
+		h := sha256.Sum256(certs[0].Raw)
+		sum = h[:]
+	}
+	return sum
+}
+
+// parseNullTerminatedList splits a PostgreSQL null-terminated string list.
+func parseNullTerminatedList(b []byte) []string {
+	var out []string
+	for _, part := range bytes.Split(b, []byte{0}) {
+		if len(part) > 0 {
+			out = append(out, string(part))
+		}
+	}
+	return out
 }
 
 func (s *NativeReplicationStream) sendQuery(query string) error {
