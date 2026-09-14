@@ -124,4 +124,13 @@
 //
 // 8. Cloud IAM & Dynamic Auth: Decoupled TokenProvider and DialFunc interfaces allowing
 // dynamic credential renewal across reconnects for Google Cloud SQL, AlloyDB, and AWS RDS IAM.
+//
+// 9. Cross-Language Surface & Expansion Service: Exposes canonical SchemaTransforms
+// (WriteToPostgres, ReadFromPostgresCDC) via a standalone gRPC expansion service binary
+// (cmd/beam-go-expansion-service), Python facade (apache_beam.io.postgres_cdc), and
+// generated YAML reference specification (YAML_REFERENCE.md).
+//
+// 10. Self-Contained Docker Quickstart: Out-of-the-box docker-compose demonstration
+// (examples/postgres/quickstart) provisioning logical replication, seed data, the
+// beam_cdc_health view, and a real-time CDC synchronization pipeline.
 package postgresio

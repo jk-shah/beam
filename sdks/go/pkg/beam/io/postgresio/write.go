@@ -23,7 +23,6 @@ import (
 	"hash/fnv"
 	"math/rand"
 
-	"os"
 	"reflect"
 	"strings"
 	"time"
@@ -150,10 +149,7 @@ func (fn *writeFn) Setup(ctx context.Context) error {
 	if sslMode == "" {
 		sslMode = "disable"
 	}
-	password := fn.Options.Password
-	if password == "" {
-		password = os.Getenv("PGPASSWORD")
-	}
+	password := fn.Options.ResolvePassword()
 	dsn := buildWriteDSN(fn.Options.Host, fn.Options.Port, fn.Options.Database,
 		fn.Options.Username, password, sslMode)
 

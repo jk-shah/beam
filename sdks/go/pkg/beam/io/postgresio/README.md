@@ -45,6 +45,7 @@
    - [Native Go Write & Upsert](#native-go-write--upsert)
    - [Native Go CDC Streaming](#native-go-cdc-streaming)
    - [Declarative Beam YAML Pipelines](#declarative-beam-yaml-pipelines)
+   - [Docker Compose Quickstart](#docker-compose-quickstart)
 4. [Configuration Reference](#4-configuration-reference)
    - [WriteOptions](#writeoptions)
    - [CDCOptions](#cdcoptions)
@@ -54,6 +55,7 @@
    - [Failover slots](#failover-slots)
    - [WAL retention circuit breaker](#wal-retention-circuit-breaker)
    - [DBA operational surface](#dba-operational-surface)
+   - [Python & YAML Cross-Language Surface](#python--yaml-cross-language-surface)
    - [Known Limitations](#known-limitations)
 5. [Contributor Guide: Codebase Map & Invariants](#5-contributor-guide-codebase-map--invariants)
    - [File Inventory & Responsibilities](#file-inventory--responsibilities)
@@ -726,6 +728,67 @@ single worker that reads the stream and caps itself at one open connection.
 > It freezes when a pipeline stalls and must not be used to detect one. Use
 > `cdc_slot_retained_bytes`, which is measured on a separate connection, or the
 > `health` column of the view.
+
+### Python & YAML Cross-Language Surface
+
+The Go `postgresio` connector is accessible from Python and Apache Beam YAML pipelines via SchemaTransforms and the standalone Go expansion service.
+
+#### Python Façade
+
+Import from `apache_beam.io.postgres_cdc`:
+
+```python
+from apache_beam.io.postgres_cdc import ReadFromPostgresCDC, WriteToPostgres
+
+# Continuous Change Data Capture streaming
+with beam.Pipeline(options=opts) as p:
+    events = p | ReadFromPostgresCDC(
+        host="localhost",
+        database="shop",
+        slot_name="beam_slot",
+        publication="beam_pub",
+        username="beam_cdc",
+        password_env_var="PGPASSWORD",
+    )
+
+# Bulk writing with Dead-Letter Queue output
+with beam.Pipeline(options=opts) as p:
+    res = rows | WriteToPostgres(
+        host="localhost",
+        database="shop",
+        table="public.orders",
+        username="beam_writer",
+        password_env_var="PGPASSWORD",
+        conflict_keys=["order_id"],
+    )
+    # Access DLQ failed rows
+    res.failed_rows | beam.Map(logging.error)
+```
+
+The Python façade uses a multi-tier expansion service resolver in the following evaluation order:
+1. Explicit `expansion_service` parameter passed to the transform.
+2. `BEAM_GO_EXPANSION_SERVICE` environment variable (host:port endpoint or binary path).
+3. Sibling `beam-go-expansion-service` binary in `PATH` or virtual environment `bin/`.
+4. Cached pre-built binary at `~/.apache_beam/cache/bin/beam-go-expansion-service`.
+5. Source compilation via `go build -mod=readonly` if a Beam repository checkout and Go toolchain are detected.
+
+#### YAML Schema Reference
+
+Apache Beam YAML pipelines invoke `WriteToPostgres` and `ReadFromPostgresCDC` directly. Configuration parameter descriptions, types, and defaults are documented in [YAML_REFERENCE.md](YAML_REFERENCE.md), which is programmatically verified against the in-process schema registry (`schematransform.DefaultRegistry()`) via `TestYAMLReference_ByteEquality` to prevent documentation drift.
+
+### Docker Compose Quickstart
+
+A self-contained demonstration environment is located in `examples/postgres/quickstart/`:
+
+```bash
+cd sdks/go/examples/postgres/quickstart
+docker compose up --build
+```
+
+This starts:
+* A PostgreSQL 17 database configured with `wal_level=logical`, a replication role (`beam_cdc`), and publication (`beam_pub`).
+* The `beam_cdc_health` monitoring view for WAL retention and slot tracking.
+* An Apache Beam pipeline streaming changes from `orders_source` to `orders_target` in real time.
 
 ### Known Limitations
 

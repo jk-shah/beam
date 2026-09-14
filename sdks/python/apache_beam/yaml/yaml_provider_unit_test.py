@@ -399,3 +399,14 @@ class GoBinaryProviderTest(unittest.TestCase):
     self.assertIn('PostgreSqlReadCDC', provider._urns)
     self.assertEqual(provider.cache_artifacts(), ['/usr/local/bin/beam_go_expansion'])
 
+  def test_go_binary_provider_standard_io(self):
+    from apache_beam.yaml import yaml_io
+    providers = yaml_io.io_providers()
+    go_providers = [p for p in providers if isinstance(p, yaml_provider.ExternalGoProvider)]
+    self.assertTrue(len(go_providers) >= 1)
+    urns = {}
+    for gp in go_providers:
+      urns.update(gp._urns)
+    self.assertEqual(urns.get('WriteToPostgres'), 'beam:schematransform:org.apache.beam:postgres_write:v1')
+    self.assertEqual(urns.get('ReadFromPostgresCDC'), 'beam:schematransform:org.apache.beam:postgres_read_cdc:v1')
+

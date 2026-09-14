@@ -415,6 +415,8 @@ def go_binary(
     provider_base_path=None,
     binary: str = '',
     args: Optional[list[str]] = None):
+  if not binary:
+    binary = 'beam-go-expansion-service'
   if provider_base_path and not os.path.isabs(binary):
     full_path = _join_url_or_filepath(provider_base_path, binary)
   else:
@@ -428,14 +430,27 @@ class ExternalGoProvider(ExternalProvider):
       urns,
       binary_path: str,
       args: Optional[list[str]] = None):
-    super().__init__(
-        urns, lambda: external.GoBinaryExpansionService(
-            binary_path, extra_args=args))
+    def get_service():
+      if not os.path.exists(binary_path) and not shutil.which(binary_path):
+        try:
+          from apache_beam.io.postgres_cdc import default_expansion_service
+          return default_expansion_service()
+        except Exception:
+          pass
+      return external.GoBinaryExpansionService(binary_path, extra_args=args)
+
+    super().__init__(urns, get_service)
     self._binary_path = binary_path
 
   def available(self):
     if os.path.exists(self._binary_path) or shutil.which(self._binary_path):
       return True
+    try:
+      from apache_beam.io.postgres_cdc import default_expansion_service
+      default_expansion_service()
+      return True
+    except Exception:
+      pass
     return NotAvailableWithReason(
         f'Unable to locate Go executable binary: {self._binary_path}')
 

@@ -17,6 +17,7 @@ package postgresio
 
 import (
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -31,6 +32,7 @@ type CDCOptions struct {
 	Database          string
 	Username          string
 	Password          string `json:"password,omitempty"`
+	PasswordEnvVar    string `json:"password_env_var,omitempty"`
 	SSLMode           string
 	SSLRootCert       string
 	SSLCert           string
@@ -248,6 +250,26 @@ func WithCDCPassword(password string) CDCOption {
 		o.Password = password
 		o.TokenProvider = NewStaticTokenProvider(password)
 	}
+}
+
+// WithCDCPasswordEnvVar sets the environment variable name to resolve the replication password.
+func WithCDCPasswordEnvVar(envVar string) CDCOption {
+	return func(o *CDCOptions) {
+		o.PasswordEnvVar = envVar
+	}
+}
+
+// ResolvePassword returns the password to use, prioritizing PasswordEnvVar, then Password, then PGPASSWORD.
+func (o CDCOptions) ResolvePassword() string {
+	if o.PasswordEnvVar != "" {
+		if val := os.Getenv(o.PasswordEnvVar); val != "" {
+			return val
+		}
+	}
+	if o.Password != "" {
+		return o.Password
+	}
+	return os.Getenv("PGPASSWORD")
 }
 
 // WithCDCSSLMode sets the SSL/TLS mode (disable, require, verify-ca, verify-full).

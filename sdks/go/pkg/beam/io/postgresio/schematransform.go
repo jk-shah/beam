@@ -22,13 +22,19 @@ import (
 
 	"github.com/apache/beam/sdks/v2/go/pkg/beam"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/schematransform"
+	pipepb "github.com/apache/beam/sdks/v2/go/pkg/beam/model/pipeline_v1"
 )
 
 const (
-	// WriteSchemaTransformURN is the standard URN for PostgreSQL SchemaTransform Write.
+	// WriteSchemaTransformURN is the standard URN for PostgreSQL SchemaTransform Bulk Write.
+	// Note: We deliberately avoid "beam:schematransform:org.apache.beam:postgres_write:v1"
+	// because that URN is allocated to Java's JDBC WriteToPostgresSchemaTransformProvider
+	// (ManagedTransforms.Urns.POSTGRES_WRITE) with a disjoint configuration schema.
+	// WriteSchemaTransformURN is the canonical URN for PostgreSQL Write SchemaTransform.
 	WriteSchemaTransformURN = "beam:schematransform:org.apache.beam:postgres_write:v1"
 
 	// ReadCDCSchemaTransformURN is the standard URN for PostgreSQL SchemaTransform ReadCDC.
+	// ReadCDCSchemaTransformURN is the canonical URN for PostgreSQL ReadCDC SchemaTransform.
 	ReadCDCSchemaTransformURN = "beam:schematransform:org.apache.beam:postgres_read_cdc:v1"
 )
 
@@ -45,6 +51,7 @@ type PostgreSqlWriteConfig struct {
 	Table             string   `beam:"table" doc:"Target PostgreSQL table, schema-qualified (for example public.orders)."`
 	Username          string   `beam:"username" doc:"Authentication username."`
 	Password          string   `beam:"password,secret" doc:"Authentication password."`
+	PasswordEnvVar    string   `beam:"password_env_var" doc:"Environment variable name on the worker containing the authentication password."`
 	SSLMode           string   `beam:"sslmode" doc:"SSL mode (e.g. disable, require, verify-ca, verify-full)."`
 	ConflictKeys      []string `beam:"conflict_keys" doc:"Columns used as primary or unique key conflict targets for UPSERT."`
 	UpdateFields      []string `beam:"update_fields" doc:"Columns to update ON CONFLICT DO UPDATE. If empty, uses DO NOTHING."`
@@ -117,6 +124,7 @@ func (t *postgreSqlWriteTransform) BuildTransform(s beam.Scope, inputs map[strin
 		MaxBatchBytes:         int(t.cfg.MaxBatchBytes),
 		UsePgBouncer:          t.cfg.UsePgBouncer,
 		ReplicationOriginName: t.cfg.ReplicationOrigin,
+		PasswordEnvVar:        t.cfg.PasswordEnvVar,
 	}
 	if opts.Port <= 0 {
 		opts.Port = 5432
@@ -165,6 +173,7 @@ type PostgreSqlReadCDCConfig struct {
 	Publication    string   `beam:"publication" doc:"PostgreSQL publication name to capture."`
 	Username       string   `beam:"username" doc:"Replication user name."`
 	Password       string   `beam:"password,secret" doc:"Replication user password."`
+	PasswordEnvVar string   `beam:"password_env_var" doc:"Environment variable name on the worker containing the replication password."`
 	SSLMode        string   `beam:"sslmode" doc:"SSL mode (e.g. disable, require, verify-ca, verify-full)."`
 	Tables         []string `beam:"tables" doc:"Optional list of tables to capture (empty captures all in publication)."`
 	OriginFilter   string   `beam:"origin_filter" doc:"Replication origin filter: 'all' (default) or 'none'."`
@@ -230,6 +239,9 @@ func (t *postgreSqlReadCDCTransform) BuildTransform(s beam.Scope, _ map[string]b
 	if t.cfg.StreamingMode != "" {
 		opts = append(opts, WithCDCStreamingMode(t.cfg.StreamingMode))
 	}
+	if t.cfg.PasswordEnvVar != "" {
+		opts = append(opts, WithCDCPasswordEnvVar(t.cfg.PasswordEnvVar))
+	}
 
 	cdcCol := ReadCDC(s, opts...)
 
@@ -269,4 +281,87 @@ func (p *postgreSqlReadCDCProvider) OutputCollectionNames() []string {
 
 func (p *postgreSqlReadCDCProvider) CreateTransform(cfg PostgreSqlReadCDCConfig) (schematransform.SchemaTransform, error) {
 	return &postgreSqlReadCDCTransform{cfg: cfg}, nil
+}
+
+// formatFieldType returns a clean human-readable representation of a SchemaTransform field type.
+func formatFieldType(ft *pipepb.FieldType) string {
+	if ft == nil {
+		return "unknown"
+	}
+	if arr := ft.GetArrayType(); arr != nil {
+		return "list[" + formatFieldType(arr.GetElementType()) + "]"
+	}
+	if at := ft.GetAtomicType(); at != pipepb.AtomicType_UNSPECIFIED {
+		switch at {
+		case pipepb.AtomicType_STRING:
+			return "string"
+		case pipepb.AtomicType_INT32:
+			return "integer (int32)"
+		case pipepb.AtomicType_INT64:
+			return "integer (int64)"
+		case pipepb.AtomicType_BOOLEAN:
+			return "boolean"
+		case pipepb.AtomicType_FLOAT:
+			return "float"
+		case pipepb.AtomicType_DOUBLE:
+			return "double"
+		default:
+			return strings.ToLower(at.String())
+		}
+	}
+	return "object"
+}
+
+// GenerateYAMLReference generates GitHub-flavored Markdown reference documentation
+// for all registered PostgreSQL SchemaTransforms.
+func GenerateYAMLReference() string {
+	var b strings.Builder
+	b.WriteString("# PostgreSQL YAML Schema Reference\n\n")
+	b.WriteString("This reference is programmatically generated from the registered Apache Beam Go SchemaTransform providers.\n")
+	b.WriteString("Do not edit this document manually; update the struct tags in `schematransform.go` and regenerate.\n\n")
+
+	reg := schematransform.DefaultRegistry()
+	entries := []struct {
+		name string
+		urn  string
+		kind string
+	}{
+		{name: "WriteToPostgres", urn: WriteSchemaTransformURN, kind: "Sink"},
+		{name: "ReadFromPostgresCDC", urn: ReadCDCSchemaTransformURN, kind: "Source"},
+	}
+
+	for i, entry := range entries {
+		p, schema, ok := reg.Get(entry.urn)
+		if !ok || schema == nil {
+			continue
+		}
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		fmt.Fprintf(&b, "## %s\n\n", entry.name)
+		fmt.Fprintf(&b, "* **URN:** `%s`\n", entry.urn)
+		fmt.Fprintf(&b, "* **Description:** %s\n", p.Description())
+		fmt.Fprintf(&b, "* **Type:** %s\n\n", entry.kind)
+		b.WriteString("### Configuration Parameters\n\n")
+		b.WriteString("| Field | Type | Secret | Description |\n")
+		b.WriteString("| :--- | :--- | :--- | :--- |\n")
+
+		for _, f := range schema.GetFields() {
+			isSecret := "No"
+			for _, opt := range f.GetOptions() {
+				if opt.GetName() == "beam:schema:option:secret:v1" {
+					isSecret = "Yes"
+					break
+				}
+			}
+			fmt.Fprintf(&b, "| `%s` | %s | %s | %s |\n",
+				f.GetName(),
+				formatFieldType(f.GetType()),
+				isSecret,
+				f.GetDescription(),
+			)
+		}
+	}
+
+	return b.String()
 }

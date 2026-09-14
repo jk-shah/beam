@@ -192,7 +192,7 @@ func newSQLSlotQuerier(opts CDCOptions) (*sqlSlotQuerier, error) {
 	}
 	// Reuses the sink's DSN builder so this connection inherits the same value
 	// escaping and the same pinned search_path.
-	dsn := buildWriteDSN(opts.Host, opts.Port, opts.Database, opts.Username, opts.Password, sslMode)
+	dsn := buildWriteDSN(opts.Host, opts.Port, opts.Database, opts.Username, opts.ResolvePassword(), sslMode)
 
 	db, err := sql.Open("postgres", dsn)
 	if err != nil {

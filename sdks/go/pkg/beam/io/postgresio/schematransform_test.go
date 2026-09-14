@@ -16,6 +16,7 @@
 package postgresio
 
 import (
+	"os"
 	"testing"
 
 	"github.com/apache/beam/sdks/v2/go/pkg/beam"
@@ -358,5 +359,85 @@ func TestPostgreSqlSchemaTransformProviders_MetadataAndFactory(t *testing.T) {
 	}
 	if rtf == nil {
 		t.Fatalf("rp.CreateTransform() returned nil transform")
+	}
+}
+
+func TestSchemaTransformURNs_Canonical(t *testing.T) {
+	wantWrite := "beam:schematransform:org.apache.beam:postgres_write:v1"
+	if WriteSchemaTransformURN != wantWrite {
+		t.Errorf("WriteSchemaTransformURN = %q, want %q", WriteSchemaTransformURN, wantWrite)
+	}
+
+	wantCDC := "beam:schematransform:org.apache.beam:postgres_read_cdc:v1"
+	if ReadCDCSchemaTransformURN != wantCDC {
+		t.Errorf("ReadCDCSchemaTransformURN = %q, want %q", ReadCDCSchemaTransformURN, wantCDC)
+	}
+
+	if WriteSchemaTransformURN == ReadCDCSchemaTransformURN {
+		t.Fatalf("write and CDC URNs must be distinct: %q", WriteSchemaTransformURN)
+	}
+}
+
+func TestOptions_PasswordResolution(t *testing.T) {
+	t.Run("WriteOptions", func(t *testing.T) {
+		// 1. PasswordEnvVar takes highest precedence
+		t.Setenv("BEAM_TEST_SECRET_ENV", "env_secret_pw")
+		t.Setenv("PGPASSWORD", "pgpass_fallback")
+		opts := WriteOptions{
+			Password:       "direct_pw",
+			PasswordEnvVar: "BEAM_TEST_SECRET_ENV",
+		}
+		if got := opts.ResolvePassword(); got != "env_secret_pw" {
+			t.Errorf("ResolvePassword() = %q, want env_secret_pw", got)
+		}
+
+		// 2. Direct password takes second precedence
+		optsNoEnvVar := WriteOptions{
+			Password: "direct_pw",
+		}
+		if got := optsNoEnvVar.ResolvePassword(); got != "direct_pw" {
+			t.Errorf("ResolvePassword() = %q, want direct_pw", got)
+		}
+
+		// 3. PGPASSWORD fallback
+		optsEmpty := WriteOptions{}
+		if got := optsEmpty.ResolvePassword(); got != "pgpass_fallback" {
+			t.Errorf("ResolvePassword() = %q, want pgpass_fallback", got)
+		}
+	})
+
+	t.Run("CDCOptions", func(t *testing.T) {
+		t.Setenv("BEAM_TEST_SECRET_ENV", "cdc_env_secret_pw")
+		t.Setenv("PGPASSWORD", "cdc_pgpass_fallback")
+		opts := CDCOptions{
+			Password:       "cdc_direct_pw",
+			PasswordEnvVar: "BEAM_TEST_SECRET_ENV",
+		}
+		if got := opts.ResolvePassword(); got != "cdc_env_secret_pw" {
+			t.Errorf("ResolvePassword() = %q, want cdc_env_secret_pw", got)
+		}
+
+		optsNoEnvVar := CDCOptions{
+			Password: "cdc_direct_pw",
+		}
+		if got := optsNoEnvVar.ResolvePassword(); got != "cdc_direct_pw" {
+			t.Errorf("ResolvePassword() = %q, want cdc_direct_pw", got)
+		}
+
+		optsEmpty := CDCOptions{}
+		if got := optsEmpty.ResolvePassword(); got != "cdc_pgpass_fallback" {
+			t.Errorf("ResolvePassword() = %q, want cdc_pgpass_fallback", got)
+		}
+	})
+}
+
+func TestYAMLReference_ByteEquality(t *testing.T) {
+	want, err := os.ReadFile("YAML_REFERENCE.md")
+	if err != nil {
+		t.Fatalf("failed to read YAML_REFERENCE.md: %v", err)
+	}
+	got := GenerateYAMLReference()
+	if string(want) != got {
+		t.Fatalf("YAML_REFERENCE.md content drift detected.\n--- Want ---\n%s\n--- Got ---\n%s", string(want), got)
 	}
 }

@@ -20,6 +20,7 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"net"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -67,6 +68,7 @@ type WriteOptions struct {
 	Database              string
 	Username              string
 	Password              string `json:"password,omitempty"`
+	PasswordEnvVar        string `json:"password_env_var,omitempty"`
 	SSLMode               string
 	WriteMode             WriteMode
 	WriteMethod           WriteMethod
@@ -169,6 +171,26 @@ func WithPassword(pass string) Option {
 	return func(o *WriteOptions) {
 		o.Password = pass
 	}
+}
+
+// WithPasswordEnvVar sets the environment variable name on the worker to resolve the password.
+func WithPasswordEnvVar(envVar string) Option {
+	return func(o *WriteOptions) {
+		o.PasswordEnvVar = envVar
+	}
+}
+
+// ResolvePassword returns the password to use, prioritizing PasswordEnvVar, then Password, then PGPASSWORD.
+func (o WriteOptions) ResolvePassword() string {
+	if o.PasswordEnvVar != "" {
+		if val := os.Getenv(o.PasswordEnvVar); val != "" {
+			return val
+		}
+	}
+	if o.Password != "" {
+		return o.Password
+	}
+	return os.Getenv("PGPASSWORD")
 }
 
 // WithSSLMode sets the SSL/TLS connection mode (disable, require, verify-ca, verify-full).
