@@ -1,0 +1,75 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# Window Function Top-N Ranking per Category in Declarative Beam YAML
+#
+# Use Case:
+# Computes deterministic Top-N product ranking per category partition using
+# SQL window ranking functions and performs atomic upsert into `top_products_by_category`.
+#
+# Execution:
+#   python3 -m apache_beam.yaml.main --yaml_pipeline_file=pipeline.yaml
+
+pipeline:
+  type: chain
+  transforms:
+    - type: ReadFromPostgreSQLCDC
+      name: IngestProductsCDC
+      config:
+        host: "localhost"
+        port: 5432
+        database: "postgres"
+        username: "beam_test"
+        password_env_var: "PGPASSWORD"
+        slot_name: "products_topn_slot"
+        publication: "products_pub"
+
+    - type: Sql
+      name: RankTopProductsByCategory
+      config:
+        query: |
+          WITH Ranked AS (
+            SELECT
+              category,
+              product_id,
+              product_name,
+              sales_volume,
+              ROW_NUMBER() OVER (PARTITION BY category ORDER BY sales_volume DESC) AS rank_position
+            FROM PCOLLECTION
+          )
+          SELECT
+            category,
+            CAST(rank_position AS INTEGER) AS rank_position,
+            product_id,
+            product_name,
+            sales_volume,
+            CURRENT_TIMESTAMP AS updated_at
+          FROM Ranked
+          WHERE rank_position <= 10
+
+    - type: WriteToPostgreSQL
+      name: SinkTopProducts
+      config:
+        host: "localhost"
+        port: 5432
+        database: "postgres"
+        username: "beam_test"
+        password_env_var: "PGPASSWORD"
+        table: "public.top_products_by_category"
+        conflict_keys:
+          - "category"
+          - "rank_position"

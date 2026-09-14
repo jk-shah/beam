@@ -1,0 +1,74 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# Real-Time Streaming Fraud Inference in Declarative Beam YAML
+#
+# Use Case:
+# Evaluates statistical fraud risk model on incoming payments directly in worker
+# memory with zero external RPC overhead, writing predictions back to PostgreSQL.
+#
+# Execution:
+#   python3 -m apache_beam.yaml.main --yaml_pipeline_file=pipeline.yaml
+
+pipeline:
+  type: chain
+  transforms:
+    - type: ReadFromPostgreSQLCDC
+      name: IngestPaymentsCDC
+      config:
+        host: "localhost"
+        port: 5432
+        database: "postgres"
+        username: "beam_test"
+        password_env_var: "PGPASSWORD"
+        slot_name: "fraud_inference_slot"
+        publication: "fraud_inference_pub"
+
+    - type: Filter
+      name: FilterValidPayments
+      config:
+        language: python
+        keep: "operation in ('INSERT', 'UPDATE') and float(amount) > 0"
+
+    - type: Sql
+      name: EvaluateFraudRiskModel
+      config:
+        query: |
+          SELECT
+            payment_id,
+            account_id,
+            amount,
+            1.0 / (1.0 + EXP(-(-3.5 + 0.002 * amount + 0.05 * distance_from_home_km + 1.2 * (CASE WHEN is_international THEN 1.0 ELSE 0.0 END)))) AS fraud_probability,
+            CASE
+              WHEN 1.0 / (1.0 + EXP(-(-3.5 + 0.002 * amount + 0.05 * distance_from_home_km + 1.2 * (CASE WHEN is_international THEN 1.0 ELSE 0.0 END)))) >= 0.85 THEN 'HIGH_RISK_BLOCK'
+              WHEN 1.0 / (1.0 + EXP(-(-3.5 + 0.002 * amount + 0.05 * distance_from_home_km + 1.2 * (CASE WHEN is_international THEN 1.0 ELSE 0.0 END)))) >= 0.50 THEN 'SUSPICIOUS_REVIEW'
+              ELSE 'LOW_RISK_CLEAR'
+            END AS risk_tier,
+            CURRENT_TIMESTAMP AS scored_at
+          FROM PCOLLECTION
+
+    - type: WriteToPostgreSQL
+      name: SinkFraudPredictions
+      config:
+        host: "localhost"
+        port: 5432
+        database: "postgres"
+        username: "beam_test"
+        password_env_var: "PGPASSWORD"
+        table: "public.payment_fraud_predictions"
+        conflict_keys:
+          - "payment_id"

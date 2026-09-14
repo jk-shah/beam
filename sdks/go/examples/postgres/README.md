@@ -33,22 +33,39 @@ Each example demonstrates idiomatic Apache Beam pipeline design, error-handling 
 
 ## Pattern Catalog
 
-| Pattern / Use Case | Directory | Primary Beam Concepts | PostgreSQL Source/Sink Characteristics |
-| :--- | :--- | :--- | :--- |
-| **1. Dead-Letter Queue (DLQ) & Anomaly Routing** | [`dead_letter_queue/`](./dead_letter_queue/) | `beam.ParDo2` (Multi-Output), Data Sanitization, Error Tagging | Dual sink: clean production table + quarantined `dead_letter_payments` table with error codes. |
-| **2. Stream Deduplication & Idempotent Upsert** | [`deduplication/`](./deduplication/) | `beam.GroupByKey`, Event-Time Windowing, Discarding Duplicates | Elimination of at-least-once retries; atomic `ON CONFLICT (event_id) DO UPDATE` sink. |
-| **3. Customer 360 Relational Stream Join** | [`relational_enrichment/`](./relational_enrichment/) | `beam.CoGroupByKey`, Stream-to-Dimension Enrichment | Joining transaction stream with customer dimension tables; atomic upsert to `enriched_orders`. |
-| **4. Slowly Changing Dimensions (SCD Type 2)** | [`scd_type2/`](./scd_type2/) | Temporal Sorting, Version Generation, Window State | Non-destructive audit history with `valid_from`, `valid_to`, `is_current` flags in `customer_dim_history`. |
-| **5. High-Throughput Vectorized Batch ETL** | [`vectorized_batch_etl/`](./vectorized_batch_etl/) | Parameterized `UNNEST` Vectorization, Micro-Batching | High-speed database migration loading >33,000 rows/sec with zero per-row heap allocations. |
-| **6. Real-Time Streaming Windowed Aggregation** | [`streaming_aggregation/`](./streaming_aggregation/) | `postgresio.ReadCDC`, `window.NewFixedWindows`, Rollup Grouping | Decoupled logical replication stream source + continuous window rollup table sink. |
-| **7. Multi-Dimensional OLAP Sales Cube** | [`advanced_use_cases/multi_dimensional_olap/`](./advanced_use_cases/multi_dimensional_olap/) | Composite Keys (`Region\|Category`), `beam.GroupByKey`, Rollups | Incremental rollup aggregation with memory-bounded execution and atomic upsert on `(region, category)`. |
-| **8. Window Function Top-N per Group** | [`advanced_use_cases/top_n_ranking/`](./advanced_use_cases/top_n_ranking/) | Partition by Category, Bounded Sort/Heap, Truncation | Deterministic ranking per category partition; bounded heap prevents allocation spikes; atomic `(category, rank_position)` upsert. |
-| **9. Graph Topology & Degree Centrality** | [`advanced_use_cases/graph_vertex_degrees/`](./advanced_use_cases/graph_vertex_degrees/) | Edge Fan-Out, Directional Degree Deltas, `beam.GroupByKey` | Computes in-degree, out-degree, total degree, and average edge weights in a single-pass MapReduce pipeline. |
-| **10. ML Feature Engineering & Scaling** | [`advanced_use_cases/ml_feature_engineering/`](./advanced_use_cases/ml_feature_engineering/) | Global Population Combiner, Beam Side Inputs, Normalization | Normalizes features into bounded distributions `[0, 1]` and Z-scores using population statistics side inputs. |
-| **11. Inactivity Gap User Sessionization** | [`advanced_use_cases/sessionization/`](./advanced_use_cases/sessionization/) | Temporal Sorting, Delta Gap Evaluation (`gap > 30m`), Bounce Detection | Time-bounded stream grouping; captures single-click bounces (`is_bounce = true`) and session durations in seconds. |
-| **12. Data Reconciliation & Table Diff** | [`advanced_use_cases/data_reconciliation_diff/`](./advanced_use_cases/data_reconciliation_diff/) | Full Outer `beam.CoGroupByKey`, Anti-Join Checksum Validation | Audits replication fidelity, classifying records as `MATCH`, `VALUE_DRIFT`, `MISSING_TARGET`, or `MISSING_SOURCE`. |
-| **13. Dynamic PostgreSQL Lookup & Enrichment** | [`lookup_enrichment/`](./lookup_enrichment/) | Worker Connection Pooling, Concurrency-Safe TTL Cache, Business Rule Evaluation | Ingests orders from PostgreSQL, enriches transactions against PostgreSQL dimension tables via cached connection pools, and sinks back to PostgreSQL with idempotent upsert. |
-| **14. Real-Time Streaming Local Inference** | [`local_inference/`](./local_inference/) | Embedded In-Memory ML Model, Sub-Millisecond Scoring, Anomaly Tagging | Ingests continuous streaming transactions from PostgreSQL CDC, scores fraud risk locally in worker memory with zero RPC overhead, and writes predictions back to PostgreSQL with idempotent upsert. |
+Each example is provided as a native Go implementation, with companion declarative **Beam YAML (`pipeline.yaml`)** and **Python (`pipeline.py`)** stubs co-located in the same directory for PostgreSQL users, DBAs, and data engineers.
+
+| Pattern / Use Case | Directory | Available Formats | Primary Beam Concepts | PostgreSQL Source/Sink Characteristics |
+| :--- | :--- | :---: | :--- | :--- |
+| **1. Dead-Letter Queue (DLQ) & Anomaly Routing** | [`dead_letter_queue/`](./dead_letter_queue/) | Go, YAML, Python | `beam.ParDo2` (Multi-Output), Data Sanitization, Error Tagging | Dual sink: clean production table + quarantined `dead_letter_payments` table with error codes. |
+| **2. Stream Deduplication & Idempotent Upsert** | [`deduplication/`](./deduplication/) | Go, YAML, Python | `beam.GroupByKey`, Event-Time Windowing, Discarding Duplicates | Elimination of at-least-once retries; atomic `ON CONFLICT (event_id) DO UPDATE` sink. |
+| **3. Customer 360 Relational Stream Join** | [`relational_enrichment/`](./relational_enrichment/) | Go, YAML, Python | `beam.CoGroupByKey`, Stream-to-Dimension Enrichment | Joining transaction stream with customer dimension tables; atomic upsert to `enriched_orders`. |
+| **4. Slowly Changing Dimensions (SCD Type 2)** | [`scd_type2/`](./scd_type2/) | Go, YAML, Python | Temporal Sorting, Version Generation, Window State | Non-destructive audit history with `valid_from`, `valid_to`, `is_current` flags in `customer_dim_history`. |
+| **5. High-Throughput Vectorized Batch ETL** | [`vectorized_batch_etl/`](./vectorized_batch_etl/) | Go, YAML, Python | Parameterized `UNNEST` Vectorization, Micro-Batching | High-speed database migration loading >33,000 rows/sec with zero per-row heap allocations. |
+| **6. Real-Time Streaming Windowed Aggregation** | [`streaming_aggregation/`](./streaming_aggregation/) | Go, YAML, Python | `postgresio.ReadCDC`, `window.NewFixedWindows`, Rollup Grouping | Decoupled logical replication stream source + continuous window rollup table sink. |
+| **7. Multi-Dimensional OLAP Sales Cube** | [`advanced_use_cases/multi_dimensional_olap/`](./advanced_use_cases/multi_dimensional_olap/) | Go, YAML, Python | Composite Keys (`Region\|Category`), `beam.GroupByKey`, Rollups | Incremental rollup aggregation with memory-bounded execution and atomic upsert on `(region, category)`. |
+| **8. Window Function Top-N per Group** | [`advanced_use_cases/top_n_ranking/`](./advanced_use_cases/top_n_ranking/) | Go, YAML, Python | Partition by Category, Bounded Sort/Heap, Truncation | Deterministic ranking per category partition; bounded heap prevents allocation spikes; atomic `(category, rank_position)` upsert. |
+| **9. Graph Topology & Degree Centrality** | [`advanced_use_cases/graph_vertex_degrees/`](./advanced_use_cases/graph_vertex_degrees/) | Go | Edge Fan-Out, Directional Degree Deltas, `beam.GroupByKey` | Computes in-degree, out-degree, total degree, and average edge weights in a single-pass MapReduce pipeline. |
+| **10. ML Feature Engineering & Scaling** | [`advanced_use_cases/ml_feature_engineering/`](./advanced_use_cases/ml_feature_engineering/) | Go | Global Population Combiner, Beam Side Inputs, Normalization | Normalizes features into bounded distributions `[0, 1]` and Z-scores using population statistics side inputs. |
+| **11. Inactivity Gap User Sessionization** | [`advanced_use_cases/sessionization/`](./advanced_use_cases/sessionization/) | Go | Temporal Sorting, Delta Gap Evaluation (`gap > 30m`), Bounce Detection | Time-bounded stream grouping; captures single-click bounces (`is_bounce = true`) and session durations in seconds. |
+| **12. Data Reconciliation & Table Diff** | [`advanced_use_cases/data_reconciliation_diff/`](./advanced_use_cases/data_reconciliation_diff/) | Go | Full Outer `beam.CoGroupByKey`, Anti-Join Checksum Validation | Audits replication fidelity, classifying records as `MATCH`, `VALUE_DRIFT`, `MISSING_TARGET`, or `MISSING_SOURCE`. |
+| **13. Dynamic PostgreSQL Lookup & Enrichment** | [`lookup_enrichment/`](./lookup_enrichment/) | Go, YAML, Python | Worker Connection Pooling, Concurrency-Safe TTL Cache, Business Rule Evaluation | Ingests orders from PostgreSQL, enriches transactions against PostgreSQL dimension tables via cached connection pools, and sinks back to PostgreSQL with idempotent upsert. |
+| **14. Real-Time Streaming Local Inference** | [`local_inference/`](./local_inference/) | Go, YAML, Python | Embedded In-Memory ML Model, Sub-Millisecond Scoring, Anomaly Tagging | Ingests continuous streaming transactions from PostgreSQL CDC, scores fraud risk locally in worker memory with zero RPC overhead, and writes predictions back to PostgreSQL with idempotent upsert. |
+
+### Running in Go, Beam YAML, or Python
+
+Choose the syntax and language that best fits your operational workflow:
+
+```bash
+# Option 1: Native Go implementation
+go run sdks/go/examples/postgres/streaming_aggregation/main.go --runner=prism
+
+# Option 2: Declarative Beam YAML (No SDK code, pure YAML + SQL)
+python3 -m apache_beam.yaml.main --yaml_pipeline_file=sdks/go/examples/postgres/streaming_aggregation/pipeline.yaml
+
+# Option 3: Python implementation (using apache_beam.io.postgres_cdc)
+python3 sdks/go/examples/postgres/streaming_aggregation/pipeline.py --runner=DirectRunner
+```
 
 ---
 

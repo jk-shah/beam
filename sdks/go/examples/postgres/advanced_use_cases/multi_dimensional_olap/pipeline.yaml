@@ -1,0 +1,68 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# Multi-Dimensional OLAP Sales Cube in Declarative Beam YAML
+#
+# Use Case:
+# Computes composite dimensional rollups (total revenue, order count, average order value)
+# grouped by `(region, category)` and atomic upsert into `olap_sales_cube`.
+#
+# Execution:
+#   python3 -m apache_beam.yaml.main --yaml_pipeline_file=pipeline.yaml
+
+pipeline:
+  type: chain
+  transforms:
+    - type: ReadFromPostgreSQLCDC
+      name: IngestSalesOrdersCDC
+      config:
+        host: "localhost"
+        port: 5432
+        database: "postgres"
+        username: "beam_test"
+        password_env_var: "PGPASSWORD"
+        slot_name: "olap_sales_slot"
+        publication: "sales_pub"
+
+    - type: Sql
+      name: ComputeSalesCubeRollup
+      config:
+        query: |
+          SELECT
+            region,
+            category,
+            SUM(amount) AS total_revenue,
+            COUNT(*) AS order_count,
+            AVG(amount) AS avg_order_value,
+            MAX(amount) AS max_order_value,
+            CURRENT_TIMESTAMP AS computed_at
+          FROM PCOLLECTION
+          WHERE operation IN ('INSERT', 'UPDATE')
+          GROUP BY region, category
+
+    - type: WriteToPostgreSQL
+      name: SinkSalesCube
+      config:
+        host: "localhost"
+        port: 5432
+        database: "postgres"
+        username: "beam_test"
+        password_env_var: "PGPASSWORD"
+        table: "public.olap_sales_cube"
+        conflict_keys:
+          - "region"
+          - "category"
