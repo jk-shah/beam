@@ -387,12 +387,15 @@ func (s *NativeReplicationStream) handshake(ctx context.Context) error {
 	}
 
 	// Server should respond with CopyBothResponse ('W') or CopyOutResponse ('H')
-	msgType, _, err := s.readRawMessage()
+	msgType, payload, err := s.readRawMessage()
 	if err != nil {
 		return err
 	}
 	if msgType != 'W' && msgType != 'H' {
-		return fmt.Errorf("expected CopyResponse ('W' or 'H'), got %c", msgType)
+		if msgType == 'E' {
+			return fmt.Errorf("START_REPLICATION failed: %s", sanitizeErrorPayload(payload))
+		}
+		return fmt.Errorf("expected CopyResponse ('W' or 'H'), got %c (payload: %s)", msgType, string(payload))
 	}
 
 	return nil
