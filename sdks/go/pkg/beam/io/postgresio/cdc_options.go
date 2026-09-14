@@ -74,6 +74,27 @@ type CDCOptions struct {
 	// correct trade for a slot that must survive failover, but it is not a
 	// trade to make on a user's behalf.
 	FailoverSlot bool
+
+	// MaxSlotLagBytes is the WAL retention budget for this slot. Zero, the
+	// default, disables the circuit breaker.
+	//
+	// A replication slot retains WAL from its restart_lsn until the consumer
+	// acknowledges, with no client-side bound. A pipeline that stops
+	// acknowledging therefore accumulates WAL on the primary until its volume
+	// fills. Setting a budget makes that condition fail loudly instead.
+	//
+	// The breaker detects and reports; it does not reclaim WAL. Pair it with
+	// the server-side max_slot_wal_keep_size, which does not depend on this
+	// client being alive.
+	MaxSlotLagBytes uint64
+
+	// SlotLagPolicy selects what happens on breach. Defaults to
+	// SlotLagFailPipeline.
+	SlotLagPolicy SlotLagPolicy
+
+	// SlotLagCheckInterval is how often retention is measured. Defaults to
+	// DefaultSlotLagCheckInterval and is clamped to at least one second.
+	SlotLagCheckInterval time.Duration
 }
 
 // CDCOption defines a functional option for configuring CDCOptions.
@@ -366,5 +387,45 @@ func WithCDCStreamingMode(mode string) CDCOption {
 func WithCDCTwoPhase(twoPhase bool) CDCOption {
 	return func(o *CDCOptions) {
 		o.TwoPhaseCommit = twoPhase
+	}
+}
+
+// WithCDCMaxSlotLagBytes sets the WAL retention budget and enables the
+// replication slot circuit breaker.
+//
+// The budget is measured against pg_replication_slots.restart_lsn, which is the
+// oldest LSN the slot still requires and therefore what the primary is actually
+// retaining. Enabling the breaker opens one additional, ordinary connection to
+// poll that value; it cannot be derived from the replication connection,
+// because the in-process figure stops advancing when the pipeline stalls.
+//
+// On breach the default policy fails the pipeline and severs the replication
+// session, leaving the slot in place so the pipeline can resume.
+//
+// Use MiB and GiB for readability:
+//
+//	postgresio.WithCDCMaxSlotLagBytes(8 * postgresio.GiB)
+func WithCDCMaxSlotLagBytes(n uint64) CDCOption {
+	return func(o *CDCOptions) {
+		o.MaxSlotLagBytes = n
+	}
+}
+
+// WithCDCSlotLagPolicy selects the action taken when the retention budget is
+// exceeded. Defaults to SlotLagFailPipeline.
+func WithCDCSlotLagPolicy(p SlotLagPolicy) CDCOption {
+	return func(o *CDCOptions) {
+		o.SlotLagPolicy = p
+	}
+}
+
+// WithCDCSlotLagCheckInterval sets how often WAL retention is measured.
+//
+// Defaults to DefaultSlotLagCheckInterval. Values below one second are clamped:
+// the query is cheap but not free, and a primary that is accumulating WAL may
+// already be under pressure.
+func WithCDCSlotLagCheckInterval(d time.Duration) CDCOption {
+	return func(o *CDCOptions) {
+		o.SlotLagCheckInterval = d
 	}
 }

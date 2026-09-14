@@ -133,6 +133,20 @@ type cdcSourceFn struct {
 	// return would make connection churn proportional to the checkpoint rate.
 	session *cdcSession
 	mu      sync.Mutex
+
+	// monitor measures WAL retention on a connection independent of the
+	// replication stream. It is started lazily, on the first session this
+	// worker actually opens, so a worker the runner initialized but never
+	// scheduled does not open a connection or poll the primary.
+	//
+	// It is owned here rather than by cdcSession because it must outlive one.
+	// A session that is dropped and not recreated is the stalled case, and a
+	// monitor tied to the session would stop measuring at the moment the slot
+	// is orphaned and still retaining WAL.
+	monitor *slotMonitor
+
+	// newSlotQuerier is a test seam. Nil means the production SQL querier.
+	newSlotQuerier func(CDCOptions) (slotRetentionQuerier, error)
 }
 
 func newCDCSourceFn(opts CDCOptions) *cdcSourceFn {
@@ -244,16 +258,65 @@ func (fn *cdcSourceFn) Setup(_ context.Context) error {
 	return nil
 }
 
-// Teardown closes the replication connection and stops the keepalive loop.
+// Teardown closes the replication connection and stops the keepalive loop and
+// the slot monitor.
 func (fn *cdcSourceFn) Teardown() error {
 	fn.mu.Lock()
 	session := fn.session
 	fn.session = nil
+	monitor := fn.monitor
+	fn.monitor = nil
 	fn.mu.Unlock()
-	if session == nil {
-		return nil
+
+	var err error
+	if session != nil {
+		err = session.close()
 	}
-	return session.close()
+	if monitor != nil {
+		if mErr := monitor.close(); mErr != nil && err == nil {
+			err = mErr
+		}
+	}
+	return err
+}
+
+// startMonitorLocked starts the slot monitor if the circuit breaker is
+// configured and it is not already running. fn.mu must be held.
+//
+// A failure to start the monitor is logged rather than returned. The breaker is
+// a safety net; refusing to run the pipeline because the net could not be hung
+// would make the protective feature an availability risk in its own right.
+func (fn *cdcSourceFn) startMonitorLocked(ctx context.Context) {
+	if fn.Options.MaxSlotLagBytes == 0 || fn.monitor != nil {
+		return
+	}
+
+	newQuerier := fn.newSlotQuerier
+	if newQuerier == nil {
+		newQuerier = func(opts CDCOptions) (slotRetentionQuerier, error) {
+			return newSQLSlotQuerier(opts)
+		}
+	}
+	querier, err := newQuerier(fn.Options)
+	if err != nil {
+		cdcSlotLagCheckFailures.Inc(ctx, 1)
+		log.Errorf(ctx, "postgresio: could not start the WAL retention circuit breaker for slot %q, "+
+			"the database is not protected against unbounded WAL growth by this pipeline: %v",
+			fn.Options.SlotName, err)
+		return
+	}
+
+	monitor := newSlotMonitor(fn.Options, querier, func() {
+		// Sever the replication session. This runs on the monitor goroutine,
+		// so it must not take fn.mu in a way that can deadlock against a
+		// caller already holding it; dropSession takes the lock itself and the
+		// monitor never holds it.
+		if session := fn.currentSession(); session != nil {
+			fn.dropSession(session)
+		}
+	})
+	monitor.start(ctx)
+	fn.monitor = monitor
 }
 
 // --- Splittable DoFn: processing ---
@@ -277,6 +340,14 @@ func (fn *cdcSourceFn) ProcessElement(
 	rest, ok := rt.GetRestriction().(offsetrange.Restriction)
 	if !ok {
 		return sdf.StopProcessing(), fmt.Errorf("postgresio: unexpected restriction type %T", rt.GetRestriction())
+	}
+
+	// A breach latched by the monitor is reported before any further reading.
+	// The monitor has already severed the session; continuing would reopen the
+	// replication connection and resume pinning WAL on a slot that is over
+	// budget.
+	if breach := fn.latchedBreach(); breach != nil {
+		return sdf.StopProcessing(), breach
 	}
 
 	session, err := fn.ensureSession(ctx, uint64(rest.Start))
@@ -326,6 +397,15 @@ readLoop:
 		if ctx.Err() != nil {
 			continuation = sdf.StopProcessing()
 			break
+		}
+
+		// Only at a boundary: abandoning mid-transaction would discard the
+		// unread remainder, and the breach is reported on the next invocation
+		// regardless.
+		if atBoundary {
+			if breach := fn.latchedBreach(); breach != nil {
+				return sdf.StopProcessing(), breach
+			}
 		}
 
 		readDeadline := deadline
@@ -592,6 +672,7 @@ func (fn *cdcSourceFn) ensureSession(ctx context.Context, resumeLSN uint64) (*cd
 		return existing, nil
 	}
 	fn.session = session
+	fn.startMonitorLocked(ctx)
 	fn.mu.Unlock()
 	return session, nil
 }
@@ -610,6 +691,20 @@ func (fn *cdcSourceFn) currentSession() *cdcSession {
 	fn.mu.Lock()
 	defer fn.mu.Unlock()
 	return fn.session
+}
+
+// latchedBreach returns the circuit breaker's latched breach, or nil.
+//
+// The latch clears on its own once a later measurement comes in under budget,
+// so a backlog that drains does not fail the pipeline permanently.
+func (fn *cdcSourceFn) latchedBreach() *slotBreach {
+	fn.mu.Lock()
+	monitor := fn.monitor
+	fn.mu.Unlock()
+	if monitor == nil {
+		return nil
+	}
+	return monitor.breached()
 }
 
 func (s *cdcSession) keepaliveLoop(ctx context.Context, interval time.Duration) {

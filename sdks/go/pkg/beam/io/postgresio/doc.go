@@ -43,11 +43,17 @@
 //     WithCDCFailoverSlot, so a logical consumer keeps its position across a
 //     failover. It is off by default because it makes pipeline latency
 //     depend on physical standby replication.
+//   - A WAL retention circuit breaker bounds how much WAL a stalled pipeline
+//     can pin. It measures the slot's restart_lsn on a separate connection,
+//     because the replication connection is only read while ProcessElement
+//     runs and so goes blind in exactly that situation. Off by default; set
+//     WithCDCMaxSlotLagBytes to enable it. It does not drop the slot, so
+//     max_slot_wal_keep_size remains the server-side backstop.
 //
 // Known open items include the UNNEST write path not setting a replication
-// origin, no circuit breaker on replication slot lag, and the connector being
-// built on lib/pq rather than pgx. See the Known Limitations section of the
-// package README for the full list and the current state of each item.
+// origin, no initial backfill, and the connector being built on lib/pq rather
+// than pgx. See the Known Limitations section of the package README for the
+// full list and the current state of each item.
 //
 // # Key Capabilities
 //

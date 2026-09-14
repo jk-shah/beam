@@ -52,6 +52,7 @@
    - [Checkpointing & Acknowledgment](#checkpointing--acknowledgment)
    - [Security & TLS Configuration](#security--tls-configuration)
    - [Failover slots](#failover-slots)
+   - [WAL retention circuit breaker](#wal-retention-circuit-breaker)
    - [Known Limitations](#known-limitations)
 5. [Contributor Guide: Codebase Map & Invariants](#5-contributor-guide-codebase-map--invariants)
    - [File Inventory & Responsibilities](#file-inventory--responsibilities)
@@ -428,6 +429,9 @@ pipeline:
 | `WithCDCDialFunc(DialFunc)` | `nil` | Custom network dialer |
 | `WithCDCSSLMode(string)` | `verify-full` — see [Security](#security--tls-configuration) | `disable`, `require`, `verify-ca`, or `verify-full` |
 | `WithCDCFailoverSlot(bool)` | `false` | Creates the slot with `FAILOVER` so PostgreSQL 17 and later synchronize it to a standby. Requires server major version 17; slot creation fails on an older server rather than downgrading. See [Failover slots](#failover-slots). |
+| `WithCDCMaxSlotLagBytes(uint64)` | `0` (disabled) | Retention budget for the slot. When exceeded, the configured policy applies. See [WAL retention circuit breaker](#wal-retention-circuit-breaker). |
+| `WithCDCSlotLagPolicy(SlotLagPolicy)` | `SlotLagFailPipeline` | `SlotLagFailPipeline` fails the pipeline and severs the replication session; `SlotLagLogOnly` records the breach and continues. Only consulted when a budget is set. |
+| `WithCDCSlotLagCheckInterval(Duration)` | `30s` | How often retention is measured. Clamped to a minimum of `1s`. |
 
 ### Checkpointing & Acknowledgment
 
@@ -504,13 +508,77 @@ Enabling the option against a server older than 17 is an error rather than a
 silent downgrade. Reporting success for a slot that is not actually
 failover-safe would leave the operator relying on a guarantee they do not have.
 
+### WAL retention circuit breaker
+
+A replication slot pins WAL on the primary until the consumer acknowledges it.
+If a pipeline stalls, is drained, or is suspended, the slot keeps its position
+and the primary keeps accumulating WAL. Left unattended this exhausts the WAL
+volume, which affects every workload on that server, not just the pipeline.
+
+The circuit breaker bounds that exposure. It is **off by default**; set a budget
+to enable it:
+
+```go
+opts := postgresio.NewCDCOptions(
+    postgresio.WithCDCSlotName("beam_streaming_slot"),
+    postgresio.WithCDCMaxSlotLagBytes(16*1024*1024*1024), // 16 GiB
+    postgresio.WithCDCSlotLagPolicy(postgresio.SlotLagFailPipeline),
+    postgresio.WithCDCSlotLagCheckInterval(30*time.Second),
+)
+```
+
+**What is measured.** Retention is measured from the slot's `restart_lsn`, not
+its `confirmed_flush_lsn`. `restart_lsn` is the oldest WAL the server must keep
+for the slot, which is what determines disk consumption; `confirmed_flush_lsn`
+is further ahead and understates it.
+
+The measurement runs on a **separate connection**, not the replication
+connection. Frames on the replication connection are only read while
+`ProcessElement` is executing, so a stalled pipeline stops updating the
+in-process view of the server's WAL position. Deriving the budget from that view
+would go blind in precisely the situation the breaker exists for.
+
+On a standby the query anchors to `pg_last_wal_receive_lsn()` instead of
+`pg_current_wal_lsn()`, which raises an error during recovery.
+
+**What happens on a breach.** Under `SlotLagFailPipeline` the monitor closes the
+replication session and latches the breach. Closing the session stops the
+keepalives and releases the walsender, which marks the slot inactive
+server-side — the state DBA tooling and `max_slot_wal_keep_size` key on. The
+next `ProcessElement` invocation returns the breach as an error; an invocation
+already running stops at its next transaction boundary. The latch clears on its
+own if a later measurement comes in under budget, so a backlog that drains does
+not fail the pipeline permanently.
+
+The slot is **not** dropped. Dropping it would reclaim the WAL but discard the
+pipeline's position permanently, and the connector has no backfill to recover
+from that. See [Known Limitations](#known-limitations).
+
+**Privileges.** `pg_replication_slots` carries no privilege restriction, so no
+additional grant is needed to read retention. Reading
+`max_slot_wal_keep_size` from `pg_settings` is likewise unrestricted; if it
+cannot be read the monitor continues without the startup comparison.
+
+> [!IMPORTANT]
+> The breaker complements the server-side `max_slot_wal_keep_size` setting, it
+> does not replace it. The server setting protects the database by invalidating
+> the slot, which silently destroys the pipeline's position. The client-side
+> breaker fails loudly first and leaves the slot recoverable. Configure both. If
+> the client budget is larger than the server limit the server acts first, and
+> the monitor logs a warning at startup.
+
+> [!WARNING]
+> A bundle already blocked inside a downstream `emit` cannot be interrupted from
+> outside. The breaker severs the replication session and reports on the next
+> scheduling boundary, but it cannot force a wedged bundle to return.
+
 ### Known Limitations
 
 The connector is unreleased and experimental. The list below is what is still open; the [remediation acceptance suite](#remediation-acceptance-suite) covers the items that have been fixed and fails if any of them regresses.
 
 | Area | Limitation | Impact |
 | :--- | :--- | :--- |
-| **Slot lag** | Replication slot lag is reported as the `cdc_slot_lag_bytes` metric, but nothing acts on it. A pipeline that stalls or is suspended keeps its slot, and the primary keeps retaining WAL. | The database can still run out of WAL volume if a stalled pipeline is left unattended. Alert on `pg_replication_slots` independently. |
+| **Slot lag** | The [circuit breaker](#wal-retention-circuit-breaker) bounds retention, but it is off by default and it does not drop the slot, so WAL is not reclaimed by the breach itself. A bundle already blocked inside a downstream `emit` cannot be interrupted from outside. | Without a configured budget the database can still run out of WAL volume if a stalled pipeline is left unattended. Set `WithCDCMaxSlotLagBytes`, and configure `max_slot_wal_keep_size` server-side as a backstop. |
 | **Long transactions** | A checkpoint cannot land partway through a transaction, so `WithCDCCheckpointInterval` is advisory while one is open. A single very large transaction extends the invocation until its `COMMIT` frame arrives. | Acknowledgment latency, and the memory the parser holds for a streamed transaction, both scale with the largest transaction on the source. A connection that stops delivering mid-transaction is dropped after two minutes of silence and the bundle is retried. |
 | **Initial backfill** | Slot creation exports a consistent snapshot and `SlotCreationResult.SnapshotIsolationStatements` returns the statements needed to read it, but the connector does not run the backfill. | Pre-existing table rows require a separate read. Only changes after the slot's creation point arrive through CDC. |
 | **Replication origin on the write path** | The staged `COPY` path sets a replication origin; the `UNNEST` fallback does not. | In a bi-directional topology, rows written through the fallback path are not distinguishable from user writes and can be replicated back. |
