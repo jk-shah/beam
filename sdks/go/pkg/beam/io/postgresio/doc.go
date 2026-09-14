@@ -17,6 +17,25 @@
 // for writing to and streaming from PostgreSQL databases without Java Virtual Machine
 // (JVM) dependencies.
 //
+// # Status
+//
+// This package is unreleased and under active remediation. It is not ready for
+// production use. A security and correctness review identified defects that affect
+// the source database rather than only the pipeline:
+//
+//   - The replication slot is not acknowledged in production. ProcessElement does not
+//     return, so no bundle finalizes and the BundleFinalization callback that advances
+//     confirmed_flush_lsn never runs. Write-ahead log accumulates on the primary until
+//     its volume fills.
+//   - TLS is disabled by default. An unset sslmode skips negotiation entirely, so
+//     credentials are sent in cleartext, and no option exists for supplying a CA bundle.
+//   - SCRAM-SHA-256 is unsupported, so a default PostgreSQL 14+ server cannot be reached.
+//   - No watermark is produced, so downstream windows cannot close reliably.
+//   - There is no initial snapshot, so pre-existing rows are never emitted.
+//
+// See the Known Limitations section of the package README for the full list and the
+// current state of each item.
+//
 // # Key Capabilities
 //
 // 1. Parameterized UNNEST Array Upserts: Executes high-throughput bulk inserts
@@ -36,10 +55,12 @@
 // (INSERT, UPDATE, DELETE, TRUNCATE) from PostgreSQL logical replication slots using a
 // native binary pgoutput wire decoder, eliminating Debezium and external JVM processes.
 //
-// 5. Decoupled Heartbeat & Strict Checkpointing: Implements an asynchronous keepalive
+// 5. Decoupled Heartbeat & Checkpointing Design: Implements an asynchronous keepalive
 // goroutine sending StandbyStatusUpdate messages to prevent PostgreSQL wal_sender_timeout
-// (60s) drops during downstream backpressure, while coordinating confirmed FlushLSN
-// strictly via Beam's BundleFinalizer to eliminate data loss risks.
+// (60s) drops during downstream backpressure. Confirmed FlushLSN is coordinated strictly
+// via Beam's BundleFinalizer so that no LSN is acknowledged for data Beam has not durably
+// committed. Note that this is the intended design; see Status above for the defect that
+// currently prevents the acknowledgment from advancing at all.
 //
 // 6. Stateful TOAST Reassembly (ReassembleToast): Automatically caches baseline tuples
 // in Beam runner state (state.Value[ChangeEvent]) and reassembles unmodified out-of-line

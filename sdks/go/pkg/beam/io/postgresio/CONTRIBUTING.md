@@ -195,10 +195,28 @@ go test -v -race ./pkg/beam/io/postgresio/...
 
 # Run targeted benchmark tests
 go test -bench=BenchmarkArrowBatcher -benchmem ./pkg/beam/io/postgresio/
+
+# Run the remediation acceptance suite (expected to FAIL until the
+# corresponding workstream lands -- see README "Known Limitations")
+go test -v -tags postgresio_remediation ./pkg/beam/io/postgresio/
 ```
+
+### Test Suite Layout
+
+| File | Build tag | Expected state | Purpose |
+| :--- | :--- | :--- | :--- |
+| `remediation_invariants_test.go` | none | Passing | Locks in guarantees that already hold: injection-resistant identifier sanitization, slot and heartbeat validation, credential redaction, batch compaction and deadlock-avoiding sort, key determinism. A failure means a change broke an existing guarantee. |
+| `remediation_acceptance_test.go` | `postgresio_remediation` | Failing by design | Executable definition of done for the outstanding defects. Hermetic: wire-level tests over `net.Pipe`, behavioral tests, and source-level guards. |
+
+> [!IMPORTANT]
+> Do not weaken or delete an acceptance test to get a green run. A test is retired only by making it pass and moving it into the default suite. Several of these guard defects that affect the source database, not just the pipeline.
+
+If you fix a defect listed in the README's Known Limitations table, move its test out of the tagged file in the same pull request and update that table.
 
 ### Verification Checklist Before Submitting PR
 - [ ] `go test -v -race ./...` passes with zero race detector warnings.
+- [ ] `remediation_invariants_test.go` still passes; no assertion in it was relaxed.
+- [ ] Any acceptance test made to pass has been moved into the default suite and the README Known Limitations table updated.
 - [ ] Code is formatted with `gofmt -s -w .`.
 - [ ] Zero personal usernames or credentials in repository code, tests, docs, or roles (use `beam_test` exclusively).
 - [ ] Apache 2.0 license header is present on every newly created file.
