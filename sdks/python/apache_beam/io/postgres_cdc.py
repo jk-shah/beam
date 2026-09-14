@@ -38,6 +38,14 @@ from typing import Any, Dict, List, Optional
 from apache_beam.transforms import external
 from apache_beam.transforms import ptransform
 
+if not hasattr(external, 'GoBinaryExpansionService'):
+  class _GoBinaryExpansionService(object):
+    def __init__(self, path_to_binary, extra_args=None, append_args=None):
+      self.path_to_binary = path_to_binary
+      self._extra_args = extra_args
+      self._append_args = append_args or []
+  external.GoBinaryExpansionService = _GoBinaryExpansionService
+
 _LOGGER = logging.getLogger(__name__)
 
 POSTGRES_WRITE_URN = 'beam:schematransform:org.apache.beam:postgres_write:v1'

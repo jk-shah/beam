@@ -28,7 +28,7 @@ services:
       -c max_wal_senders=8
       -c max_slot_wal_keep_size=1024MB
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5434}:5432"
     volumes:
       - ./init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
     healthcheck:
@@ -39,8 +39,8 @@ services:
 
   pipeline:
     build:
-      context: ../../../..
-      dockerfile: examples/postgres/quickstart/Dockerfile
+      context: ../../../../..
+      dockerfile: sdks/go/examples/postgres/quickstart/Dockerfile
     container_name: quickstart-pipeline
     depends_on:
       postgres:

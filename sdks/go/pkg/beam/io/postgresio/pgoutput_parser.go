@@ -479,6 +479,28 @@ func (p *PgOutputParser) emitOrSpool(ev *ChangeEvent) []*ChangeEvent {
 	return []*ChangeEvent{ev}
 }
 
+// ParseXLogData decodes a WAL data ('w') message envelope.
+// In the PostgreSQL streaming replication protocol, CopyData ('d') messages carrying
+// WAL data begin with Byte1('w'), followed by startLSN (8 bytes), endWAL (8 bytes),
+// serverTime (8 bytes), and the inner pgoutput stream message payload.
+func ParseXLogData(data []byte) (startLSN, endWAL uint64, serverTime time.Time, walData []byte, err error) {
+	if len(data) < 25 || data[0] != 'w' {
+		return 0, 0, time.Time{}, nil, fmt.Errorf("invalid XLogData message")
+	}
+	r := bytes.NewReader(data[1:])
+	var serverMicros int64
+	if err := binary.Read(r, binary.BigEndian, &startLSN); err != nil {
+		return 0, 0, time.Time{}, nil, err
+	}
+	if err := binary.Read(r, binary.BigEndian, &endWAL); err != nil {
+		return 0, 0, time.Time{}, nil, err
+	}
+	if err := binary.Read(r, binary.BigEndian, &serverMicros); err != nil {
+		return 0, 0, time.Time{}, nil, err
+	}
+	return startLSN, endWAL, PgTimeToGo(serverMicros), data[25:], nil
+}
+
 // ParseKeepAlive decodes a Primary Keepalive ('k') message.
 func ParseKeepAlive(data []byte) (endWAL uint64, serverTime time.Time, replyRequested bool, err error) {
 	if len(data) < 18 || data[0] != 'k' {

@@ -79,3 +79,9 @@ CROSS JOIN LATERAL (
     END AS retained_bytes
 ) calc
 WHERE s.slot_type = 'logical';
+
+-- Pre-create replication slot for quickstart pipeline
+SELECT pg_create_logical_replication_slot('quickstart_slot', 'pgoutput')
+WHERE NOT EXISTS (
+    SELECT 1 FROM pg_replication_slots WHERE slot_name = 'quickstart_slot'
+);

@@ -21,12 +21,18 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"reflect"
 	"time"
 
 	"github.com/apache/beam/sdks/v2/go/pkg/beam"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/io/postgresio"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/x/beamx"
 )
+
+func init() {
+	beam.RegisterType(reflect.TypeOf((*targetOrderRow)(nil)).Elem())
+	beam.RegisterFunction(transformCDCToTarget)
+}
 
 var (
 	host     = flag.String("host", "postgres", "PostgreSQL database host.")
@@ -39,14 +45,55 @@ var (
 )
 
 type targetOrderRow struct {
-	ID         int       `beam:"id"`
-	CustomerID int       `beam:"customer_id"`
-	Amount     float64   `beam:"amount"`
-	Status     string    `beam:"status"`
-	SyncedAt   time.Time `beam:"synced_at"`
+	ID         int       `beam:"id" db:"id"`
+	CustomerID int       `beam:"customer_id" db:"customer_id"`
+	Amount     float64   `beam:"amount" db:"amount"`
+	Status     string    `beam:"status" db:"status"`
+	SyncedAt   time.Time `beam:"synced_at" db:"synced_at"`
+}
+
+func toInt(v any) int {
+	switch val := v.(type) {
+	case int:
+		return val
+	case int32:
+		return int(val)
+	case int64:
+		return int(val)
+	case float64:
+		return int(val)
+	case string:
+		var i int
+		fmt.Sscanf(val, "%d", &i)
+		return i
+	default:
+		return 0
+	}
+}
+
+func toFloat(v any) float64 {
+	switch val := v.(type) {
+	case float64:
+		return val
+	case float32:
+		return float64(val)
+	case int64:
+		return float64(val)
+	case int32:
+		return float64(val)
+	case int:
+		return float64(val)
+	case string:
+		var f float64
+		fmt.Sscanf(val, "%f", &f)
+		return f
+	default:
+		return 0
+	}
 }
 
 func transformCDCToTarget(record postgresio.ChangeEvent, emit func(targetOrderRow)) error {
+	log.Printf("[TRANSFORM] received change event: op=%v table=%s.%s lsn=%d", record.Operation, record.Schema, record.Table, record.LSN)
 	if record.Operation == postgresio.OpDelete {
 		return nil
 	}
@@ -56,19 +103,14 @@ func transformCDCToTarget(record postgresio.ChangeEvent, emit func(targetOrderRo
 		return nil
 	}
 
-	idVal, ok := data["id"].(int64)
-	if !ok {
-		if f, ok := data["id"].(float64); ok {
-			idVal = int64(f)
-		}
-	}
-	custVal, _ := data["customer_id"].(int64)
-	amountVal, _ := data["amount"].(float64)
+	idVal := toInt(data["id"])
+	custVal := toInt(data["customer_id"])
+	amountVal := toFloat(data["amount"])
 	statusVal, _ := data["status"].(string)
 
 	emit(targetOrderRow{
-		ID:         int(idVal),
-		CustomerID: int(custVal),
+		ID:         idVal,
+		CustomerID: custVal,
 		Amount:     amountVal,
 		Status:     statusVal,
 		SyncedAt:   time.Now().UTC(),
@@ -92,6 +134,7 @@ func main() {
 		postgresio.WithCDCSlotName(*slotName),
 		postgresio.WithCDCPublication(*pubName),
 		postgresio.WithCDCSSLMode("disable"),
+		postgresio.WithCDCCreateSlotIfMissing(true),
 		postgresio.WithCDCHeartbeatInterval(10 * time.Second),
 	}
 
@@ -108,7 +151,7 @@ func main() {
 		SSLMode:        "disable",
 		WriteMode:      postgresio.WriteModeUpsert,
 		PrimaryKeyCols: []string{"id"},
-		BatchSize:      100,
+		BatchSize:      1,
 	}
 
 	postgresio.Write(s.Scope("WriteTarget"), "public.orders_target", writeOpts, targetRows)

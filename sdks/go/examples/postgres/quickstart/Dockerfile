@@ -13,11 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM golang:1.24-alpine AS builder
+FROM golang:alpine AS builder
+ENV GOTOOLCHAIN=auto
 
 WORKDIR /workspace
 
-# Copy Go SDK source
+# Copy Go SDK module definition and source
+COPY sdks/go.mod sdks/go.sum /workspace/sdks/
 COPY sdks/go /workspace/sdks/go
 
 WORKDIR /workspace/sdks/go/examples/postgres/quickstart

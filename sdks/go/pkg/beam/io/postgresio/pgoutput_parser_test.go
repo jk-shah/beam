@@ -258,6 +258,33 @@ func TestKeepAliveAndStatusUpdateEncoding(t *testing.T) {
 	}
 }
 
+func TestParseXLogData(t *testing.T) {
+	var buf bytes.Buffer
+	buf.WriteByte('w')
+	_ = binary.Write(&buf, binary.BigEndian, uint64(10000)) // startLSN
+	_ = binary.Write(&buf, binary.BigEndian, uint64(20000)) // endWAL
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	_ = binary.Write(&buf, binary.BigEndian, GoTimeToPg(now)) // serverTime
+	buf.WriteString("pgoutput_data_payload")
+
+	startLSN, endWAL, serverTime, walData, err := ParseXLogData(buf.Bytes())
+	if err != nil {
+		t.Fatalf("failed to parse XLogData: %v", err)
+	}
+	if startLSN != 10000 {
+		t.Errorf("expected startLSN 10000, got %d", startLSN)
+	}
+	if endWAL != 20000 {
+		t.Errorf("expected endWAL 20000, got %d", endWAL)
+	}
+	if serverTime.Sub(now).Abs() > time.Millisecond {
+		t.Errorf("expected server time %v, got %v", now, serverTime)
+	}
+	if string(walData) != "pgoutput_data_payload" {
+		t.Errorf("expected payload 'pgoutput_data_payload', got %q", string(walData))
+	}
+}
+
 func TestTimeConversions(t *testing.T) {
 	orig := time.Date(2026, 9, 5, 15, 30, 45, 123456000, time.UTC)
 	micros := GoTimeToPg(orig)

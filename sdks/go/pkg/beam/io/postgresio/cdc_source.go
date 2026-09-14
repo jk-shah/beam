@@ -35,6 +35,15 @@ import (
 )
 
 var (
+	globalCDCSessionsMu sync.Mutex
+	globalCDCSessions   = make(map[string]*cdcSession)
+)
+
+func cdcSessionKey(opts CDCOptions) string {
+	return fmt.Sprintf("%s:%d/%s/%s", opts.Host, opts.Port, opts.Database, opts.SlotName)
+}
+
+var (
 	cdcProcessedRecords = beam.NewCounter("postgresio", "cdc_processed_records")
 	cdcFilteredRecords  = beam.NewCounter("postgresio", "cdc_filtered_origin_records")
 
@@ -279,9 +288,17 @@ func (fn *cdcSourceFn) Teardown() error {
 
 	var err error
 	if session != nil {
-		err = session.close()
+		if fn.Options.StreamFactory != nil {
+			key := cdcSessionKey(fn.Options)
+			globalCDCSessionsMu.Lock()
+			if globalCDCSessions[key] == session {
+				delete(globalCDCSessions, key)
+			}
+			globalCDCSessionsMu.Unlock()
+			err = session.close()
+		}
 	}
-	if monitor != nil {
+	if monitor != nil && fn.Options.StreamFactory != nil {
 		if mErr := monitor.close(); mErr != nil && err == nil {
 			err = mErr
 		}
@@ -301,8 +318,16 @@ func (fn *cdcSourceFn) Teardown() error {
 // A failure to start the monitor is logged rather than returned. Monitoring is
 // a safety net; refusing to run the pipeline because the net could not be hung
 // would make the protective feature an availability risk in its own right.
-func (fn *cdcSourceFn) startMonitorLocked(ctx context.Context) {
-	if fn.Options.DisableSlotMonitoring || fn.monitor != nil {
+func (fn *cdcSourceFn) startMonitorLocked(ctx context.Context, session *cdcSession) {
+	if fn.Options.DisableSlotMonitoring {
+		return
+	}
+	if session.monitor != nil {
+		fn.monitor = session.monitor
+		return
+	}
+	if fn.monitor != nil {
+		session.monitor = fn.monitor
 		return
 	}
 
@@ -322,15 +347,10 @@ func (fn *cdcSourceFn) startMonitorLocked(ctx context.Context) {
 	}
 
 	monitor := newSlotMonitor(fn.Options, querier, func() {
-		// Sever the replication session. This runs on the monitor goroutine,
-		// so it must not take fn.mu in a way that can deadlock against a
-		// caller already holding it; dropSession takes the lock itself and the
-		// monitor never holds it.
-		if session := fn.currentSession(); session != nil {
-			fn.dropSession(session)
-		}
+		fn.dropSession(session)
 	})
 	monitor.start(ctx)
+	session.monitor = monitor
 	fn.monitor = monitor
 }
 
@@ -386,6 +406,7 @@ func (fn *cdcSourceFn) ProcessElement(
 	// consumed while part of it is still unread, and the server does not resend
 	// acknowledged data.
 	var pendingAck uint64
+	var claimedLSN uint64
 
 	emitted := 0
 	checkpointInterval := fn.Options.CheckpointInterval
@@ -501,7 +522,19 @@ readLoop:
 			continue
 		}
 
-		events, err := session.parser.ParseMessages(payload)
+		msgPayload := payload
+		if len(payload) > 0 && payload[0] == 'w' {
+			startLSN, endWAL, _, walData, err := ParseXLogData(payload)
+			if err != nil {
+				log.Warnf(ctx, "postgresio: failed to parse XLogData envelope: %v", err)
+				continue
+			}
+			session.observeServerWALEnd(endWAL)
+			session.observeReceived(startLSN)
+			msgPayload = walData
+		}
+
+		events, err := session.parser.ParseMessages(msgPayload)
 		if err != nil {
 			log.Warnf(ctx, "postgresio: failed to parse pgoutput message: %v", err)
 			continue
@@ -520,7 +553,7 @@ readLoop:
 			// pgoutput transaction carries the LSN of its BEGIN record, so
 			// successive events within one transaction repeat a position that
 			// has already been claimed and must not be claimed again.
-			if event.LSN > session.claimedLSN {
+			if event.LSN > claimedLSN {
 				if event.LSN > math.MaxInt64 {
 					return sdf.StopProcessing(), fmt.Errorf("postgresio: LSN %d exceeds the representable restriction range", event.LSN)
 				}
@@ -532,7 +565,7 @@ readLoop:
 					continuation = sdf.StopProcessing()
 					break readLoop
 				}
-				session.claimedLSN = event.LSN
+				claimedLSN = event.LSN
 			}
 
 			session.observeReceived(event.LSN)
@@ -565,12 +598,12 @@ readLoop:
 	// still lose. There is deliberately no alternative path that advances the
 	// confirmed LSN directly: a shortcut taken only under test would leave
 	// production acknowledging nothing while the suite stayed green.
-	if ackCandidate > 0 {
-		bf.RegisterCallback(bundleFinalizationTimeout, func() error {
+	bf.RegisterCallback(bundleFinalizationTimeout, func() error {
+		if ackCandidate > 0 {
 			session.confirmFlushed(ackCandidate)
-			return nil
-		})
-	}
+		}
+		return nil
+	})
 
 	session.publishMetrics(ctx)
 	return continuation, nil
@@ -605,28 +638,19 @@ type cdcSession struct {
 	stream ReplicationStream
 	parser *PgOutputParser
 
-	// claimedLSN is the highest LSN claimed from the restriction tracker. It
-	// deduplicates claims across the events of a single transaction, which all
-	// carry the same LSN.
-	claimedLSN uint64
-
-	// latestReceivedLSN is the highest LSN this worker has read off the wire.
-	// Reported as write_lsn, which is advisory only.
 	latestReceivedLSN atomic.Uint64
-
-	// confirmedFlushLSN is the highest LSN whose records are durable in the
-	// pipeline. Reported as both flush_lsn and apply_lsn, and therefore the
-	// only value that lets the server recycle WAL.
 	confirmedFlushLSN atomic.Uint64
+	serverWALEnd      atomic.Uint64
 
-	// serverWALEnd is the primary's write position as reported by keepalives.
-	serverWALEnd atomic.Uint64
+	readMu  sync.Mutex
+	monitor *slotMonitor
 
 	cancel context.CancelFunc
 	done   chan struct{}
 
 	closeOnce sync.Once
 	closeErr  error
+	isClosed  atomic.Bool
 }
 
 // runPreflightOnce validates the server configuration the first time this
@@ -678,7 +702,7 @@ func (fn *cdcSourceFn) runPreflightOnce(ctx context.Context, opts CDCOptions) er
 
 func (fn *cdcSourceFn) ensureSession(ctx context.Context, resumeLSN uint64) (*cdcSession, error) {
 	fn.mu.Lock()
-	if fn.session != nil {
+	if fn.session != nil && !fn.session.isClosed.Load() {
 		session := fn.session
 		fn.mu.Unlock()
 		return session, nil
@@ -686,13 +710,21 @@ func (fn *cdcSourceFn) ensureSession(ctx context.Context, resumeLSN uint64) (*cd
 	fn.mu.Unlock()
 
 	opts := fn.Options
-	// Resume where the restriction says, not where the pipeline was originally
-	// configured to start. On a retry after a checkpoint these differ.
 	opts.StartLSN = resumeLSN
 
-	// Validate before dialing the replication protocol, so a misconfigured
-	// server is reported by name rather than as a protocol-level error.
+	key := cdcSessionKey(opts)
+	globalCDCSessionsMu.Lock()
+	if existing, ok := globalCDCSessions[key]; ok && !existing.isClosed.Load() {
+		globalCDCSessionsMu.Unlock()
+		fn.mu.Lock()
+		fn.session = existing
+		fn.startMonitorLocked(ctx, existing)
+		fn.mu.Unlock()
+		return existing, nil
+	}
+
 	if err := fn.runPreflightOnce(ctx, opts); err != nil {
+		globalCDCSessionsMu.Unlock()
 		return nil, err
 	}
 
@@ -704,6 +736,7 @@ func (fn *cdcSourceFn) ensureSession(ctx context.Context, resumeLSN uint64) (*cd
 		stream, err = NewNativeReplicationStream(ctx, opts)
 	}
 	if err != nil {
+		globalCDCSessionsMu.Unlock()
 		return nil, err
 	}
 
@@ -724,28 +757,28 @@ func (fn *cdcSourceFn) ensureSession(ctx context.Context, resumeLSN uint64) (*cd
 	session.confirmedFlushLSN.Store(resumeLSN)
 	session.serverWALEnd.Store(resumeLSN)
 
-	// The keepalive loop is owned by the session rather than by a single
-	// ProcessElement call. It must keep running between invocations: the server
-	// closes a replication connection that is silent for wal_sender_timeout.
 	keepaliveCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	session.cancel = cancel
 	go session.keepaliveLoop(keepaliveCtx, statusInterval)
 
+	globalCDCSessions[key] = session
+	globalCDCSessionsMu.Unlock()
+
 	fn.mu.Lock()
-	if fn.session != nil {
-		// Another invocation won the race.
-		existing := fn.session
-		fn.mu.Unlock()
-		_ = session.close()
-		return existing, nil
-	}
 	fn.session = session
-	fn.startMonitorLocked(ctx)
+	fn.startMonitorLocked(ctx, session)
 	fn.mu.Unlock()
 	return session, nil
 }
 
 func (fn *cdcSourceFn) dropSession(session *cdcSession) {
+	key := cdcSessionKey(fn.Options)
+	globalCDCSessionsMu.Lock()
+	if globalCDCSessions[key] == session {
+		delete(globalCDCSessions, key)
+	}
+	globalCDCSessionsMu.Unlock()
+
 	fn.mu.Lock()
 	if fn.session == session {
 		fn.session = nil
@@ -803,6 +836,8 @@ func (s *cdcSession) sendStatus(ctx context.Context) {
 }
 
 func (s *cdcSession) nextMessage(ctx context.Context, deadline time.Time) ([]byte, error) {
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
 	readCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
 	return s.stream.NextMessage(readCtx)
@@ -854,6 +889,10 @@ func (s *cdcSession) publishMetrics(ctx context.Context) {
 // preventing it.
 func (s *cdcSession) close() error {
 	s.closeOnce.Do(func() {
+		s.isClosed.Store(true)
+		if s.monitor != nil {
+			_ = s.monitor.close()
+		}
 		s.closeErr = s.stream.Close()
 		if s.cancel != nil {
 			s.cancel()
