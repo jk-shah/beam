@@ -17,7 +17,9 @@ package postgresio
 
 import (
 	"encoding/binary"
+	"strings"
 	"testing"
+	"time"
 )
 
 // encodeNumeric builds a PostgreSQL binary NUMERIC payload.
@@ -331,4 +333,25 @@ func TestPgVectorFormatting(t *testing.T) {
 		t.Errorf("expected [], got %q", FormatVectorLiteral(emptyVec))
 	}
 }
+
+func TestPgIntervalDurationAndString(t *testing.T) {
+	iv := PgInterval{
+		Months:      2,
+		Days:        5,
+		Microthings: int64(3 * time.Hour / time.Microsecond),
+	}
+
+	dur := iv.Duration()
+	expectedDays := int64(2*30 + 5)
+	expectedDur := time.Duration(expectedDays)*24*time.Hour + 3*time.Hour
+	if dur != expectedDur {
+		t.Errorf("expected duration %v, got %v", expectedDur, dur)
+	}
+
+	s := iv.String()
+	if !strings.Contains(s, "2 mons") || !strings.Contains(s, "5 days") {
+		t.Errorf("unexpected interval string: %s", s)
+	}
+}
+
 

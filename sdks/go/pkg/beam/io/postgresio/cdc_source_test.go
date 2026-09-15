@@ -26,6 +26,7 @@ import (
 
 	"github.com/apache/beam/sdks/v2/go/pkg/beam"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/graph"
+	"github.com/apache/beam/sdks/v2/go/pkg/beam/io/rtrackers/offsetrange"
 )
 
 type mockBundleFinalizer struct {
@@ -264,3 +265,28 @@ func TestChangeEventDeterministicEventID(t *testing.T) {
 		t.Errorf("unexpected EventID format: got %q, want %q", ev1.EventID, expectedKey)
 	}
 }
+
+func TestCdcSourceFn_RestrictionMethods(t *testing.T) {
+	fn := &cdcSourceFn{
+		Options: CDCOptions{
+			StartLSN: 1000,
+		},
+	}
+
+	rest := offsetrange.Restriction{Start: 100, End: 500}
+	size := fn.RestrictionSize(0, rest)
+	if size < 0 {
+		t.Errorf("expected non-negative restriction size, got %f", size)
+	}
+
+	tracker := fn.CreateTracker(rest)
+	if tracker == nil {
+		t.Fatalf("expected non-nil tracker")
+	}
+
+	truncated := fn.TruncateRestriction(tracker, 0)
+	if truncated.Start != 0 || truncated.End != 0 {
+		t.Errorf("expected empty restriction on drain, got %+v", truncated)
+	}
+}
+
