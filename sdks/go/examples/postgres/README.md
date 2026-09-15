@@ -51,6 +51,7 @@ Each example is provided as a native Go implementation, with companion declarati
 | **12. Data Reconciliation & Table Diff** | [`advanced_use_cases/data_reconciliation_diff/`](./advanced_use_cases/data_reconciliation_diff/) | Go | Full Outer `beam.CoGroupByKey`, Anti-Join Checksum Validation | Audits replication fidelity, classifying records as `MATCH`, `VALUE_DRIFT`, `MISSING_TARGET`, or `MISSING_SOURCE`. |
 | **13. Dynamic PostgreSQL Lookup & Enrichment** | [`lookup_enrichment/`](./lookup_enrichment/) | Go, YAML, Python | Worker Connection Pooling, Concurrency-Safe TTL Cache, Business Rule Evaluation | Ingests orders from PostgreSQL, enriches transactions against PostgreSQL dimension tables via cached connection pools, and sinks back to PostgreSQL with idempotent upsert. |
 | **14. Real-Time Streaming Local Inference** | [`local_inference/`](./local_inference/) | Go, YAML, Python | Embedded In-Memory ML Model, Sub-Millisecond Scoring, Anomaly Tagging | Ingests continuous streaming transactions from PostgreSQL CDC, scores fraud risk locally in worker memory with zero RPC overhead, and writes predictions back to PostgreSQL with idempotent upsert. |
+| **15. Cross-Database Geo Fan-Out & PII Masking** | [`geo_fanout_masking/`](./geo_fanout_masking/) | Go, YAML, Python | Zero-Alloc PII Masking, `beam.Partition`, `beam.Reshuffle` | Replicates central CDC to regional databases (US, EU, APAC) with masked SSN/emails, stage isolation, and SQL standard MERGE. |
 
 ### Running in Go, Beam YAML, or Python
 
