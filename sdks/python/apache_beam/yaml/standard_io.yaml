@@ -692,3 +692,11 @@
       config:
         gradle_target: 'sdks:java:io:expansion-service:shadowJar'
 
+# PostgreSQL (Go native SchemaTransforms)
+- type: goBinary
+  transforms:
+    'WriteToPostgres': 'beam:schematransform:org.apache.beam:postgres_write:v1'
+    'ReadFromPostgresCDC': 'beam:schematransform:org.apache.beam:postgres_read_cdc:v1'
+  config:
+    binary: 'beam-go-expansion-service'
+
