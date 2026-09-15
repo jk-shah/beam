@@ -32,7 +32,7 @@ pipeline:
       config:
         url: "jdbc:postgresql://localhost:5432/postgres"
         table: "test_pipelines.source_orders"
-        username: "beam_test"
+        username: "beam_navigator"
         password_env_var: "PGPASSWORD"
 
     - type: MapToFields
@@ -52,8 +52,8 @@ pipeline:
       config:
         host: "localhost"
         port: 5432
-        database: "postgres"
-        username: "beam_test"
+        database: "beammeup"
+        username: "beam_navigator"
         password_env_var: "PGPASSWORD"
         table: "public.migrated_transactions"
         conflict_keys:

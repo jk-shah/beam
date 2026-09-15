@@ -50,10 +50,11 @@ import (
 var (
 	host        = flag.String("host", "localhost", "PgBouncer host")
 	port        = flag.Int("port", 6432, "PgBouncer port (default 6432)")
-	database    = flag.String("database", "postgres", "Target database name")
-	username    = flag.String("username", "beam_pooler", "Database user")
-	password    = flag.String("password", "beam_pooler_pass", "Database password")
-	table       = flag.String("table", "public.pooled_events", "Target table")
+	database    = flag.String("database", "beammeup", "Target database name")
+	username    = flag.String("username", "beam_transporter", "Database user")
+	password    = flag.String("password", "beam_transporter_pass", "Database password")
+	table        = flag.String("table", "public.pooled_events", "Target table")
+	sslMode      = flag.String("sslmode", "disable", "PostgreSQL SSL mode")
 	usePgBouncer = flag.Bool("pgbouncer", true, "Enable PgBouncer transaction-pooler compatibility")
 )
 
@@ -112,6 +113,7 @@ func main() {
 		postgresio.WithDatabase(*database),
 		postgresio.WithUsername(*username),
 		postgresio.WithPassword(*password),
+		postgresio.WithSSLMode(*sslMode),
 		postgresio.WithPgBouncer(*usePgBouncer),
 		postgresio.WithPrimaryKeyColumns("event_id"),
 		postgresio.WithWriteMode(postgresio.WriteModeUpsert),

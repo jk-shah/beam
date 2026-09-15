@@ -32,8 +32,8 @@ pipeline:
       config:
         host: "localhost"
         port: 5432
-        database: "postgres"
-        username: "beam_test"
+        database: "beammeup"
+        username: "beam_navigator"
         password_env_var: "PGPASSWORD"
         slot_name: "fraud_inference_slot"
         publication: "fraud_inference_pub"
@@ -66,8 +66,8 @@ pipeline:
       config:
         host: "localhost"
         port: 5432
-        database: "postgres"
-        username: "beam_test"
+        database: "beammeup"
+        username: "beam_navigator"
         password_env_var: "PGPASSWORD"
         table: "public.payment_fraud_predictions"
         conflict_keys:

@@ -44,6 +44,7 @@ var (
 	database = flag.String("database", "beammeup", "PostgreSQL database name")
 	username = flag.String("username", "scotty", "PostgreSQL user")
 	password = flag.String("password", "scotty_secret", "PostgreSQL password")
+	sslMode  = flag.String("sslmode", "disable", "PostgreSQL SSL mode")
 )
 
 func init() {
@@ -186,6 +187,7 @@ func main() {
 		Database:       *database,
 		Username:       *username,
 		Password:       *password,
+		SSLMode:        *sslMode,
 		WriteMode:      postgresio.WriteModeUpsert,
 		PrimaryKeyCols: []string{"payment_id"},
 		BatchSize:      1000,
@@ -200,6 +202,7 @@ func main() {
 		Database:       *database,
 		Username:       *username,
 		Password:       *password,
+		SSLMode:        *sslMode,
 		WriteMode:      postgresio.WriteModeUpsert,
 		PrimaryKeyCols: []string{"payment_id"},
 		BatchSize:      1000,

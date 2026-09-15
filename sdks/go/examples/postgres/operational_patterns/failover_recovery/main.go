@@ -52,9 +52,10 @@ import (
 var (
 	clusterEndpoint = flag.String("cluster_endpoint", "pg-ha.internal", "PostgreSQL HA cluster endpoint/VIP")
 	port            = flag.Int("port", 5432, "PostgreSQL port")
-	database        = flag.String("database", "postgres", "Database name")
-	username        = flag.String("username", "beam_cdc", "Replication user")
-	password        = flag.String("password", "beam_cdc_pass", "Replication password")
+	database        = flag.String("database", "beammeup", "Database name")
+	username        = flag.String("username", "scotty", "Replication user")
+	password        = flag.String("password", "scotty_secret", "Replication password")
+	sslMode  = flag.String("sslmode", "disable", "PostgreSQL SSL mode")
 	slotName        = flag.String("slot_name", "ha_failover_slot", "Failover-synchronized slot name")
 	pubName         = flag.String("publication", "ha_critical_pub", "CDC publication name")
 	targetTable     = flag.String("target_table", "public.ha_replicated_orders", "Target table")
@@ -116,6 +117,7 @@ func main() {
 		postgresio.WithCDCDatabase(*database),
 		postgresio.WithCDCUsername(*username),
 		postgresio.WithCDCPassword(*password),
+		postgresio.WithCDCSSLMode(*sslMode),
 		postgresio.WithCDCSlotName(*slotName),
 		postgresio.WithCDCPublication(*pubName),
 		// WithCDCFailoverSlot(true) adds the FAILOVER parameter during slot creation:
@@ -134,6 +136,7 @@ func main() {
 		postgresio.WithDatabase(*database),
 		postgresio.WithUsername(*username),
 		postgresio.WithPassword(*password),
+		postgresio.WithSSLMode(*sslMode),
 		postgresio.WithPrimaryKeyColumns("record_id"),
 		postgresio.WithWriteMode(postgresio.WriteModeUpsert),
 		postgresio.WithBatchSize(1000),

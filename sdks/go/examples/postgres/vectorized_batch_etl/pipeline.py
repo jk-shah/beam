@@ -58,8 +58,8 @@ def run(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="localhost", help="PostgreSQL host")
     parser.add_argument("--port", type=int, default=5432, help="PostgreSQL port")
-    parser.add_argument("--database", default="postgres", help="PostgreSQL database")
-    parser.add_argument("--username", default="beam_test", help="PostgreSQL username")
+    parser.add_argument("--database", default="beammeup", help="PostgreSQL database")
+    parser.add_argument("--username", default="beam_navigator", help="PostgreSQL username")
     parser.add_argument("--rows", type=int, default=5000, help="Row count for batch ETL")
     known_args, pipeline_args = parser.parse_known_args(argv)
 

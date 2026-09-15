@@ -32,8 +32,8 @@ pipeline:
       config:
         host: "localhost"
         port: 5432
-        database: "postgres"
-        username: "beam_test"
+        database: "beammeup"
+        username: "beam_navigator"
         password_env_var: "PGPASSWORD"
         slot_name: "customers_scd2_slot"
         publication: "customers_pub"
@@ -58,8 +58,8 @@ pipeline:
       config:
         host: "localhost"
         port: 5432
-        database: "postgres"
-        username: "beam_test"
+        database: "beammeup"
+        username: "beam_navigator"
         password_env_var: "PGPASSWORD"
         table: "public.customer_dim_history"
         conflict_keys:

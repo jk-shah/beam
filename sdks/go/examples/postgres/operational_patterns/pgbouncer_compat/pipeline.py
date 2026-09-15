@@ -50,9 +50,9 @@ def run():
     parser = argparse.ArgumentParser(description="PostgreSQL PgBouncer Compat Pipeline")
     parser.add_argument("--host", default="localhost", help="PgBouncer host")
     parser.add_argument("--port", type=int, default=6432, help="PgBouncer port")
-    parser.add_argument("--database", default="postgres", help="Database name")
-    parser.add_argument("--username", default="beam_pooler", help="Database user")
-    parser.add_argument("--password", default="beam_pooler_pass", help="Database password")
+    parser.add_argument("--database", default="beammeup", help="Database name")
+    parser.add_argument("--username", default="beam_transporter", help="Database user")
+    parser.add_argument("--password", default="beam_transporter_pass", help="Database password")
     parser.add_argument("--table", default="public.pooled_events", help="Target table")
 
     known_args, pipeline_args = parser.parse_known_args()

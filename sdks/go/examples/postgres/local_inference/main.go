@@ -80,9 +80,10 @@ import (
 var (
 	host         = flag.String("host", "localhost", "PostgreSQL host")
 	port         = flag.Int("port", 5432, "PostgreSQL port")
-	database     = flag.String("database", "postgres", "PostgreSQL database name")
-	username     = flag.String("username", "beam_test", "PostgreSQL user")
-	password     = flag.String("password", "beam_test", "PostgreSQL password")
+	database     = flag.String("database", "beammeup", "PostgreSQL database name")
+	username     = flag.String("username", "beam_navigator", "PostgreSQL user")
+	password     = flag.String("password", "beam_navigator", "PostgreSQL password")
+	sslMode  = flag.String("sslmode", "disable", "PostgreSQL SSL mode")
 	sourceMode   = flag.String("source_mode", "sample", "Source mode: 'sample' or 'cdc'")
 	slot         = flag.String("slot", "fraud_inference_slot", "CDC replication slot name")
 	pub          = flag.String("publication", "fraud_inference_pub", "CDC publication name")
@@ -331,6 +332,7 @@ func main() {
 			postgresio.WithCDCDatabase(*database),
 			postgresio.WithCDCUsername(*username),
 			postgresio.WithCDCPassword(*password),
+		postgresio.WithCDCSSLMode(*sslMode),
 			postgresio.WithCDCSlotName(*slot),
 			postgresio.WithCDCPublication(*pub),
 		}
@@ -398,6 +400,7 @@ func main() {
 		Database:       *database,
 		Username:       *username,
 		Password:       *password,
+		SSLMode:        *sslMode,
 		WriteMode:      postgresio.WriteModeUpsert,
 		PrimaryKeyCols: []string{"payment_id"},
 		BatchSize:      2000,

@@ -172,7 +172,7 @@ func TestEnrichmentPipelineGraph(t *testing.T) {
 	orders := beam.CreateList(s, sampleOrders)
 
 	enrichFn := &enrichOrderWithPostgresFn{
-		ConnStr:     "host=localhost port=5432 dbname=postgres user=beam_test password=beam_test sslmode=disable",
+		ConnStr:     "host=localhost port=5432 dbname=beammeup user=beam_navigator password=beam_navigator sslmode=disable",
 		CacheTTLSec: 300,
 		PoolSize:    2,
 		cache: map[string]cachedProfile{

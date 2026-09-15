@@ -1,0 +1,4 @@
+"scotty" "scotty_secret"
+"beam_transporter" "beam_transporter_pass"
+"beam_navigator" "beam_navigator"
+"postgres" "secret"

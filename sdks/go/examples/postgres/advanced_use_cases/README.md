@@ -105,7 +105,10 @@ CREATE TABLE IF NOT EXISTS public.data_reconciliation_audit (
     audited_at TIMESTAMPTZ NOT NULL
 );
 
-GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO beam_test;
+GRANT CONNECT ON DATABASE beammeup TO beam_navigator;
+GRANT USAGE, CREATE ON SCHEMA public TO beam_navigator;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO beam_navigator;
+GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO beam_navigator;
 ```
 
 ---
@@ -117,7 +120,7 @@ GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO beam_test;
 - **Execution Command**:
   ```bash
   go run sdks/go/examples/postgres/advanced_use_cases/multi_dimensional_olap/main.go \
-      --database=postgres --username=beam_test --password=beam_test
+      --database=beammeup --username=beam_navigator --password=beam_navigator
   ```
 
 ### 2. Window Function Top-N Ranking per Category
@@ -125,7 +128,7 @@ GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO beam_test;
 - **Execution Command**:
   ```bash
   go run sdks/go/examples/postgres/advanced_use_cases/top_n_ranking/main.go \
-      --top_k=3 --database=postgres --username=beam_test --password=beam_test
+      --top_k=3 --database=beammeup --username=beam_navigator --password=beam_navigator
   ```
 
 ### 3. Graph Degree Centrality & Topological Summary
@@ -133,7 +136,7 @@ GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO beam_test;
 - **Execution Command**:
   ```bash
   go run sdks/go/examples/postgres/advanced_use_cases/graph_vertex_degrees/main.go \
-      --database=postgres --username=beam_test --password=beam_test
+      --database=beammeup --username=beam_navigator --password=beam_navigator
   ```
 
 ### 4. Machine Learning Feature Engineering (StandardScaler & MinMaxScaler)
@@ -141,7 +144,7 @@ GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO beam_test;
 - **Execution Command**:
   ```bash
   go run sdks/go/examples/postgres/advanced_use_cases/ml_feature_engineering/main.go \
-      --database=postgres --username=beam_test --password=beam_test
+      --database=beammeup --username=beam_navigator --password=beam_navigator
   ```
 
 ### 5. Inactivity Gap User Sessionization
@@ -149,7 +152,7 @@ GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO beam_test;
 - **Execution Command**:
   ```bash
   go run sdks/go/examples/postgres/advanced_use_cases/sessionization/main.go \
-      --gap_minutes=30 --database=postgres --username=beam_test --password=beam_test
+      --gap_minutes=30 --database=beammeup --username=beam_navigator --password=beam_navigator
   ```
 
 ### 6. Data Reconciliation & Table Anti-Join Diff
@@ -157,7 +160,7 @@ GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO beam_test;
 - **Execution Command**:
   ```bash
   go run sdks/go/examples/postgres/advanced_use_cases/data_reconciliation_diff/main.go \
-      --database=postgres --username=beam_test --password=beam_test
+      --database=beammeup --username=beam_navigator --password=beam_navigator
   ```
 
 ---

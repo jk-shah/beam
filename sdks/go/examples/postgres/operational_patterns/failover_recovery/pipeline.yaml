@@ -33,8 +33,8 @@ pipeline:
       config:
         host: "pg-ha.internal"
         port: 5432
-        database: "postgres"
-        username: "beam_cdc"
+        database: "beammeup"
+        username: "scotty"
         password_env_var: "PGPASSWORD"
         slot_name: "ha_failover_slot"
         publication: "ha_critical_pub"
@@ -59,8 +59,8 @@ pipeline:
       config:
         host: "pg-ha.internal"
         port: 5432
-        database: "postgres"
-        username: "beam_cdc"
+        database: "beammeup"
+        username: "scotty"
         password_env_var: "PGPASSWORD"
         table: "public.ha_replicated_orders"
         primary_key_columns: ["record_id"]

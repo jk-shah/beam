@@ -218,7 +218,7 @@ If you fix a defect listed in the README's Known Limitations table, move its tes
 - [ ] `remediation_invariants_test.go` still passes; no assertion in it was relaxed.
 - [ ] Any acceptance test made to pass has been moved into the default suite and the README Known Limitations table updated.
 - [ ] Code is formatted with `gofmt -s -w .`.
-- [ ] Zero personal usernames or credentials in repository code, tests, docs, or roles (use `beam_test` exclusively).
+- [ ] Zero personal usernames or credentials in repository code, tests, docs, or roles (use `beam_navigator`, `scotty`, or `beam_transporter` exclusively).
 - [ ] Apache 2.0 license header is present on every newly created file.
 - [ ] Conformance tests pass against PostgreSQL 15, 16, 17, and 18.
 - [ ] Arrow batcher allocations remain at 0 allocs/op for the hot decoding path.

@@ -41,9 +41,10 @@ import (
 var (
 	host     = flag.String("host", "localhost", "PostgreSQL host")
 	port     = flag.Int("port", 5432, "PostgreSQL port")
-	database = flag.String("database", "postgres", "PostgreSQL database name")
-	username = flag.String("username", "beam_test", "PostgreSQL user")
-	password = flag.String("password", "beam_test", "PostgreSQL password")
+	database = flag.String("database", "beammeup", "PostgreSQL database name")
+	username = flag.String("username", "beam_navigator", "PostgreSQL user")
+	password = flag.String("password", "beam_navigator", "PostgreSQL password")
+	sslMode  = flag.String("sslmode", "disable", "PostgreSQL SSL mode")
 )
 
 func init() {
@@ -164,6 +165,7 @@ func main() {
 		Database:       *database,
 		Username:       *username,
 		Password:       *password,
+		SSLMode:        *sslMode,
 		WriteMode:      postgresio.WriteModeUpsert,
 		PrimaryKeyCols: []string{"node_id"},
 		BatchSize:      2000,

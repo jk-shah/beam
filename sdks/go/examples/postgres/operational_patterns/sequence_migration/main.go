@@ -52,9 +52,10 @@ import (
 var (
 	host     = flag.String("host", "localhost", "PostgreSQL host")
 	port     = flag.Int("port", 5432, "PostgreSQL port")
-	database = flag.String("database", "postgres", "Database name")
-	username = flag.String("username", "beam_test", "Database user")
-	password = flag.String("password", "beam_test", "Database password")
+	database = flag.String("database", "beammeup", "Database name")
+	username = flag.String("username", "beam_navigator", "Database user")
+	password = flag.String("password", "beam_navigator", "Database password")
+	sslMode  = flag.String("sslmode", "disable", "PostgreSQL SSL mode")
 	table    = flag.String("table", "public.orders_sequence_demo", "Target table")
 )
 
@@ -68,8 +69,10 @@ func init() {
 // MigratedOrderRecord represents migrated records with auto-incrementing identity keys.
 type MigratedOrderRecord struct {
 	OrderID     int64     `json:"order_id" db:"order_id" beam:"order_id"`
-	Description string    `json:"description" db:"description" beam:"description"`
-	MigratedAt  time.Time `json:"migrated_at" db:"migrated_at" beam:"migrated_at"`
+	CustomerID  int       `json:"customer_id" db:"customer_id" beam:"customer_id"`
+	TotalAmount float64   `json:"total_amount" db:"total_amount" beam:"total_amount"`
+	Status      string    `json:"status" db:"status" beam:"status"`
+	OrderDate   time.Time `json:"order_date" db:"order_date" beam:"order_date"`
 }
 
 // SequenceReconciliationSQL holds the generated DDL/DML statement to adjust sequences.
@@ -120,9 +123,9 @@ func main() {
 
 	// 1. Ingest migrated records (simulating bulk load + CDC stream)
 	records := beam.CreateList(s, []MigratedOrderRecord{
-		{OrderID: 100001, Description: "order_alpha", MigratedAt: time.Now().UTC()},
-		{OrderID: 100002, Description: "order_beta", MigratedAt: time.Now().UTC()},
-		{OrderID: 100050, Description: "order_gamma", MigratedAt: time.Now().UTC()},
+		{OrderID: 100001, CustomerID: 101, TotalAmount: 150.25, Status: "MIGRATED", OrderDate: time.Now().UTC()},
+		{OrderID: 100002, CustomerID: 102, TotalAmount: 240.00, Status: "MIGRATED", OrderDate: time.Now().UTC()},
+		{OrderID: 100050, CustomerID: 103, TotalAmount: 89.99, Status: "MIGRATED", OrderDate: time.Now().UTC()},
 	})
 
 	// 2. Sink data to target table
@@ -132,6 +135,7 @@ func main() {
 		postgresio.WithDatabase(*database),
 		postgresio.WithUsername(*username),
 		postgresio.WithPassword(*password),
+		postgresio.WithSSLMode(*sslMode),
 		postgresio.WithPrimaryKeyColumns("order_id"),
 		postgresio.WithWriteMode(postgresio.WriteModeUpsert),
 		postgresio.WithBatchSize(1000),

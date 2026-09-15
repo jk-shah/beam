@@ -66,6 +66,7 @@ var (
 
 	destUser    = flag.String("dest_username", "beam_writer", "Destination PostgreSQL username")
 	destPassword= flag.String("dest_password", "", "Destination PostgreSQL password")
+	sslMode     = flag.String("sslmode", "disable", "PostgreSQL SSL mode")
 )
 
 // CustomerAccount represents the domain entity replicated across databases.
@@ -239,6 +240,7 @@ func main() {
 		postgresio.WithCDCDatabase(*srcDatabase),
 		postgresio.WithCDCUsername(*srcUsername),
 		postgresio.WithCDCPassword(*srcPassword),
+		postgresio.WithCDCSSLMode(*sslMode),
 		postgresio.WithCDCSlotName(*srcSlot),
 		postgresio.WithCDCPublication(*srcPub),
 		postgresio.WithCDCMaxSlotLagBytes(8 * 1024 * 1024 * 1024), // 8GB WAL budget
@@ -281,6 +283,7 @@ func main() {
 			postgresio.WithDatabase(db),
 			postgresio.WithUsername(*destUser),
 			postgresio.WithPassword(*destPassword),
+		postgresio.WithSSLMode(*sslMode),
 			postgresio.WithPrimaryKeyColumns("account_id"),
 			postgresio.WithWriteMode(postgresio.WriteModeMerge),
 			postgresio.WithOpColumn("_op_type"),

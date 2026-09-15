@@ -257,7 +257,10 @@ CREATE TABLE IF NOT EXISTS public.payment_fraud_predictions (
     predicted_at TIMESTAMPTZ NOT NULL
 );
 
-GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO beam_test;
+GRANT CONNECT ON DATABASE beammeup TO beam_navigator;
+GRANT USAGE, CREATE ON SCHEMA public TO beam_navigator;
+GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO beam_navigator;
+GRANT USAGE, SELECT, UPDATE ON ALL SEQUENCES IN SCHEMA public TO beam_navigator;
 ```
 
 ---
@@ -286,9 +289,9 @@ GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO beam_test;
 go run sdks/go/examples/postgres/dead_letter_queue/main.go \
     --host=localhost \
     --port=5432 \
-    --database=postgres \
-    --username=beam_test \
-    --password=beam_test
+    --database=beammeup \
+    --username=beam_navigator \
+    --password=beam_navigator
 ```
 
 ---
@@ -325,9 +328,9 @@ go run sdks/go/examples/postgres/dead_letter_queue/main.go \
 go run sdks/go/examples/postgres/deduplication/main.go \
     --host=localhost \
     --port=5432 \
-    --database=postgres \
-    --username=beam_test \
-    --password=beam_test
+    --database=beammeup \
+    --username=beam_navigator \
+    --password=beam_navigator
 ```
 
 ---
@@ -356,9 +359,9 @@ go run sdks/go/examples/postgres/deduplication/main.go \
 go run sdks/go/examples/postgres/relational_enrichment/main.go \
     --host=localhost \
     --port=5432 \
-    --database=postgres \
-    --username=beam_test \
-    --password=beam_test
+    --database=beammeup \
+    --username=beam_navigator \
+    --password=beam_navigator
 ```
 
 ---
@@ -393,9 +396,9 @@ go run sdks/go/examples/postgres/relational_enrichment/main.go \
 go run sdks/go/examples/postgres/scd_type2/main.go \
     --host=localhost \
     --port=5432 \
-    --database=postgres \
-    --username=beam_test \
-    --password=beam_test
+    --database=beammeup \
+    --username=beam_navigator \
+    --password=beam_navigator
 ```
 
 ---
@@ -411,9 +414,9 @@ go run sdks/go/examples/postgres/scd_type2/main.go \
 go run sdks/go/examples/postgres/vectorized_batch_etl/main.go \
     --host=localhost \
     --port=5432 \
-    --database=postgres \
-    --username=beam_test \
-    --password=beam_test \
+    --database=beammeup \
+    --username=beam_navigator \
+    --password=beam_navigator \
     --rows=100000
 ```
 
@@ -544,7 +547,7 @@ Executes the pipeline within the local Go process using the direct engine:
 ```bash
 go run sdks/go/examples/postgres/vectorized_batch_etl/main.go \
     --runner=direct \
-    --database=postgres --username=beam_test --password=beam_test
+    --database=beammeup --username=beam_navigator --password=beam_navigator
 ```
 
 #### 3. Modern Portable Local Runner (`--runner=prism`)
@@ -552,7 +555,7 @@ Executes using the Prism portable runner harness with loopback FnAPI execution:
 ```bash
 go run sdks/go/examples/postgres/vectorized_batch_etl/main.go \
     --runner=prism \
-    --database=postgres --username=beam_test --password=beam_test
+    --database=beammeup --username=beam_navigator --password=beam_navigator
 ```
 
 #### 4. Portable JobService Runner (`--runner=universal`)
@@ -562,7 +565,7 @@ go run sdks/go/examples/postgres/vectorized_batch_etl/main.go \
     --runner=universal \
     --endpoint=localhost:8073 \
     --environment_type=LOOPBACK \
-    --database=postgres --username=beam_test --password=beam_test
+    --database=beammeup --username=beam_navigator --password=beam_navigator
 ```
 
 #### 5. Apache Flink Runner (`--runner=flink`)
@@ -572,7 +575,7 @@ go run sdks/go/examples/postgres/vectorized_batch_etl/main.go \
     --runner=flink \
     --endpoint=localhost:8073 \
     --environment_type=LOOPBACK \
-    --database=postgres --username=beam_test --password=beam_test
+    --database=beammeup --username=beam_navigator --password=beam_navigator
 ```
 
 #### 6. Apache Spark Runner (`--runner=spark`)
@@ -582,7 +585,7 @@ go run sdks/go/examples/postgres/vectorized_batch_etl/main.go \
     --runner=spark \
     --endpoint=localhost:8073 \
     --environment_type=LOOPBACK \
-    --database=postgres --username=beam_test --password=beam_test
+    --database=beammeup --username=beam_navigator --password=beam_navigator
 ```
 
 #### 7. Google Cloud Dataflow (`--runner=dataflow`)
@@ -611,7 +614,7 @@ go run sdks/go/examples/postgres/vectorized_batch_etl/main.go \
     --host="10.0.0.31" \
     --port=5432 \
     --database="postgres" \
-    --username="beam_test" \
+    --username="beam_navigator" \
     --password="secret_password"
 ```
 

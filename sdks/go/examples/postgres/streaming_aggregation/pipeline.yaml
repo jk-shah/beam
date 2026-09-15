@@ -32,8 +32,8 @@ pipeline:
       config:
         host: "localhost"
         port: 5432
-        database: "postgres"
-        username: "beam_test"
+        database: "beammeup"
+        username: "beam_navigator"
         password_env_var: "PGPASSWORD"
         slot_name: "beam_mv_slot"
         publication: "transactions_pub"
@@ -60,8 +60,8 @@ pipeline:
       config:
         host: "localhost"
         port: 5432
-        database: "postgres"
-        username: "beam_test"
+        database: "beammeup"
+        username: "beam_navigator"
         password_env_var: "PGPASSWORD"
         table: "public.merchant_minute_rollups"
         conflict_keys:

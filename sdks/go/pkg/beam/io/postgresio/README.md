@@ -119,7 +119,7 @@ sequenceDiagram
     participant Worker as Downstream Worker / State
 
     Note over PG,Client: Session Initialization & SSL Handshake
-    Client->>PG: SSLRequest (0x04d2162f) -> StartupMessage (beam_test)
+    Client->>PG: SSLRequest (0x04d2162f) -> StartupMessage (beam_navigator)
     Client->>PG: IDENTIFY_SYSTEM
     PG-->>Client: systemid, timeline, xlogpos, dbname
     Client->>Slot: START_REPLICATION SLOT beam_cdc_slot LOGICAL 0/0 (proto_version '2', publication_names 'pub', origin 'none')
@@ -275,7 +275,7 @@ func main() {
 		postgresio.WithHost("localhost"),
 		postgresio.WithPort(5432),
 		postgresio.WithDatabase("postgres"),
-		postgresio.WithUsername("beam_test"),
+		postgresio.WithUsername("beam_navigator"),
 		postgresio.WithPassword("beam_password"),
 		postgresio.WithPrimaryKeyColumns("order_id"),
 		postgresio.WithWriteMode(postgresio.WriteModeUpsert),
@@ -322,7 +322,7 @@ func main() {
 		postgresio.WithCDCHost("localhost"),
 		postgresio.WithCDCPort(5432),
 		postgresio.WithCDCDatabase("postgres"),
-		postgresio.WithCDCUsername("beam_test"),
+		postgresio.WithCDCUsername("scotty"),
 		postgresio.WithCDCPassword("beam_password"),
 		postgresio.WithCDCSlotName("beam_streaming_slot"),
 		postgresio.WithCDCPublication("beam_orders_pub"),
@@ -357,7 +357,7 @@ pipeline:
       config:
         url: "jdbc:postgresql://localhost:5432/postgres"
         table: "test_pipelines.source_orders"
-        username: "beam_test"
+        username: "beam_navigator"
         password: "beam_password"
 
     - type: Filter
@@ -384,7 +384,7 @@ pipeline:
       config:
         url: "jdbc:postgresql://localhost:5432/postgres"
         table: "test_pipelines.target_orders_transformed"
-        username: "beam_test"
+        username: "beam_navigator"
         password: "beam_password"
         primary_keys: ["order_id"]
         write_method: "UPSERT"

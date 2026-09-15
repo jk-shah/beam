@@ -47,8 +47,8 @@ pipeline:
       config:
         host: "localhost"
         port: 6432
-        database: "postgres"
-        username: "beam_pooler"
+        database: "beammeup"
+        username: "beam_transporter"
         password_env_var: "PGPASSWORD"
         table: "public.pooled_events"
         primary_key_columns: ["event_id"]

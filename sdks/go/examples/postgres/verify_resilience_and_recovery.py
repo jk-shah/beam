@@ -33,7 +33,7 @@ import pg8000.native
 
 DB_HOST = "localhost"
 DB_NAME = "postgres"
-DB_USER = "beam_test"
+DB_USER = "beam_navigator"
 SLOT_NAME = "beam_resilience_slot"
 PUB_NAME = "beam_resilience_pub"
 

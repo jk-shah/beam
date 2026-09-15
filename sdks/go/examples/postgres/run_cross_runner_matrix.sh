@@ -20,7 +20,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_DIR="${SCRIPT_DIR}"
-DOT_DIR="/tmp/beam_test_graphs"
+DOT_DIR="/tmp/beam_graphs"
 LOG_DIR="/tmp/beam_runner_test_logs"
 mkdir -p "${DOT_DIR}" "${LOG_DIR}"
 
