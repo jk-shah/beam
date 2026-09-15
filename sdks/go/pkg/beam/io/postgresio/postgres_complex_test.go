@@ -154,13 +154,45 @@ func TestGoComplexPipeline_PostgresToPostgres(t *testing.T) {
 		t.Skipf("skipping: postgres unreachable: %v", err)
 	}
 
-	// 1. Truncate target tables before test and clean up stray test rows in source_orders
-	if _, err := db.Exec("TRUNCATE TABLE test_pipelines.target_orders_transformed; TRUNCATE TABLE test_pipelines.target_orders_filtered; DELETE FROM test_pipelines.source_orders WHERE order_id >= 90000;"); err != nil {
-		t.Fatalf("failed to prepare tables for test: %v", err)
+	// 1. Truncate target tables before test and ensure source_orders has 20 canonical rows
+	if _, err := db.Exec("TRUNCATE TABLE test_pipelines.target_orders_transformed; TRUNCATE TABLE test_pipelines.target_orders_filtered;"); err != nil {
+		t.Fatalf("failed to prepare target tables for test: %v", err)
 	}
-	t.Cleanup(func() {
-		_, _ = db.Exec("DELETE FROM test_pipelines.source_orders WHERE order_id >= 90000;")
-	})
+
+	var srcCount int
+	_ = db.QueryRow("SELECT count(*) FROM test_pipelines.source_orders").Scan(&srcCount)
+	if srcCount != 20 {
+		if _, err := db.Exec("TRUNCATE TABLE test_pipelines.source_orders CASCADE;"); err != nil {
+			t.Fatalf("failed to truncate source_orders: %v", err)
+		}
+		stmt, err := db.Prepare(`INSERT INTO test_pipelines.source_orders 
+			(order_id, customer_id, customer_email, amount, status, country_code, items_count, created_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`)
+		if err != nil {
+			t.Fatalf("failed to prepare insert: %v", err)
+		}
+		defer stmt.Close()
+		for i := 1; i <= 20; i++ {
+			var amount float64
+			var status string
+			switch {
+			case i <= 7:
+				amount = 1500.00
+				status = "COMPLETED"
+			case i <= 13:
+				amount = 250.00
+				status = "COMPLETED"
+			default:
+				amount = 50.00
+				status = "PENDING"
+			}
+			custID := fmt.Sprintf("CUST_%05d", i)
+			email := fmt.Sprintf("user_%d@example.com", i)
+			if _, err := stmt.Exec(int64(i), custID, email, amount, status, "US", 2); err != nil {
+				t.Fatalf("failed to insert seed row %d: %v", i, err)
+			}
+		}
+	}
 
 	// 2. Build and run Beam Go Pipeline
 	p, s := beam.NewPipelineWithRoot()
