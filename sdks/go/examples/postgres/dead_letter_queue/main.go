@@ -41,9 +41,9 @@ import (
 var (
 	host     = flag.String("host", "localhost", "PostgreSQL host")
 	port     = flag.Int("port", 5432, "PostgreSQL port")
-	database = flag.String("database", "beam_test", "PostgreSQL database name")
-	username = flag.String("username", "beam_test", "PostgreSQL user")
-	password = flag.String("password", "beam_test", "PostgreSQL password")
+	database = flag.String("database", "beammeup", "PostgreSQL database name")
+	username = flag.String("username", "scotty", "PostgreSQL user")
+	password = flag.String("password", "scotty_secret", "PostgreSQL password")
 )
 
 func init() {

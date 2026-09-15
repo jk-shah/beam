@@ -32,8 +32,8 @@ pipeline:
       config:
         host: "localhost"
         port: 5432
-        database: "postgres"
-        username: "beam_test"
+        database: "beammeup"
+        username: "scotty"
         password_env_var: "PGPASSWORD"
         slot_name: "payments_dlq_slot"
         publication: "payments_pub"
@@ -49,8 +49,8 @@ pipeline:
       config:
         host: "localhost"
         port: 5432
-        database: "postgres"
-        username: "beam_test"
+        database: "beammeup"
+        username: "scotty"
         password_env_var: "PGPASSWORD"
         table: "public.clean_payments"
         conflict_keys:
