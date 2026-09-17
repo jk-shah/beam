@@ -74,7 +74,7 @@ func observeFirstWireBytes(t *testing.T, n int, opts ...CDCOption) []byte {
 	}
 
 	base := []CDCOption{
-		WithCDCHost("db.example.internal"),
+		WithCDCHost("db.example.com"),
 		WithCDCPort(5432),
 		WithCDCDatabase("orders"),
 		WithCDCUsername("beam_cdc"),
@@ -298,7 +298,7 @@ func TestSCRAMSHA256IsSupported(t *testing.T) {
 	}
 
 	opts := NewCDCOptions(
-		WithCDCHost("db.example.internal"),
+		WithCDCHost("db.example.com"),
 		WithCDCDatabase("orders"),
 		WithCDCUsername("beam_cdc"),
 		WithCDCPassword("correct horse battery staple"),

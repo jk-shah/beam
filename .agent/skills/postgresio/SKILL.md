@@ -230,7 +230,7 @@ with beam.Pipeline() as p:
   )
 
   _ = mutations | "ReplicateToTarget" >> WriteToPostgresIO(
-      host="replica.internal",
+      host="replica.example.com",
       port=5432,
       database="beammeup",
       table="public.orders",
@@ -363,7 +363,7 @@ pipeline:
       name: ReplicateToTarget
       input: IngestWALStream
       config:
-        host: "replica.internal"
+        host: "replica.example.com"
         port: 5432
         database: "beammeup"
         table: "public.orders"

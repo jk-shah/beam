@@ -61,10 +61,10 @@ func TestMaskEmail(t *testing.T) {
 		expected string
 	}{
 		{"standard email", "john.doe@example.com", "j***e@example.com"},
-		{"single character local", "a@corp.com", "a***@corp.com"},
-		{"two character local", "ab@corp.com", "a***@corp.com"},
-		{"three character local", "abc@corp.com", "a***c@corp.com"},
-		{"multi-subdomain", "user@corp.internal.net", "u***r@corp.internal.net"},
+		{"single character local", "a@example.com", "a***@example.com"},
+		{"two character local", "ab@example.com", "a***@example.com"},
+		{"three character local", "abc@example.com", "a***c@example.com"},
+		{"multi-subdomain", "user@sub.example.net", "u***r@sub.example.net"},
 		{"missing at symbol", "invalid-email-address", "***@redacted.local"},
 		{"leading at symbol", "@example.com", "***@redacted.local"},
 		{"trailing at symbol", "user@", "***@redacted.local"},

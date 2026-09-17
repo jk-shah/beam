@@ -54,7 +54,7 @@ class ExtractHARecord(beam.DoFn):
 
 def run():
     parser = argparse.ArgumentParser(description="PostgreSQL HA Failover Recovery Pipeline")
-    parser.add_argument("--cluster_endpoint", default="pg-ha.internal", help="HA cluster VIP / endpoint")
+    parser.add_argument("--cluster_endpoint", default="pg-ha.example.com", help="HA cluster VIP / endpoint")
     parser.add_argument("--port", type=int, default=5432, help="PostgreSQL port")
     parser.add_argument("--database", default="beammeup", help="Database name")
     parser.add_argument("--username", default="scotty", help="Database user")

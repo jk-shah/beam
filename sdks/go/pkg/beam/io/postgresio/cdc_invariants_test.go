@@ -228,7 +228,7 @@ func TestCDCOptionsStringRedactsPassword(t *testing.T) {
 	const secret = "sup3rs3cr3t-hunter2"
 
 	opts := NewCDCOptions(
-		WithCDCHost("db.internal"),
+		WithCDCHost("db.example.com"),
 		WithCDCUsername("beam_cdc"),
 		WithCDCPassword(secret),
 		WithCDCSlotName("beam_slot"),

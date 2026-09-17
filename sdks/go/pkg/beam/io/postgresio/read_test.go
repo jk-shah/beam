@@ -468,8 +468,8 @@ func TestParseJdbcURL(t *testing.T) {
 		},
 		{
 			name:         "jdbc url with query parameters",
-			url:          "jdbc:postgresql://db.corp.internal:5433/prod_orders?sslmode=verify-full&user=appuser&password=apppassword",
-			expectedHost: "db.corp.internal",
+			url:          "jdbc:postgresql://db.example.com:5433/prod_orders?sslmode=verify-full&user=appuser&password=apppassword",
+			expectedHost: "db.example.com",
 			expectedPort: 5433,
 			expectedDB:   "prod_orders",
 			expectedSSL:  "verify-full",

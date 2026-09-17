@@ -93,7 +93,7 @@ func TestValidatePoolerRecordFn(t *testing.T) {
 
 func TestPgBouncerWriteOptions(t *testing.T) {
 	opts := postgresio.NewWriteOptions(
-		postgresio.WithHost("pooler.internal"),
+		postgresio.WithHost("pooler.example.com"),
 		postgresio.WithPort(6432),
 		postgresio.WithDatabase("analytics"),
 		postgresio.WithPgBouncer(true),

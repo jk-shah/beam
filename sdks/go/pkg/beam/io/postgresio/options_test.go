@@ -38,7 +38,7 @@ func TestNewWriteOptionsDefaults(t *testing.T) {
 
 func TestWriteOptionsFunctionalBuilders(t *testing.T) {
 	opts := NewWriteOptions(
-		WithHost("db.internal.net"),
+		WithHost("db.example.net"),
 		WithPort(5433),
 		WithDatabase("prod_db"),
 		WithUsername("beam_writer"),
@@ -52,8 +52,8 @@ func TestWriteOptionsFunctionalBuilders(t *testing.T) {
 		WithPgBouncer(true),
 	)
 
-	if opts.Host != "db.internal.net" {
-		t.Errorf("expected host db.internal.net, got %s", opts.Host)
+	if opts.Host != "db.example.net" {
+		t.Errorf("expected host db.example.net, got %s", opts.Host)
 	}
 	if opts.Port != 5433 {
 		t.Errorf("expected port 5433, got %d", opts.Port)

@@ -567,7 +567,7 @@ func TestCheckpointResumesAfterTheLastClaimedLSN(t *testing.T) {
 // distributed runner: no host, no slot name, no publication.
 func TestSourceOptionsSurviveSerialization(t *testing.T) {
 	original := newCDCSourceFn(NewCDCOptions(
-		WithCDCHost("db.internal"),
+		WithCDCHost("db.example.com"),
 		WithCDCPort(6543),
 		WithCDCDatabase("shop"),
 		WithCDCSlotName("beam_slot"),
@@ -590,7 +590,7 @@ func TestSourceOptionsSurviveSerialization(t *testing.T) {
 	if decoded.Options.Publication != "beam_pub" {
 		t.Errorf("publication after a round trip is %q, want %q", decoded.Options.Publication, "beam_pub")
 	}
-	if decoded.Options.Host != "db.internal" || decoded.Options.Port != 6543 || decoded.Options.Database != "shop" {
+	if decoded.Options.Host != "db.example.com" || decoded.Options.Port != 6543 || decoded.Options.Database != "shop" {
 		t.Errorf("connection settings did not survive a round trip: %+v", decoded.Options)
 	}
 }

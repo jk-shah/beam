@@ -277,7 +277,7 @@ func TestBuildWriteDSNRejectsKeywordInjection(t *testing.T) {
 	const payload = "hunter2 sslrootcert=/tmp/attacker-ca.crt"
 
 	naive := fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=%s search_path=pg_catalog,pg_temp",
-		"db.example.internal", 5432, "orders", "beam", payload, "verify-full")
+		"db.example.com", 5432, "orders", "beam", payload, "verify-full")
 	naiveFields, err := parseLibpqDSN(naive)
 	if err != nil {
 		t.Fatalf("parsing the unescaped DSN failed: %v", err)
@@ -291,7 +291,7 @@ func TestBuildWriteDSNRejectsKeywordInjection(t *testing.T) {
 			got, "hunter2")
 	}
 
-	fields, err := parseLibpqDSN(buildWriteDSN("db.example.internal", 5432, "orders", "beam", payload, "verify-full"))
+	fields, err := parseLibpqDSN(buildWriteDSN("db.example.com", 5432, "orders", "beam", payload, "verify-full"))
 	if err != nil {
 		t.Fatalf("parsing the sink DSN failed: %v", err)
 	}
@@ -315,7 +315,7 @@ func TestBuildWriteDSNRejectsKeywordInjection(t *testing.T) {
 // setting or reopen CVE-2018-1058. Reordering the format string would remove
 // that second layer silently, so it is asserted rather than left to review.
 func TestBuildWriteDSNEmitsSecuritySettingsLast(t *testing.T) {
-	dsn := buildWriteDSN("db.example.internal", 5432, "orders", "beam", "pw", "verify-full")
+	dsn := buildWriteDSN("db.example.com", 5432, "orders", "beam", "pw", "verify-full")
 
 	sslmode := strings.Index(dsn, "sslmode=")
 	searchPath := strings.Index(dsn, "search_path=")

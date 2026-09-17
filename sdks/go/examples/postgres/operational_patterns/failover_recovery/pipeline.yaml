@@ -31,7 +31,7 @@ pipeline:
     - type: ReadFromPostgresCDC
       name: IngestFromHAFailoverSlot
       config:
-        host: "pg-ha.internal"
+        host: "pg-ha.example.com"
         port: 5432
         database: "beammeup"
         username: "scotty"
@@ -57,7 +57,7 @@ pipeline:
     - type: WriteToPostgresIO
       name: SinkToTargetTable
       config:
-        host: "pg-ha.internal"
+        host: "pg-ha.example.com"
         port: 5432
         database: "beammeup"
         username: "scotty"
