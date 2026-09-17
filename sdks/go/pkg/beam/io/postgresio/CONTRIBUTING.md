@@ -27,7 +27,7 @@ This guide details the system architecture, design invariants, cross-language ex
 
 The Go PostgreSQL connector provides two decoupled runtime engines:
 1. **Streaming CDC Engine**: Direct logical replication slot consumer decoding `pgoutput` records into Arrow micro-batches and Beam schemas.
-2. **Staged COPY Upsert Engine**: Binary-stream staging tables with atomic `ON CONFLICT` merges achieving write throughput >102,000 rows/sec.
+2. **Staged COPY Upsert Engine**: Session-scoped staging tables loaded with `COPY ... FROM STDIN`, then applied to the target with an atomic `ON CONFLICT` merge.
 
 ### 1.1 Native CDC Streaming Architecture & LSN Standby Feedback Loop
 
@@ -94,11 +94,11 @@ sequenceDiagram
         DoFn->>PG: SELECT pg_replication_origin_xact_setup('origin_name', '0/0')
     end
     
-    DoFn->>PG: CREATE TEMP TABLE temp_batch (LIKE target INCLUDING DEFAULTS) ON COMMIT DROP
+    DoFn->>PG: CREATE TEMP TABLE IF NOT EXISTS temp_batch (LIKE target INCLUDING DEFAULTS) ON COMMIT DELETE ROWS
     PG-->>Temp: Temporary table created
     
-    DoFn->>PG: COPY temp_batch (col1, col2, ...) FROM STDIN WITH (FORMAT binary)
-    DoFn->>PG: Stream binary tuple data directly via pgx CopyFromSource
+    DoFn->>PG: COPY temp_batch (col1, col2, ...) FROM STDIN
+    DoFn->>PG: Stream row values through the prepared COPY statement
     PG-->>DoFn: CommandComplete: COPY N
     
     rect rgb(255, 250, 240)
@@ -211,7 +211,7 @@ type PostgreSqlReadCDCConfig struct {
    Per-row processing in logical decoding loops must avoid heap allocations. Reusable byte buffers, slice pooling, and zero-allocation Arrow builders must be maintained.
 3. **Upstream Database Guardrails**:
    * Single-consumer restriction: Exactly one Splittable DoFn worker connects to a physical replication slot (`Parallelism = 1` at the slot boundary).
-   * Connection pool bounding: Worker write connection pools are capped at `max(1, NumCPU / 2)` to eliminate connection exhaustion under large worker autoscaling.
+   * Connection pool bounding: `WriteOptions.MaxConnections` defaults to 2 per worker to eliminate connection exhaustion under large worker autoscaling.
    * Last-Write-Wins (LWW) compaction & primary key sorting: Prevents duplicate updates and eliminates PostgreSQL `40P01` deadlock errors on concurrent batches.
    * Dynamic IAM Token Expiration: Pooled connections enforce token lifetime limits to renew short-lived cloud credentials before socket expiration.
 4. **Factual and Objective Tone**:
@@ -232,29 +232,28 @@ type PostgreSqlReadCDCConfig struct {
 go test -v -race ./pkg/beam/io/postgresio/...
 
 # Run targeted benchmark tests
-go test -bench=BenchmarkArrowBatcher -benchmem ./pkg/beam/io/postgresio/
-
-# Run the remediation acceptance suite (expected to FAIL until the
-# corresponding workstream lands -- see README "Known Limitations")
-go test -v -tags postgresio_remediation ./pkg/beam/io/postgresio/
+go test -run XXX -bench=BenchmarkArrowBatching -benchmem ./pkg/beam/io/postgresio/
 ```
 
 ### Test Suite Layout
 
-| File | Build tag | Expected state | Purpose |
-| :--- | :--- | :--- | :--- |
-| `remediation_invariants_test.go` | none | Passing | Locks in guarantees that already hold: injection-resistant identifier sanitization, slot and heartbeat validation, credential redaction, batch compaction and deadlock-avoiding sort, key determinism. A failure means a change broke an existing guarantee. |
-| `remediation_acceptance_test.go` | `postgresio_remediation` | Failing by design | Executable definition of done for the outstanding defects. Hermetic: wire-level tests over `net.Pipe`, behavioral tests, and source-level guards. |
+Every test file in the package is part of the default `go test ./...` run.
+There are no build-tagged suites.
+
+| File | Purpose |
+| :--- | :--- |
+| `cdc_invariants_test.go` | Locks in guarantees that already hold: injection-resistant identifier sanitization, slot and heartbeat validation, credential redaction, batch compaction and deadlock-avoiding sort, key determinism. A failure means a change broke an existing guarantee. |
+| `cdc_acceptance_test.go` | Regression guards for the defects that have been fixed. Hermetic: wire-level tests over `net.Pipe`, behavioral tests, and source-level guards for defects no behavioral test can reach. |
 
 > [!IMPORTANT]
-> Do not weaken or delete an acceptance test to get a green run. A test is retired only by making it pass and moving it into the default suite. Several of these guard defects that affect the source database, not just the pipeline.
+> Do not weaken or delete an acceptance test to get a green run. Several of these guard defects that affect the source database, not just the pipeline.
 
-If you fix a defect listed in the README's Known Limitations table, move its test out of the tagged file in the same pull request and update that table.
+If you fix a defect listed in the README's Known Limitations table, add its regression guard to `cdc_acceptance_test.go` in the same pull request and update that table.
 
 ### Verification Checklist Before Submitting PR
 - [ ] `go test -v -race ./...` passes with zero race detector warnings.
-- [ ] `remediation_invariants_test.go` still passes; no assertion in it was relaxed.
-- [ ] Any acceptance test made to pass has been moved into the default suite and the README Known Limitations table updated.
+- [ ] `cdc_invariants_test.go` still passes; no assertion in it was relaxed.
+- [ ] Any newly fixed defect has a regression guard in `cdc_acceptance_test.go` and the README Known Limitations table is updated.
 - [ ] Code is formatted with `gofmt -s -w .`.
 - [ ] Zero personal usernames or credentials in repository code, tests, docs, or roles (use `beam_navigator`, `scotty`, or `beam_transporter` exclusively).
 - [ ] Apache 2.0 license header is present on every newly created file.

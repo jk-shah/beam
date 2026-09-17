@@ -13,22 +13,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Acceptance suite for the PostgreSQLIO remediation.
+// Acceptance suite for the PostgreSQLIO connector.
 //
-// These tests encode the behavior the connector MUST have once the
-// remediation lands. Several of them FAIL against the current tree -- that is
-// their purpose. They are the executable definition of done for the findings
-// in postgresio_go_adoption_review.md, and they exist so that a future change
-// cannot quietly reintroduce a defect that was already paid for.
+// Each test here encodes behavior the connector must have, for a defect that
+// has been fixed, so that a future change cannot quietly reintroduce it. The
+// suite runs as part of the default `go test ./...` -- it is not build-tagged.
 //
-// The suite is behind a build tag so that a red acceptance test does not block
-// unrelated work:
-//
-//	go test -tags postgresio_remediation ./pkg/beam/io/postgresio/
-//
-// As each workstream lands, its tests here go green. When every test in this
-// file passes, the build tag should be removed and the file folded into the
-// default suite. Do not delete or weaken a test to make it pass.
+// Do not delete or weaken a test to make it pass. Several of these guard
+// defects that affect the source database, not just the pipeline.
 //
 // Tests requiring a live PostgreSQL server (snapshot consistency, WAL
 // retention under load, catalog bloat, TOAST round-trips, the PG 13-18 matrix)

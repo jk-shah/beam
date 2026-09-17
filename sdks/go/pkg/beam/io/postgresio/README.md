@@ -39,7 +39,6 @@
    - [C. Bounded Batch Read Engine](#c-bounded-batch-read-engine)
    - [D. Columnar Apache Arrow Vectorized Engine](#d-columnar-apache-arrow-vectorized-engine)
    - [E. Native Go SchemaTransform Framework & Expansion Service](#e-native-go-schematransform-framework--expansion-service)
-   - [F. Multi-Architecture Toolchain & Cross-Platform Stager](#f-multi-architecture-toolchain--cross-platform-stager)
 3. [Quickstart & Getting Started](#3-quickstart--getting-started)
    - [Native Go Bounded Batch Read](#native-go-bounded-batch-read)
    - [Native Go Write & Upsert](#native-go-write--upsert)
@@ -50,7 +49,6 @@
    - [ReadOptions](#readoptions)
    - [WriteOptions](#writeoptions)
    - [CDCOptions](#cdcoptions)
-   - [ArrowBatchOptions](#arrowbatchoptions)
    - [Checkpointing & Acknowledgment](#checkpointing--acknowledgment)
    - [Security & TLS Configuration](#security--tls-configuration)
    - [Failover slots](#failover-slots)
@@ -66,7 +64,7 @@
    - [Memory Model & Allocation Constraints](#memory-model--allocation-constraints)
 6. [Testing & Verification Runbook](#6-testing--verification-runbook)
    - [Unit Testing](#unit-testing)
-   - [Remediation Acceptance Suite](#remediation-acceptance-suite)
+   - [Acceptance Suite](#acceptance-suite)
    - [Integration Testing against PostgreSQL 18](#integration-testing-against-postgresql-18)
    - [Benchmarks & Performance Profiling](#benchmarks--performance-profiling)
    - [Operational Troubleshooting & Slot Recovery](#operational-troubleshooting--slot-recovery)
@@ -88,14 +86,14 @@
 |       postgresio.ReadCDC Source        |   |        postgresio.Write Sink         |
 |  - Decoupled Heartbeat Goroutine       |   |  - BatchCompactor (LWW deduplication)|
 |  - pgoutput Binary Message Parser      |   |  - Canonical Composite PK Sorter     |
-|  - In-Flight XID Transaction Spooler   |   |  - Dynamic Pool Clamping (NumCPU/2)  |
+|  - In-Flight XID Transaction Spooler   |   |  - Pool Clamping (2 conns default)   |
 |  - Bundle Checkpointing (FlushLSN)     |   |  - Dead-Letter Queue (FailedRow)     |
 +--------------------+-------------------+   +---------------+----------------------+
                      |                                       ^
                      v                                       |
 +--------------------+---------------------------------------+----------------------+
 |                      Apache Arrow Columnar Vectorized Engine                      |
-|  - ArrowRecordBatch zero-copy conversion (222.8 ns/op, 0 allocs/rec)              |
+|  - ArrowRecordBatch zero-copy conversion (0 allocs/op, amortized)                 |
 |  - Schema Reflection & Go Type Unnesting (cdc_range, arrays, jsonb)               |
 +-----------------------------------------------------------------------------------+
                      |                                       ^
@@ -174,11 +172,11 @@ sequenceDiagram
         DoFn->>PG: SELECT pg_replication_origin_xact_setup('origin_name', '0/0')
     end
     
-    DoFn->>PG: CREATE TEMP TABLE temp_batch (LIKE target INCLUDING DEFAULTS) ON COMMIT DROP
+    DoFn->>PG: CREATE TEMP TABLE IF NOT EXISTS temp_batch (LIKE target INCLUDING DEFAULTS) ON COMMIT DELETE ROWS
     PG-->>Temp: Temporary table created
     
-    DoFn->>PG: COPY temp_batch (col1, col2, ...) FROM STDIN WITH (FORMAT binary)
-    DoFn->>PG: Stream binary tuple data directly via pgx CopyFromSource
+    DoFn->>PG: COPY temp_batch (col1, col2, ...) FROM STDIN
+    DoFn->>PG: Stream row values through the prepared COPY statement
     PG-->>DoFn: CommandComplete: COPY N
     
     rect rgb(255, 250, 240)
@@ -204,7 +202,7 @@ sequenceDiagram
 ## 2. Subsystem Architecture
 
 ### A. High-Throughput Write Engine
-* **Staged COPY Upsert (`WriteMethodStagedCopy`, Default)**: Streams micro-batched tuples using PostgreSQL's binary/text `CopyData` protocol via `pq.CopyIn` into an isolated session temporary table (`CREATE TEMP TABLE stage_<id> (LIKE target INCLUDING DEFAULTS) ON COMMIT DROP`). Once streamed, it executes an atomic set-based merge (`INSERT INTO target SELECT * FROM stage_<id> ON CONFLICT DO UPDATE SET ...`). Bypasses SQL parsing and AST generation entirely, achieving **>102,000 rows/sec** write throughput.
+* **Staged COPY Upsert (`WriteMethodStagedCopy`, Default)**: Streams micro-batched tuples through a prepared `COPY <staging> (<columns>) FROM STDIN` into a session-scoped temporary table (`CREATE TEMP TABLE IF NOT EXISTS <staging> (LIKE target INCLUDING DEFAULTS) ON COMMIT DELETE ROWS`). The staging table is created once per session and emptied at each commit rather than created and dropped per batch, so steady-state flushes execute no catalog DDL. Once streamed, an atomic set-based merge (`INSERT INTO target SELECT ... FROM <staging> ON CONFLICT DO UPDATE SET ...`) applies the batch, so per-row statements are never parsed or planned.
 * **Parameterized `UNNEST` Array Upsert (`WriteMethodUnnest`)**: Executes batch inserts and upserts via vectorized array parameters with explicit type casts (`UNNEST($1::bigint[], $2::text[], ...)`), providing fallback execution when temporary table creation is restricted.
 * **In-Memory Batch Compaction & Deadlock Prevention**: The `BatchCompactor` applies Last-Write-Wins (LWW) deduplication within micro-batches and sorts records canonically by composite primary key prior to database execution. This guarantees uniform row-lock acquisition order across distributed parallel workers, eliminating `SQLState 40P01` deadlocks.
 * **Declarative Replication Origin Stamping**: Users can configure `.WithReplicationOriginName("beam_origin")`. Write transactions are tagged via `SELECT pg_replication_origin_xact_setup('beam_origin', '0/0')`, preventing cyclic feedback loops in active-active bidirectional database synchronization.
@@ -228,7 +226,7 @@ sequenceDiagram
 
 ### D. Columnar Apache Arrow Vectorized Engine
 * **Micro-Batch Columnar Buffers**: Groups individual row events into contiguous Apache Arrow `RecordBatch` structures (`arrow_batcher.go`).
-* **Zero-Allocation Decoding**: Achieves **222.8 ns/op** decoding speed with **0 heap allocations per record** by recycling field builder buffers across micro-batches.
+* **Amortized Allocation-Free Decoding**: Recycles field builder buffers across micro-batches, so `BenchmarkArrowBatching` reports **0 allocs/op**. Buffer growth still allocates, so bytes/op is not zero; the invariant is that no allocation happens per record in the steady state. See [Benchmarks & Performance Profiling](#benchmarks--performance-profiling) for how to measure it on your own hardware.
 * **PostgreSQL Complex Type Support**: Supports native Arrow columnar conversion for discrete and unbounded ranges (`int4range`, `numrange`, `tsrange`), multi-dimensional Postgres arrays (`int[]`, `text[]`), and JSONB documents.
 
 ### E. Native Go SchemaTransform Framework & Expansion Service
@@ -238,12 +236,6 @@ sequenceDiagram
   * Bounded Batch Read: `beam:schematransform:org.apache.beam:postgres_read:v1`
   * CDC Stream: `beam:schematransform:org.apache.beam:postgres_read_cdc:v1`
 * **Expansion Service**: Serves the gRPC `ExpansionService` protocol, allowing Beam YAML and Python pipelines to execute Go-native PostgreSQL transforms. Any Beam SDK that speaks the expansion protocol can connect, but only the YAML and Python paths are covered by tests in this contribution.
-
-### F. Multi-Architecture Toolchain & Cross-Platform Stager
-* **Static Pure Go Compiler**: Enforces `CGO_ENABLED=0`, `-tags "netgo osusergo static_build"`, and `-ldflags "-s -w -extldflags '-static'"`.
-* **Static ELF Validation**: Verifies binary output using standard Go `debug/elf` (`ELFCLASS64`, `ELFDATA2LSB`, `EM_X86_64` / `EM_AARCH64`, absence of `PT_INTERP`, and 0 dynamic libraries).
-* **Target Architecture Resolution**: Automatically detects target platforms across GCP (Tau `t2a`, Axion `c4a`, `n4a`, `m4a`), AWS Graviton (`*g.*`), pipeline experiment flags (`use_arm64_workers`), and explicit overrides.
-* **Content-Addressable Storage (CAS)**: SHA-256 deduplication avoids redundant uploads when staging worker binaries to cloud buckets.
 
 ---
 
@@ -873,7 +865,7 @@ This starts:
 
 ### Known Limitations
 
-The connector is unreleased and experimental. The list below is what is still open; the [remediation acceptance suite](#remediation-acceptance-suite) covers the items that have been fixed and fails if any of them regresses.
+The connector is unreleased and experimental. The list below is what is still open; the [acceptance suite](#acceptance-suite) covers the items that have been fixed and fails if any of them regresses.
 
 | Area | Limitation | Impact |
 | :--- | :--- | :--- |
@@ -903,12 +895,14 @@ This section details internal design invariants for contributors maintaining or 
 | [`compactor.go`](compactor.go) | Sink | `BatchCompactor` micro-batch accumulator, LWW deduplication, composite primary key canonical sort. |
 | [`options.go`](options.go) | Config | `WriteOptions` definition, functional options, identifier sanitization. |
 | [`cdc_source.go`](cdc_source.go) | CDC | Single-consumer `cdcSourceFn`, decoupled heartbeat loop, bundle commit callbacks. |
-| [`cdc_stream.go`](cdc_stream.go) | CDC | Physical replication protocol connection via `pglogrepl`, START_REPLICATION protocol handshakes. |
+| [`cdc_stream.go`](cdc_stream.go) | CDC | `ReplicationStream` interface and its native implementation: connection setup and the `START_REPLICATION` handshake, written directly against the PostgreSQL wire protocol. |
 | [`cdc_types.go`](cdc_types.go) | CDC | `ChangeEvent`, `ColumnValue`, `OpType`, custom JSON coder registrations. |
 | [`cdc_spooler.go`](cdc_spooler.go) | CDC | In-flight transaction spooling (`TransactionMessage`), commit/abort boundary isolation. |
 | [`cdc_demux.go`](cdc_demux.go) | CDC | Downstream routing transforms (`FilterByTable`, `FilterBySchema`, `FilterByOrigin`). |
 | [`cdc_toast.go`](cdc_toast.go) | CDC | Stateful TOAST hydration using Beam runner state (`state.Value`). |
-| [`cdc_slot_manager.go`](cdc_slot_manager.go) | CDC | Replication slot lifecycle, creation, dropping, and lag monitoring queries. |
+| [`cdc_slot_creation.go`](cdc_slot_creation.go) | CDC | `CREATE_REPLICATION_SLOT` and `DROP_REPLICATION_SLOT`, exported snapshot, two-phase and `FAILOVER` options. |
+| [`cdc_slot_health.go`](cdc_slot_health.go) | CDC | `SlotHealth` and `SlotHealthReport`: classification of a slot's retention state. |
+| [`cdc_slot_monitor.go`](cdc_slot_monitor.go) | CDC | Out-of-band retention measurement, `SlotLagPolicy`, and the WAL retention circuit breaker. |
 | [`arrow_batcher.go`](arrow_batcher.go) | Arrow | Columnar conversion of CDC change events to Apache Arrow `RecordBatch` micro-batches. |
 | [`arrow_decoder.go`](arrow_decoder.go) | Arrow | Zero-copy conversion from Arrow RecordBatches back to typed Beam structs or rows. |
 | [`arrow_types.go`](arrow_types.go) | Arrow | `ArrowBatchRecord`, schema representations, batch options. |
@@ -963,7 +957,7 @@ PostgreSQL Write-Ahead Log (WAL)
       |
       v
 +-------------------------------------------------------+
-| [Physical Stream via pglogrepl]                       |
+| [Replication stream: native pgoutput wire protocol]   |
 | 1. Worker connects with START_REPLICATION             |
 | 2. Background goroutine sends StandbyStatusUpdate     |
 |    (ticks every HeartbeatInterval, preserves FlushLSN)|
@@ -1014,7 +1008,7 @@ When working with Beam Go DoFns and schema-registered types:
 ### Memory Model & Allocation Constraints
 
 * **Arrow Buffer Reuse**: The Arrow batcher uses pre-allocated memory pools. When modifying `arrow_batcher.go`, ensure slice allocations occur during builder initialization, not inside per-element iteration loops.
-* **Concurrency Clamping**: Worker connection pools must never exceed `runtime.NumCPU() / 2` to prevent connection exhaustion on PostgreSQL when hundreds of Beam workers scale out on Dataflow.
+* **Connection Pool Bounding**: `WriteOptions.MaxConnections` defaults to 2 per worker, so that a pipeline scaling out to hundreds of Beam workers does not exhaust the server's `max_connections`. `WithMaxConnections` raises it; raise the server's budget to match before doing so.
 
 ---
 
@@ -1029,20 +1023,16 @@ cd sdks/go/pkg/beam/io/postgresio
 go test -v -race -count=1 ./...
 ```
 
-This includes `remediation_invariants_test.go`, which locks in guarantees that already hold and must not regress: identifier sanitization against SQL injection, replication slot name and heartbeat validation, credential redaction in `CDCOptions.String()` and `SanitizeErrorMessage`, batch compaction collapse and deadlock-avoiding sort order, and `PrimaryKeyString` determinism. A failure there means a change has broken an existing guarantee.
+This includes `cdc_invariants_test.go`, which locks in guarantees that already hold and must not regress: identifier sanitization against SQL injection, replication slot name and heartbeat validation, credential redaction in `CDCOptions.String()` and `SanitizeErrorMessage`, batch compaction collapse and deadlock-avoiding sort order, and `PrimaryKeyString` determinism. A failure there means a change has broken an existing guarantee.
 
-### Remediation Acceptance Suite
+### Acceptance Suite
 
-A second suite encodes behavior the connector must have once the outstanding defects in [Known Limitations](#known-limitations) are fixed. It is gated behind a build tag because it is **expected to fail** against the current tree:
-
-```bash
-go test -v -tags postgresio_remediation ./pkg/beam/io/postgresio/
-```
+`cdc_acceptance_test.go` encodes the behavior the connector must have for each defect that has been fixed. It runs as part of the default suite above — there is no separate command and no build tag.
 
 The suite is hermetic — no containers, no ports, runs in milliseconds. It combines wire-level tests over `net.Pipe` (for example, asserting that the first bytes sent on a new connection are the `SSLRequest` packet rather than a cleartext startup packet), behavioral tests (asserting LSN-aware conflict resolution in the compactor), and source-level guards for defects that no behavioral test can reach.
 
 > [!IMPORTANT]
-> A test in the acceptance suite is retired only by being made to pass and folded into the default suite. Weakening an assertion to get a green run reintroduces the defect the test was written to prevent.
+> These tests are regression guards, not aspirational specifications. Weakening an assertion to get a green run reintroduces the defect the test was written to prevent.
 
 
 ### Integration Testing against PostgreSQL 18
@@ -1067,23 +1057,20 @@ Integration tests require a running PostgreSQL instance with logical replication
    python3 sdks/go/examples/postgres/verify_resilience_and_recovery.py
    ```
 
-4. **Validate the Beam YAML example specifications** (static; no database needed):
-   ```bash
-   python3 sdks/python/apache_beam/yaml/examples/testing/validate_postgres_examples.py
-   ```
-
 ### Benchmarks & Performance Profiling
 
 Run the Apache Arrow vectorized decoding and micro-batching benchmarks:
 
 ```bash
-go test -bench=BenchmarkArrowBatcher -benchmem -cpu=1,4,8
+go test -run XXX -bench=BenchmarkArrowBatching -benchmem -count=3 ./pkg/beam/io/postgresio/
 ```
 
-Target benchmark metrics:
-* Throughput: $\ge$ 4,000,000 ops/sec
-* Allocation Speed: $\le$ 250 ns/op
-* Allocations: **0 allocs/op**
+The invariant this guards is **0 allocs/op**: the field builders are recycled
+across micro-batches, so the steady state must not allocate per record. A
+change that makes this non-zero is a regression.
+
+Latency is hardware-dependent and is not asserted. For reference, on an AMD
+EPYC 7B12 with Go 1.26.6 the batcher measures ~260 ns/op at 0 allocs/op.
 
 ### Operational Troubleshooting & Slot Recovery
 
