@@ -35,6 +35,7 @@ This directory contains skills that help the agent perform specialized tasks in 
 | [developing-new-io-connectors](developing-new-io-connectors/SKILL.md) | A detailed guide on developing new I/O connectors |
 | [java-development](java-development/SKILL.md) | Java SDK development, building, testing, project structure |
 | [license-compliance](license-compliance/SKILL.md) | Apache 2.0 license headers for all new files |
+| [postgresio](postgresio/SKILL.md) | Guides using the Apache Beam PostgreSQL connector (postgresio) across Go, Python, and YAML |
 | [python-development](python-development/SKILL.md) | Python SDK environment setup, testing, building pipelines |
 | [runners](runners/SKILL.md) | Direct, Dataflow, Flink, Spark runner configuration |
 | [yaml-development](yaml-development/SKILL.md) | YAML SDK development, environment setup, testing, and key concepts |
