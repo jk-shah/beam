@@ -1,0 +1,60 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# High-Throughput Batch ETL & Transformation in Declarative Beam YAML
+#
+# Use Case:
+# Bulk migration pipeline reading raw source transactions, standardizing
+# currency codes and tiers, and bulk-upserting into `migrated_transactions`.
+#
+# Execution:
+#   python3 -m apache_beam.yaml.main --yaml_pipeline_file=pipeline.yaml
+
+pipeline:
+  type: chain
+  transforms:
+    - type: ReadFromPostgresIO
+      name: ReadSourceTransactions
+      config:
+        jdbc_url: "jdbc:postgresql://localhost:5432/postgres"
+        table: "test_pipelines.source_orders"
+        username: "beam_navigator"
+        password_env_var: "PGPASSWORD"
+
+    - type: MapToFields
+      name: StandardizeAndEnrich
+      config:
+        language: python
+        fields:
+          id: "int(order_id)"
+          code: "str(country_code).upper()"
+          amount: "round(float(amount), 2)"
+          region: "'NORTH_AMERICA' if str(country_code).upper() in ('US', 'CA') else 'INTERNATIONAL'"
+          tier: "'VIP' if float(amount) >= 1000.0 else 'STANDARD'"
+          loaded_at: "datetime.datetime.now(datetime.timezone.utc).isoformat()"
+
+    - type: WriteToPostgresIO
+      name: BulkUpsertTarget
+      config:
+        host: "localhost"
+        port: 5432
+        database: "beammeup"
+        username: "beam_navigator"
+        password_env_var: "PGPASSWORD"
+        table: "public.migrated_transactions"
+        conflict_keys:
+          - "id"
