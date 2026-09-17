@@ -49,6 +49,11 @@ func (p PCollection) IsValid() bool {
 	return p.n != nil
 }
 
+// Node returns the underlying graph Node, or nil if invalid.
+func (p PCollection) Node() *graph.Node {
+	return p.n
+}
+
 // TODO(herohde) 5/30/2017: add name for PCollections? Java supports it.
 
 // Type returns the full type 'A' of the elements. 'A' must be a concrete

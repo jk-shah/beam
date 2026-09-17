@@ -70,6 +70,7 @@
 * SolaceIO now supports reading and writing binary and text content data payload (Java) ([#39875](https://github.com/apache/beam/issues/39875)).
 * ClickHouseIO: support writing `Decimal(P, S)` / `Decimal32/64/128/256` columns (Java) ([#39840](https://github.com/apache/beam/issues/39840)).
 * Added PostgreSQLIO, a native PostgreSQL connector for the Go SDK, with a vectorized sink using staged `COPY` and parameterized `UNNEST` upserts, dead-letter routing for failed mutations, and PgBouncer transaction-pooling support (Go) ([#39959](https://github.com/apache/beam/issues/39959)).
+* PostgreSQLIO is available from Python and Beam YAML as `ReadFromPostgresIO`, `WriteToPostgresIO` and `ReadFromPostgresCDC`, backed by the Go SchemaTransforms through a portable expansion service. Supports partitioned batch reads, logical-replication CDC, and `MERGE`-mode sinks that apply deletes (Python) ([#39959](https://github.com/apache/beam/issues/39959)).
 
 ## New Features / Improvements
 

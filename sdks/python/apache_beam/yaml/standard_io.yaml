@@ -714,3 +714,9 @@
       config:
         gradle_target: 'sdks:java:io:expansion-service:shadowJar'
 
+# PostgreSQL (Go native SchemaTransforms via Python cross-language wrapper)
+- type: python
+  transforms:
+    'WriteToPostgresIO': 'apache_beam.io.postgres.WriteToPostgres'
+    'ReadFromPostgresIO': 'apache_beam.io.postgres.ReadFromPostgres'
+    'ReadFromPostgresCDC': 'apache_beam.io.postgres.ReadFromPostgresCDC'
