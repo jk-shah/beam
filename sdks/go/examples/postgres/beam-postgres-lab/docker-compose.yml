@@ -1,0 +1,104 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+services:
+  postgres:
+    image: postgres:17
+    container_name: beam-lab-postgres
+    environment:
+      POSTGRES_DB: beammeup
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: secret
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_replication_slots=10
+      -c max_wal_senders=10
+      -c max_slot_wal_keep_size=2048MB
+      -c track_commit_timestamp=on
+      -c password_encryption=scram-sha-256
+    ports:
+      - "${POSTGRES_BIND:-0.0.0.0}:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - ./init-lab.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d beammeup"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+    networks:
+      - beam-lab-net
+
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: beam-lab-pgbouncer
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "${PGBOUNCER_BIND:-0.0.0.0}:${PGBOUNCER_PORT:-6432}:6432"
+    volumes:
+      - ./pgbouncer.ini:/etc/pgbouncer/pgbouncer.ini:ro
+      - ./userlist.txt:/etc/pgbouncer/userlist.txt:ro
+    networks:
+      - beam-lab-net
+
+  airflow:
+    image: apache/airflow:2.10.0-python3.11
+    container_name: beam-lab-airflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - AIRFLOW__CORE__LOAD_EXAMPLES=False
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=sqlite:////opt/airflow/airflow.db
+      - _AIRFLOW_DB_UPGRADE=true
+      - _AIRFLOW_WWW_USER_CREATE=true
+      - _AIRFLOW_WWW_USER_USERNAME=admin
+      - _AIRFLOW_WWW_USER_PASSWORD=admin
+    ports:
+      - "${AIRFLOW_BIND:-0.0.0.0}:${AIRFLOW_PORT:-8080}:8080"
+    volumes:
+      - ./dags:/opt/airflow/dags
+    command: bash -c "airflow db init && airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com && airflow webserver & airflow scheduler"
+    networks:
+      - beam-lab-net
+
+  beam-runner:
+    build:
+      context: ../../../../..
+      dockerfile: sdks/go/examples/postgres/beam-postgres-lab/Dockerfile
+    container_name: beam-lab-runner
+    depends_on:
+      postgres:
+        condition: service_healthy
+      pgbouncer:
+        condition: service_started
+    environment:
+      - PGHOST=postgres
+      - PGPORT=5432
+      - PGDATABASE=beammeup
+      - PGUSER=beam_navigator
+      - PGPASSWORD=beam_navigator
+      - PGBOUNCER_HOST=pgbouncer
+      - PGBOUNCER_PORT=6432
+    entrypoint: ["tail", "-f", "/dev/null"]
+    networks:
+      - beam-lab-net
+
+networks:
+  beam-lab-net:
+    driver: bridge
+
