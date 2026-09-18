@@ -78,7 +78,65 @@ sequenceDiagram
 
 ---
 
-## 2. Engineering Invariants & Coding Guidelines
+## 2. Cross-Language SchemaTransform Architecture
+
+Apache Beam provides cross-language schema transform compatibility so that pipelines authored in Python, YAML, or Java can transparently invoke the Go PostgreSQL I/O transforms:
+
+| Transform | Standard URN | Go Registration | Schema Config Struct |
+| :--- | :--- | :--- | :--- |
+| **Bounded Batch Read** | `beam:schematransform:org.apache.beam:postgres_read:v1` | `schematransform.GlobalRegisterTyped[PostgreSqlReadConfig]` | `PostgreSqlReadConfig` |
+| **Write Sink** | `beam:schematransform:org.apache.beam:postgres_write:v1` | `schematransform.GlobalRegisterTyped[PostgreSqlWriteConfig]` | `PostgreSqlWriteConfig` |
+
+### Configuration Fields Schema
+
+```go
+type PostgreSqlReadConfig struct {
+    Location        string `beam:"location"`
+    ReadQuery       string `beam:"read_query"`
+    JdbcUrl         string `beam:"jdbc_url"`
+    Host            string `beam:"host"`
+    Port            int32  `beam:"port"`
+    Database        string `beam:"database"`
+    Table           string `beam:"table"`
+    Query           string `beam:"query"`
+    Username        string `beam:"username"`
+    Password        string `beam:"password,secret"`
+    PasswordEnvVar  string `beam:"password_env_var"`
+    SSLMode         string `beam:"sslmode"`
+    FetchSize       int32  `beam:"fetch_size"`
+    PartitionColumn string `beam:"partition_column"`
+    NumPartitions   int32  `beam:"num_partitions"`
+    LowerBound      *int64 `beam:"lower_bound"`
+    UpperBound      *int64 `beam:"upper_bound"`
+}
+```
+
+```go
+type PostgreSqlWriteConfig struct {
+    Host                  string   `beam:"host"`
+    Port                  int32    `beam:"port"`
+    Database              string   `beam:"database"`
+    Table                 string   `beam:"table"`
+    Username              string   `beam:"username"`
+    Password              string   `beam:"password,secret"`
+    PasswordEnvVar        string   `beam:"password_env_var"`
+    SSLMode               string   `beam:"sslmode"`
+    ConflictKeys          []string `beam:"conflict_keys"`
+    UpdateFields          []string `beam:"update_fields"`
+    MaxBatchRows          int32    `beam:"max_batch_rows"`
+    MaxBatchBytes         int32    `beam:"max_batch_bytes"`
+    UsePgBouncer          bool     `beam:"use_pgbouncer"`
+    ReplicationOrigin     string   `beam:"replication_origin"`
+    WriteMode             string   `beam:"write_mode"`
+    OpColumn              string   `beam:"op_column"`
+    DeleteOpValue         string   `beam:"delete_op_value"`
+    ExplainAnalyze        bool     `beam:"explain_analyze"`
+}
+```
+
+---
+
+## 3. Engineering Invariants & Coding Guidelines
 
 1. **Pure Go Without JNI or JVM Wrappers**:
    The Go connector is completely self-contained (`CGO_ENABLED=0` invariant). It does not require a Java runtime or expansion service for native Go pipelines.
@@ -91,7 +149,7 @@ sequenceDiagram
 
 ---
 
-## 3. Local Development & Testing
+## 4. Local Development & Testing
 
 ### Prerequisites
 * Go 1.21 or higher
