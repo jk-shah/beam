@@ -47,7 +47,7 @@ sequenceDiagram
     Client->>PG: IDENTIFY_SYSTEM
     PG-->>Client: systemid, timeline, xlogpos, dbname
     Client->>Slot: START_REPLICATION SLOT beam_cdc_slot LOGICAL 0/0 (proto_version '2', publication_names 'pub', origin 'none')
-    
+
     rect rgb(240, 248, 255)
         Note over PG,Client: Streaming WAL Protocol Loop
         loop Every Change Event & Standby Keepalive
@@ -61,7 +61,7 @@ sequenceDiagram
                 SDF->>Batcher: Buffer into RecordBatch
                 Batcher->>Worker: Emit Arrow RecordBatch / Row PCollection
             end
-            
+
             PG->>Client: CopyData Message 'k' (Primary Keepalive: walEnd, serverTime, replyRequested)
             opt replyRequested or Standby Timeout (10s)
                 Client->>PG: Standby Status Update (flushedLSN, appliedLSN, clientTime, reply=0)
@@ -85,22 +85,22 @@ sequenceDiagram
     Note over DoFn,Target: Bundle Lifecycle: StartBundle / ProcessElement
     DoFn->>DoFn: Buffer incoming records into batch slice (e.g. 5,000 rows)
     DoFn->>DoFn: LWW compaction & canonical primary-key sorting
-    
+
     Note over DoFn,Target: Execution in FinishBundle: executeStagedCopy
     DoFn->>Pool: Acquire dedicated connection (max lifetime validated)
     DoFn->>PG: BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
-    
+
     opt WithReplicationOriginName configured
         DoFn->>PG: SELECT pg_replication_origin_xact_setup('origin_name', '0/0')
     end
-    
+
     DoFn->>PG: CREATE TEMP TABLE IF NOT EXISTS temp_batch (LIKE target INCLUDING DEFAULTS) ON COMMIT DELETE ROWS
     PG-->>Temp: Temporary table created
-    
+
     DoFn->>PG: COPY temp_batch (col1, col2, ...) FROM STDIN
     DoFn->>PG: Stream row values through the prepared COPY statement
     PG-->>DoFn: CommandComplete: COPY N
-    
+
     rect rgb(255, 250, 240)
         Note over PG,Target: Atomic Merge into Target Table
         DoFn->>PG: INSERT INTO target (col1, col2, ...) SELECT col1, col2, ... FROM temp_batch ON CONFLICT (pk) DO UPDATE SET col1=EXCLUDED.col1, ...

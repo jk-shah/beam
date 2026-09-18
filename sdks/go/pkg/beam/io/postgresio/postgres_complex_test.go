@@ -165,7 +165,7 @@ func TestGoComplexPipeline_PostgresToPostgres(t *testing.T) {
 		if _, err := db.Exec("TRUNCATE TABLE test_pipelines.source_orders CASCADE;"); err != nil {
 			t.Fatalf("failed to truncate source_orders: %v", err)
 		}
-		stmt, err := db.Prepare(`INSERT INTO test_pipelines.source_orders 
+		stmt, err := db.Prepare(`INSERT INTO test_pipelines.source_orders
 			(order_id, customer_id, customer_email, amount, status, country_code, items_count, created_at)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())`)
 		if err != nil {

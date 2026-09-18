@@ -331,7 +331,7 @@ ON CONFLICT (customer_id) DO NOTHING;
 
 -- 6. Deploy standardized DBA replication health monitoring view
 CREATE OR REPLACE VIEW public.beam_cdc_health AS
-SELECT 
+SELECT
     slot_name,
     slot_type,
     active,
@@ -339,7 +339,7 @@ SELECT
     COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0) AS retained_bytes,
     pg_size_pretty(COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0)) AS retained_size,
     confirmed_flush_lsn,
-    CASE 
+    CASE
         WHEN NOT active THEN 'UNCONNECTED'
         WHEN pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) > 1073741824 THEN 'WARNING_LAG_HIGH'
         ELSE 'HEALTHY'

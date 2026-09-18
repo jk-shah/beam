@@ -30,7 +30,7 @@ with DAG(
         postgres_conn_id="postgres_primary",
         autocommit=True,
         sql="""
-            ALTER TABLE public.orders_partitioned 
+            ALTER TABLE public.orders_partitioned
             DETACH PARTITION public.orders_2026_09_01 CONCURRENTLY;
         """,
     )
