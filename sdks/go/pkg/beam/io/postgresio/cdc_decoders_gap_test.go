@@ -225,13 +225,13 @@ func TestCompactor_ExtractPrimaryKeys_Variations(t *testing.T) {
 	}
 	u := TestUser{ID: 101, Name: "bob"}
 	k, vals := ExtractPrimaryKeys(u, []string{"ID"})
-	if k != "101|" || len(vals) != 1 || vals[0] != int64(101) {
+	if k != "i:101|" || len(vals) != 1 || vals[0] != int64(101) {
 		t.Errorf("ExtractPrimaryKeys(exact) = (%q, %v)", k, vals)
 	}
 
 	// Pointer to struct with EqualFold
 	k2, vals2 := ExtractPrimaryKeys(&u, []string{"id"})
-	if k2 != "101|" || len(vals2) != 1 {
+	if k2 != "i:101|" || len(vals2) != 1 {
 		t.Errorf("ExtractPrimaryKeys(EqualFold) = (%q, %v)", k2, vals2)
 	}
 
@@ -241,7 +241,7 @@ func TestCompactor_ExtractPrimaryKeys_Variations(t *testing.T) {
 	}
 	tu := TaggedUser{UserKey: 777}
 	k3, vals3 := ExtractPrimaryKeys(tu, []string{"user_id"})
-	if k3 != "777|" || len(vals3) != 1 || vals3[0] != int64(777) {
+	if k3 != "i:777|" || len(vals3) != 1 || vals3[0] != int64(777) {
 		t.Errorf("ExtractPrimaryKeys(db tag) = (%q, %v)", k3, vals3)
 	}
 
@@ -254,7 +254,7 @@ func TestCompactor_ExtractPrimaryKeys_Variations(t *testing.T) {
 	// Map lookup
 	m := map[string]any{"id": "order_123", "region": "US"}
 	k5, vals5 := ExtractPrimaryKeys(m, []string{"id", "region"})
-	if k5 != "order_123|US|" || len(vals5) != 2 {
+	if k5 != "s:order_123|s:US|" || len(vals5) != 2 {
 		t.Errorf("ExtractPrimaryKeys(map) = (%q, %v)", k5, vals5)
 	}
 
