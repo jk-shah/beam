@@ -285,9 +285,18 @@ func (fn *writeFn) flushBatch(ctx context.Context, emitSuccess func(beam.X), emi
 	return nil
 }
 
-// failBatch routes an entire batch to the dead-letter output when a batch cannot
-// be written. The error message is sanitized and emitted along with each row to
-// the FailedRows dead-letter queue.
+// failBatch routes an entire batch to the dead-letter output. It is used by the
+// paths that cannot produce a correct write and must not retry or degrade: the
+// caller still returns the error so the bundle fails, but the rows are surfaced
+// on the failed-mutations output rather than disappearing.
+//
+// This is deliberately distinct from the execution-failure path in
+// writePartition. A batch rejected here is rejected because the pipeline is
+// configured in a way that cannot ever produce a correct write, so retrying the
+// bundle against the same configuration would fail identically. Continuing
+// would drain every row of every batch into the dead-letter output while
+// reporting success, which hides a misconfiguration behind an apparently
+// healthy pipeline.
 func (fn *writeFn) failBatch(ctx context.Context, batch []any, err error, emitFailed func(FailedRow)) {
 	sinkFailedRows.Inc(ctx, int64(len(batch)))
 	msg := SanitizeErrorMessage(err)
@@ -311,7 +320,7 @@ func (fn *writeFn) writePartition(ctx context.Context, part writePartition, emit
 	// UNNEST path emits INSERT ... ON CONFLICT against the target, a statement
 	// with no DELETE arm, so a MERGE batch routed through it would apply the
 	// inserts and updates and silently discard every delete. A silently wrong
-	// result is worse than a failed bundle, so these cases fail loudly to DLQ.
+	// result is worse than a failed bundle, so these cases fail loudly.
 	mergeMode := fn.Options.WriteMode == WriteModeMerge
 	if mergeMode {
 		var err error
@@ -324,7 +333,7 @@ func (fn *writeFn) writePartition(ctx context.Context, part writePartition, emit
 		}
 		if err != nil {
 			fn.failBatch(ctx, batch, err, emitFailed)
-			return nil
+			return err
 		}
 	}
 
@@ -349,7 +358,7 @@ func (fn *writeFn) writePartition(ctx context.Context, part writePartition, emit
 		if mergeMode {
 			err := fmt.Errorf("postgresio: MERGE staged COPY failed: %w", copyErr)
 			fn.failBatch(ctx, batch, err, emitFailed)
-			return nil
+			return err
 		}
 		log.Warnf(ctx, "postgresio: staged COPY failed (%v), falling back to parameterized UNNEST", copyErr)
 	}
@@ -362,7 +371,7 @@ func (fn *writeFn) writePartition(ctx context.Context, part writePartition, emit
 			err = fmt.Errorf("postgresio: parameterized UNNEST build failed: %w", err)
 		}
 		fn.failBatch(ctx, batch, err, emitFailed)
-		return nil
+		return err
 	}
 
 	// Safety net: retry loop for SQLState 40P01 deadlock detected with full-jitter exponential backoff
@@ -821,21 +830,29 @@ func (fn *writeFn) buildUnnestQueryForColumns(batch []any, columns []string) (st
 			unnestPlaceholders[i] = fmt.Sprintf("$%d::text[]", i+1)
 			selectCols = append(selectCols, fmt.Sprintf("t.col%d::%s[]", i, baseType))
 
+			// Elements are collected into []any rather than []string so that a
+			// row whose array is absent stays nil and is encoded as NULL. A
+			// []string would force the zero value "", which PostgreSQL reads
+			// as an empty-string element rather than a NULL array.
 			arrVals := make([]any, len(batch))
 			for r := 0; r < len(batch); r++ {
 				val := columnArrays[i][r]
-				if val != nil {
-					if s, ok := val.(string); ok {
-						arrVals[r] = s
-					} else {
-						valv, err := pq.Array(val).Value()
-						if err == nil && valv != nil {
-							arrVals[r] = valv
-						} else {
-							arrVals[r] = val
-						}
-					}
+				if val == nil {
+					continue // leave nil: encoded as NULL
 				}
+				if s, ok := val.(string); ok {
+					arrVals[r] = s
+					continue
+				}
+				// Value() returns (nil, nil) for a nil slice, which is exactly
+				// the NULL case, so the result is assigned unconditionally.
+				// Guarding on valv != nil here would discard that NULL and fall
+				// back to the raw Go slice, which pq cannot encode as an element.
+				valv, err := pq.Array(val).Value()
+				if err != nil {
+					return "", nil, fmt.Errorf("postgresio: failed to encode array column %q: %w", col, err)
+				}
+				arrVals[r] = valv
 			}
 			args[i] = pq.Array(arrVals)
 		} else {

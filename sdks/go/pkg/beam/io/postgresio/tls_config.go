@@ -70,4 +70,3 @@ func validateSSLMode(mode string) error {
 	}
 	return nil
 }
-

@@ -201,4 +201,3 @@ func TestExtractPrimaryKeysCollisionResistance(t *testing.T) {
 		t.Fatalf("expected distinct keys for backslash-containing fields, but both got %q", key3)
 	}
 }
-

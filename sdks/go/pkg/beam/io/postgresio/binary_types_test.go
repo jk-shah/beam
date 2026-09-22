@@ -291,8 +291,8 @@ func TestPgVectorFormatting(t *testing.T) {
 
 func TestPgIntervalDurationAndString(t *testing.T) {
 	iv := PgInterval{
-		Months:      2,
-		Days:        5,
+		Months:       2,
+		Days:         5,
 		Microseconds: int64(3 * time.Hour / time.Microsecond),
 	}
 

@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/apache/beam/sdks/v2/go/pkg/beam"
+	"github.com/lib/pq"
 )
 
 func TestBuildUnnestQueryUpsert(t *testing.T) {
@@ -201,7 +202,6 @@ func TestBuildMergeQueryNullOp(t *testing.T) {
 		t.Errorf("expected IS DISTINCT FROM clause, got:\n%s", sql)
 	}
 }
-
 
 func TestWriteTransformPipelineConstruction(t *testing.T) {
 	p, s := beam.NewPipelineWithRoot()
@@ -553,7 +553,7 @@ func TestBuildMergeQuery(t *testing.T) {
 		if !strings.Contains(query, `WHEN MATCHED THEN`+"\n"+`  UPDATE SET`+"\n"+`    "customer_id" = source."customer_id",`+"\n"+`    "amount" = source."amount"`) {
 			t.Errorf("missing UPDATE SET, got:\n%s", query)
 		}
-		if !strings.Contains(query, `WHEN NOT MATCHED AND source."_op_type" <> 'D' THEN`+"\n"+`  INSERT ("order_id", "customer_id", "amount")`+"\n"+`  VALUES (source."order_id", source."customer_id", source."amount")`) {
+		if !strings.Contains(query, `WHEN NOT MATCHED AND (source."_op_type" IS DISTINCT FROM 'D') THEN`+"\n"+`  INSERT ("order_id", "customer_id", "amount")`+"\n"+`  VALUES (source."order_id", source."customer_id", source."amount")`) {
 			t.Errorf("missing INSERT clause, got:\n%s", query)
 		}
 	})
@@ -623,7 +623,7 @@ func TestExplainPlanParsingAndSampling(t *testing.T) {
 	}
 }
 
-func TestWriteRoutesFailedRowOnQueryFailure(t *testing.T) {
+func TestWriteReturnsErrorOnQueryFailure(t *testing.T) {
 	fn := &writeFn{
 		Table:          `"public"."orders"`,
 		Options:        NewWriteOptions(),
@@ -635,22 +635,107 @@ func TestWriteRoutesFailedRowOnQueryFailure(t *testing.T) {
 	ctx := context.Background()
 	fn.compactor = NewBatchCompactor(10, 1024, 0)
 
+	// A batch that cannot be turned into a statement is a configuration fault,
+	// not a data fault: every later batch would fail identically. The bundle
+	// must fail rather than silently draining the input into the dead-letter
+	// output, but the rows are still surfaced there so they are recoverable.
 	var failedRows []FailedRow
-	emitFailed := func(f FailedRow) {
-		failedRows = append(failedRows, f)
-	}
+	emitFailed := func(f FailedRow) { failedRows = append(failedRows, f) }
 
 	_ = fn.ProcessElement(ctx, TestOrder{ID: 1}, func(v beam.X) {}, emitFailed)
 	err := fn.FinishBundle(ctx, func(v beam.X) {}, emitFailed)
 
-	if err != nil {
-		t.Fatalf("expected FinishBundle to return nil so DLQ can be delivered, got error: %v", err)
+	if err == nil {
+		t.Fatalf("expected FinishBundle to return error when query building fails, got nil")
+	}
+	if !strings.Contains(err.Error(), "identifier cannot be empty") {
+		t.Errorf("expected error to contain 'identifier cannot be empty', got: %v", err)
 	}
 	if len(failedRows) != 1 {
-		t.Fatalf("expected 1 failed row routed to DLQ, got %d", len(failedRows))
+		t.Errorf("expected the rejected row to still reach the failed output, got %d", len(failedRows))
 	}
-	if !strings.Contains(failedRows[0].ErrorMessage, "identifier cannot be empty") {
-		t.Errorf("expected DLQ error message to contain 'identifier cannot be empty', got: %v", failedRows[0].ErrorMessage)
+}
+
+// failingConn is a database/sql connection whose every statement execution
+// fails with a fixed error, so the sink's execution-failure path can be
+// exercised without a live PostgreSQL server.
+type failingConn struct{ err error }
+
+func (c failingConn) Prepare(string) (driver.Stmt, error) { return nil, c.err }
+func (c failingConn) Close() error                        { return nil }
+func (c failingConn) Begin() (driver.Tx, error)           { return nil, c.err }
+func (c failingConn) ExecContext(context.Context, string, []driver.NamedValue) (driver.Result, error) {
+	return nil, c.err
+}
+
+type failingDriver struct{ err error }
+
+func (d failingDriver) Open(string) (driver.Conn, error) { return failingConn{err: d.err}, nil }
+
+type failingConnector struct{ err error }
+
+func (c failingConnector) Connect(context.Context) (driver.Conn, error) {
+	return failingConn{err: c.err}, nil
+}
+func (c failingConnector) Driver() driver.Driver { return failingDriver{err: c.err} }
+
+// TestWriteRoutesRejectedRowsToDLQOnExecFailure covers the case the dead-letter
+// queue exists for: the statement is well-formed and the server rejects the
+// data. Such a batch must not fail the bundle, because failing it would discard
+// the dead-letter output that carries the rejected rows, and the next attempt
+// would hit the same rejection forever.
+func TestWriteRoutesRejectedRowsToDLQOnExecFailure(t *testing.T) {
+	execErr := &pq.Error{Code: "23505", Message: "duplicate key value violates unique constraint"}
+
+	fn := &writeFn{
+		Table: `"public"."orders"`,
+		// The UNNEST method reaches the execution path directly, without the
+		// staged COPY fast path that would need a real transaction.
+		Options: NewWriteOptions(
+			WithWriteMode(WriteModeInsert),
+			WithWriteMethod(WriteMethodUnnest),
+		),
+		Type:    beam.EncodedType{T: reflect.TypeOf(TestOrder{})},
+		columns: []string{"id", "region", "amount"},
+		colTypes: map[string]string{
+			"id":     "INT8",
+			"region": "TEXT",
+			"amount": "FLOAT8",
+		},
+		db: sql.OpenDB(failingConnector{err: execErr}),
+	}
+	defer fn.db.Close()
+
+	ctx := context.Background()
+	fn.compactor = NewBatchCompactor(10, 1024, 0)
+
+	var succeeded []any
+	var failedRows []FailedRow
+
+	_ = fn.ProcessElement(ctx, TestOrder{ID: 1, Region: "US", Amount: 10},
+		func(v beam.X) { succeeded = append(succeeded, v) },
+		func(f FailedRow) { failedRows = append(failedRows, f) })
+	err := fn.FinishBundle(ctx,
+		func(v beam.X) { succeeded = append(succeeded, v) },
+		func(f FailedRow) { failedRows = append(failedRows, f) })
+
+	if err != nil {
+		t.Fatalf("expected FinishBundle to return nil so the dead-letter output is committed, got: %v", err)
+	}
+	if len(succeeded) != 0 {
+		t.Errorf("emitted %d rows as written despite the statement failing", len(succeeded))
+	}
+	if len(failedRows) != 1 {
+		t.Fatalf("expected 1 row on the dead-letter output, got %d", len(failedRows))
+	}
+	if failedRows[0].SqlState != "23505" {
+		t.Errorf("expected SqlState 23505 to be propagated, got %q", failedRows[0].SqlState)
+	}
+	if !strings.Contains(failedRows[0].ErrorMessage, "duplicate key") {
+		t.Errorf("expected the server message to be preserved, got %q", failedRows[0].ErrorMessage)
+	}
+	if got, ok := failedRows[0].Row.(TestOrder); !ok || got.ID != 1 {
+		t.Errorf("expected the original row to be recoverable from the dead-letter output, got %#v", failedRows[0].Row)
 	}
 }
 

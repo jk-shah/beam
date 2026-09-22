@@ -45,8 +45,8 @@ const numericDigitsPerWord = 4
 // them into a time.Duration would silently lose that distinction, so the
 // components are preserved.
 type PgInterval struct {
-	Months      int32
-	Days        int32
+	Months       int32
+	Days         int32
 	Microseconds int64 // microseconds within the day
 }
 
@@ -251,8 +251,8 @@ func decodeBinaryInterval(b []byte) (PgInterval, error) {
 	}
 	return PgInterval{
 		Microseconds: int64(binary.BigEndian.Uint64(b[0:8])),
-		Days:        int32(binary.BigEndian.Uint32(b[8:12])),
-		Months:      int32(binary.BigEndian.Uint32(b[12:16])),
+		Days:         int32(binary.BigEndian.Uint32(b[8:12])),
+		Months:       int32(binary.BigEndian.Uint32(b[12:16])),
 	}, nil
 }
 
