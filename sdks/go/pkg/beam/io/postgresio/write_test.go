@@ -18,6 +18,7 @@ package postgresio
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -97,6 +98,110 @@ func TestBuildUnnestQueryInsertOnly(t *testing.T) {
 		t.Errorf("expected 3 args, got %d", len(args))
 	}
 }
+
+func TestBuildUnnestQueryUpdate(t *testing.T) {
+	fn := &writeFn{
+		Table:          `"public"."orders"`,
+		Options:        NewWriteOptions(WithWriteMode(WriteModeUpdate), WithPrimaryKeyColumns("id")),
+		Type:           beam.EncodedType{T: reflect.TypeOf(TestOrder{})},
+		PrimaryKeyCols: []string{"id"},
+		columns:        []string{"id", "region", "amount"},
+		colTypes: map[string]string{
+			"id":     "INT8",
+			"region": "TEXT",
+			"amount": "FLOAT8",
+		},
+	}
+
+	batch := []any{
+		TestOrder{ID: 1, Region: "US", Amount: 50.0},
+	}
+
+	query, args, err := fn.buildUnnestQuery(batch)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !strings.HasPrefix(query, `UPDATE "public"."orders" AS target SET`) {
+		t.Errorf("expected UPDATE statement, got %q", query)
+	}
+	if !strings.Contains(query, `FROM (SELECT t.col0 AS "id", t.col1 AS "region", t.col2 AS "amount" FROM UNNEST`) {
+		t.Errorf("expected UNNEST subquery, got %q", query)
+	}
+	if !strings.Contains(query, `WHERE target."id" = source."id"`) {
+		t.Errorf("expected WHERE clause on primary key, got %q", query)
+	}
+	if !strings.Contains(query, `"region" = source."region"`) || !strings.Contains(query, `"amount" = source."amount"`) {
+		t.Errorf("expected SET clause on non-pk columns, got %q", query)
+	}
+	if len(args) != 3 {
+		t.Errorf("expected 3 args, got %d", len(args))
+	}
+}
+
+func TestBuildUnnestQueryNullArray(t *testing.T) {
+	type ArrayOrder struct {
+		ID   int64    `db:"id"`
+		Tags []string `db:"tags"`
+	}
+
+	fn := &writeFn{
+		Table:          `"public"."orders"`,
+		Options:        NewWriteOptions(WithWriteMode(WriteModeInsert)),
+		Type:           beam.EncodedType{T: reflect.TypeOf(ArrayOrder{})},
+		PrimaryKeyCols: nil,
+		columns:        []string{"id", "tags"},
+		colTypes: map[string]string{
+			"id":   "INT8",
+			"tags": "_TEXT",
+		},
+	}
+
+	batch := []any{
+		ArrayOrder{ID: 1, Tags: []string{"electronics"}},
+		ArrayOrder{ID: 2, Tags: nil}, // nil array
+	}
+
+	query, args, err := fn.buildUnnestQuery(batch)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !strings.Contains(query, `SELECT t.col0, t.col1::TEXT[] FROM UNNEST`) {
+		t.Errorf("expected select to cast t.col1::TEXT[], got %q", query)
+	}
+
+	if len(args) != 2 {
+		t.Fatalf("expected 2 arguments, got %d", len(args))
+	}
+
+	arrayVal, err := args[1].(driver.Valuer).Value()
+	if err != nil {
+		t.Fatalf("failed to get driver value from array arg: %v", err)
+	}
+	strVal, ok := arrayVal.(string)
+	if !ok {
+		t.Fatalf("expected string from driver.Valuer, got %T", arrayVal)
+	}
+	if strings.Contains(strVal, `,""`) || strings.Contains(strVal, `""`) {
+		t.Fatalf("array literal contains empty string instead of NULL: %s", strVal)
+	}
+	if !strings.Contains(strVal, "NULL") {
+		t.Fatalf("expected array literal to contain NULL for nil slice, got %s", strVal)
+	}
+}
+
+func TestBuildMergeQueryNullOp(t *testing.T) {
+	sql, err := buildMergeQuery("public.orders", "pg_temp.orders_staging", []string{"id", "val"}, []string{"id"}, "op", "d")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	expected := "WHEN NOT MATCHED AND (source.\"op\" IS DISTINCT FROM 'd') THEN\n  INSERT (\"id\", \"val\")"
+	if !strings.Contains(sql, expected) {
+		t.Errorf("expected IS DISTINCT FROM clause, got:\n%s", sql)
+	}
+}
+
 
 func TestWriteTransformPipelineConstruction(t *testing.T) {
 	p, s := beam.NewPipelineWithRoot()
@@ -501,7 +606,7 @@ func TestExplainPlanParsingAndSampling(t *testing.T) {
 	]`)
 
 	// Ensure recordExplainTelemetry runs without panic or error
-	recordExplainTelemetry(planJSON, "public.orders")
+	recordExplainTelemetry(context.Background(), planJSON, "public.orders")
 
 	var results []ExplainPlanResult
 	if err := json.Unmarshal(planJSON, &results); err != nil {
@@ -518,7 +623,7 @@ func TestExplainPlanParsingAndSampling(t *testing.T) {
 	}
 }
 
-func TestWriteReturnsErrorOnQueryFailure(t *testing.T) {
+func TestWriteRoutesFailedRowOnQueryFailure(t *testing.T) {
 	fn := &writeFn{
 		Table:          `"public"."orders"`,
 		Options:        NewWriteOptions(),
@@ -530,14 +635,22 @@ func TestWriteReturnsErrorOnQueryFailure(t *testing.T) {
 	ctx := context.Background()
 	fn.compactor = NewBatchCompactor(10, 1024, 0)
 
-	_ = fn.ProcessElement(ctx, TestOrder{ID: 1}, func(v beam.X) {}, func(f FailedRow) {})
-	err := fn.FinishBundle(ctx, func(v beam.X) {}, func(f FailedRow) {})
-
-	if err == nil {
-		t.Fatalf("expected FinishBundle to return error when query building fails, got nil")
+	var failedRows []FailedRow
+	emitFailed := func(f FailedRow) {
+		failedRows = append(failedRows, f)
 	}
-	if !strings.Contains(err.Error(), "identifier cannot be empty") {
-		t.Errorf("expected error to contain 'identifier cannot be empty', got: %v", err)
+
+	_ = fn.ProcessElement(ctx, TestOrder{ID: 1}, func(v beam.X) {}, emitFailed)
+	err := fn.FinishBundle(ctx, func(v beam.X) {}, emitFailed)
+
+	if err != nil {
+		t.Fatalf("expected FinishBundle to return nil so DLQ can be delivered, got error: %v", err)
+	}
+	if len(failedRows) != 1 {
+		t.Fatalf("expected 1 failed row routed to DLQ, got %d", len(failedRows))
+	}
+	if !strings.Contains(failedRows[0].ErrorMessage, "identifier cannot be empty") {
+		t.Errorf("expected DLQ error message to contain 'identifier cannot be empty', got: %v", failedRows[0].ErrorMessage)
 	}
 }
 

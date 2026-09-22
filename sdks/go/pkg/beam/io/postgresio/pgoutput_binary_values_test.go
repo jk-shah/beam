@@ -64,7 +64,7 @@ func TestParseBinaryValueDecodesInterval(t *testing.T) {
 	if !ok {
 		t.Fatalf("parseBinaryValue(INTERVAL) returned %T, want PgInterval", got)
 	}
-	if iv.Microthings != 3_600_000_000 {
-		t.Errorf("interval microseconds = %d, want 3600000000", iv.Microthings)
+	if iv.Microseconds != 3_600_000_000 {
+		t.Errorf("interval microseconds = %d, want 3600000000", iv.Microseconds)
 	}
 }

@@ -47,7 +47,7 @@ const numericDigitsPerWord = 4
 type PgInterval struct {
 	Months      int32
 	Days        int32
-	Microthings int64 // microseconds within the day
+	Microseconds int64 // microseconds within the day
 }
 
 // String renders the interval in PostgreSQL's standard output format.
@@ -67,8 +67,8 @@ func (iv PgInterval) String() string {
 		parts = append(parts, fmt.Sprintf("%d day%s", iv.Days, plural(int64(iv.Days))))
 	}
 
-	if iv.Microthings != 0 || len(parts) == 0 {
-		micros := iv.Microthings
+	if iv.Microseconds != 0 || len(parts) == 0 {
+		micros := iv.Microseconds
 		neg := micros < 0
 		if neg {
 			micros = -micros
@@ -101,7 +101,7 @@ func (iv PgInterval) String() string {
 // approximate magnitude. Prefer the individual components for correctness.
 func (iv PgInterval) Duration() time.Duration {
 	days := int64(iv.Months)*30 + int64(iv.Days)
-	return time.Duration(days)*24*time.Hour + time.Duration(iv.Microthings)*time.Microsecond
+	return time.Duration(days)*24*time.Hour + time.Duration(iv.Microseconds)*time.Microsecond
 }
 
 func plural(n int64) string {
@@ -250,7 +250,7 @@ func decodeBinaryInterval(b []byte) (PgInterval, error) {
 		return PgInterval{}, fmt.Errorf("interval: expected 16 bytes, got %d", len(b))
 	}
 	return PgInterval{
-		Microthings: int64(binary.BigEndian.Uint64(b[0:8])),
+		Microseconds: int64(binary.BigEndian.Uint64(b[0:8])),
 		Days:        int32(binary.BigEndian.Uint32(b[8:12])),
 		Months:      int32(binary.BigEndian.Uint32(b[12:16])),
 	}, nil

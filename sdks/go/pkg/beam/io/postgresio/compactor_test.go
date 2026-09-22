@@ -172,3 +172,33 @@ func TestExtractPrimaryKeys(t *testing.T) {
 		t.Errorf("unexpected sort keys: %v", sortKeys)
 	}
 }
+
+func TestExtractPrimaryKeysCollisionResistance(t *testing.T) {
+	type KeyItem struct {
+		PartA string `db:"part_a"`
+		PartB string `db:"part_b"`
+	}
+
+	// Without escaping, ("a|b", "c") and ("a", "b|c") both yield "a|b|c|".
+	// With escaping, ("a|b", "c") -> "a\|b|c|" vs ("a", "b|c") -> "a|b\|c|".
+	item1 := KeyItem{PartA: "a|b", PartB: "c"}
+	item2 := KeyItem{PartA: "a", PartB: "b|c"}
+
+	key1, _ := ExtractPrimaryKeys(item1, []string{"part_a", "part_b"})
+	key2, _ := ExtractPrimaryKeys(item2, []string{"part_a", "part_b"})
+
+	if key1 == key2 {
+		t.Fatalf("expected distinct keys for pipe-containing fields, but both got %q", key1)
+	}
+
+	// Test backslash escaping
+	item3 := KeyItem{PartA: `a\`, PartB: "b"}
+	item4 := KeyItem{PartA: "a", PartB: `\b`}
+	key3, _ := ExtractPrimaryKeys(item3, []string{"part_a", "part_b"})
+	key4, _ := ExtractPrimaryKeys(item4, []string{"part_a", "part_b"})
+
+	if key3 == key4 {
+		t.Fatalf("expected distinct keys for backslash-containing fields, but both got %q", key3)
+	}
+}
+

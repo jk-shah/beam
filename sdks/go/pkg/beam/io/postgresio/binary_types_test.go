@@ -190,7 +190,7 @@ func TestDecodeBinaryInterval(t *testing.T) {
 				t.Fatalf("decodeBinaryInterval() error: %v", err)
 			}
 
-			if iv.Months != tc.months || iv.Days != tc.days || iv.Microthings != tc.micros {
+			if iv.Months != tc.months || iv.Days != tc.days || iv.Microseconds != tc.micros {
 				t.Errorf("decodeBinaryInterval() = %+v, want months=%d days=%d micros=%d",
 					iv, tc.months, tc.days, tc.micros)
 			}
@@ -293,7 +293,7 @@ func TestPgIntervalDurationAndString(t *testing.T) {
 	iv := PgInterval{
 		Months:      2,
 		Days:        5,
-		Microthings: int64(3 * time.Hour / time.Microsecond),
+		Microseconds: int64(3 * time.Hour / time.Microsecond),
 	}
 
 	dur := iv.Duration()

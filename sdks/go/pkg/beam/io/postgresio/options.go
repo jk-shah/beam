@@ -101,27 +101,64 @@ func (o WriteOptions) String() string {
 
 // pqDialerAdapter adapts a postgresio DialFunc into a pq.Dialer.
 type pqDialerAdapter struct {
+	ctx      context.Context
 	dialFunc DialFunc
 }
 
 func (a *pqDialerAdapter) Dial(network, address string) (net.Conn, error) {
-	return a.dialFunc(context.Background(), network, address)
+	ctx := a.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return a.dialFunc(ctx, network, address)
 }
 
 func (a *pqDialerAdapter) DialTimeout(network, address string, timeout time.Duration) (net.Conn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx := a.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	return a.dialFunc(ctx, network, address)
 }
 
-// pqConnector implements driver.Connector using a custom pq.Dialer.
+// pqConnector implements driver.Connector using a custom pq.Dialer and optional per-connection init SQL.
 type pqConnector struct {
-	dialer pq.Dialer
-	dsn    string
+	dialFunc DialFunc
+	dialer   pq.Dialer
+	dsn      string
+	initSQL  string
 }
 
 func (c *pqConnector) Connect(ctx context.Context) (driver.Conn, error) {
-	return pq.DialOpen(c.dialer, c.dsn)
+	var conn driver.Conn
+	var err error
+	if c.dialFunc != nil {
+		conn, err = pq.DialOpen(&pqDialerAdapter{ctx: ctx, dialFunc: c.dialFunc}, c.dsn)
+	} else if c.dialer != nil {
+		conn, err = pq.DialOpen(c.dialer, c.dsn)
+	} else {
+		d := &pq.Driver{}
+		conn, err = d.Open(c.dsn)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	if c.initSQL != "" {
+		var initErr error
+		if execer, ok := conn.(driver.ExecerContext); ok {
+			_, initErr = execer.ExecContext(ctx, c.initSQL, nil)
+		} else if execerSync, ok := conn.(driver.Execer); ok {
+			_, initErr = execerSync.Exec(c.initSQL, nil)
+		}
+		if initErr != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("postgresio: connection init SQL failed: %w", initErr)
+		}
+	}
+	return conn, nil
 }
 
 func (c *pqConnector) Driver() driver.Driver {

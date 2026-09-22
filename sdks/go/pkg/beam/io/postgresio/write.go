@@ -73,7 +73,7 @@ type WriteResult struct {
 }
 
 // Write writes elements from an input PCollection to a target PostgreSQL table using
-// parameterized array upserts, in-memory deduplication, and deadlock prevention sorting.
+// parameterized array upserts, in-memory deduplication, and deadlock mitigation sorting.
 func Write(s beam.Scope, table string, opts WriteOptions, col beam.PCollection) WriteResult {
 	s = s.Scope("postgresio.Write")
 
@@ -92,6 +92,10 @@ func Write(s beam.Scope, table string, opts WriteOptions, col beam.PCollection) 
 	sanitizedTable, err := SanitizeTableIdentifier(table)
 	if err != nil {
 		panic(fmt.Sprintf("postgresio.Write: invalid table name %q: %v", table, err))
+	}
+
+	if opts.WriteMode == WriteModeUpdate && len(opts.PrimaryKeyCols) == 0 {
+		panic("postgresio.Write: WriteModeUpdate requires primary key columns (PrimaryKeyCols)")
 	}
 
 	elemType := col.Type().Type()
@@ -149,24 +153,27 @@ type writeFn struct {
 func (fn *writeFn) Setup(ctx context.Context) error {
 	fn.workerID = fmt.Sprintf("%016x", rand.Uint64())
 
+	if fn.Options.WriteMode == WriteModeUpdate && len(fn.PrimaryKeyCols) == 0 {
+		return fmt.Errorf("postgresio: WriteModeUpdate requires primary key columns (PrimaryKeyCols)")
+	}
+
 	sslMode := fn.Options.SSLMode
 	if sslMode == "" {
-		sslMode = "disable"
+		sslMode = DefaultSSLMode
+	}
+	if err := validateSSLMode(sslMode); err != nil {
+		return fmt.Errorf("postgresio: invalid sslmode: %w", err)
 	}
 	password := fn.Options.ResolvePassword()
 	dsn := buildWriteDSN(fn.Options.Host, fn.Options.Port, fn.Options.Database,
 		fn.Options.Username, password, sslMode)
 
-	var db *sql.DB
-	var err error
-	if fn.Options.DialFunc != nil {
-		db = sql.OpenDB(&pqConnector{dialer: &pqDialerAdapter{dialFunc: fn.Options.DialFunc}, dsn: dsn})
-	} else {
-		db, err = sql.Open("postgres", dsn)
-		if err != nil {
-			return fmt.Errorf("postgresio: failed to open connection pool: %w", err)
-		}
+	connector := &pqConnector{
+		dialFunc: fn.Options.DialFunc,
+		dsn:      dsn,
+		initSQL:  fn.Options.ConnectionInitSQL,
 	}
+	db := sql.OpenDB(connector)
 
 	// Clamp worker pool connections to prevent connection storms across distributed workers
 	maxConns := fn.Options.MaxConnections
@@ -176,12 +183,6 @@ func (fn *writeFn) Setup(ctx context.Context) error {
 	db.SetMaxOpenConns(maxConns)
 	db.SetMaxIdleConns(maxConns)
 	db.SetConnMaxLifetime(30 * time.Minute)
-
-	if fn.Options.ConnectionInitSQL != "" {
-		if _, err := db.ExecContext(ctx, fn.Options.ConnectionInitSQL); err != nil {
-			log.Warnf(ctx, "postgresio: connection init SQL failed: %v", err)
-		}
-	}
 
 	fn.db = db
 	fn.compactor = NewBatchCompactor(fn.Options.BatchSize, fn.Options.MaxBatchBytes, fn.Options.FlushInterval)
@@ -284,13 +285,13 @@ func (fn *writeFn) flushBatch(ctx context.Context, emitSuccess func(beam.X), emi
 	return nil
 }
 
-// failBatch routes an entire batch to the dead-letter output. It is used by the
-// paths that cannot produce a correct write and must not retry or degrade: the
-// caller still returns the error so the bundle fails, but the rows are surfaced
-// on the failed-mutations output rather than disappearing.
+// failBatch routes an entire batch to the dead-letter output when a batch cannot
+// be written. The error message is sanitized and emitted along with each row to
+// the FailedRows dead-letter queue.
 func (fn *writeFn) failBatch(ctx context.Context, batch []any, err error, emitFailed func(FailedRow)) {
 	sinkFailedRows.Inc(ctx, int64(len(batch)))
 	msg := SanitizeErrorMessage(err)
+	log.Errorf(ctx, "postgresio: %s", msg)
 	for _, item := range batch {
 		emitFailed(FailedRow{
 			Row:          item,
@@ -310,7 +311,7 @@ func (fn *writeFn) writePartition(ctx context.Context, part writePartition, emit
 	// UNNEST path emits INSERT ... ON CONFLICT against the target, a statement
 	// with no DELETE arm, so a MERGE batch routed through it would apply the
 	// inserts and updates and silently discard every delete. A silently wrong
-	// result is worse than a failed bundle, so these cases fail loudly.
+	// result is worse than a failed bundle, so these cases fail loudly to DLQ.
 	mergeMode := fn.Options.WriteMode == WriteModeMerge
 	if mergeMode {
 		var err error
@@ -323,7 +324,7 @@ func (fn *writeFn) writePartition(ctx context.Context, part writePartition, emit
 		}
 		if err != nil {
 			fn.failBatch(ctx, batch, err, emitFailed)
-			return err
+			return nil
 		}
 	}
 
@@ -348,7 +349,7 @@ func (fn *writeFn) writePartition(ctx context.Context, part writePartition, emit
 		if mergeMode {
 			err := fmt.Errorf("postgresio: MERGE staged COPY failed: %w", copyErr)
 			fn.failBatch(ctx, batch, err, emitFailed)
-			return err
+			return nil
 		}
 		log.Warnf(ctx, "postgresio: staged COPY failed (%v), falling back to parameterized UNNEST", copyErr)
 	}
@@ -361,10 +362,10 @@ func (fn *writeFn) writePartition(ctx context.Context, part writePartition, emit
 			err = fmt.Errorf("postgresio: parameterized UNNEST build failed: %w", err)
 		}
 		fn.failBatch(ctx, batch, err, emitFailed)
-		return err
+		return nil
 	}
 
-	// Retry loop for SQLState 40P01 deadlock detected with full-jitter exponential backoff
+	// Safety net: retry loop for SQLState 40P01 deadlock detected with full-jitter exponential backoff
 	maxRetries := 5
 	backoff := 50 * time.Millisecond
 
@@ -402,7 +403,7 @@ func (fn *writeFn) writePartition(ctx context.Context, part writePartition, emit
 				SqlState:     sqlState,
 			})
 		}
-		return execErr
+		return nil
 	}
 
 	return nil
@@ -625,6 +626,32 @@ func (fn *writeFn) executeStagedCopy(ctx context.Context, batch []any) error {
 		if err != nil {
 			return err
 		}
+	} else if fn.Options.WriteMode == WriteModeUpdate {
+		if len(sanitizedPks) == 0 {
+			return fmt.Errorf("postgresio: WriteModeUpdate requires primary key columns")
+		}
+		setClauses := make([]string, 0, len(fn.columns))
+		for _, col := range fn.columns {
+			if !pkSet[col] {
+				san, err := SanitizeIdentifier(col)
+				if err != nil {
+					return err
+				}
+				setClauses = append(setClauses, fmt.Sprintf("%s = %s.%s", san, tempTable, san))
+			}
+		}
+		if len(setClauses) == 0 {
+			setClauses = append(setClauses, fmt.Sprintf("%s = %s.%s", sanitizedPks[0], tempTable, sanitizedPks[0]))
+		}
+		whereClauses := make([]string, len(sanitizedPks))
+		for i, pk := range sanitizedPks {
+			whereClauses[i] = fmt.Sprintf("%s.%s = %s.%s", fn.Table, pk, tempTable, pk)
+		}
+		mergeSql = fmt.Sprintf("UPDATE %s SET %s FROM %s WHERE %s",
+			fn.Table, strings.Join(setClauses, ", "), tempTable, strings.Join(whereClauses, " AND "))
+	} else if fn.Options.WriteMode == WriteModeInsert {
+		mergeSql = fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM %s",
+			fn.Table, colList, colList, tempTable)
 	} else if len(sanitizedPks) == 0 {
 		mergeSql = fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM %s ON CONFLICT DO NOTHING",
 			fn.Table, colList, colList, tempTable)
@@ -642,7 +669,7 @@ func (fn *writeFn) executeStagedCopy(ctx context.Context, batch []any) error {
 		if err := txn.QueryRowContext(ctx, explainSql).Scan(&planJSON); err != nil {
 			return err
 		}
-		recordExplainTelemetry(planJSON, fn.Table)
+		recordExplainTelemetry(ctx, planJSON, fn.Table)
 	} else {
 		if _, err := txn.ExecContext(ctx, mergeSql); err != nil {
 			return err
@@ -794,21 +821,23 @@ func (fn *writeFn) buildUnnestQueryForColumns(batch []any, columns []string) (st
 			unnestPlaceholders[i] = fmt.Sprintf("$%d::text[]", i+1)
 			selectCols = append(selectCols, fmt.Sprintf("t.col%d::%s[]", i, baseType))
 
-			arrStr := make([]string, len(batch))
+			arrVals := make([]any, len(batch))
 			for r := 0; r < len(batch); r++ {
 				val := columnArrays[i][r]
 				if val != nil {
 					if s, ok := val.(string); ok {
-						arrStr[r] = s
+						arrVals[r] = s
 					} else {
 						valv, err := pq.Array(val).Value()
 						if err == nil && valv != nil {
-							arrStr[r] = valv.(string)
+							arrVals[r] = valv
+						} else {
+							arrVals[r] = val
 						}
 					}
 				}
 			}
-			args[i] = pq.Array(arrStr)
+			args[i] = pq.Array(arrVals)
 		} else {
 			unnestPlaceholders[i] = fmt.Sprintf("$%d::%s[]", i+1, dbType)
 			selectCols = append(selectCols, fmt.Sprintf("t.col%d", i))
@@ -816,12 +845,59 @@ func (fn *writeFn) buildUnnestQueryForColumns(batch []any, columns []string) (st
 		}
 	}
 
-	var sb strings.Builder
 	tCols := make([]string, len(columns))
 	for i := range columns {
 		tCols[i] = fmt.Sprintf("col%d", i)
 	}
 
+	if fn.Options.WriteMode == WriteModeUpdate {
+		if len(fn.PrimaryKeyCols) == 0 {
+			return "", nil, fmt.Errorf("postgresio: WriteModeUpdate requires primary key columns")
+		}
+		sanitizedPks := make([]string, len(fn.PrimaryKeyCols))
+		pkSet := make(map[string]bool)
+		for i, pk := range fn.PrimaryKeyCols {
+			san, err := SanitizeIdentifier(pk)
+			if err != nil {
+				return "", nil, err
+			}
+			sanitizedPks[i] = san
+			pkSet[pk] = true
+		}
+
+		var selectAsCols []string
+		var setClauses []string
+		var whereClauses []string
+
+		for i, col := range columns {
+			san, err := SanitizeIdentifier(col)
+			if err != nil {
+				return "", nil, err
+			}
+			selectAsCols = append(selectAsCols, fmt.Sprintf("%s AS %s", selectCols[i], san))
+			if pkSet[col] {
+				whereClauses = append(whereClauses, fmt.Sprintf("target.%s = source.%s", san, san))
+			} else {
+				setClauses = append(setClauses, fmt.Sprintf("%s = source.%s", san, san))
+			}
+		}
+
+		if len(setClauses) == 0 {
+			setClauses = append(setClauses, fmt.Sprintf("%s = source.%s", sanitizedPks[0], sanitizedPks[0]))
+		}
+
+		query := fmt.Sprintf("UPDATE %s AS target SET %s FROM (SELECT %s FROM UNNEST(%s) AS t(%s)) AS source WHERE %s",
+			fn.Table,
+			strings.Join(setClauses, ", "),
+			strings.Join(selectAsCols, ", "),
+			strings.Join(unnestPlaceholders, ", "),
+			strings.Join(tCols, ", "),
+			strings.Join(whereClauses, " AND "),
+		)
+		return query, args, nil
+	}
+
+	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM UNNEST(%s) AS t(%s)",
 		fn.Table,
 		strings.Join(sanitizedCols, ", "),
@@ -934,14 +1010,14 @@ func shouldSampleExplain(rate float64) bool {
 	return rand.Float64() < rate
 }
 
-func recordExplainTelemetry(planJSON []byte, targetTable string) {
+func recordExplainTelemetry(ctx context.Context, planJSON []byte, targetTable string) {
 	var results []ExplainPlanResult
 	if err := json.Unmarshal(planJSON, &results); err != nil || len(results) == 0 {
 		return
 	}
 	res := results[0]
 	if res.ExecutionTime > 250.0 {
-		log.Warnf(context.Background(),
+		log.Warnf(ctx,
 			"[POSTGRES_SINK_PLAN_ALERT] table=%s execution_time=%.2fms planning_time=%.2fms node=%s hit_blocks=%d read_blocks=%d",
 			targetTable, res.ExecutionTime, res.PlanningTime, res.Plan.NodeType,
 			res.Plan.SharedHitBlocks, res.Plan.SharedReadBlocks)
@@ -1054,7 +1130,7 @@ func buildMergeQueryForSanitizedTables(sanitizedTarget, sanitizedSource string, 
 
 	if hasOp {
 		delValEscaped := strings.ReplaceAll(deleteOpVal, "'", "''")
-		sb.WriteString(fmt.Sprintf("WHEN NOT MATCHED AND source.%s <> '%s' THEN\n", sanOp, delValEscaped))
+		sb.WriteString(fmt.Sprintf("WHEN NOT MATCHED AND (source.%s IS DISTINCT FROM '%s') THEN\n", sanOp, delValEscaped))
 	} else {
 		sb.WriteString("WHEN NOT MATCHED THEN\n")
 	}

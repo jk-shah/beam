@@ -41,7 +41,7 @@ type RecordEntry struct {
 }
 
 // BatchCompactor manages micro-batch buffering, Last-Write-Wins (LWW) deduplication,
-// and deterministic primary key sorting to prevent PostgreSQL SQLState 40P01 deadlocks.
+// and deterministic primary key sorting to minimize PostgreSQL SQLState 40P01 deadlocks.
 type BatchCompactor struct {
 	maxBatchSize  int
 	maxBatchBytes int
@@ -147,7 +147,7 @@ func (bc *BatchCompactor) CompactAndSort() []any {
 		return nil
 	}
 
-	// Canonical sort to eliminate SQLState 40P01 deadlocks
+	// Canonical sort to minimize SQLState 40P01 deadlocks
 	sort.SliceStable(bc.buffer, func(i, j int) bool {
 		return compareSortKeys(bc.buffer[i].SortKey, bc.buffer[j].SortKey) < 0
 	})
@@ -289,7 +289,7 @@ func ExtractPrimaryKeys(val any, pkCols []string) (string, []any) {
 			}
 			if f.IsValid() {
 				sortKeys[i] = f.Interface()
-				sb.WriteString(fmt.Sprint(sortKeys[i]))
+				sb.WriteString(formatPKPart(sortKeys[i]))
 			} else {
 				sortKeys[i] = nil
 				sb.WriteString("nil")
@@ -304,7 +304,7 @@ func ExtractPrimaryKeys(val any, pkCols []string) (string, []any) {
 			mapVal := v.MapIndex(reflect.ValueOf(col))
 			if mapVal.IsValid() {
 				sortKeys[i] = mapVal.Interface()
-				sb.WriteString(fmt.Sprint(sortKeys[i]))
+				sb.WriteString(formatPKPart(sortKeys[i]))
 			} else {
 				sortKeys[i] = nil
 				sb.WriteString("nil")
@@ -315,4 +315,14 @@ func ExtractPrimaryKeys(val any, pkCols []string) (string, []any) {
 	}
 
 	return "", nil
+}
+
+func formatPKPart(v any) string {
+	if v == nil {
+		return "nil"
+	}
+	s := fmt.Sprint(v)
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `|`, `\|`)
+	return s
 }

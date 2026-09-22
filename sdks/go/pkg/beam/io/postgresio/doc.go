@@ -84,10 +84,11 @@
 // unqualified name when the pipeline is constructed rather than letting a
 // worker fail later with "relation does not exist".
 //
-// 2. Deadlock Elimination (Anti-40P01): Employs an in-memory BatchCompactor that
+// 2. Deadlock Mitigation (Anti-40P01): Employs an in-memory BatchCompactor that
 // deduplicates micro-batches via Last-Write-Wins (LWW) and sorts records canonically
-// by composite primary key prior to database transmission, preventing PostgreSQL
-// SQLState 40P01 deadlocks across distributed workers.
+// by composite primary key prior to database transmission, minimizing PostgreSQL
+// SQLState 40P01 deadlocks across distributed workers, backed by an exponential-backoff
+// retry loop as the primary safety net.
 //
 // 3. Multi-Output Dead-Letter Queue (DLQ): Returns a WriteResult struct separating
 // successfully committed records from rejected records (with sanitized error messages
