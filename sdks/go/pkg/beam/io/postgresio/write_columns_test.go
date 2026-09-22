@@ -101,6 +101,10 @@ type taggedRow struct {
 	Region     string `beam:"region_code" json:"region"`
 	Note       string `json:",omitempty"`
 	Internal   string `db:"-"`
+	// Never read by design: this field exists so the test covers the case of
+	// inspectColumns skipping unexported fields. Its absence from the wanted
+	// column list below is the assertion.
+	//lint:ignore U1000 deliberately unread fixture field; see comment above
 	unexported string
 }
 

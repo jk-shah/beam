@@ -20,8 +20,6 @@ import (
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/core/state"
 )
 
-const unchangedToastMarker = "<unchanged_toast>"
-
 func init() {
 	beam.RegisterDoFn(&toastReassemblyFn{})
 	beam.RegisterDoFn(&keyByPrimaryKeyFn{})

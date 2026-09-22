@@ -536,11 +536,6 @@ func WithCDCSlotLagPolicy(p SlotLagPolicy) CDCOption {
 	}
 }
 
-// WithCDCSlotLagCheckInterval sets how often WAL retention is measured.
-//
-// Defaults to DefaultSlotLagCheckInterval. Values below one second are clamped:
-// the query is cheap but not free, and a primary that is accumulating WAL may
-// already be under pressure.
 // WithCDCSlotMonitoring enables or disables the slot retention monitor.
 //
 // Monitoring is on by default and is independent of the circuit breaker: with
@@ -582,6 +577,12 @@ func WithCDCAllowPublisherRowSecurity(allow bool) CDCOption {
 	}
 }
 
+// WithCDCSlotLagCheckInterval sets how often WAL retention is measured.
+//
+// Defaults to DefaultSlotLagCheckInterval. Values below one second are clamped:
+// the query is cheap but not free, and a primary that is accumulating WAL may
+// already be under pressure. Both the default and the clamp are applied when
+// the monitor starts, so the value stored here is returned verbatim.
 func WithCDCSlotLagCheckInterval(d time.Duration) CDCOption {
 	return func(o *CDCOptions) {
 		o.SlotLagCheckInterval = d

@@ -31,7 +31,6 @@ import (
 
 var (
 	readRecordsTotal     = beam.NewCounter("postgresio", "postgres_read_records_total")
-	readBytesTotal       = beam.NewCounter("postgresio", "postgres_read_bytes_total")
 	readQueryErrorsTotal = beam.NewCounter("postgresio", "postgres_read_query_errors_total")
 	readLatencyMs        = beam.NewDistribution("postgresio", "postgres_read_latency_ms")
 )

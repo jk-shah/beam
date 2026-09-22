@@ -33,10 +33,6 @@ const (
 	numericNegInf   = 0xF000
 )
 
-// numericDigitsPerWord is the base-10000 grouping used by PostgreSQL's
-// on-disk and wire representation of NUMERIC.
-const numericDigitsPerWord = 4
-
 // PgInterval represents a PostgreSQL INTERVAL.
 //
 // PostgreSQL stores an interval as three independent components rather than a

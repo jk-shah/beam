@@ -90,9 +90,6 @@ func (c PostgreSqlReadCDCConfig) Validate() error {
 	if c.Host == "" {
 		return errors.New("host cannot be empty")
 	}
-	if c.Port <= 0 {
-		c.Port = 5432
-	}
 	if c.Database == "" {
 		return errors.New("database cannot be empty")
 	}
@@ -120,9 +117,16 @@ type postgreSqlReadCDCTransform struct {
 
 // BuildTransform translates the SchemaTransform configuration into native postgresio.ReadCDC pipeline steps.
 func (t *postgreSqlReadCDCTransform) BuildTransform(s beam.Scope, _ map[string]beam.PCollection) (map[string]beam.PCollection, error) {
+	// Validate cannot apply this default: it has a value receiver, so any
+	// assignment to c.Port is discarded. WithCDCPort assigns unconditionally,
+	// so an unset port would otherwise clobber the NewCDCOptions default.
+	port := int(t.cfg.Port)
+	if port <= 0 {
+		port = 5432
+	}
 	opts := []CDCOption{
 		WithCDCHost(t.cfg.Host),
-		WithCDCPort(int(t.cfg.Port)),
+		WithCDCPort(port),
 		WithCDCDatabase(t.cfg.Database),
 		WithCDCUsername(t.cfg.Username),
 		WithCDCPassword(t.cfg.Password),

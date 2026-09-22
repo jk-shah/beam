@@ -593,9 +593,14 @@ func TestBuildMergeQuery(t *testing.T) {
 }
 
 func TestExplainPlanParsingAndSampling(t *testing.T) {
-	if shouldSampleExplain(0.0) {
-		// With default rate (0.001), sampling is probabilistic. Explicit 0.0 defaults to 0.001.
+	// rand.Float64 returns a value in [0,1), so a rate of 1.0 always samples.
+	if !shouldSampleExplain(1.0) {
+		t.Errorf("shouldSampleExplain(1.0) = false, want true")
 	}
+
+	// An explicit 0.0 falls back to the 0.001 default, which is probabilistic
+	// and so has no deterministic assertion; the call exercises that branch.
+	shouldSampleExplain(0.0)
 
 	planJSON := []byte(`[
 		{
@@ -676,14 +681,14 @@ func (c failingConn) ExecContext(context.Context, string, []driver.NamedValue) (
 
 type failingDriver struct{ err error }
 
-func (d failingDriver) Open(string) (driver.Conn, error) { return failingConn{err: d.err}, nil }
+func (d failingDriver) Open(string) (driver.Conn, error) { return failingConn(d), nil }
 
 type failingConnector struct{ err error }
 
 func (c failingConnector) Connect(context.Context) (driver.Conn, error) {
-	return failingConn{err: c.err}, nil
+	return failingConn(c), nil
 }
-func (c failingConnector) Driver() driver.Driver { return failingDriver{err: c.err} }
+func (c failingConnector) Driver() driver.Driver { return failingDriver(c) }
 
 // stmtRecorder captures every statement issued against the fake driver, so a
 // test can assert on both the statements and their transactional framing.
@@ -734,7 +739,7 @@ func (c recordingConn) Close() error                        { return nil }
 
 func (c recordingConn) Begin() (driver.Tx, error) {
 	c.rec.record("BEGIN")
-	return recordingTx{rec: c.rec}, nil
+	return recordingTx(c), nil
 }
 
 func (c recordingConn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
@@ -749,14 +754,14 @@ func (t recordingTx) Rollback() error { t.rec.record("ROLLBACK"); return nil }
 
 type recordingDriver struct{ rec *stmtRecorder }
 
-func (d recordingDriver) Open(string) (driver.Conn, error) { return recordingConn{rec: d.rec}, nil }
+func (d recordingDriver) Open(string) (driver.Conn, error) { return recordingConn(d), nil }
 
 type recordingConnector struct{ rec *stmtRecorder }
 
 func (c recordingConnector) Connect(context.Context) (driver.Conn, error) {
-	return recordingConn{rec: c.rec}, nil
+	return recordingConn(c), nil
 }
-func (c recordingConnector) Driver() driver.Driver { return recordingDriver{rec: c.rec} }
+func (c recordingConnector) Driver() driver.Driver { return recordingDriver(c) }
 
 // newRecordingWriteFn builds a sink on the UNNEST path backed by the recording
 // driver, which reaches the parameterized execution path without needing the

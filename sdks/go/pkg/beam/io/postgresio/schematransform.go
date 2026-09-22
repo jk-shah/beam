@@ -91,9 +91,6 @@ func (c PostgreSqlWriteConfig) Validate() error {
 	if c.Host == "" {
 		return errors.New("host cannot be empty")
 	}
-	if c.Port <= 0 {
-		c.Port = 5432
-	}
 	if c.Database == "" {
 		return errors.New("database cannot be empty")
 	}

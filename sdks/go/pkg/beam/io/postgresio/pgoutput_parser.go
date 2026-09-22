@@ -30,14 +30,6 @@ import (
 // pgEpoch represents the PostgreSQL microsecond epoch: 2000-01-01 00:00:00 UTC.
 var pgEpoch = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
 
-// Buffer pool for recycling frame byte buffers to prevent GC churn.
-var frameBufferPool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 65536)
-		return &b
-	},
-}
-
 // PgTimeToGo converts PostgreSQL epoch microseconds into time.Time.
 func PgTimeToGo(micro int64) time.Time {
 	return pgEpoch.Add(time.Duration(micro) * time.Microsecond)
@@ -778,7 +770,7 @@ func parseRelation(r *bytes.Reader) (*RelationDef, error) {
 		return nil, fmt.Errorf("negative column count %d in Relation message", numCols)
 	}
 	if int(numCols) > r.Len() {
-		return nil, fmt.Errorf("Relation column count %d exceeds %d bytes remaining in frame", numCols, r.Len())
+		return nil, fmt.Errorf("relation column count %d exceeds %d bytes remaining in frame", numCols, r.Len())
 	}
 
 	cols := make([]ColumnDef, numCols)

@@ -98,51 +98,6 @@ func TestCoders_Roundtrip(t *testing.T) {
 	}
 }
 
-func TestWrite_GoTypeToPgArrayType(t *testing.T) {
-	tests := []struct {
-		val  any
-		want string
-	}{
-		{nil, "text[]"},
-		{int64(1), "bigint[]"},
-		{int(1), "integer[]"},
-		{int32(1), "integer[]"},
-		{int16(1), "smallint[]"},
-		{float64(1.5), "double precision[]"},
-		{float32(1.5), "real[]"},
-		{true, "boolean[]"},
-		{"string", "text[]"},
-		{[]byte{1, 2}, "bytea[]"},
-		{[]string{"a"}, "text[]"},
-		{time.Now(), "timestamptz[]"},
-	}
-
-	for _, tt := range tests {
-		var typ reflect.Type
-		if tt.val != nil {
-			typ = reflect.TypeOf(tt.val)
-		}
-		got := goTypeToPgArrayType(typ)
-		if got != tt.want {
-			t.Errorf("goTypeToPgArrayType(%v) = %q, want %q", typ, got, tt.want)
-		}
-	}
-
-	// Pointer unwrapping
-	var ptrInt int64 = 42
-	gotPtr := goTypeToPgArrayType(reflect.TypeOf(&ptrInt))
-	if gotPtr != "bigint[]" {
-		t.Errorf("goTypeToPgArrayType(*int64) = %q, want bigint[]", gotPtr)
-	}
-
-	// Struct fallback
-	type Custom struct{ A int }
-	gotStruct := goTypeToPgArrayType(reflect.TypeOf(Custom{}))
-	if gotStruct != "text[]" {
-		t.Errorf("goTypeToPgArrayType(Custom{}) = %q, want text[]", gotStruct)
-	}
-}
-
 func TestWrite_ExtractSqlState(t *testing.T) {
 	if got := extractSqlState(nil); got != "" {
 		t.Errorf("extractSqlState(nil) = %q, want empty", got)

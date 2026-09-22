@@ -1358,41 +1358,6 @@ func extractSqlState(err error) string {
 	return "UNKNOWN"
 }
 
-func goTypeToPgArrayType(t reflect.Type) string {
-	if t == nil {
-		return "text[]"
-	}
-	for t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-	switch t.Kind() {
-	case reflect.Int64:
-		return "bigint[]"
-	case reflect.Int, reflect.Int32:
-		return "integer[]"
-	case reflect.Int16:
-		return "smallint[]"
-	case reflect.Float64:
-		return "double precision[]"
-	case reflect.Float32:
-		return "real[]"
-	case reflect.Bool:
-		return "boolean[]"
-	case reflect.String:
-		return "text[]"
-	case reflect.Slice:
-		if t.Elem().Kind() == reflect.Uint8 {
-			return "bytea[]"
-		}
-		return "text[]"
-	default:
-		if t.String() == "time.Time" {
-			return "timestamptz[]"
-		}
-		return "text[]"
-	}
-}
-
 // ExplainPlanResult captures PostgreSQL JSON plan metrics from EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON).
 type ExplainPlanResult struct {
 	PlanningTime  float64 `json:"Planning Time"`
