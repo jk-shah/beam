@@ -206,11 +206,17 @@ func TestGoComplexPipeline_PostgresToPostgres(t *testing.T) {
 	// Branch A: Complex Transformation & PII Masking
 	transformed := beam.ParDo(s, &EnrichOrderFn{}, orders)
 	Write(s, "test_pipelines.target_orders_transformed", WriteOptions{
-		Host:           "localhost",
-		Port:           5432,
-		Database:       "postgres",
-		Username:       "beam_test",
-		Password:       "beam_password",
+		Host:     "localhost",
+		Port:     5432,
+		Database: "postgres",
+		Username: "beam_test",
+		Password: "beam_password",
+		// The sink defaults to verify-full. This fixture talks to a local
+		// server over loopback whose certificate is issued for the machine's
+		// own hostname, so verification of "localhost" cannot succeed. The
+		// downgrade is stated explicitly rather than relying on a default,
+		// which is the behaviour the connector deliberately no longer has.
+		SSLMode:        SSLModeDisable,
 		WriteMode:      WriteModeUpsert,
 		PrimaryKeyCols: []string{"order_id"},
 		BatchSize:      10,
@@ -224,6 +230,7 @@ func TestGoComplexPipeline_PostgresToPostgres(t *testing.T) {
 		Database:       "postgres",
 		Username:       "beam_test",
 		Password:       "beam_password",
+		SSLMode:        SSLModeDisable,
 		WriteMode:      WriteModeUpsert,
 		PrimaryKeyCols: []string{"order_id"},
 		BatchSize:      10,
