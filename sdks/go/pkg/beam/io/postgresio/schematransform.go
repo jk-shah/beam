@@ -74,6 +74,7 @@ type PostgreSqlWriteConfig struct {
 	Password          string   `beam:"password,secret" doc:"Authentication password."`
 	PasswordEnvVar    string   `beam:"password_env_var" doc:"Environment variable name on the worker containing the authentication password."`
 	SSLMode           string   `beam:"sslmode" doc:"SSL mode (e.g. disable, require, verify-ca, verify-full)."`
+	SSLRootCert       string   `beam:"sslrootcert" doc:"Path to SSL root certificate file (PEM format) for verify-ca/verify-full."`
 	ConflictKeys      []string `beam:"conflict_keys" doc:"Columns used as primary or unique key conflict targets for UPSERT."`
 	UpdateFields      []string `beam:"update_fields" doc:"Columns to update ON CONFLICT DO UPDATE. If empty, uses DO NOTHING."`
 	MaxBatchRows      int32    `beam:"max_batch_rows" doc:"Maximum rows per batch UNNEST statement (default: 5000)."`
@@ -140,6 +141,7 @@ func (t *postgreSqlWriteTransform) BuildTransform(s beam.Scope, inputs map[strin
 		Username:              t.cfg.Username,
 		Password:              t.cfg.Password,
 		SSLMode:               t.cfg.SSLMode,
+		SSLRootCert:           t.cfg.SSLRootCert,
 		WriteMethod:           WriteMethodStagedCopy,
 		PrimaryKeyCols:        t.cfg.ConflictKeys,
 		BatchSize:             int(t.cfg.MaxBatchRows),
@@ -216,6 +218,7 @@ type PostgreSqlReadConfig struct {
 	Password        string `beam:"password,secret" doc:"Authentication password."`
 	PasswordEnvVar  string `beam:"password_env_var" doc:"Environment variable name on the worker containing the authentication password."`
 	SSLMode         string `beam:"sslmode" doc:"SSL mode (e.g. disable, require, verify-ca, verify-full)."`
+	SSLRootCert     string `beam:"sslrootcert" doc:"Path to SSL root certificate file (PEM format) for verify-ca/verify-full."`
 	FetchSize       int32  `beam:"fetch_size" doc:"Server-side cursor fetch chunk size (default: 5000)."`
 	PartitionColumn string `beam:"partition_column" doc:"Numeric column name used for parallel partitioned reads."`
 	NumPartitions   int32  `beam:"num_partitions" doc:"Number of parallel partitions to split the table read into."`
@@ -307,7 +310,7 @@ func (c PostgreSqlReadConfig) normalize() (PostgreSqlReadConfig, error) {
 		c.FetchSize = 5000
 	}
 	if c.SSLMode == "" {
-		c.SSLMode = "require"
+		c.SSLMode = DefaultSSLMode
 	}
 	return c, nil
 }
@@ -364,6 +367,7 @@ func (t *postgreSqlReadTransform) BuildTransform(s beam.Scope, _ map[string]beam
 		WithReadPassword(t.cfg.Password),
 		WithReadPasswordEnvVar(t.cfg.PasswordEnvVar),
 		WithReadSSLMode(t.cfg.SSLMode),
+		WithReadSSLRootCert(t.cfg.SSLRootCert),
 		WithReadFetchSize(int(t.cfg.FetchSize)),
 	}
 	if t.cfg.NumPartitions > 0 && t.cfg.PartitionColumn != "" && t.cfg.LowerBound != nil && t.cfg.UpperBound != nil {

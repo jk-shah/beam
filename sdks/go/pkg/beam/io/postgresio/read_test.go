@@ -171,6 +171,29 @@ func TestReadOptions_Validation(t *testing.T) {
 			errSubstr: "lower_bound (100) must be less than upper_bound (100)",
 		},
 		{
+			name: "invalid sslmode",
+			opts: ReadOptions{
+				Host:     "localhost",
+				Port:     5432,
+				Database: "testdb",
+				Username: "postgres",
+				SSLMode:  "invalid-mode",
+			},
+			expectErr: true,
+			errSubstr: "invalid sslmode",
+		},
+		{
+			name: "valid explicit sslmode require",
+			opts: ReadOptions{
+				Host:     "localhost",
+				Port:     5432,
+				Database: "testdb",
+				Username: "postgres",
+				SSLMode:  SSLModeRequire,
+			},
+			expectErr: false,
+		},
+		{
 			name: "valid partitioned options",
 			opts: NewReadOptions(
 				WithReadHost("localhost"),
@@ -200,6 +223,52 @@ func TestReadOptions_Validation(t *testing.T) {
 				t.Fatalf("unexpected error: %v", err)
 			}
 		})
+	}
+}
+
+func TestReadOptions_DefaultSSLMode(t *testing.T) {
+	// 1. Default constructor must set DefaultSSLMode ("verify-full")
+	opts := NewReadOptions(
+		WithReadHost("localhost"),
+		WithReadDatabase("testdb"),
+		WithReadUsername("postgres"),
+	)
+	if opts.SSLMode != DefaultSSLMode {
+		t.Errorf("NewReadOptions() default SSLMode = %q, want %q", opts.SSLMode, DefaultSSLMode)
+	}
+
+	// 2. Caller can explicitly lower to "require"
+	optsRequire := NewReadOptions(
+		WithReadHost("localhost"),
+		WithReadDatabase("testdb"),
+		WithReadUsername("postgres"),
+		WithReadSSLMode(SSLModeRequire),
+	)
+	if optsRequire.SSLMode != SSLModeRequire {
+		t.Errorf("WithReadSSLMode(%q) = %q, want %q", SSLModeRequire, optsRequire.SSLMode, SSLModeRequire)
+	}
+
+	// 3. Explicit empty string is normalized to DefaultSSLMode
+	optsEmpty := NewReadOptions(
+		WithReadHost("localhost"),
+		WithReadDatabase("testdb"),
+		WithReadUsername("postgres"),
+		WithReadSSLMode(""),
+	)
+	if optsEmpty.SSLMode != DefaultSSLMode {
+		t.Errorf("WithReadSSLMode(\"\") = %q, want %q", optsEmpty.SSLMode, DefaultSSLMode)
+	}
+}
+
+func TestReadOptions_SSLRootCert(t *testing.T) {
+	opts := NewReadOptions(
+		WithReadHost("localhost"),
+		WithReadDatabase("testdb"),
+		WithReadUsername("postgres"),
+		WithReadSSLRootCert("/etc/ssl/certs/pg_ca.pem"),
+	)
+	if opts.SSLRootCert != "/etc/ssl/certs/pg_ca.pem" {
+		t.Errorf("WithReadSSLRootCert failed: got %q, want %q", opts.SSLRootCert, "/etc/ssl/certs/pg_ca.pem")
 	}
 }
 

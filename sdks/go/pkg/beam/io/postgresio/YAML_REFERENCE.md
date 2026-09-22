@@ -40,6 +40,7 @@ Do not edit this document manually; update the struct tags in the `schematransfo
 | `password` | string | Yes | Authentication password. |
 | `password_env_var` | string | No | Environment variable name on the worker containing the authentication password. |
 | `sslmode` | string | No | SSL mode (e.g. disable, require, verify-ca, verify-full). |
+| `sslrootcert` | string | No | Path to SSL root certificate file (PEM format) for verify-ca/verify-full. |
 | `conflict_keys` | list[string] | No | Columns used as primary or unique key conflict targets for UPSERT. |
 | `update_fields` | list[string] | No | Columns to update ON CONFLICT DO UPDATE. If empty, uses DO NOTHING. |
 | `max_batch_rows` | integer (int32) | No | Maximum rows per batch UNNEST statement (default: 5000). |
@@ -73,6 +74,7 @@ Do not edit this document manually; update the struct tags in the `schematransfo
 | `password` | string | Yes | Authentication password. |
 | `password_env_var` | string | No | Environment variable name on the worker containing the authentication password. |
 | `sslmode` | string | No | SSL mode (e.g. disable, require, verify-ca, verify-full). |
+| `sslrootcert` | string | No | Path to SSL root certificate file (PEM format) for verify-ca/verify-full. |
 | `fetch_size` | integer (int32) | No | Server-side cursor fetch chunk size (default: 5000). |
 | `partition_column` | string | No | Numeric column name used for parallel partitioned reads. |
 | `num_partitions` | integer (int32) | No | Number of parallel partitions to split the table read into. |
@@ -98,6 +100,7 @@ Do not edit this document manually; update the struct tags in the `schematransfo
 | `password` | string | Yes | Replication user password. |
 | `password_env_var` | string | No | Environment variable name on the worker containing the replication password. |
 | `sslmode` | string | No | SSL mode (e.g. disable, require, verify-ca, verify-full). |
+| `sslrootcert` | string | No | Path to SSL root certificate file (PEM format) for verify-ca/verify-full. |
 | `tables` | list[string] | No | Optional list of tables to capture (empty captures all in publication). |
 | `origin_filter` | string | No | Replication origin filter: 'all' (default) or 'none'. |
 | `output_format` | string | No | Output format: 'row' (default) or 'arrow'. |

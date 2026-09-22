@@ -225,8 +225,16 @@ func (fn *singleReadFn) Setup(ctx context.Context) error {
 		return errDialFuncLost()
 	}
 
+	sslMode := fn.Options.SSLMode
+	if sslMode == "" {
+		sslMode = DefaultSSLMode
+	}
+	if err := validateSSLMode(sslMode); err != nil {
+		return fmt.Errorf("postgresio: invalid sslmode: %w", err)
+	}
+
 	dsn := buildWriteDSN(fn.Options.Host, fn.Options.Port, fn.Options.Database,
-		fn.Options.Username, fn.Options.ResolvePassword(), fn.Options.SSLMode)
+		fn.Options.Username, fn.Options.ResolvePassword(), sslMode, fn.Options.SSLRootCert)
 
 	var db *sql.DB
 	var err error
@@ -292,8 +300,16 @@ func (fn *partitionedReadFn) Setup(ctx context.Context) error {
 		return errDialFuncLost()
 	}
 
+	sslMode := fn.Options.SSLMode
+	if sslMode == "" {
+		sslMode = DefaultSSLMode
+	}
+	if err := validateSSLMode(sslMode); err != nil {
+		return fmt.Errorf("postgresio: invalid sslmode: %w", err)
+	}
+
 	dsn := buildWriteDSN(fn.Options.Host, fn.Options.Port, fn.Options.Database,
-		fn.Options.Username, fn.Options.ResolvePassword(), fn.Options.SSLMode)
+		fn.Options.Username, fn.Options.ResolvePassword(), sslMode, fn.Options.SSLRootCert)
 
 	var db *sql.DB
 	var err error

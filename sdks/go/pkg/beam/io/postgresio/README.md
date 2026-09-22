@@ -463,7 +463,7 @@ pipeline:
 | `WithReadUsername(string)` | `""` | Database user role |
 | `WithReadPassword(string)` | `""` | Database password |
 | `WithReadPasswordEnvVar(string)` | `""` | Environment variable name on worker to resolve password |
-| `WithReadSSLMode(string)` | `"require"` | SSL connection mode (`disable`, `require`, `verify-ca`, `verify-full`) |
+| `WithReadSSLMode(string)` | `verify-full` | SSL connection mode (`disable`, `require`, `verify-ca`, `verify-full`) |
 | `WithReadSSLRootCert(string)` | `""` | SSL root certificate file path or PEM data |
 | `WithReadFetchSize(int)` | `5000` | Cursor fetch chunk size (`FETCH FORWARD <n>`) |
 | `WithReadMaxConnections(int)` | `2` | Maximum worker pool connections (prevents DB connection exhaustion) |
@@ -481,6 +481,7 @@ pipeline:
 | `WithUsername(string)` | `""` | Database user role |
 | `WithPassword(string)` | `""` | Database password |
 | `WithSSLMode(string)` | `verify-full` | SSL connection mode (`disable`, `require`, `verify-ca`, `verify-full`) |
+| `WithSSLRootCert(string)` | `""` | SSL root certificate file path or PEM data for verify-ca/verify-full |
 | `WithWriteMode(WriteMode)` | `WriteModeUpsert` | Mutation strategy: `WriteModeInsert`, `WriteModeUpsert`, `WriteModeUpdate`, `WriteModeMerge` |
 | `WithPrimaryKeyColumns(...string)` | `nil` | Primary key columns used for `ON CONFLICT` resolution |
 | `WithBatchSize(int)` | `5000` | Maximum rows per micro-batch flush |

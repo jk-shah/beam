@@ -113,6 +113,7 @@ type WriteOptions struct {
 	Password              string `beam:"password,secret" json:"password,omitempty"`
 	PasswordEnvVar        string `json:"password_env_var,omitempty"`
 	SSLMode               string
+	SSLRootCert           string
 	WriteMode             WriteMode
 	WriteMethod           WriteMethod
 	PrimaryKeyCols        []string
@@ -353,6 +354,18 @@ func WithSSLMode(sslMode string) Option {
 	return func(o *WriteOptions) {
 		o.SSLMode = sslMode
 	}
+}
+
+// WithSSLRootCert sets the SSL root certificate path or PEM for verify-ca or verify-full.
+func WithSSLRootCert(cert string) Option {
+	return func(o *WriteOptions) {
+		o.SSLRootCert = cert
+	}
+}
+
+// WithSSLRootCerts is an alias for WithSSLRootCert.
+func WithSSLRootCerts(cert string) Option {
+	return WithSSLRootCert(cert)
 }
 
 // WithWriteMethod sets the bulk write method (WriteMethodStagedCopy or WriteMethodUnnest).

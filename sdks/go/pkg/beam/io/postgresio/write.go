@@ -207,11 +207,17 @@ func Write(s beam.Scope, table string, opts WriteOptions, col beam.PCollection) 
 // Keyword order is load-bearing as a second layer of defence. libpq lets a
 // later duplicate keyword win, so the two settings that carry the security
 // properties, sslmode and the pinned search_path, are emitted last and cannot
-// be displaced by anything injected from an earlier value.
-func buildWriteDSN(host string, port int, database, username, password, sslMode string) string {
-	return fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s sslmode=%s search_path=pg_catalog,pg_temp",
+// be displaced by anything injected from an earlier value. If a custom
+// sslrootcert is supplied, it is emitted before sslmode so sslmode still
+// governs transport security.
+func buildWriteDSN(host string, port int, database, username, password, sslMode, sslRootCert string) string {
+	var rootCertClause string
+	if strings.TrimSpace(sslRootCert) != "" {
+		rootCertClause = fmt.Sprintf(" sslrootcert=%s", quoteDSNValue(sslRootCert))
+	}
+	return fmt.Sprintf("host=%s port=%d dbname=%s user=%s password=%s%s sslmode=%s search_path=pg_catalog,pg_temp",
 		quoteDSNValue(host), port, quoteDSNValue(database),
-		quoteDSNValue(username), quoteDSNValue(password), quoteDSNValue(sslMode))
+		quoteDSNValue(username), quoteDSNValue(password), rootCertClause, quoteDSNValue(sslMode))
 }
 
 type writeFn struct {
@@ -249,7 +255,7 @@ func (fn *writeFn) Setup(ctx context.Context) error {
 	}
 	password := fn.Options.ResolvePassword()
 	dsn := buildWriteDSN(fn.Options.Host, fn.Options.Port, fn.Options.Database,
-		fn.Options.Username, password, sslMode)
+		fn.Options.Username, password, sslMode, fn.Options.SSLRootCert)
 
 	connector := &pqConnector{
 		dialFunc:          fn.Options.DialFunc,

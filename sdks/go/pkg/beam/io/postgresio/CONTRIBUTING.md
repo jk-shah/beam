@@ -148,6 +148,7 @@ type PostgreSqlReadConfig struct {
     Password        string `beam:"password,secret"`
     PasswordEnvVar  string `beam:"password_env_var"`
     SSLMode         string `beam:"sslmode"`
+    SSLRootCert     string `beam:"sslrootcert"`
     FetchSize       int32  `beam:"fetch_size"`
     PartitionColumn string `beam:"partition_column"`
     NumPartitions   int32  `beam:"num_partitions"`
@@ -166,6 +167,7 @@ type PostgreSqlWriteConfig struct {
     Password              string   `beam:"password,secret"`
     PasswordEnvVar        string   `beam:"password_env_var"`
     SSLMode               string   `beam:"sslmode"`
+    SSLRootCert           string   `beam:"sslrootcert"`
     ConflictKeys          []string `beam:"conflict_keys"`
     UpdateFields          []string `beam:"update_fields"`
     MaxBatchRows          int32    `beam:"max_batch_rows"`
@@ -190,6 +192,7 @@ type PostgreSqlReadCDCConfig struct {
     Password          string                   `beam:"password,secret"`
     PasswordEnvVar    string                   `beam:"password_env_var"`
     SSLMode           string                   `beam:"sslmode"`
+    SSLRootCert       string                   `beam:"sslrootcert"`
     Tables            []string                 `beam:"tables"`
     OriginFilter      string                   `beam:"origin_filter"`
     OutputFormat      string                   `beam:"output_format"`

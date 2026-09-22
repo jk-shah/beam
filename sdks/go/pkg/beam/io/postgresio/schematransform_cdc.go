@@ -74,6 +74,7 @@ type PostgreSqlReadCDCConfig struct {
 	Password          string                   `beam:"password,secret" doc:"Replication user password."`
 	PasswordEnvVar    string                   `beam:"password_env_var" doc:"Environment variable name on the worker containing the replication password."`
 	SSLMode           string                   `beam:"sslmode" doc:"SSL mode (e.g. disable, require, verify-ca, verify-full)."`
+	SSLRootCert       string                   `beam:"sslrootcert" doc:"Path to SSL root certificate file (PEM format) for verify-ca/verify-full."`
 	Tables            []string                 `beam:"tables" doc:"Optional list of tables to capture (empty captures all in publication)."`
 	OriginFilter      string                   `beam:"origin_filter" doc:"Replication origin filter: 'all' (default) or 'none'."`
 	OutputFormat      string                   `beam:"output_format" doc:"Output format: 'row' (default) or 'arrow'."`
@@ -134,6 +135,9 @@ func (t *postgreSqlReadCDCTransform) BuildTransform(s beam.Scope, _ map[string]b
 		WithCDCPublication(t.cfg.Publication),
 		WithCDCSSLMode(t.cfg.SSLMode),
 		WithCDCOriginFilter(t.cfg.OriginFilter),
+	}
+	if t.cfg.SSLRootCert != "" {
+		opts = append(opts, WithCDCSSLRootCert(t.cfg.SSLRootCert))
 	}
 	if t.cfg.ProtoVersion > 0 {
 		opts = append(opts, WithCDCProtoVersion(int(t.cfg.ProtoVersion)))

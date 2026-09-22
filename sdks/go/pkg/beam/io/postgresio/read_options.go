@@ -59,13 +59,17 @@ type ReadOption func(*ReadOptions)
 func NewReadOptions(opts ...ReadOption) ReadOptions {
 	ro := ReadOptions{
 		Port:           5432,
-		SSLMode:        "require",
+		SSLMode:        DefaultSSLMode,
 		FetchSize:      5000,
 		MaxConnections: 2, // Clamps worker pool connections to prevent DB exhaustion
 		QueryTimeout:   30 * time.Minute,
 	}
 	for _, opt := range opts {
 		opt(&ro)
+	}
+	// An option that explicitly clears the mode must not be read as "plaintext".
+	if ro.SSLMode == "" {
+		ro.SSLMode = DefaultSSLMode
 	}
 	return ro
 }
@@ -201,6 +205,9 @@ func (o ReadOptions) Validate() error {
 	}
 	if strings.TrimSpace(o.Username) == "" {
 		return fmt.Errorf("postgresio: username cannot be empty")
+	}
+	if err := validateSSLMode(o.SSLMode); err != nil {
+		return fmt.Errorf("postgresio: %w", err)
 	}
 	if o.FetchSize < 0 {
 		return fmt.Errorf("postgresio: fetch_size cannot be negative")

@@ -398,7 +398,7 @@ func TestBuildWriteDSNRejectsKeywordInjection(t *testing.T) {
 			got, "hunter2")
 	}
 
-	fields, err := parseLibpqDSN(buildWriteDSN("db.example.com", 5432, "orders", "beam", payload, "verify-full"))
+	fields, err := parseLibpqDSN(buildWriteDSN("db.example.com", 5432, "orders", "beam", payload, "verify-full", ""))
 	if err != nil {
 		t.Fatalf("parsing the sink DSN failed: %v", err)
 	}
@@ -422,7 +422,7 @@ func TestBuildWriteDSNRejectsKeywordInjection(t *testing.T) {
 // setting or reopen CVE-2018-1058. Reordering the format string would remove
 // that second layer silently, so it is asserted rather than left to review.
 func TestBuildWriteDSNEmitsSecuritySettingsLast(t *testing.T) {
-	dsn := buildWriteDSN("db.example.com", 5432, "orders", "beam", "pw", "verify-full")
+	dsn := buildWriteDSN("db.example.com", 5432, "orders", "beam", "pw", "verify-full", "/etc/ssl/certs/root.crt")
 
 	sslmode := strings.Index(dsn, "sslmode=")
 	searchPath := strings.Index(dsn, "search_path=")
@@ -430,7 +430,7 @@ func TestBuildWriteDSNEmitsSecuritySettingsLast(t *testing.T) {
 		t.Fatalf("DSN is missing sslmode or search_path: %s", dsn)
 	}
 
-	for _, keyword := range []string{"host=", "port=", "dbname=", "user=", "password="} {
+	for _, keyword := range []string{"host=", "port=", "dbname=", "user=", "password=", "sslrootcert="} {
 		at := strings.Index(dsn, keyword)
 		if at < 0 {
 			t.Fatalf("DSN is missing %s: %s", keyword, dsn)
@@ -466,7 +466,7 @@ func TestBuildWriteDSNRoundTripsHostileValues(t *testing.T) {
 
 	for _, tc := range hostile {
 		t.Run(tc.name, func(t *testing.T) {
-			fields, err := parseLibpqDSN(buildWriteDSN(tc.value, 5432, tc.value, tc.value, tc.value, "verify-full"))
+			fields, err := parseLibpqDSN(buildWriteDSN(tc.value, 5432, tc.value, tc.value, tc.value, "verify-full", ""))
 			if err != nil {
 				t.Fatalf("parsing DSN failed: %v", err)
 			}
@@ -482,6 +482,82 @@ func TestBuildWriteDSNRoundTripsHostileValues(t *testing.T) {
 				t.Errorf("search_path was overridden: got %q, want %q", got, "pg_catalog,pg_temp")
 			}
 		})
+	}
+}
+
+func TestBuildWriteDSN_SSLRootCert(t *testing.T) {
+	// 1. Empty sslRootCert -> omitted from DSN
+	dsnEmpty := buildWriteDSN("db.example.com", 5432, "orders", "beam", "pw", "verify-full", "")
+	fieldsEmpty, err := parseLibpqDSN(dsnEmpty)
+	if err != nil {
+		t.Fatalf("parseLibpqDSN failed: %v", err)
+	}
+	if _, ok := fieldsEmpty["sslrootcert"]; ok {
+		t.Errorf("expected no sslrootcert in DSN when unset, got %q", fieldsEmpty["sslrootcert"])
+	}
+
+	// 2. Whitespace-only sslRootCert -> omitted from DSN
+	dsnWhitespace := buildWriteDSN("db.example.com", 5432, "orders", "beam", "pw", "verify-full", "   ")
+	fieldsWhitespace, err := parseLibpqDSN(dsnWhitespace)
+	if err != nil {
+		t.Fatalf("parseLibpqDSN failed: %v", err)
+	}
+	if _, ok := fieldsWhitespace["sslrootcert"]; ok {
+		t.Errorf("expected no sslrootcert in DSN for whitespace, got %q", fieldsWhitespace["sslrootcert"])
+	}
+
+	// 3. Configured sslRootCert -> properly quoted and emitted
+	certPath := "/etc/ssl/certs/pg root CA's.crt"
+	dsnWithCert := buildWriteDSN("db.example.com", 5432, "orders", "beam", "pw", "verify-full", certPath)
+	fieldsWithCert, err := parseLibpqDSN(dsnWithCert)
+	if err != nil {
+		t.Fatalf("parseLibpqDSN failed: %v", err)
+	}
+	if got := fieldsWithCert["sslrootcert"]; got != certPath {
+		t.Errorf("sslrootcert = %q, want %q", got, certPath)
+	}
+	if got := fieldsWithCert["sslmode"]; got != "verify-full" {
+		t.Errorf("sslmode = %q, want %q", got, "verify-full")
+	}
+}
+
+func TestWriteOptions_SSLRootCert(t *testing.T) {
+	opts := NewWriteOptions(
+		WithHost("localhost"),
+		WithDatabase("testdb"),
+		WithSSLRootCert("/etc/ssl/ca.pem"),
+	)
+	if opts.SSLRootCert != "/etc/ssl/ca.pem" {
+		t.Errorf("WithSSLRootCert failed: got %q, want %q", opts.SSLRootCert, "/etc/ssl/ca.pem")
+	}
+
+	optsAlias := NewWriteOptions(
+		WithHost("localhost"),
+		WithDatabase("testdb"),
+		WithSSLRootCerts("/etc/ssl/ca-alias.pem"),
+	)
+	if optsAlias.SSLRootCert != "/etc/ssl/ca-alias.pem" {
+		t.Errorf("WithSSLRootCerts failed: got %q, want %q", optsAlias.SSLRootCert, "/etc/ssl/ca-alias.pem")
+	}
+}
+
+func TestWriteOptions_DefaultSSLMode(t *testing.T) {
+	opts := NewWriteOptions(
+		WithHost("localhost"),
+		WithDatabase("testdb"),
+	)
+	if opts.SSLMode != DefaultSSLMode {
+		t.Errorf("default SSLMode = %q, want %q", opts.SSLMode, DefaultSSLMode)
+	}
+
+	// Caller can explicitly lower to "require"
+	optsRequire := NewWriteOptions(
+		WithHost("localhost"),
+		WithDatabase("testdb"),
+		WithSSLMode("require"),
+	)
+	if optsRequire.SSLMode != "require" {
+		t.Errorf("WithSSLMode(require) = %q, want require", optsRequire.SSLMode)
 	}
 }
 

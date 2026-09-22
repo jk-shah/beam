@@ -290,6 +290,7 @@ class ReadFromPostgresCDC(ptransform.PTransform):
       password: Optional[str] = None,
       password_env_var: Optional[str] = None,
       sslmode: str = 'verify-full',
+      sslrootcert: Optional[str] = None,
       tables: Optional[list[str]] = None,
       origin_filter: Optional[str] = None,
       output_format: str = 'row',
@@ -315,6 +316,8 @@ class ReadFromPostgresCDC(ptransform.PTransform):
       self._config['password'] = password
     if password_env_var is not None:
       self._config['password_env_var'] = password_env_var
+    if sslrootcert is not None:
+      self._config['sslrootcert'] = sslrootcert
     if tables is not None:
       self._config['tables'] = tables
     if origin_filter is not None:
@@ -370,7 +373,8 @@ class ReadFromPostgres(ptransform.PTransform):
       port: int = 5432,
       password: Optional[str] = None,
       password_env_var: Optional[str] = None,
-      sslmode: str = 'require',
+      sslmode: str = 'verify-full',
+      sslrootcert: Optional[str] = None,
       query: Optional[str] = None,
       location: Optional[str] = None,
       read_query: Optional[str] = None,
@@ -387,6 +391,8 @@ class ReadFromPostgres(ptransform.PTransform):
         'sslmode': sslmode,
         'fetch_size': fetch_size,
     }
+    if sslrootcert is not None:
+      self._config['sslrootcert'] = sslrootcert
     if host is not None:
       self._config['host'] = host
     if database is not None:
@@ -454,6 +460,7 @@ class WriteToPostgres(ptransform.PTransform):
       password: Optional[str] = None,
       password_env_var: Optional[str] = None,
       sslmode: str = 'verify-full',
+      sslrootcert: Optional[str] = None,
       conflict_keys: Optional[list[str]] = None,
       update_fields: Optional[list[str]] = None,
       max_batch_rows: Optional[int] = None,
@@ -479,6 +486,8 @@ class WriteToPostgres(ptransform.PTransform):
       self._config['password'] = password
     if password_env_var is not None:
       self._config['password_env_var'] = password_env_var
+    if sslrootcert is not None:
+      self._config['sslrootcert'] = sslrootcert
     if conflict_keys is not None:
       self._config['conflict_keys'] = conflict_keys
     if update_fields is not None:
