@@ -16,6 +16,7 @@
 package postgresio
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 )
@@ -101,9 +102,15 @@ func (p writePartition) IsComplete() bool {
 // follow in lexicographic signature order. Determinism matters because a retry
 // must issue the same statements in the same order to avoid introducing a new
 // deadlock ordering between attempts.
-func partitionBatchByUnchangedColumns(batch []any, allColumns []string) []writePartition {
+// An unrecognized name is rejected rather than ignored. subtractColumns
+// removes nothing for a name that matches no column, so a typo left the row
+// carrying its full column set while still marking it partial: the staged-COPY
+// fast path was silently skipped, and under MERGE the write failed naming a
+// column the target does not have. Neither symptom points at the row type that
+// produced the name.
+func partitionBatchByUnchangedColumns(batch []any, allColumns []string) ([]writePartition, error) {
 	if len(batch) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	// Fast path: scan once and avoid all allocation when no row is partial,
@@ -116,12 +123,24 @@ func partitionBatchByUnchangedColumns(batch []any, allColumns []string) []writeP
 		}
 	}
 	if !anyPartial {
-		return []writePartition{{Columns: allColumns, Rows: batch}}
+		return []writePartition{{Columns: allColumns, Rows: batch}}, nil
+	}
+
+	known := make(map[string]bool, len(allColumns))
+	for _, c := range allColumns {
+		known[c] = true
 	}
 
 	groups := make(map[string]*writePartition, 4)
 	for _, item := range batch {
 		unchanged := rowUnchangedColumns(item)
+		for _, c := range unchanged {
+			if !known[c] {
+				return nil, fmt.Errorf("postgresio: UnchangedColumns reported %q, which is not a column of this row type; "+
+					"names must match the columns derived from the db, beam or json struct tags (%s)",
+					c, strings.Join(allColumns, ", "))
+			}
+		}
 		signature := strings.Join(unchanged, "\x00")
 
 		g, ok := groups[signature]
@@ -151,7 +170,7 @@ func partitionBatchByUnchangedColumns(batch []any, allColumns []string) []writeP
 		}
 		out = append(out, *groups[sig])
 	}
-	return out
+	return out, nil
 }
 
 // subtractColumns returns all columns not present in remove, preserving the

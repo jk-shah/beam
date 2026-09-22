@@ -616,11 +616,11 @@ func TestSinkDoesNotCreateATempTablePerBatch(t *testing.T) {
 
 // TestOriginSetupErrorIsNotDiscarded guards bidirectional loop prevention.
 //
-// FINDING P1-5. The result of pg_replication_origin_xact_setup is assigned to
-// blank identifiers. Any error inside a transaction poisons it (SQLSTATE
-// 25P02), so the next statement fails with a confusing message, and the
-// fallback write path loses origin tagging entirely -- which in a
-// bidirectional topology means replication loops.
+// FINDING P1-5. The origin selection used to be issued inside the write
+// transaction with its result assigned to blank identifiers. It now happens
+// once per connection in options.go, but the hazard is the same in both
+// places: a swallowed error hands back a connection whose writes are
+// unstamped, and a bidirectional peer replays every one of them back.
 func TestOriginSetupErrorIsNotDiscarded(t *testing.T) {
 	src, err := os.ReadFile("write.go")
 	if err != nil {
@@ -630,6 +630,32 @@ func TestOriginSetupErrorIsNotDiscarded(t *testing.T) {
 	if strings.Contains(string(src), "_, _ = txn.ExecContext") {
 		t.Error("write.go discards the result of a transactional Exec.\n" +
 			"An error inside a transaction poisons it (25P02); check the error and fail with the required grant named.")
+	}
+
+	opts, err := os.ReadFile("options.go")
+	if err != nil {
+		t.Skipf("cannot read options.go: %v", err)
+	}
+	body := string(opts)
+
+	// The function that actually names an origin. xact_setup takes
+	// (origin_lsn, origin_timestamp) and cannot name one at all.
+	if !strings.Contains(body, "pg_replication_origin_session_setup") {
+		t.Error("no call to pg_replication_origin_session_setup.\n" +
+			"It is the only function that selects an origin; pg_replication_origin_xact_setup " +
+			"records replay progress and errors unless a session origin was already selected.")
+	}
+	// Matched as a call, so the comment explaining why it is wrong does not
+	// trip this.
+	if strings.Contains(body, "pg_replication_origin_xact_setup(") {
+		t.Error("options.go calls pg_replication_origin_xact_setup, which cannot name an origin.")
+	}
+
+	// A connection that could not select the origin must not be pooled.
+	if !strings.Contains(body, "selectReplicationOrigin(ctx, conn, c.replicationOrigin); err != nil") ||
+		!strings.Contains(body, "_ = conn.Close()") {
+		t.Error("Connect does not fail closed when the origin cannot be selected.\n" +
+			"Pooling such a connection silently disables loop prevention for every write on it.")
 	}
 }
 

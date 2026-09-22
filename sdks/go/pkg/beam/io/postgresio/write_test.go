@@ -690,12 +690,16 @@ func (c failingConnector) Driver() driver.Driver { return failingDriver{err: c.e
 type stmtRecorder struct {
 	mu    sync.Mutex
 	stmts []string
+	args  [][]driver.NamedValue
 }
 
-func (r *stmtRecorder) record(s string) {
+func (r *stmtRecorder) record(s string) { r.recordWithArgs(s, nil) }
+
+func (r *stmtRecorder) recordWithArgs(s string, args []driver.NamedValue) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.stmts = append(r.stmts, s)
+	r.args = append(r.args, args)
 }
 
 func (r *stmtRecorder) all() []string {
@@ -713,6 +717,16 @@ func (r *stmtRecorder) indexOf(substr string) int {
 	return -1
 }
 
+// argsAt returns the bound parameters recorded for statement i.
+func (r *stmtRecorder) argsAt(i int) []driver.NamedValue {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if i < 0 || i >= len(r.args) {
+		return nil
+	}
+	return r.args[i]
+}
+
 type recordingConn struct{ rec *stmtRecorder }
 
 func (c recordingConn) Prepare(string) (driver.Stmt, error) { return nil, driver.ErrSkip }
@@ -723,8 +737,8 @@ func (c recordingConn) Begin() (driver.Tx, error) {
 	return recordingTx{rec: c.rec}, nil
 }
 
-func (c recordingConn) ExecContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
-	c.rec.record(query)
+func (c recordingConn) ExecContext(_ context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	c.rec.recordWithArgs(query, args)
 	return driver.RowsAffected(0), nil
 }
 
@@ -778,53 +792,101 @@ func drainRecordingWriteFn(t *testing.T, fn *writeFn) {
 	}
 }
 
-// TestUnnestPathTagsReplicationOrigin covers the gap the reviewer found: only
-// executeStagedCopy tagged its transaction, so a write that took the
-// parameterized path -- either by configuration or by falling back after a
-// failed COPY -- went out untagged. A peer in a bidirectional topology would
-// not recognize those rows as its own and would replay them back.
-func TestUnnestPathTagsReplicationOrigin(t *testing.T) {
+// TestConnectorSelectsReplicationOrigin covers the mechanism that stamps
+// outgoing writes. pg_replication_origin_session_setup is the only function
+// that names an origin; the code previously called
+// pg_replication_origin_xact_setup, which takes (origin_lsn, origin_timestamp)
+// and was being passed the origin name where an LSN belongs. Every tagged
+// write therefore failed, and loop prevention never worked.
+func TestConnectorSelectsReplicationOrigin(t *testing.T) {
 	rec := &stmtRecorder{}
-	fn := newRecordingWriteFn(rec, WithReplicationOriginName("beam_sink"))
-	defer fn.db.Close()
+	conn := recordingConn{rec: rec}
 
-	drainRecordingWriteFn(t, fn)
-
-	originAt := rec.indexOf("pg_replication_origin_xact_setup")
-	if originAt < 0 {
-		t.Fatalf("the parameterized write was not tagged with the replication origin; statements: %v", rec.all())
+	if err := selectReplicationOrigin(context.Background(), conn, "beam_sink"); err != nil {
+		t.Fatalf("selectReplicationOrigin: %v", err)
 	}
 
-	beginAt := rec.indexOf("BEGIN")
-	if beginAt < 0 || beginAt > originAt {
-		t.Errorf("the origin must be set inside an explicit transaction; statements: %v", rec.all())
+	at := rec.indexOf("pg_replication_origin_session_setup")
+	if at < 0 {
+		t.Fatalf("the origin was not selected; statements: %v", rec.all())
+	}
+	if rec.indexOf("pg_replication_origin_xact_setup") >= 0 {
+		t.Errorf("xact_setup cannot name an origin and errors without a session origin; statements: %v", rec.all())
 	}
 
-	insertAt := rec.indexOf("INSERT INTO")
-	if insertAt < 0 || insertAt < originAt {
-		t.Errorf("the write must follow the origin tag, not precede it; statements: %v", rec.all())
+	// Passed as a bound parameter rather than interpolated, so the statement
+	// is not a function of the configured name.
+	args := rec.argsAt(at)
+	if len(args) != 1 {
+		t.Fatalf("got %d bound parameters, want 1; the origin name must not be interpolated", len(args))
 	}
-
-	if rec.indexOf("COMMIT") < insertAt {
-		t.Errorf("the tagged transaction was not committed after the write; statements: %v", rec.all())
+	if got, ok := args[0].Value.(string); !ok || got != "beam_sink" {
+		t.Errorf("bound parameter = %v, want %q", args[0].Value, "beam_sink")
 	}
 }
 
-// TestUnnestPathStaysInAutocommitWithoutOrigin confirms the transaction is
-// opened only when it carries a tag, so the hot path keeps its single
-// round trip.
-func TestUnnestPathStaysInAutocommitWithoutOrigin(t *testing.T) {
+func TestConnectorSkipsOriginWhenUnset(t *testing.T) {
 	rec := &stmtRecorder{}
-	fn := newRecordingWriteFn(rec)
-	defer fn.db.Close()
 
-	drainRecordingWriteFn(t, fn)
-
-	if rec.indexOf("INSERT INTO") < 0 {
-		t.Fatalf("expected the write to be issued; statements: %v", rec.all())
+	if err := selectReplicationOrigin(context.Background(), recordingConn{rec: rec}, ""); err != nil {
+		t.Fatalf("selectReplicationOrigin: %v", err)
 	}
-	if rec.indexOf("BEGIN") >= 0 {
-		t.Errorf("no origin was configured, so no transaction should have been opened; statements: %v", rec.all())
+	if len(rec.all()) != 0 {
+		t.Errorf("no origin was configured, so no statement should have been issued; got %v", rec.all())
+	}
+}
+
+// failingOriginConn rejects the origin selection the way a server would for a
+// role without the privilege, or for an origin that does not exist.
+type failingOriginConn struct{ recordingConn }
+
+func (c failingOriginConn) ExecContext(context.Context, string, []driver.NamedValue) (driver.Result, error) {
+	return nil, &pq.Error{Code: "42501", Message: "permission denied for function pg_replication_origin_session_setup"}
+}
+
+// TestConnectorFailsClosedWhenOriginCannotBeSelected pins the failure mode.
+// Continuing here would hand back a working connection whose writes are
+// unstamped, and a bidirectional peer would replay every one of them back --
+// the loop the origin exists to break, appearing only in production.
+func TestConnectorFailsClosedWhenOriginCannotBeSelected(t *testing.T) {
+	err := selectReplicationOrigin(context.Background(), failingOriginConn{}, "beam_sink")
+	if err == nil {
+		t.Fatal("a connection that could not select the origin was accepted")
+	}
+	for _, want := range []string{"beam_sink", "pg_replication_origin_create"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error does not mention %q, so the operator cannot act on it: %v", want, err)
+		}
+	}
+}
+
+// TestUnnestPathStaysInAutocommit confirms the hot path keeps its single round
+// trip. The origin is session state selected when the connection is opened, so
+// no transaction has to be opened to carry it.
+func TestUnnestPathStaysInAutocommit(t *testing.T) {
+	for _, origin := range []string{"", "beam_sink"} {
+		name := "without origin"
+		if origin != "" {
+			name = "with origin"
+		}
+		t.Run(name, func(t *testing.T) {
+			rec := &stmtRecorder{}
+			opts := []Option{}
+			if origin != "" {
+				opts = append(opts, WithReplicationOriginName(origin))
+			}
+			fn := newRecordingWriteFn(rec, opts...)
+			defer fn.db.Close()
+
+			drainRecordingWriteFn(t, fn)
+
+			if rec.indexOf("INSERT INTO") < 0 {
+				t.Fatalf("expected the write to be issued; statements: %v", rec.all())
+			}
+			if rec.indexOf("BEGIN") >= 0 {
+				t.Errorf("the parameterized path must stay in autocommit; statements: %v", rec.all())
+			}
+		})
 	}
 }
 

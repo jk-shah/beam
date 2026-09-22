@@ -19,13 +19,14 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"math/rand"
-
 	"reflect"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/apache/beam/sdks/v2/go/pkg/beam"
 	"github.com/apache/beam/sdks/v2/go/pkg/beam/log"
@@ -136,6 +137,39 @@ func Write(s beam.Scope, table string, opts WriteOptions, col beam.PCollection) 
 		panic(fmt.Sprintf("postgresio.Write: %v", err))
 	}
 
+	// MERGE is only expressible through the staged COPY path, and PgBouncer
+	// compatibility forces the parameterized path because transaction pooling
+	// cannot keep a session-scoped staging table alive between flushes. The
+	// two cannot both be satisfied, so the conflict is reported here rather
+	// than as a first-flush failure on every worker.
+	if opts.WriteMode == WriteModeMerge && opts.UsePgBouncer {
+		panic("postgresio.Write: WriteModeMerge cannot be combined with PgBouncer compatibility. " +
+			"MERGE is issued through the staged COPY path, which reuses a session-scoped staging table, " +
+			"and transaction pooling cannot guarantee that table is present on the connection a later " +
+			"flush lands on. Connect directly to PostgreSQL, or use a session-pooling PgBouncer mode.")
+	}
+
+	// Checked here as well as in WithReplicationOriginName, because the
+	// cross-language SchemaTransform assigns the field directly and never
+	// passes through the option.
+	if opts.ReplicationOriginName != "" && !originNameRegex.MatchString(opts.ReplicationOriginName) {
+		panic(fmt.Sprintf("postgresio.Write: invalid replication origin name %q (must match %s)",
+			opts.ReplicationOriginName, originNameRegex.String()))
+	}
+
+	// A replication origin is selected on the session. Under transaction
+	// pooling a later statement can be routed to a server connection that
+	// never selected it, so some writes would go out unstamped and a
+	// bidirectional peer would replay exactly those back -- intermittently,
+	// which is worse than not working at all.
+	if opts.ReplicationOriginName != "" && opts.UsePgBouncer {
+		panic("postgresio.Write: WithReplicationOriginName cannot be combined with PgBouncer " +
+			"compatibility. Selecting a replication origin is session state, and transaction pooling " +
+			"cannot guarantee a later statement runs on a connection that selected it, so writes would " +
+			"be stamped intermittently. Connect directly to PostgreSQL, or use a session-pooling " +
+			"PgBouncer mode.")
+	}
+
 	// Recorded here, in the submitting process, because this is the last point
 	// at which the closure is observable. Setup runs on the worker, where a
 	// dropped DialFunc and an unconfigured one are otherwise indistinguishable.
@@ -218,9 +252,10 @@ func (fn *writeFn) Setup(ctx context.Context) error {
 		fn.Options.Username, password, sslMode)
 
 	connector := &pqConnector{
-		dialFunc: fn.Options.DialFunc,
-		dsn:      dsn,
-		initSQL:  fn.Options.ConnectionInitSQL,
+		dialFunc:          fn.Options.DialFunc,
+		dsn:               dsn,
+		initSQL:           fn.Options.ConnectionInitSQL,
+		replicationOrigin: fn.Options.ReplicationOriginName,
 	}
 	db := sql.OpenDB(connector)
 
@@ -233,6 +268,8 @@ func (fn *writeFn) Setup(ctx context.Context) error {
 	db.SetMaxIdleConns(maxConns)
 	db.SetConnMaxLifetime(30 * time.Minute)
 
+	fn.applyPgBouncerCompatibility(ctx)
+
 	fn.db = db
 	fn.compactor = NewBatchCompactor(fn.Options.BatchSize, fn.Options.MaxBatchBytes, fn.Options.FlushInterval)
 	fn.inspectColumns(fn.Type.T)
@@ -243,29 +280,149 @@ func (fn *writeFn) Setup(ctx context.Context) error {
 	return nil
 }
 
+// applyPgBouncerCompatibility adjusts the write path so it holds no session
+// state, which is the only way it can survive transaction pooling.
+//
+// PgBouncer in transaction pooling mode hands each transaction whichever
+// server connection is free, so nothing that lives in a session survives
+// between them.
+//
+// The staged-COPY path depends on exactly that: it creates a temporary staging
+// table once and reuses it across flushes, deliberately, to keep per-batch DDL
+// out of the catalogs. Under transaction pooling a later flush can arrive on a
+// connection where that table was never created, so the method is downgraded
+// to the parameterized path. This is what the option is for; it previously set
+// a field nothing read.
+func (fn *writeFn) applyPgBouncerCompatibility(ctx context.Context) {
+	if !fn.Options.UsePgBouncer {
+		return
+	}
+	if fn.Options.WriteMethod == WriteMethodStagedCopy {
+		log.Warnf(ctx, "postgresio: PgBouncer compatibility is enabled, so the staged COPY write method "+
+			"has been downgraded to the parameterized UNNEST path. Staged COPY reuses a session-scoped "+
+			"staging table, which transaction pooling cannot guarantee is present on the connection a "+
+			"later flush lands on.")
+		fn.Options.WriteMethod = WriteMethodUnnest
+	}
+	if fn.Options.ConnectionInitSQL != "" {
+		log.Warnf(ctx, "postgresio: ConnectionInitSQL is set alongside PgBouncer compatibility. It runs "+
+			"when a pooled connection is opened, but transaction pooling may route a later statement to "+
+			"a different server connection that never ran it, so session-level settings apply "+
+			"inconsistently. Prefer values that can be set as connection parameters.")
+	}
+}
+
+// columnTagKeys are the struct tags consulted for a column name, in priority
+// order. db is checked first because it names a database column specifically,
+// where json also governs unrelated HTTP encoding.
+var columnTagKeys = []string{"db", "beam", "json"}
+
+// columnNameFromTag returns the column name a struct tag declares, whether the
+// field is explicitly excluded, and whether the tag named anything at all.
+//
+// Tag values carry options after a comma -- `json:"customer_id,omitempty"` is
+// the common one. The whole value used to be taken as the column name, which
+// produced a column literally named `customer_id,omitempty`; SanitizeIdentifier
+// then rejected it with an error that pointed at the sanitizer rather than at
+// the tag.
+//
+// A name of "-" means the field is not a column. That is the standard
+// convention for these tags and previously produced a column named "-".
+func columnNameFromTag(tag string) (name string, excluded bool, ok bool) {
+	if tag == "" {
+		return "", false, false
+	}
+	name, _, _ = strings.Cut(tag, ",")
+	switch name {
+	case "":
+		// An options-only tag such as `json:",omitempty"` names nothing; fall
+		// through to the next tag or to the field name.
+		return "", false, false
+	case "-":
+		return "", true, true
+	}
+	return name, false, true
+}
+
+// fieldTagNames returns the set of column names a field's tags declare.
+//
+// resolveColumn matches a column against a field by tag, and has to read those
+// tags exactly as inspectColumns did when it derived the column name. Comparing
+// the raw tag value instead meant a field tagged `json:"customer_id,omitempty"`
+// never matched the column `customer_id` that was derived from it, so the
+// value read as absent and the column was written NULL.
+func fieldTagNames(fld reflect.StructField) map[string]bool {
+	names := make(map[string]bool, len(columnTagKeys))
+	for _, key := range columnTagKeys {
+		if name, excluded, ok := columnNameFromTag(fld.Tag.Get(key)); ok && !excluded {
+			names[name] = true
+		}
+	}
+	return names
+}
+
+// toSnakeCase converts a Go field name to the snake_case spelling PostgreSQL
+// columns conventionally use.
+//
+// Lowercasing alone mapped CustomerID to "customerid", which matches no real
+// column, so every untagged multi-word field silently produced a name the
+// server would reject. Consecutive capitals are treated as one acronym, so
+// CustomerID becomes customer_id rather than customer_i_d, and HTTPServer
+// becomes http_server.
+func toSnakeCase(name string) string {
+	runes := []rune(name)
+
+	var b strings.Builder
+	b.Grow(len(runes) + 4)
+
+	for i, r := range runes {
+		if !unicode.IsUpper(r) {
+			b.WriteRune(r)
+			continue
+		}
+		// A boundary exists where a lowercase run ends (userID -> user_id) or
+		// where an acronym run ends and a new word begins (HTTPServer ->
+		// http_server).
+		endsLowerRun := i > 0 && (unicode.IsLower(runes[i-1]) || unicode.IsDigit(runes[i-1]))
+		startsNewWord := i > 0 && i+1 < len(runes) && unicode.IsLower(runes[i+1])
+		if endsLowerRun || startsNewWord {
+			b.WriteByte('_')
+		}
+		b.WriteRune(unicode.ToLower(r))
+	}
+	return b.String()
+}
+
 func (fn *writeFn) inspectColumns(t reflect.Type) {
 	if t.Kind() == reflect.Ptr {
 		t = t.Elem()
 	}
-	if t.Kind() == reflect.Struct {
-		fn.columns = make([]string, 0, t.NumField())
-		for i := 0; i < t.NumField(); i++ {
-			field := t.Field(i)
-			if !field.IsExported() {
-				continue
-			}
-			colName := field.Tag.Get("db")
-			if colName == "" {
-				colName = field.Tag.Get("beam")
-			}
-			if colName == "" {
-				colName = field.Tag.Get("json")
-			}
-			if colName == "" {
-				colName = strings.ToLower(field.Name)
-			}
-			fn.columns = append(fn.columns, colName)
+	if t.Kind() != reflect.Struct {
+		return
+	}
+
+	fn.columns = make([]string, 0, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		field := t.Field(i)
+		if !field.IsExported() {
+			continue
 		}
+
+		var colName string
+		var excluded, tagged bool
+		for _, key := range columnTagKeys {
+			colName, excluded, tagged = columnNameFromTag(field.Tag.Get(key))
+			if tagged {
+				break
+			}
+		}
+		if excluded {
+			continue
+		}
+		if !tagged {
+			colName = toSnakeCase(field.Name)
+		}
+		fn.columns = append(fn.columns, colName)
 	}
 }
 
@@ -326,7 +483,17 @@ func (fn *writeFn) flushBatch(ctx context.Context, emitSuccess func(beam.X), emi
 	// columns whose TOASTed values the server did not retransmit. A single
 	// statement can only name one column list, so the batch is grouped by the
 	// set of columns present and each group written separately.
-	for _, part := range partitionBatchByUnchangedColumns(batch, fn.columns) {
+	parts, err := partitionBatchByUnchangedColumns(batch, fn.columns)
+	if err != nil {
+		// A row type naming a column that does not exist is a defect in that
+		// type, not a transient fault, so the bundle fails rather than
+		// draining every batch to the dead-letter output under a
+		// misconfiguration that will repeat.
+		fn.failBatch(ctx, batch, err, emitFailed)
+		return err
+	}
+
+	for _, part := range parts {
 		if err := fn.writePartition(ctx, part, emitSuccess, emitFailed); err != nil {
 			return err
 		}
@@ -396,7 +563,13 @@ func (fn *writeFn) writePartition(ctx context.Context, part writePartition, emit
 	// subset. This is a rare case, so the hot path is unaffected.
 	var copyErr error
 	if fn.Options.WriteMethod == WriteMethodStagedCopy && part.IsComplete() {
-		copyErr = fn.executeStagedCopy(ctx, batch)
+		// Retried on its own rather than relying on the fallback. A deadlock
+		// here says nothing about the batch, and dropping to the slower
+		// parameterized path -- or, under MERGE, to the dead-letter queue,
+		// which has no fallback at all -- discards a fast-path write that a
+		// replay would almost certainly land.
+		copyErr = retryOnDeadlock(ctx, func() { sinkDeadlockRetries.Inc(ctx, 1) },
+			func(ctx context.Context) error { return fn.executeStagedCopy(ctx, batch) })
 		if copyErr == nil {
 			sinkWrittenRows.Inc(ctx, int64(len(batch)))
 			for _, item := range batch {
@@ -423,81 +596,94 @@ func (fn *writeFn) writePartition(ctx context.Context, part writePartition, emit
 		return err
 	}
 
-	// The parameterized path runs in autocommit unless a replication origin is
-	// configured. An origin has to be attached with
-	// pg_replication_origin_xact_setup, which only takes effect inside an
-	// explicit transaction, so one is opened solely to carry the tag.
-	//
-	// Tagging here is not optional. executeStagedCopy already tags its own
-	// transaction, and this path is reached both when the caller selects
-	// WriteMethodUnnest and when a staged COPY fails and falls through. If the
-	// fallback wrote untagged, a bidirectional topology would stop recognizing
-	// these rows as its own and replay them back to their source, which is the
-	// replication loop the origin exists to break -- and it would appear only
-	// for the batches that happened to fail COPY.
+	// Autocommit. A replication origin, when configured, is selected once per
+	// connection by pqConnector, so every statement this path issues is
+	// already stamped with it and no explicit transaction is needed to carry
+	// the tag. That applies equally when this path is entered directly and
+	// when a staged COPY fails and falls through to it, so the fallback
+	// cannot write untagged rows that a bidirectional peer would replay back.
 	execBatch := func(ctx context.Context) error {
-		if fn.Options.ReplicationOriginName == "" {
-			_, err := fn.db.ExecContext(ctx, query, args...)
-			return err
-		}
-
-		txn, err := fn.db.BeginTx(ctx, nil)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = txn.Rollback() }()
-
-		if err := fn.setupReplicationOrigin(ctx, txn); err != nil {
-			return err
-		}
-		if _, err := txn.ExecContext(ctx, query, args...); err != nil {
-			return err
-		}
-		return txn.Commit()
+		_, err := fn.db.ExecContext(ctx, query, args...)
+		return err
 	}
 
-	// Safety net: retry loop for SQLState 40P01 deadlock detected with full-jitter exponential backoff
-	maxRetries := 5
-	backoff := 50 * time.Millisecond
-
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		execErr := execBatch(ctx)
-		if execErr == nil {
-			sinkWrittenRows.Inc(ctx, int64(len(batch)))
-			for _, item := range batch {
-				emitSuccess(item)
-			}
-			return nil
-		}
-
-		sqlState := extractSqlState(execErr)
-		if sqlState == "40P01" && attempt < maxRetries {
-			sinkDeadlockRetries.Inc(ctx, 1)
-			jitter := time.Duration(rand.Int63n(int64(backoff)))
-			time.Sleep(backoff + jitter)
-			backoff *= 2
-			continue
-		}
-
-		if copyErr != nil {
-			execErr = fmt.Errorf("postgresio: write batch fallback failed with sqlstate %s: %w (original COPY error: %v)", sqlState, execErr, copyErr)
-		}
-
-		// Permanent failure: route batch to Dead-Letter Queue (DLQ)
-		sinkFailedRows.Inc(ctx, int64(len(batch)))
-		sanitizedMsg := SanitizeErrorMessage(execErr)
-		log.Errorf(ctx, "postgresio: %s", sanitizedMsg)
+	execErr := retryOnDeadlock(ctx, func() { sinkDeadlockRetries.Inc(ctx, 1) }, execBatch)
+	if execErr == nil {
+		sinkWrittenRows.Inc(ctx, int64(len(batch)))
 		for _, item := range batch {
-			emitFailed(FailedRow{
-				Row:          item,
-				ErrorMessage: sanitizedMsg,
-				SqlState:     sqlState,
-			})
+			emitSuccess(item)
 		}
 		return nil
 	}
 
+	sqlState := extractSqlState(execErr)
+	if copyErr != nil {
+		execErr = fmt.Errorf("postgresio: write batch fallback failed with sqlstate %s: %w (original COPY error: %v)", sqlState, execErr, copyErr)
+	}
+
+	// Permanent failure: route batch to Dead-Letter Queue (DLQ)
+	sinkFailedRows.Inc(ctx, int64(len(batch)))
+	sanitizedMsg := SanitizeErrorMessage(execErr)
+	log.Errorf(ctx, "postgresio: %s", sanitizedMsg)
+	for _, item := range batch {
+		emitFailed(FailedRow{
+			Row:          item,
+			ErrorMessage: sanitizedMsg,
+			SqlState:     sqlState,
+		})
+	}
 	return nil
+}
+
+// deadlockMaxRetries bounds how many times a batch is replayed after
+// PostgreSQL breaks a deadlock cycle involving it.
+const deadlockMaxRetries = 5
+
+// deadlockBaseBackoff is the first wait in the full-jitter ladder. It is a
+// variable so tests can walk the whole ladder without waiting seconds for it;
+// nothing outside tests reassigns it.
+var deadlockBaseBackoff = 50 * time.Millisecond
+
+// retryOnDeadlock runs op, replaying it while PostgreSQL reports a detected
+// deadlock, with full-jitter exponential backoff.
+//
+// A deadlock is not a property of the data. PostgreSQL resolves a cycle by
+// aborting one participant, and the aborted statement normally succeeds once
+// the other side has committed, so this is the one SQLSTATE where an immediate
+// replay is both safe and likely to work. Every other error returns
+// immediately: retrying a constraint violation only delays the dead-letter
+// routing that is already correct for it.
+//
+// Jitter is full rather than fixed because the workers that deadlock with each
+// other are running identical code. A deterministic backoff would reschedule
+// them at the same instant and reproduce the same cycle.
+//
+// The wait honours ctx. A sleep that ignored cancellation would keep a worker
+// that is draining for shutdown alive for the remainder of the ladder, and
+// would outlive the bundle the work belongs to.
+func retryOnDeadlock(ctx context.Context, onRetry func(), op func(context.Context) error) error {
+	backoff := deadlockBaseBackoff
+
+	var err error
+	for attempt := 0; attempt <= deadlockMaxRetries; attempt++ {
+		if err = op(ctx); err == nil {
+			return nil
+		}
+		if extractSqlState(err) != sqlStateDeadlockDetected || attempt == deadlockMaxRetries {
+			return err
+		}
+		if onRetry != nil {
+			onRetry()
+		}
+
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("postgresio: abandoned deadlock retry: %w (last database error: %v)", ctx.Err(), err)
+		case <-time.After(backoff + time.Duration(rand.Int63n(int64(backoff)))):
+		}
+		backoff *= 2
+	}
+	return err
 }
 
 // buildCopyStatement returns a COPY ... FROM STDIN statement.
@@ -533,32 +719,11 @@ func stagingTableName(qualifiedTable string, workerID string) string {
 	return fmt.Sprintf("beam_stage_%016x_%s", h.Sum64(), workerID)
 }
 
-// setupReplicationOrigin tags the transaction with a replication origin.
-//
-// The error is deliberately not discarded. Any failed statement inside a
-// transaction puts it into an aborted state (SQLSTATE 25P02), so swallowing
-// this error causes the *next* statement to fail with an unrelated message.
-// It also silently disables bidirectional loop prevention, which is the only
-// reason the origin is being set.
-func (fn *writeFn) setupReplicationOrigin(ctx context.Context, txn *sql.Tx) error {
-	if fn.Options.ReplicationOriginName == "" {
-		return nil
-	}
-
-	escapedOrigin := strings.ReplaceAll(fn.Options.ReplicationOriginName, "'", "''")
-	_, err := txn.ExecContext(ctx, fmt.Sprintf("SELECT pg_replication_origin_xact_setup('%s', '0/0')", escapedOrigin))
-	if err != nil {
-		return fmt.Errorf("postgresio: failed to set replication origin %q: %w\n"+
-			"pg_replication_origin_xact_setup requires superuser or membership in pg_checkpoint, "+
-			"and the origin must already exist (SELECT pg_replication_origin_create('%s')). "+
-			"Continuing without the origin would disable bidirectional loop prevention",
-			fn.Options.ReplicationOriginName, err, fn.Options.ReplicationOriginName)
-	}
-	return nil
-}
-
 // executeStagedCopy executes a two-phase bulk upsert: a PostgreSQL COPY into a
 // session-scoped staging table followed by an atomic set-based ON CONFLICT merge.
+//
+// A configured replication origin needs nothing here: pqConnector selects it on
+// the connection, so this transaction inherits it along with every other.
 func (fn *writeFn) executeStagedCopy(ctx context.Context, batch []any) error {
 	if len(fn.columns) == 0 {
 		return fmt.Errorf("postgresio: no columns discovered for type %v", fn.Type.T)
@@ -578,10 +743,6 @@ func (fn *writeFn) executeStagedCopy(ctx context.Context, batch []any) error {
 		return err
 	}
 	defer txn.Rollback()
-
-	if err := fn.setupReplicationOrigin(ctx, txn); err != nil {
-		return err
-	}
 
 	// Append-only fast path
 	if fn.Options.WriteMode == WriteModeInsert && len(fn.PrimaryKeyCols) == 0 {
@@ -824,10 +985,7 @@ func resolveColumn(v reflect.Value, colName string) (any, reflect.Type, bool) {
 			if !fld.IsExported() {
 				continue
 			}
-			if strings.EqualFold(fld.Name, colName) ||
-				fld.Tag.Get("db") == colName ||
-				fld.Tag.Get("beam") == colName ||
-				fld.Tag.Get("json") == colName {
+			if strings.EqualFold(fld.Name, colName) || fieldTagNames(fld)[colName] {
 				return v.Field(i).Interface(), fld.Type, true
 			}
 		}
@@ -875,33 +1033,111 @@ func (fn *writeFn) extractRowValues(item any) []any {
 	return vals
 }
 
+const (
+	// minElementSizeEstimate floors the per-element estimate so that a batch
+	// of tiny rows still counts against MaxBatchBytes at a realistic rate;
+	// every row carries per-tuple overhead the Go value does not show.
+	minElementSizeEstimate = 64
+	// maxSizeInspectionDepth bounds recursion through nested values. Beyond
+	// it the static type size is used, which keeps a cyclic or deeply nested
+	// graph from making the estimate more expensive than the write.
+	maxSizeInspectionDepth = 4
+
+	// Go header sizes, added so that a field contributes its own footprint in
+	// addition to the bytes it points at.
+	stringHeaderSize = 16
+	sliceHeaderSize  = 24
+)
+
+// estimateElementSize approximates the number of bytes one element contributes
+// to a batch, which is what MaxBatchBytes budgets.
+//
+// The previous implementation added f.Len() for slices. That is the element
+// count, not a byte count, so a []string holding a hundred one-kilobyte values
+// counted as 100 rather than ~100,000. Wide rows therefore under-reported by
+// orders of magnitude and a flush could carry far more memory than configured.
 func estimateElementSize(elem any) int {
 	if elem == nil {
-		return 64
+		return minElementSizeEstimate
 	}
-	v := reflect.ValueOf(elem)
-	if v.Kind() == reflect.Ptr {
-		if v.IsNil() {
-			return 64
-		}
-		v = v.Elem()
-	}
-	if v.Kind() == reflect.Struct {
-		sz := int(v.Type().Size())
-		for i := 0; i < v.NumField(); i++ {
-			f := v.Field(i)
-			if f.Kind() == reflect.String {
-				sz += f.Len()
-			} else if f.Kind() == reflect.Slice {
-				sz += f.Len()
-			}
-		}
-		if sz < 64 {
-			return 64
-		}
+	if sz := estimateValueSize(reflect.ValueOf(elem), 0); sz > minElementSizeEstimate {
 		return sz
 	}
-	return 64
+	return minElementSizeEstimate
+}
+
+// estimateValueSize returns the approximate byte footprint of a single value.
+func estimateValueSize(v reflect.Value, depth int) int {
+	if !v.IsValid() {
+		return 0
+	}
+	if depth > maxSizeInspectionDepth {
+		return int(v.Type().Size())
+	}
+
+	switch v.Kind() {
+	case reflect.Ptr, reflect.Interface:
+		if v.IsNil() {
+			return 0
+		}
+		return estimateValueSize(v.Elem(), depth+1)
+
+	case reflect.String:
+		return stringHeaderSize + v.Len()
+
+	case reflect.Slice, reflect.Array:
+		elemType := v.Type().Elem()
+		// A slice of fixed-width elements is measured by arithmetic rather
+		// than by walking it, so a large []byte or []int64 costs nothing to
+		// size.
+		if isFixedWidthKind(elemType.Kind()) {
+			return sliceHeaderSize + v.Len()*int(elemType.Size())
+		}
+		total := sliceHeaderSize
+		for i := 0; i < v.Len(); i++ {
+			total += estimateValueSize(v.Index(i), depth+1)
+		}
+		return total
+
+	case reflect.Map:
+		total := sliceHeaderSize
+		iter := v.MapRange()
+		for iter.Next() {
+			total += estimateValueSize(iter.Key(), depth+1) + estimateValueSize(iter.Value(), depth+1)
+		}
+		return total
+
+	case reflect.Struct:
+		total := 0
+		for i := 0; i < v.NumField(); i++ {
+			f := v.Field(i)
+			// An unexported field cannot be read through reflection, so it
+			// contributes its declared width.
+			if !f.CanInterface() {
+				total += int(f.Type().Size())
+				continue
+			}
+			total += estimateValueSize(f, depth+1)
+		}
+		return total
+
+	default:
+		return int(v.Type().Size())
+	}
+}
+
+// isFixedWidthKind reports whether every value of a kind occupies the same
+// number of bytes, which is what makes the multiplication above valid.
+func isFixedWidthKind(k reflect.Kind) bool {
+	switch k {
+	case reflect.Bool,
+		reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64,
+		reflect.Complex64, reflect.Complex128:
+		return true
+	}
+	return false
 }
 
 func (fn *writeFn) buildUnnestQuery(batch []any) (string, []any, error) {
@@ -1098,11 +1334,25 @@ func (fn *writeFn) buildUnnestQueryForColumns(batch []any, columns []string) (st
 	return sb.String(), args, nil
 }
 
+// sqlStateDeadlockDetected is the SQLSTATE PostgreSQL reports when it breaks a
+// deadlock cycle by aborting one of the participating transactions.
+const sqlStateDeadlockDetected = "40P01"
+
+// extractSqlState returns the SQLSTATE PostgreSQL reported for an error.
+//
+// The error is unwrapped rather than type-asserted. Every layer between the
+// driver and here may wrap: the staged-COPY path annotates failures with
+// context, the UNNEST fallback attaches the original COPY error, and
+// database/sql itself wraps in places. A direct assertion sees only the
+// outermost error, so a wrapped deadlock reported "UNKNOWN" and the batch went
+// to the dead-letter queue instead of being retried -- the one state where
+// retrying almost always succeeds.
 func extractSqlState(err error) string {
 	if err == nil {
 		return ""
 	}
-	if pqErr, ok := err.(*pq.Error); ok {
+	var pqErr *pq.Error
+	if errors.As(err, &pqErr) {
 		return string(pqErr.Code)
 	}
 	return "UNKNOWN"

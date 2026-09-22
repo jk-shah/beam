@@ -67,10 +67,29 @@
 //     security policy halts replication rather than executing inside the
 //     replication session of a least-privilege role.
 //
-// Known open items include the UNNEST write path not setting a replication
-// origin, no initial backfill, and the connector being built on lib/pq rather
-// than pgx. See the Known Limitations section of the package README for the
-// full list and the current state of each item.
+// Known open items include no initial backfill and the connector being built
+// on lib/pq rather than pgx. See the Known Limitations section of the package
+// README for the full list and the current state of each item.
+//
+// # Required Privileges
+//
+// Writing needs SELECT, INSERT and, for the upsert, update and merge modes,
+// UPDATE on the target table; merge additionally needs DELETE when its op
+// column can carry one. SELECT is required even for plain inserts, because
+// Setup reads the target's column types with SELECT * FROM target LIMIT 0.
+// The default WriteMethodStagedCopy also needs the TEMPORARY privilege on the
+// database, which PostgreSQL grants to PUBLIC unless it has been revoked.
+//
+// Reading needs SELECT on every table the query touches.
+//
+// CDC needs a role with the LOGIN and REPLICATION attributes, a matching
+// replication entry in pg_hba.conf, wal_level=logical, and SELECT on each
+// published table.
+//
+// WithReplicationOriginName is the one option that needs more than table
+// privileges: each connection runs pg_replication_origin_session_setup, which
+// is superuser-only unless EXECUTE has been granted, and the origin must
+// already exist. See the Required privileges section of the README.
 //
 // # Key Capabilities
 //

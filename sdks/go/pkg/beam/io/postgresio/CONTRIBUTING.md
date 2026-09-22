@@ -88,11 +88,12 @@ sequenceDiagram
 
     Note over DoFn,Target: Execution in FinishBundle: executeStagedCopy
     DoFn->>Pool: Acquire dedicated connection (max lifetime validated)
-    DoFn->>PG: BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
 
-    opt WithReplicationOriginName configured
-        DoFn->>PG: SELECT pg_replication_origin_xact_setup('origin_name', '0/0')
+    opt WithReplicationOriginName configured (once, when the connection is opened)
+        DoFn->>PG: SELECT pg_replication_origin_session_setup($1)
     end
+
+    DoFn->>PG: BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
 
     DoFn->>PG: CREATE TEMP TABLE IF NOT EXISTS temp_batch (LIKE target INCLUDING DEFAULTS) ON COMMIT DELETE ROWS
     PG-->>Temp: Temporary table created

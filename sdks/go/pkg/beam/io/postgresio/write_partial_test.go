@@ -58,6 +58,18 @@ func newPartialWriteFn(t *testing.T) *writeFn {
 	return fn
 }
 
+// mustPartition partitions a batch that is expected to be well formed. The
+// tests below exercise partition layout, so the error return is checked once
+// here rather than at every call site.
+func mustPartition(t *testing.T, batch []any, allColumns []string) []writePartition {
+	t.Helper()
+	parts, err := partitionBatchByUnchangedColumns(batch, allColumns)
+	if err != nil {
+		t.Fatalf("partitionBatchByUnchangedColumns(%v) returned an unexpected error: %v", batch, err)
+	}
+	return parts
+}
+
 // --- interface detection ---
 
 func TestRowUnchangedColumnsIgnoresNonPartialRows(t *testing.T) {
@@ -95,7 +107,7 @@ func TestRowUnchangedColumnsNormalizes(t *testing.T) {
 func TestPartitionKeepsCompleteBatchWhole(t *testing.T) {
 	batch := []any{completeDoc{ID: 1}, completeDoc{ID: 2}, completeDoc{ID: 3}}
 
-	parts := partitionBatchByUnchangedColumns(batch, testDocColumns)
+	parts := mustPartition(t, batch, testDocColumns)
 	if len(parts) != 1 {
 		t.Fatalf("got %d partitions, want 1", len(parts))
 	}
@@ -119,7 +131,7 @@ func TestPartitionGroupsBySignature(t *testing.T) {
 		partialDoc{ID: 5},
 	}
 
-	parts := partitionBatchByUnchangedColumns(batch, testDocColumns)
+	parts := mustPartition(t, batch, testDocColumns)
 	if len(parts) != 3 {
 		t.Fatalf("got %d partitions, want 3 (complete, body, body+title)", len(parts))
 	}
@@ -170,7 +182,7 @@ func TestPartitionPreservesEveryRow(t *testing.T) {
 		partialDoc{ID: 7, unchanged: []string{"version"}},
 	}
 
-	parts := partitionBatchByUnchangedColumns(batch, testDocColumns)
+	parts := mustPartition(t, batch, testDocColumns)
 
 	seen := map[int64]int{}
 	total := 0
@@ -203,7 +215,7 @@ func TestPartitionPreservesRowOrderWithinPartition(t *testing.T) {
 		partialDoc{ID: 5, unchanged: []string{"body"}},
 	}
 
-	parts := partitionBatchByUnchangedColumns(batch, testDocColumns)
+	parts := mustPartition(t, batch, testDocColumns)
 	for _, p := range parts {
 		var last int64
 		for _, r := range p.Rows {
@@ -231,7 +243,7 @@ func TestPartitionOrderIsDeterministic(t *testing.T) {
 
 	var reference []string
 	for trial := 0; trial < 50; trial++ {
-		parts := partitionBatchByUnchangedColumns(batch, testDocColumns)
+		parts := mustPartition(t, batch, testDocColumns)
 		order := make([]string, len(parts))
 		for i, p := range parts {
 			order[i] = strings.Join(p.UnchangedColumns, ",")
@@ -247,10 +259,10 @@ func TestPartitionOrderIsDeterministic(t *testing.T) {
 }
 
 func TestPartitionHandlesEmptyBatch(t *testing.T) {
-	if parts := partitionBatchByUnchangedColumns(nil, testDocColumns); parts != nil {
+	if parts := mustPartition(t, nil, testDocColumns); parts != nil {
 		t.Errorf("expected nil for a nil batch, got %v", parts)
 	}
-	if parts := partitionBatchByUnchangedColumns([]any{}, testDocColumns); parts != nil {
+	if parts := mustPartition(t, []any{}, testDocColumns); parts != nil {
 		t.Errorf("expected nil for an empty batch, got %v", parts)
 	}
 }
@@ -283,7 +295,7 @@ func TestPartialUpdateOmitsUnchangedColumnFromSetClause(t *testing.T) {
 	fn := newPartialWriteFn(t)
 	batch := []any{partialDoc{ID: 1, Title: "new title", Version: 2, unchanged: []string{"body"}}}
 
-	parts := partitionBatchByUnchangedColumns(batch, fn.columns)
+	parts := mustPartition(t, batch, fn.columns)
 	if len(parts) != 1 {
 		t.Fatalf("got %d partitions, want 1", len(parts))
 	}
@@ -321,7 +333,7 @@ func TestCompleteRowStatementIsUnchanged(t *testing.T) {
 	fn := newPartialWriteFn(t)
 	batch := []any{partialDoc{ID: 1, Title: "t", Body: "b", Version: 1}}
 
-	viaPartition := partitionBatchByUnchangedColumns(batch, fn.columns)
+	viaPartition := mustPartition(t, batch, fn.columns)
 	partQuery, partArgs, err := fn.buildUnnestQueryForColumns(viaPartition[0].Rows, viaPartition[0].Columns)
 	if err != nil {
 		t.Fatalf("partitioned build: %v", err)
@@ -351,7 +363,7 @@ func TestPartialUpdateValuesAlignWithColumns(t *testing.T) {
 		unchanged: []string{"body"},
 	}}
 
-	parts := partitionBatchByUnchangedColumns(batch, fn.columns)
+	parts := mustPartition(t, batch, fn.columns)
 	query, args, err := fn.buildUnnestQueryForColumns(parts[0].Rows, parts[0].Columns)
 	if err != nil {
 		t.Fatalf("buildUnnestQueryForColumns: %v", err)
@@ -384,7 +396,7 @@ func TestPartialUpdateWithAllNonKeyColumnsUnchanged(t *testing.T) {
 	fn := newPartialWriteFn(t)
 	batch := []any{partialDoc{ID: 1, unchanged: []string{"title", "body", "version"}}}
 
-	parts := partitionBatchByUnchangedColumns(batch, fn.columns)
+	parts := mustPartition(t, batch, fn.columns)
 	query, _, err := fn.buildUnnestQueryForColumns(parts[0].Rows, parts[0].Columns)
 	if err != nil {
 		t.Fatalf("buildUnnestQueryForColumns: %v", err)
@@ -402,6 +414,59 @@ func TestBuildUnnestQueryRejectsEmptyColumnSet(t *testing.T) {
 	fn := newPartialWriteFn(t)
 	if _, _, err := fn.buildUnnestQueryForColumns([]any{partialDoc{ID: 1}}, nil); err == nil {
 		t.Error("expected an error for an empty column set")
+	}
+}
+
+// --- validation of declared names ---
+
+// TestPartitionRejectsUnknownUnchangedColumn covers a name that matches no
+// column. subtractColumns removes nothing for it, so the row kept its full
+// column set while still counting as partial: the staged-COPY fast path was
+// silently skipped, and under MERGE the write failed naming a column the
+// target does not have. Neither symptom points back at the row type.
+func TestPartitionRejectsUnknownUnchangedColumn(t *testing.T) {
+	batch := []any{
+		partialDoc{ID: 1, unchanged: []string{"body"}},
+		partialDoc{ID: 2, unchanged: []string{"bdoy"}}, // transposed
+	}
+
+	_, err := partitionBatchByUnchangedColumns(batch, testDocColumns)
+	if err == nil {
+		t.Fatal("a misspelled column name was accepted; the row would be written by a statement " +
+			"that silently disagrees with the one its signature implies")
+	}
+	if !strings.Contains(err.Error(), "bdoy") {
+		t.Errorf("error does not name the offending column: %v", err)
+	}
+	for _, col := range testDocColumns {
+		if !strings.Contains(err.Error(), col) {
+			t.Errorf("error does not list the valid column %q, so the caller cannot see the "+
+				"intended spelling: %v", col, err)
+		}
+	}
+}
+
+// TestPartitionAcceptsCompleteBatchWithoutValidation confirms the validation
+// does not run when no row is partial, keeping the common path allocation-free.
+func TestPartitionAcceptsCompleteBatchWithoutValidation(t *testing.T) {
+	batch := []any{completeDoc{ID: 1}}
+
+	// An empty column list would fail validation if it ran, but a batch with
+	// no partial rows never consults it.
+	parts, err := partitionBatchByUnchangedColumns(batch, nil)
+	if err != nil {
+		t.Fatalf("a complete batch must not be validated against the column list: %v", err)
+	}
+	if len(parts) != 1 {
+		t.Errorf("got %d partitions, want 1", len(parts))
+	}
+}
+
+func TestPartitionRejectsUnknownColumnEvenWhenOthersAreValid(t *testing.T) {
+	batch := []any{partialDoc{ID: 1, unchanged: []string{"body", "not_a_column"}}}
+
+	if _, err := partitionBatchByUnchangedColumns(batch, testDocColumns); err == nil {
+		t.Error("a signature mixing a valid and an invalid name was accepted")
 	}
 }
 

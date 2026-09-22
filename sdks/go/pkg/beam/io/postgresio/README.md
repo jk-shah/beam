@@ -50,6 +50,7 @@
    - [WriteOptions](#writeoptions)
    - [CDCOptions](#cdcoptions)
    - [Checkpointing & Acknowledgment](#checkpointing--acknowledgment)
+   - [Required privileges](#required-privileges)
    - [Security & TLS Configuration](#security--tls-configuration)
    - [Failover slots](#failover-slots)
    - [WAL retention circuit breaker](#wal-retention-circuit-breaker)
@@ -166,11 +167,12 @@ sequenceDiagram
 
     Note over DoFn,Target: Execution in FinishBundle: executeStagedCopy
     DoFn->>Pool: Acquire dedicated connection (max lifetime validated)
-    DoFn->>PG: BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
 
-    opt WithReplicationOriginName configured
-        DoFn->>PG: SELECT pg_replication_origin_xact_setup('origin_name', '0/0')
+    opt WithReplicationOriginName configured (once, when the connection is opened)
+        DoFn->>PG: SELECT pg_replication_origin_session_setup($1)
     end
+
+    DoFn->>PG: BEGIN TRANSACTION ISOLATION LEVEL READ COMMITTED
 
     DoFn->>PG: CREATE TEMP TABLE IF NOT EXISTS temp_batch (LIKE target INCLUDING DEFAULTS) ON COMMIT DELETE ROWS
     PG-->>Temp: Temporary table created
@@ -205,7 +207,7 @@ sequenceDiagram
 * **Staged COPY Upsert (`WriteMethodStagedCopy`, Default)**: Streams micro-batched tuples through a prepared `COPY <staging> (<columns>) FROM STDIN` into a session-scoped temporary table (`CREATE TEMP TABLE IF NOT EXISTS <staging> (LIKE target INCLUDING DEFAULTS) ON COMMIT DELETE ROWS`). The staging table is created once per session and emptied at each commit rather than created and dropped per batch, so steady-state flushes execute no catalog DDL. Once streamed, an atomic set-based merge (`INSERT INTO target SELECT ... FROM <staging> ON CONFLICT DO UPDATE SET ...`) applies the batch, so per-row statements are never parsed or planned.
 * **Parameterized `UNNEST` Array Upsert (`WriteMethodUnnest`)**: Executes batch inserts and upserts via vectorized array parameters with explicit type casts (`UNNEST($1::bigint[], $2::text[], ...)`), providing fallback execution when temporary table creation is restricted.
 * **In-Memory Batch Compaction & Deadlock Mitigation**: The `BatchCompactor` applies Last-Write-Wins (LWW) deduplication within micro-batches and sorts records canonically by composite primary key prior to database execution. This enforces uniform row-lock acquisition order across distributed parallel workers to minimize `SQLState 40P01` deadlocks, backed by an exponential backoff retry loop as the primary safety net.
-* **Declarative Replication Origin Stamping**: Users can configure `.WithReplicationOriginName("beam_origin")`. Write transactions are tagged via `SELECT pg_replication_origin_xact_setup('beam_origin', '0/0')`, preventing cyclic feedback loops in active-active bidirectional database synchronization.
+* **Declarative Replication Origin Stamping**: Users can configure `.WithReplicationOriginName("beam_origin")`. Each pooled connection selects the origin once via `SELECT pg_replication_origin_session_setup($1)`, so every WAL record the sink produces carries that origin. A peer subscription declared `WITH (origin = none)` then skips those changes, breaking the cyclic feedback loop in active-active bidirectional synchronization. The origin must already exist (`SELECT pg_replication_origin_create('beam_origin')`) and the role needs the privilege described under [Required privileges](#required-privileges).
 * **Connection Pool Management & CVE-2018-1058 Mitigation**: Clamps worker connection pools to 2 connections by default to prevent connection storms. Automatically injects `search_path=pg_catalog,pg_temp` into every connection DSN, closing search-path hijacking vulnerabilities across all pool connections.
 * **Dead-Letter Queue (DLQ)**: Separates successfully committed rows from rejected records, appending sanitized error messages and PostgreSQL SQL states without credential leakage.
 
@@ -540,6 +542,85 @@ Server keepalives are acknowledgeable only when no transaction is open. This is
 what lets a slot whose publication covers only quiet tables keep up with global
 WAL, without acknowledging a position past records the parser is still holding.
 
+### Required privileges
+
+Grant the narrowest set for the paths you actually use. Every entry below is
+required by a statement this connector issues; missing one surfaces as a
+`permission denied` error at worker startup or on the first flush, not at
+pipeline construction.
+
+#### Writing (`postgresio.Write`)
+
+| Privilege | Scope | Required for | Why |
+| --- | --- | --- | --- |
+| `SELECT` | target table | **always** | `Setup` runs `SELECT * FROM <target> LIMIT 0` to learn the column types it needs for the `UNNEST` casts. |
+| `INSERT` | target table | **always** | Every write mode inserts. |
+| `UPDATE` | target table | `WriteModeUpsert`, `WriteModeUpdate`, `WriteModeMerge` | `ON CONFLICT DO UPDATE` and `MERGE ... WHEN MATCHED THEN UPDATE`. |
+| `DELETE` | target table | `WriteModeMerge` with an op column that can carry deletes | `MERGE ... WHEN MATCHED THEN DELETE`. |
+| `TEMPORARY` | database | `WriteMethodStagedCopy` (the default) | `CREATE TEMP TABLE` for the staging table. Granted to `PUBLIC` by default, so this usually needs no action — but a hardened database that has run `REVOKE TEMPORARY ON DATABASE ... FROM PUBLIC` must grant it back or select `WriteMethodUnnest`. |
+
+`ON CONFLICT` additionally requires `SELECT` on every column it reads, which
+includes the conflict-target (primary key) columns and each column read from
+`excluded`. Since the sink already needs table-wide `SELECT` for type
+inspection, a single table-level grant covers it:
+
+```sql
+GRANT SELECT, INSERT, UPDATE ON public.orders TO beam_writer;
+-- Only if TEMPORARY has been revoked from PUBLIC:
+GRANT TEMPORARY ON DATABASE appdb TO beam_writer;
+```
+
+> [!IMPORTANT]
+> `WithReplicationOriginName` needs more than table privileges. Each connection
+> runs `SELECT pg_replication_origin_session_setup($1)`, and use of the
+> replication origin functions is **superuser-only by default**. The origin must
+> also already exist. Either grant execute explicitly:
+>
+> ```sql
+> SELECT pg_replication_origin_create('beam_origin');  -- superuser, once
+> GRANT EXECUTE ON FUNCTION pg_replication_origin_session_setup(text) TO beam_writer;
+> ```
+>
+> or run the sink as a superuser. Without this the connection is refused rather
+> than silently opened unstamped, because an unstamped write is exactly the one a
+> bidirectional peer replays back.
+
+#### Reading (`postgresio.Read` / `postgresio.Query`)
+
+`SELECT` on every table referenced by the query. Partitioned reads issue the
+same query per range and need nothing further.
+
+```sql
+GRANT SELECT ON public.orders TO beam_reader;
+```
+
+#### CDC streaming (`postgresio.ReadCDC`)
+
+| Requirement | Scope | Why |
+| --- | --- | --- |
+| `REPLICATION` attribute (or superuser) | role | Required to open a replication connection and to create or read a replication slot. |
+| `LOGIN` attribute | role | The connector connects as this role. |
+| A `replication` entry in `pg_hba.conf` | server | Replication connections are matched by a separate `pg_hba.conf` database keyword. |
+| `wal_level = logical` | server | Logical decoding produces nothing otherwise. Requires a restart. |
+| `SELECT` on each published table | tables | Needed to copy initial table data. |
+| `CREATE` on the database | database | Only if you let the connector emit DDL for a publication; creating it yourself as the table owner avoids this. |
+
+```sql
+CREATE ROLE beam_cdc WITH LOGIN REPLICATION PASSWORD '...';
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO beam_cdc;
+-- As the table owner:
+CREATE PUBLICATION beam_pub FOR TABLE public.orders;
+```
+
+The preflight checks read `pg_catalog.pg_settings`, `pg_replication_slots`,
+`pg_publication` and `pg_publication_tables`. These are readable by `PUBLIC`
+and need no grant.
+
+> [!NOTE]
+> Replication slots are **cluster-wide**, not per-database, and a role with
+> `REPLICATION` can read any slot in the cluster. Treat it as a privileged
+> account even though it holds no table-level write privileges.
+
 ### Security & TLS Configuration
 
 `NewCDCOptions` defaults `sslmode` to `verify-full`. `verify-ca` is available
@@ -873,7 +954,7 @@ The connector is unreleased and experimental. The list below is what is still op
 | **Slot lag** | Retention is measured and published by default, but enforcement is not: the [circuit breaker](#wal-retention-circuit-breaker) is off until a budget is set, and it does not drop the slot, so WAL is not reclaimed by the breach itself. A bundle already blocked inside a downstream `emit` cannot be interrupted from outside. | Without a configured budget the database can still run out of WAL volume if a stalled pipeline is left unattended. Alert on `cdc_slot_retained_bytes` or the [health view](#beam_cdc_health-view), set `WithCDCMaxSlotLagBytes`, and configure `max_slot_wal_keep_size` server-side as a backstop. |
 | **Long transactions** | A checkpoint cannot land partway through a transaction, so `WithCDCCheckpointInterval` is advisory while one is open. A single very large transaction extends the invocation until its `COMMIT` frame arrives. | Acknowledgment latency, and the memory the parser holds for a streamed transaction, both scale with the largest transaction on the source. A connection that stops delivering mid-transaction is dropped after two minutes of silence and the bundle is retried. |
 | **Initial backfill** | Slot creation exports a consistent snapshot and `SlotCreationResult.SnapshotIsolationStatements` returns the statements needed to read it, but the connector does not run the backfill. | Pre-existing table rows require a separate read. Only changes after the slot's creation point arrive through CDC. |
-| **Replication origin on the write path** | The staged `COPY` path sets a replication origin; the `UNNEST` fallback does not. | In a bi-directional topology, rows written through the fallback path are not distinguishable from user writes and can be replicated back. |
+| **Replication origin on the write path** | The origin is selected once per pooled connection, so both the staged `COPY` and `UNNEST` paths stamp their writes. It cannot be combined with `WithPgBouncer`, because transaction pooling cannot guarantee a statement runs on a connection that selected it, and selecting it is superuser-only unless `EXECUTE` is granted. | Bi-directional topologies must connect directly to PostgreSQL and grant the origin function. `postgresio.Write` rejects the PgBouncer combination at construction. See [Required privileges](#required-privileges). |
 | **Driver** | Built on `lib/pq`. The CDC path implements the replication protocol directly rather than through `pgx` / `pglogrepl`. | Protocol features not implemented here are unavailable, and the wire decoder is maintained in-tree. |
 | **`search_path`** | The write path pins `search_path=pg_catalog,pg_temp` on every pooled connection to close CVE-2018-1058, so an unqualified table name cannot resolve. | Table names must be written as `schema.table`. `postgresio.Write` rejects an unqualified name when the pipeline is constructed, and the `postgres_write` SchemaTransform rejects it during configuration validation. |
 | **Failover slots** | Slots are created without `FAILOVER` unless `WithCDCFailoverSlot(true)` is set, because enabling it couples pipeline latency to standby replication. | With the default, a failover loses the slot and its position, and the pipeline restarts from whatever the new primary has. See [Failover slots](#failover-slots). |

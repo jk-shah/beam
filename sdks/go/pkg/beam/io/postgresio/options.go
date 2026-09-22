@@ -177,6 +177,10 @@ type pqConnector struct {
 	dialer   pq.Dialer
 	dsn      string
 	initSQL  string
+
+	// replicationOrigin, when set, is selected on every connection this
+	// connector opens. See selectReplicationOrigin.
+	replicationOrigin string
 }
 
 func (c *pqConnector) Connect(ctx context.Context) (driver.Conn, error) {
@@ -206,7 +210,57 @@ func (c *pqConnector) Connect(ctx context.Context) (driver.Conn, error) {
 			return nil, fmt.Errorf("postgresio: connection init SQL failed: %w", initErr)
 		}
 	}
+
+	if err := selectReplicationOrigin(ctx, conn, c.replicationOrigin); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
 	return conn, nil
+}
+
+// selectReplicationOrigin marks the connection as replaying from origin, so
+// that every WAL record it subsequently produces carries that origin id.
+//
+// This is what breaks a bidirectional replication loop: a subscription
+// declared WITH (origin = none) skips changes that carry any origin, so the
+// peer does not replay our writes back at us.
+//
+// It is done once per physical connection, not per transaction, because the
+// selection is session state. PostgreSQL rejects a second selection on a
+// session that already has one, and a pooled connection outlives the
+// transactions that run on it.
+//
+// pg_replication_origin_xact_setup is deliberately not used. It takes
+// (origin_lsn, origin_timestamp) and records replay *progress*; it does not
+// name an origin, and it errors unless a session origin has already been
+// selected. It is the wrong tool for stamping outgoing writes.
+func selectReplicationOrigin(ctx context.Context, conn driver.Conn, origin string) error {
+	if origin == "" {
+		return nil
+	}
+
+	const stmt = "SELECT pg_catalog.pg_replication_origin_session_setup($1)"
+	args := []driver.NamedValue{{Ordinal: 1, Value: origin}}
+
+	var err error
+	switch execer := conn.(type) {
+	case driver.ExecerContext:
+		_, err = execer.ExecContext(ctx, stmt, args)
+	default:
+		// Every pq connection implements ExecerContext. A driver that does
+		// not cannot be told to stamp its writes, and continuing would leave
+		// bidirectional loop prevention silently off.
+		return fmt.Errorf("postgresio: cannot select replication origin %q: the driver connection does not "+
+			"support parameterized statements", origin)
+	}
+	if err != nil {
+		return fmt.Errorf("postgresio: failed to select replication origin %q: %w\n"+
+			"The origin must already exist (SELECT pg_replication_origin_create('%s')), and selecting it "+
+			"is superuser-only unless EXECUTE on pg_replication_origin_session_setup has been granted to "+
+			"this role. Continuing without the origin would disable bidirectional loop prevention",
+			origin, err, origin)
+	}
+	return nil
 }
 
 func (c *pqConnector) Driver() driver.Driver {
@@ -350,7 +404,25 @@ func WithMaxConnections(maxConns int) Option {
 	}
 }
 
-// WithPgBouncer enables compatibility flags for PgBouncer in transaction pooling mode.
+// WithPgBouncer declares that writes go through PgBouncer in transaction
+// pooling mode.
+//
+// Transaction pooling hands each transaction whichever server connection is
+// free, so nothing that lives in a session survives between them. The sink
+// responds by avoiding session state:
+//
+//   - WriteMethodStagedCopy is downgraded to WriteMethodUnnest. Staged COPY
+//     creates a temporary staging table once and reuses it across flushes; a
+//     later flush can land on a connection where that table was never created.
+//   - ConnectionInitSQL is warned about, because it runs when a pooled
+//     connection is opened and a later statement may be routed to a server
+//     connection that never ran it.
+//
+// WriteModeMerge is rejected outright at pipeline construction, since MERGE is
+// only expressible through the staged COPY path.
+//
+// Leave this off when connecting to PostgreSQL directly, or through PgBouncer
+// in session pooling mode; the downgrade costs throughput for no benefit.
 func WithPgBouncer(usePgBouncer bool) Option {
 	return func(o *WriteOptions) {
 		o.UsePgBouncer = usePgBouncer
