@@ -21,8 +21,10 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"fmt"
+	"net"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -521,7 +523,11 @@ func TestWriteAcceptsSchemaQualifiedTableName(t *testing.T) {
 
 	_, s := beam.NewPipelineWithRoot()
 	col := beam.Create(s, TestOrder{ID: 1, Region: "US", Amount: 100.0})
-	Write(s, "public.orders", NewWriteOptions(WithPrimaryKeyColumns("id")), col)
+	Write(s, "public.orders", NewWriteOptions(
+		WithHost("localhost"),
+		WithDatabase("testdb"),
+		WithPrimaryKeyColumns("id"),
+	), col)
 }
 
 func TestBuildMergeQuery(t *testing.T) {
@@ -679,6 +685,149 @@ func (c failingConnector) Connect(context.Context) (driver.Conn, error) {
 }
 func (c failingConnector) Driver() driver.Driver { return failingDriver{err: c.err} }
 
+// stmtRecorder captures every statement issued against the fake driver, so a
+// test can assert on both the statements and their transactional framing.
+type stmtRecorder struct {
+	mu    sync.Mutex
+	stmts []string
+}
+
+func (r *stmtRecorder) record(s string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.stmts = append(r.stmts, s)
+}
+
+func (r *stmtRecorder) all() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.stmts...)
+}
+
+func (r *stmtRecorder) indexOf(substr string) int {
+	for i, s := range r.all() {
+		if strings.Contains(s, substr) {
+			return i
+		}
+	}
+	return -1
+}
+
+type recordingConn struct{ rec *stmtRecorder }
+
+func (c recordingConn) Prepare(string) (driver.Stmt, error) { return nil, driver.ErrSkip }
+func (c recordingConn) Close() error                        { return nil }
+
+func (c recordingConn) Begin() (driver.Tx, error) {
+	c.rec.record("BEGIN")
+	return recordingTx{rec: c.rec}, nil
+}
+
+func (c recordingConn) ExecContext(_ context.Context, query string, _ []driver.NamedValue) (driver.Result, error) {
+	c.rec.record(query)
+	return driver.RowsAffected(0), nil
+}
+
+type recordingTx struct{ rec *stmtRecorder }
+
+func (t recordingTx) Commit() error   { t.rec.record("COMMIT"); return nil }
+func (t recordingTx) Rollback() error { t.rec.record("ROLLBACK"); return nil }
+
+type recordingDriver struct{ rec *stmtRecorder }
+
+func (d recordingDriver) Open(string) (driver.Conn, error) { return recordingConn{rec: d.rec}, nil }
+
+type recordingConnector struct{ rec *stmtRecorder }
+
+func (c recordingConnector) Connect(context.Context) (driver.Conn, error) {
+	return recordingConn{rec: c.rec}, nil
+}
+func (c recordingConnector) Driver() driver.Driver { return recordingDriver{rec: c.rec} }
+
+// newRecordingWriteFn builds a sink on the UNNEST path backed by the recording
+// driver, which reaches the parameterized execution path without needing the
+// staged COPY fast path or a real server.
+func newRecordingWriteFn(rec *stmtRecorder, opts ...Option) *writeFn {
+	fn := &writeFn{
+		Table:   `"public"."orders"`,
+		Options: NewWriteOptions(append([]Option{WithWriteMode(WriteModeInsert), WithWriteMethod(WriteMethodUnnest)}, opts...)...),
+		Type:    beam.EncodedType{T: reflect.TypeOf(TestOrder{})},
+		columns: []string{"id", "region", "amount"},
+		colTypes: map[string]string{
+			"id":     "INT8",
+			"region": "TEXT",
+			"amount": "FLOAT8",
+		},
+		db: sql.OpenDB(recordingConnector{rec: rec}),
+	}
+	fn.compactor = NewBatchCompactor(10, 1024, 0)
+	return fn
+}
+
+func drainRecordingWriteFn(t *testing.T, fn *writeFn) {
+	t.Helper()
+	ctx := context.Background()
+	noopSuccess := func(beam.X) {}
+	noopFailed := func(FailedRow) {}
+
+	if err := fn.ProcessElement(ctx, TestOrder{ID: 1, Region: "US", Amount: 10}, noopSuccess, noopFailed); err != nil {
+		t.Fatalf("ProcessElement: %v", err)
+	}
+	if err := fn.FinishBundle(ctx, noopSuccess, noopFailed); err != nil {
+		t.Fatalf("FinishBundle: %v", err)
+	}
+}
+
+// TestUnnestPathTagsReplicationOrigin covers the gap the reviewer found: only
+// executeStagedCopy tagged its transaction, so a write that took the
+// parameterized path -- either by configuration or by falling back after a
+// failed COPY -- went out untagged. A peer in a bidirectional topology would
+// not recognize those rows as its own and would replay them back.
+func TestUnnestPathTagsReplicationOrigin(t *testing.T) {
+	rec := &stmtRecorder{}
+	fn := newRecordingWriteFn(rec, WithReplicationOriginName("beam_sink"))
+	defer fn.db.Close()
+
+	drainRecordingWriteFn(t, fn)
+
+	originAt := rec.indexOf("pg_replication_origin_xact_setup")
+	if originAt < 0 {
+		t.Fatalf("the parameterized write was not tagged with the replication origin; statements: %v", rec.all())
+	}
+
+	beginAt := rec.indexOf("BEGIN")
+	if beginAt < 0 || beginAt > originAt {
+		t.Errorf("the origin must be set inside an explicit transaction; statements: %v", rec.all())
+	}
+
+	insertAt := rec.indexOf("INSERT INTO")
+	if insertAt < 0 || insertAt < originAt {
+		t.Errorf("the write must follow the origin tag, not precede it; statements: %v", rec.all())
+	}
+
+	if rec.indexOf("COMMIT") < insertAt {
+		t.Errorf("the tagged transaction was not committed after the write; statements: %v", rec.all())
+	}
+}
+
+// TestUnnestPathStaysInAutocommitWithoutOrigin confirms the transaction is
+// opened only when it carries a tag, so the hot path keeps its single
+// round trip.
+func TestUnnestPathStaysInAutocommitWithoutOrigin(t *testing.T) {
+	rec := &stmtRecorder{}
+	fn := newRecordingWriteFn(rec)
+	defer fn.db.Close()
+
+	drainRecordingWriteFn(t, fn)
+
+	if rec.indexOf("INSERT INTO") < 0 {
+		t.Fatalf("expected the write to be issued; statements: %v", rec.all())
+	}
+	if rec.indexOf("BEGIN") >= 0 {
+		t.Errorf("no origin was configured, so no transaction should have been opened; statements: %v", rec.all())
+	}
+}
+
 // TestWriteRoutesRejectedRowsToDLQOnExecFailure covers the case the dead-letter
 // queue exists for: the statement is well-formed and the server rejects the
 // data. Such a batch must not fail the bundle, because failing it would discard
@@ -751,5 +900,261 @@ func TestWriteOptionsPasswordRedaction(t *testing.T) {
 	}
 	if !strings.Contains(str, "<redacted>") {
 		t.Fatalf("WriteOptions string missing <redacted> token: %s", str)
+	}
+}
+
+// validWriteOpts returns options that satisfy every construction-time check,
+// so a test can introduce exactly one fault and attribute the panic to it.
+func validWriteOpts() WriteOptions {
+	return NewWriteOptions(
+		WithHost("localhost"),
+		WithDatabase("testdb"),
+		WithPrimaryKeyColumns("id"),
+	)
+}
+
+// writePanic runs Write with the given options and reports the panic message,
+// or "" when the call returned normally.
+func writePanic(t *testing.T, opts WriteOptions) string {
+	t.Helper()
+
+	var msg string
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				msg = fmt.Sprint(r)
+			}
+		}()
+		_, s := beam.NewPipelineWithRoot()
+		col := beam.Create(s, TestOrder{ID: 1, Region: "US", Amount: 1})
+		Write(s, "public.orders", opts, col)
+	}()
+	return msg
+}
+
+// TestWriteRejectsConflictModesWithoutPrimaryKeys covers the case the reviewer
+// called the exact opposite of what upsert promises: with no key, the
+// statement degrades to ON CONFLICT DO NOTHING and conflicting rows are
+// dropped while the pipeline reports success.
+func TestWriteRejectsConflictModesWithoutPrimaryKeys(t *testing.T) {
+	for _, mode := range []WriteMode{WriteModeUpsert, WriteModeMerge, WriteModeUpdate} {
+		t.Run(mode.String(), func(t *testing.T) {
+			opts := validWriteOpts()
+			opts.WriteMode = mode
+			opts.PrimaryKeyCols = nil
+
+			msg := writePanic(t, opts)
+			if msg == "" {
+				t.Fatalf("%v without primary keys was accepted; conflicting rows would be silently discarded", mode)
+			}
+			if !strings.Contains(msg, "PrimaryKeyCols") {
+				t.Errorf("panic does not name the option to set: %s", msg)
+			}
+		})
+	}
+}
+
+func TestWriteRejectsIncompleteConnectionTarget(t *testing.T) {
+	t.Run("empty host", func(t *testing.T) {
+		opts := validWriteOpts()
+		opts.Host = ""
+
+		msg := writePanic(t, opts)
+		if msg == "" {
+			t.Fatal("Write accepted an empty Host; the failure would surface on a worker as a bare libpq error")
+		}
+		if !strings.Contains(msg, "Host") {
+			t.Errorf("panic does not name the empty option: %s", msg)
+		}
+	})
+
+	t.Run("empty database", func(t *testing.T) {
+		opts := validWriteOpts()
+		opts.Database = ""
+
+		msg := writePanic(t, opts)
+		if msg == "" {
+			t.Fatal("Write accepted an empty Database")
+		}
+		if !strings.Contains(msg, "Database") {
+			t.Errorf("panic does not name the empty option: %s", msg)
+		}
+	})
+}
+
+// TestWriteRejectsInvalidSSLMode confirms validateSSLMode now guards the
+// struct-literal path, not just the option builders.
+func TestWriteRejectsInvalidSSLMode(t *testing.T) {
+	opts := validWriteOpts()
+	opts.SSLMode = "verify_full" // underscore rather than hyphen
+
+	msg := writePanic(t, opts)
+	if msg == "" {
+		t.Fatal("Write accepted an invalid sslmode; every worker would fail at connect time instead")
+	}
+	if !strings.Contains(msg, "verify_full") {
+		t.Errorf("panic does not quote the rejected value: %s", msg)
+	}
+}
+
+// TestWriteAcceptsEmptySSLModeAsDefault guards against the validation
+// rejecting the common case of leaving the mode unset, which is normalized to
+// DefaultSSLMode rather than treated as invalid.
+func TestWriteAcceptsEmptySSLModeAsDefault(t *testing.T) {
+	opts := validWriteOpts()
+	opts.SSLMode = ""
+
+	if msg := writePanic(t, opts); msg != "" {
+		t.Fatalf("Write rejected an unset SSLMode instead of applying the default: %s", msg)
+	}
+}
+
+// TestExtractRowValuesFromMap covers the panic the reviewer found:
+// ExtractPrimaryKeys accepted maps, but extractRowValues called FieldByName
+// unconditionally, so a map-shaped element took down the bundle.
+func TestExtractRowValuesFromMap(t *testing.T) {
+	fn := &writeFn{columns: []string{"id", "region", "amount", "missing"}}
+
+	vals := fn.extractRowValues(map[string]any{
+		"id":     int64(7),
+		"region": "US",
+		"amount": 12.5,
+	})
+
+	if len(vals) != 4 {
+		t.Fatalf("expected one value per column, got %d", len(vals))
+	}
+	if vals[0] != int64(7) {
+		t.Errorf("id: got %#v, want int64(7)", vals[0])
+	}
+	if vals[1] != "US" {
+		t.Errorf("region: got %#v, want \"US\"", vals[1])
+	}
+	if vals[2] != 12.5 {
+		t.Errorf("amount: got %#v, want 12.5", vals[2])
+	}
+	if vals[3] != nil {
+		t.Errorf("a column absent from the map should read as NULL, got %#v", vals[3])
+	}
+}
+
+// TestExtractRowValuesFromMapCaseInsensitive confirms maps fall back to a
+// case-insensitive key match, matching how struct fields already resolve.
+func TestExtractRowValuesFromMapCaseInsensitive(t *testing.T) {
+	fn := &writeFn{columns: []string{"id"}}
+
+	vals := fn.extractRowValues(map[string]any{"ID": int64(3)})
+	if vals[0] != int64(3) {
+		t.Errorf("expected the differently cased key to resolve, got %#v", vals[0])
+	}
+}
+
+// TestExtractRowValuesFromNilPointer confirms a nil element yields NULLs
+// rather than dereferencing through a nil pointer.
+func TestExtractRowValuesFromNilPointer(t *testing.T) {
+	fn := &writeFn{columns: []string{"id"}}
+
+	vals := fn.extractRowValues((*TestOrder)(nil))
+	if vals[0] != nil {
+		t.Errorf("expected NULL for a nil element, got %#v", vals[0])
+	}
+}
+
+// TestBuildUnnestQueryFromMapElements is the same panic in the other
+// reflection path, which builds the parameterized statement.
+func TestBuildUnnestQueryFromMapElements(t *testing.T) {
+	fn := &writeFn{
+		Table:          `"public"."orders"`,
+		Options:        validWriteOpts(),
+		Type:           beam.EncodedType{T: reflect.TypeOf(map[string]any{})},
+		PrimaryKeyCols: []string{"id"},
+		columns:        []string{"id", "region"},
+		colTypes:       map[string]string{"id": "INT8", "region": "TEXT"},
+	}
+
+	batch := []any{
+		map[string]any{"id": int64(1), "region": "US"},
+		map[string]any{"id": int64(2), "region": "EU"},
+	}
+
+	query, args, err := fn.buildUnnestQuery(batch)
+	if err != nil {
+		t.Fatalf("unexpected error building unnest query from map elements: %v", err)
+	}
+	if !strings.Contains(query, `"id", "region"`) {
+		t.Errorf("query does not name the map-derived columns: %s", query)
+	}
+	if len(args) != 2 {
+		t.Fatalf("expected one array argument per column, got %d", len(args))
+	}
+}
+
+// TestWriteSetupRejectsLostDialFunc covers a dialer that was configured at
+// construction but dropped crossing the serialization boundary. Connecting
+// anyway would bypass the proxy the caller installed.
+func TestWriteSetupRejectsLostDialFunc(t *testing.T) {
+	fn := &writeFn{
+		Table: `"public"."orders"`,
+		Options: WriteOptions{
+			Host:             "localhost",
+			Port:             5432,
+			Database:         "testdb",
+			SSLMode:          SSLModeDisable,
+			RequiresDialFunc: true, // survived serialization
+			DialFunc:         nil,  // did not
+		},
+	}
+
+	err := fn.Setup(context.Background())
+	if err == nil {
+		t.Fatal("Setup connected without the configured dialer, silently bypassing the intended proxy")
+	}
+	if !strings.Contains(err.Error(), "DialFunc") {
+		t.Errorf("error does not identify the lost dialer: %v", err)
+	}
+}
+
+// TestDialFuncMarkerSurvivesSerialization demonstrates the premise the marker
+// rests on: Beam encodes DoFn fields as JSON, which drops the closure and
+// keeps the bool. Without the bool, a worker cannot distinguish a pipeline
+// that never wanted a dialer from one whose dialer was lost.
+func TestDialFuncMarkerSurvivesSerialization(t *testing.T) {
+	original := WriteOptions{
+		Host:     "localhost",
+		Database: "testdb",
+		DialFunc: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return nil, fmt.Errorf("unused")
+		},
+		RequiresDialFunc: true,
+	}
+
+	encoded, err := json.Marshal(original)
+	if err != nil {
+		t.Fatalf("options must be JSON-encodable to cross the worker boundary: %v", err)
+	}
+
+	var decoded WriteOptions
+	if err := json.Unmarshal(encoded, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	if decoded.DialFunc != nil {
+		t.Error("a closure is not serializable; DialFunc should not have survived")
+	}
+	if !decoded.RequiresDialFunc {
+		t.Error("RequiresDialFunc did not survive, so a worker cannot detect the lost dialer")
+	}
+}
+
+// TestWriteAcceptsDialFunc confirms the construction-time checks do not reject
+// a pipeline that legitimately supplies a dialer.
+func TestWriteAcceptsDialFunc(t *testing.T) {
+	opts := validWriteOpts()
+	opts.DialFunc = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return nil, fmt.Errorf("unused")
+	}
+
+	if msg := writePanic(t, opts); msg != "" {
+		t.Fatalf("Write rejected a pipeline with a custom dialer: %s", msg)
 	}
 }

@@ -138,6 +138,9 @@ func Read(s beam.Scope, table string, t reflect.Type, opts ReadOptions) beam.PCo
 		panic("postgresio.Read: record type t cannot be nil")
 	}
 
+	// Recorded while the closure is still observable; see DialFunc.
+	opts.RequiresDialFunc = opts.DialFunc != nil
+
 	if opts.NumPartitions > 1 && opts.PartitionColumn != "" {
 		ranges, err := planPartitions(opts.LowerBound, opts.UpperBound, opts.NumPartitions)
 		if err != nil {
@@ -178,6 +181,9 @@ func Query(s beam.Scope, query string, t reflect.Type, opts ReadOptions) beam.PC
 		panic("postgresio.Query: record type t cannot be nil")
 	}
 
+	// Recorded while the closure is still observable; see DialFunc.
+	opts.RequiresDialFunc = opts.DialFunc != nil
+
 	imp := beam.Impulse(s)
 	return beam.ParDo(s, &singleReadFn{
 		Query:   query,
@@ -213,6 +219,12 @@ func (fn *singleReadFn) Setup(ctx context.Context) error {
 	var rawID [8]byte
 	_, _ = rand.Read(rawID[:])
 	fn.workerID = hex.EncodeToString(rawID[:])
+
+	// A configured dialer that arrives nil was dropped crossing the
+	// serialization boundary.
+	if fn.Options.RequiresDialFunc && fn.Options.DialFunc == nil {
+		return errDialFuncLost()
+	}
 
 	dsn := buildWriteDSN(fn.Options.Host, fn.Options.Port, fn.Options.Database,
 		fn.Options.Username, fn.Options.ResolvePassword(), fn.Options.SSLMode)
@@ -274,6 +286,12 @@ func (fn *partitionedReadFn) Setup(ctx context.Context) error {
 	var rawID [8]byte
 	_, _ = rand.Read(rawID[:])
 	fn.workerID = hex.EncodeToString(rawID[:])
+
+	// A configured dialer that arrives nil was dropped crossing the
+	// serialization boundary.
+	if fn.Options.RequiresDialFunc && fn.Options.DialFunc == nil {
+		return errDialFuncLost()
+	}
 
 	dsn := buildWriteDSN(fn.Options.Host, fn.Options.Port, fn.Options.Database,
 		fn.Options.Username, fn.Options.ResolvePassword(), fn.Options.SSLMode)

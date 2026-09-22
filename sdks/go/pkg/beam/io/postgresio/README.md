@@ -478,7 +478,8 @@ pipeline:
 | `WithDatabase(string)` | `""` | Target database name |
 | `WithUsername(string)` | `""` | Database user role |
 | `WithPassword(string)` | `""` | Database password |
-| `WithWriteMode(WriteMode)` | `WriteModeUpsert` | Mutation strategy: `WriteModeInsert`, `WriteModeUpsert`, `WriteModeUpdate` |
+| `WithSSLMode(string)` | `verify-full` | SSL connection mode (`disable`, `require`, `verify-ca`, `verify-full`) |
+| `WithWriteMode(WriteMode)` | `WriteModeUpsert` | Mutation strategy: `WriteModeInsert`, `WriteModeUpsert`, `WriteModeUpdate`, `WriteModeMerge` |
 | `WithPrimaryKeyColumns(...string)` | `nil` | Primary key columns used for `ON CONFLICT` resolution |
 | `WithBatchSize(int)` | `5000` | Maximum rows per micro-batch flush |
 | `WithMaxBatchBytes(int)` | `8388608` (8 MB) | Maximum bytes per micro-batch flush |

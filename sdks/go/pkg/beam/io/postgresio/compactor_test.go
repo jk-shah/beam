@@ -16,6 +16,7 @@
 package postgresio
 
 import (
+	"database/sql"
 	"errors"
 	"strings"
 	"testing"
@@ -165,8 +166,8 @@ func TestExtractPrimaryKeys(t *testing.T) {
 	order := TestOrder{ID: 42, Region: "US", Amount: 99.5}
 
 	entityKey, sortKeys := ExtractPrimaryKeys(order, []string{"id", "region"})
-	if entityKey != "42|US|" {
-		t.Errorf("expected entity key '42|US|', got %q", entityKey)
+	if entityKey != "i:42|s:US|" {
+		t.Errorf("expected entity key 'i:42|s:US|', got %q", entityKey)
 	}
 	if len(sortKeys) != 2 || sortKeys[0] != int64(42) || sortKeys[1] != "US" {
 		t.Errorf("unexpected sort keys: %v", sortKeys)
@@ -199,5 +200,96 @@ func TestExtractPrimaryKeysCollisionResistance(t *testing.T) {
 
 	if key3 == key4 {
 		t.Fatalf("expected distinct keys for backslash-containing fields, but both got %q", key3)
+	}
+}
+
+// TestFormatPKPartCollapsesEquivalentNumerics pins the property that made
+// fmt.Sprint unsuitable: the same key value must produce the same part
+// regardless of the Go type that happens to carry it. A column read as int32
+// from a struct and int64 from a decoded map is the same row.
+func TestFormatPKPartCollapsesEquivalentNumerics(t *testing.T) {
+	type OrderID int64
+
+	want := formatPKPart(int64(5))
+	equivalents := []any{
+		int(5), int8(5), int16(5), int32(5), int64(5),
+		uint(5), uint8(5), uint16(5), uint32(5), uint64(5),
+		float32(5), float64(5),
+		OrderID(5),
+	}
+
+	for _, v := range equivalents {
+		if got := formatPKPart(v); got != want {
+			t.Errorf("formatPKPart(%T(%v)) = %q, want %q", v, v, got, want)
+		}
+	}
+}
+
+// TestFormatPKPartSeparatesCategories pins the other half: values that are
+// genuinely different must not share a part. fmt.Sprint rendered the string
+// "5", the integer 5 and the float 5.0 all as "5".
+func TestFormatPKPartSeparatesCategories(t *testing.T) {
+	seen := map[string]any{}
+	for _, v := range []any{
+		int64(5),
+		"5",
+		true,
+		5.5,
+		[]byte("5"),
+		time.Unix(5, 0),
+	} {
+		got := formatPKPart(v)
+		if prev, dup := seen[got]; dup {
+			t.Errorf("formatPKPart(%T(%v)) collided with %T(%v) at %q", v, v, prev, prev, got)
+		}
+		seen[got] = v
+	}
+}
+
+// TestFormatPKPartNormalizesTime confirms two identical instants recorded in
+// different locations produce one key rather than two.
+func TestFormatPKPartNormalizesTime(t *testing.T) {
+	utc := time.Date(2024, 3, 1, 12, 0, 0, 0, time.UTC)
+	elsewhere := utc.In(time.FixedZone("UTC+5", 5*60*60))
+
+	if formatPKPart(utc) != formatPKPart(elsewhere) {
+		t.Errorf("the same instant produced two keys: %q vs %q",
+			formatPKPart(utc), formatPKPart(elsewhere))
+	}
+}
+
+// TestFormatPKPartHandlesNil confirms an absent key and an explicit nil agree,
+// and that a typed nil pointer does not panic.
+func TestFormatPKPartHandlesNil(t *testing.T) {
+	if got := formatPKPart(nil); got != "nil" {
+		t.Errorf("formatPKPart(nil) = %q, want \"nil\"", got)
+	}
+	if got := formatPKPart((*int64)(nil)); got != "nil" {
+		t.Errorf("formatPKPart((*int64)(nil)) = %q, want \"nil\"", got)
+	}
+}
+
+// TestFormatPKPartUnwrapsValuer confirms sql.NullInt64 keys on the value it
+// holds rather than on the wrapper's Go rendering.
+func TestFormatPKPartUnwrapsValuer(t *testing.T) {
+	if got, want := formatPKPart(sql.NullInt64{Int64: 5, Valid: true}), formatPKPart(int64(5)); got != want {
+		t.Errorf("wrapped key %q does not match bare key %q", got, want)
+	}
+	if got := formatPKPart(sql.NullInt64{Valid: false}); got != "nil" {
+		t.Errorf("an invalid NullInt64 should read as NULL, got %q", got)
+	}
+}
+
+// TestExtractPrimaryKeysAcceptsMapRows confirms map-shaped rows key the same
+// way as their struct equivalents, which is what lets CDC rows compact.
+func TestExtractPrimaryKeysAcceptsMapRows(t *testing.T) {
+	structKey, _ := ExtractPrimaryKeys(TestOrder{ID: 42, Region: "US"}, []string{"id", "region"})
+	mapKey, _ := ExtractPrimaryKeys(map[string]any{
+		"id":     int64(42),
+		"region": "US",
+	}, []string{"id", "region"})
+
+	if structKey != mapKey {
+		t.Errorf("struct row keyed %q but the equivalent map row keyed %q", structKey, mapKey)
 	}
 }

@@ -17,10 +17,14 @@ package postgresio
 
 import (
 	"bytes"
+	"database/sql/driver"
+	"encoding/hex"
 	"fmt"
+	"math"
 	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -317,12 +321,98 @@ func ExtractPrimaryKeys(val any, pkCols []string) (string, []any) {
 	return "", nil
 }
 
+// formatPKPart renders one primary key component into the canonical string
+// used to group rows for compaction and to order them for deadlock avoidance.
+//
+// Two rows carrying the same key must always produce the same part, and two
+// rows carrying different keys must never produce the same part. fmt.Sprint
+// alone satisfies neither for the types PostgreSQL primary keys actually use.
+//
+// Width and named types are why the numeric cases dispatch on reflect.Kind
+// instead of on concrete types. The same column arrives as int32 on a row
+// built from a struct and int64 on a row decoded from a map, and a declared
+// type such as `type OrderID int64` matches no concrete case at all. Kind sees
+// through both to the underlying representation.
+//
+// Category prefixes are why the string "5" no longer collides with the number
+// 5: a value can now only share a part with another value of its own
+// category. fmt.Sprint rendered both as "5".
+//
+// Integral floats deliberately fall into the integer category. fmt.Sprint
+// renders float64(5) as "5" already, so the collapse is not new; making it
+// explicit means a numeric column decoded as float64 on one row and int64 on
+// another still groups as one key, which is what PostgreSQL considers it to
+// be. Non-integral floats use a shortest round-trip form so that equal values
+// never differ by spelling.
+//
+// []byte renders as hex rather than Go's "[104 105]" slice syntax, which both
+// shortens the key and keeps it free of the separator characters. time.Time is
+// normalized to UTC so two identical instants recorded in different locations
+// do not read as distinct keys.
 func formatPKPart(v any) string {
 	if v == nil {
 		return "nil"
 	}
-	s := fmt.Sprint(v)
+
+	// sql.NullString, sql.NullInt64 and the driver wrappers used by pgtype all
+	// carry the real key inside. Unwrap first so the value is classified on
+	// what it holds rather than on the wrapper type.
+	if valuer, ok := v.(driver.Valuer); ok {
+		dv, err := valuer.Value()
+		if err == nil {
+			if dv == nil {
+				return "nil"
+			}
+			if _, nested := dv.(driver.Valuer); !nested {
+				return formatPKPart(dv)
+			}
+		}
+	}
+
+	switch t := v.(type) {
+	case time.Time:
+		return "t:" + t.UTC().Format(time.RFC3339Nano)
+	case []byte:
+		return "x:" + hex.EncodeToString(t)
+	}
+
+	rv := reflect.ValueOf(v)
+	for rv.Kind() == reflect.Ptr {
+		if rv.IsNil() {
+			return "nil"
+		}
+		rv = rv.Elem()
+	}
+
+	switch rv.Kind() {
+	case reflect.Bool:
+		return "b:" + strconv.FormatBool(rv.Bool())
+
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return "i:" + strconv.FormatInt(rv.Int(), 10)
+
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return "i:" + strconv.FormatUint(rv.Uint(), 10)
+
+	case reflect.Float32, reflect.Float64:
+		f := rv.Float()
+		// Bounded well inside the int64 range: beyond it the conversion is
+		// undefined, and such a value is not a plausible key anyway.
+		if f == math.Trunc(f) && math.Abs(f) < 1<<62 {
+			return "i:" + strconv.FormatInt(int64(f), 10)
+		}
+		return "f:" + strconv.FormatFloat(f, 'g', -1, 64)
+
+	case reflect.String:
+		return "s:" + escapePKPart(rv.String())
+	}
+
+	return "?:" + escapePKPart(fmt.Sprint(v))
+}
+
+// escapePKPart neutralizes the separator so that a value containing it cannot
+// be read as two components.
+func escapePKPart(s string) string {
 	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `|`, `\|`)
-	return s
+	return strings.ReplaceAll(s, `|`, `\|`)
 }

@@ -42,6 +42,23 @@ const (
 	WriteModeMerge
 )
 
+// String returns the mode's name, so diagnostics identify it by the constant
+// callers wrote rather than by its ordinal.
+func (m WriteMode) String() string {
+	switch m {
+	case WriteModeInsert:
+		return "WriteModeInsert"
+	case WriteModeUpsert:
+		return "WriteModeUpsert"
+	case WriteModeUpdate:
+		return "WriteModeUpdate"
+	case WriteModeMerge:
+		return "WriteModeMerge"
+	default:
+		return fmt.Sprintf("WriteMode(%d)", int(m))
+	}
+}
+
 var identifierRegex = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_$]*$`)
 
 // WriteMethod determines the bulk loading mechanism used to insert or upsert rows.
@@ -60,7 +77,31 @@ const (
 // DialFunc defines a pluggable network dialer interface for connecting to PostgreSQL.
 // Used by cloud-specific dialers (e.g., Google Cloud SQL, AlloyDB) to establish
 // authenticated mTLS socket connections.
+//
+// A DialFunc is a Go closure and cannot be serialized, so it reaches a worker
+// only on runners that execute in the submitting process. On a distributed
+// runner the field arrives nil. The options structs therefore carry a
+// RequiresDialFunc marker, which does serialize, so the worker can tell a
+// pipeline that never configured a dialer apart from one whose dialer was
+// dropped in transit and fail loudly instead of quietly opening a direct
+// connection that bypasses the intended proxy.
 type DialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
+// errDialFuncLost reports a dialer that was configured at pipeline
+// construction but did not reach this worker.
+//
+// Continuing without it would open a direct TCP connection to Host:Port,
+// silently bypassing the Cloud SQL connector, AlloyDB connector or IAM proxy
+// tunnel the caller installed. That route is usually the only authorized one
+// and often the only encrypted one, so the connection has to fail rather than
+// quietly succeed by another path.
+func errDialFuncLost() error {
+	return fmt.Errorf("postgresio: a custom DialFunc was configured but did not reach this worker. " +
+		"A dialer is a Go closure and cannot be serialized, so it is only available on runners that " +
+		"execute in the submitting process. On a distributed runner, reach the database through a " +
+		"sidecar or proxy that the worker can dial directly (for example the Cloud SQL Auth Proxy) " +
+		"and leave DialFunc unset")
+}
 
 // WriteOptions configures connection pooling, write mutation modes, batch thresholds,
 // and safety guards for writing to PostgreSQL.
@@ -83,10 +124,17 @@ type WriteOptions struct {
 	ConnectionInitSQL     string
 	ReplicationOriginName string
 	DialFunc              DialFunc `beam:"-" json:"-"`
-	OpColumn              string
-	DeleteOpValue         string
-	ExplainAnalyze        bool
-	ExplainSampleRate     float64
+
+	// RequiresDialFunc records that a custom dialer was configured. It is set
+	// automatically by Write and should not be assigned directly. Unlike
+	// DialFunc it survives serialization, which is what lets a worker detect
+	// that the dialer itself did not.
+	RequiresDialFunc bool
+
+	OpColumn          string
+	DeleteOpValue     string
+	ExplainAnalyze    bool
+	ExplainSampleRate float64
 }
 
 // String returns a redacted representation of the WriteOptions, safe for logging.

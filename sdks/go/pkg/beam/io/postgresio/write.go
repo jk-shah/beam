@@ -94,9 +94,52 @@ func Write(s beam.Scope, table string, opts WriteOptions, col beam.PCollection) 
 		panic(fmt.Sprintf("postgresio.Write: invalid table name %q: %v", table, err))
 	}
 
+	// Upsert and MERGE both resolve conflicts through the primary key. With no
+	// key, the upsert degrades to ON CONFLICT DO NOTHING and MERGE has no join
+	// condition, so conflicting rows are dropped -- the exact opposite of what
+	// both modes promise. Nothing downstream can detect this: the pipeline
+	// reports success and the rows are simply absent.
+	if (opts.WriteMode == WriteModeUpsert || opts.WriteMode == WriteModeMerge) && len(opts.PrimaryKeyCols) == 0 {
+		panic(fmt.Sprintf("postgresio.Write: write mode %v requires primary key columns (PrimaryKeyCols); "+
+			"without them conflicting rows are silently discarded rather than merged. "+
+			"Set PrimaryKeyCols, or use WriteModeInsert if plain inserts are intended.", opts.WriteMode))
+	}
+
 	if opts.WriteMode == WriteModeUpdate && len(opts.PrimaryKeyCols) == 0 {
 		panic("postgresio.Write: WriteModeUpdate requires primary key columns (PrimaryKeyCols)")
 	}
+
+	// Connection identity is checked here rather than left to the worker. A
+	// missing host or database otherwise fails inside Setup on a distributed
+	// runner, long after submission, as a libpq connection error that names
+	// neither the option that was left empty nor the transform that needed it.
+	if opts.Host == "" {
+		panic("postgresio.Write: Host must be set. For a Unix domain socket, set Host to the " +
+			"socket directory, for example \"/var/run/postgresql\"; libpq's compiled-in default is " +
+			"not assumed because it differs between distributions and container images")
+	}
+	if opts.Database == "" {
+		panic("postgresio.Write: Database must be set. libpq would otherwise default it to the " +
+			"username, which is rarely the intended target")
+	}
+
+	// validateSSLMode already guards the CDC and option-builder paths. Applying
+	// it to the effective value here closes the gap for callers that build
+	// WriteOptions as a struct literal and bypass NewWriteOptions, so a typo
+	// such as "verify_full" is rejected at construction instead of at connect
+	// time on every worker.
+	effectiveSSLMode := opts.SSLMode
+	if effectiveSSLMode == "" {
+		effectiveSSLMode = DefaultSSLMode
+	}
+	if err := validateSSLMode(effectiveSSLMode); err != nil {
+		panic(fmt.Sprintf("postgresio.Write: %v", err))
+	}
+
+	// Recorded here, in the submitting process, because this is the last point
+	// at which the closure is observable. Setup runs on the worker, where a
+	// dropped DialFunc and an unconfigured one are otherwise indistinguishable.
+	opts.RequiresDialFunc = opts.DialFunc != nil
 
 	elemType := col.Type().Type()
 	fn := &writeFn{
@@ -155,6 +198,12 @@ func (fn *writeFn) Setup(ctx context.Context) error {
 
 	if fn.Options.WriteMode == WriteModeUpdate && len(fn.PrimaryKeyCols) == 0 {
 		return fmt.Errorf("postgresio: WriteModeUpdate requires primary key columns (PrimaryKeyCols)")
+	}
+
+	// A configured dialer that arrives nil was dropped crossing the
+	// serialization boundary.
+	if fn.Options.RequiresDialFunc && fn.Options.DialFunc == nil {
+		return errDialFuncLost()
 	}
 
 	sslMode := fn.Options.SSLMode
@@ -374,12 +423,45 @@ func (fn *writeFn) writePartition(ctx context.Context, part writePartition, emit
 		return err
 	}
 
+	// The parameterized path runs in autocommit unless a replication origin is
+	// configured. An origin has to be attached with
+	// pg_replication_origin_xact_setup, which only takes effect inside an
+	// explicit transaction, so one is opened solely to carry the tag.
+	//
+	// Tagging here is not optional. executeStagedCopy already tags its own
+	// transaction, and this path is reached both when the caller selects
+	// WriteMethodUnnest and when a staged COPY fails and falls through. If the
+	// fallback wrote untagged, a bidirectional topology would stop recognizing
+	// these rows as its own and replay them back to their source, which is the
+	// replication loop the origin exists to break -- and it would appear only
+	// for the batches that happened to fail COPY.
+	execBatch := func(ctx context.Context) error {
+		if fn.Options.ReplicationOriginName == "" {
+			_, err := fn.db.ExecContext(ctx, query, args...)
+			return err
+		}
+
+		txn, err := fn.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = txn.Rollback() }()
+
+		if err := fn.setupReplicationOrigin(ctx, txn); err != nil {
+			return err
+		}
+		if _, err := txn.ExecContext(ctx, query, args...); err != nil {
+			return err
+		}
+		return txn.Commit()
+	}
+
 	// Safety net: retry loop for SQLState 40P01 deadlock detected with full-jitter exponential backoff
 	maxRetries := 5
 	backoff := 50 * time.Millisecond
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
-		_, execErr := fn.db.ExecContext(ctx, query, args...)
+		execErr := execBatch(ctx)
 		if execErr == nil {
 			sinkWrittenRows.Inc(ctx, int64(len(batch)))
 			for _, item := range batch {
@@ -688,35 +770,106 @@ func (fn *writeFn) executeStagedCopy(ctx context.Context, batch []any) error {
 	return txn.Commit()
 }
 
-func (fn *writeFn) extractRowValues(item any) []any {
+// derefElement unwraps an input element down to the value that carries its
+// columns, returning the zero Value when there is nothing to read.
+//
+// Elements arrive as structs, pointers to structs, maps, or an interface
+// holding any of those. A nil pointer anywhere in that chain yields an invalid
+// Value rather than a panic, and resolveColumn reports every column of such an
+// element as absent.
+func derefElement(item any) reflect.Value {
 	v := reflect.ValueOf(item)
-	if v.Kind() == reflect.Ptr {
+	for v.Kind() == reflect.Ptr || v.Kind() == reflect.Interface {
+		if v.IsNil() {
+			return reflect.Value{}
+		}
 		v = v.Elem()
 	}
-	vals := make([]any, len(fn.columns))
-	t := v.Type()
-	for i, colName := range fn.columns {
-		f := v.FieldByName(colName)
-		if !f.IsValid() {
-			for j := 0; j < t.NumField(); j++ {
-				fld := t.Field(j)
-				if strings.EqualFold(fld.Name, colName) || fld.Tag.Get("db") == colName || fld.Tag.Get("beam") == colName || fld.Tag.Get("json") == colName {
-					f = v.Field(j)
-					break
-				}
+	return v
+}
+
+// resolveColumn returns the value stored under a column name within a single
+// input element, along with its declared type where one exists.
+//
+// The sink accepts both structs and maps: ExtractPrimaryKeys has always
+// handled each, and the CDC decoders emit map[string]any for tables whose
+// shape is only known at runtime. Resolution has to branch on the element kind
+// because reflect panics when the accessor does not match the kind --
+// FieldByName and NumField on a map, MapIndex on a struct. Calling them
+// unconditionally turned a map-shaped element into a panic that took down the
+// whole bundle.
+//
+// Structs match on the exact field name first, then case-insensitively, then
+// on the db, beam and json struct tags. Maps match on the exact key first and
+// then case-insensitively, which keeps the map[string]any rows produced by CDC
+// behaving like their struct equivalents. Unexported struct fields are skipped
+// because reading one through reflection panics.
+//
+// The declared type is returned only for structs; a map carries no static
+// per-key type, so callers fall back to the column type reported by the
+// server.
+func resolveColumn(v reflect.Value, colName string) (any, reflect.Type, bool) {
+	if !v.IsValid() {
+		return nil, nil, false
+	}
+
+	switch v.Kind() {
+	case reflect.Struct:
+		if f := v.FieldByName(colName); f.IsValid() && f.CanInterface() {
+			return f.Interface(), f.Type(), true
+		}
+		t := v.Type()
+		for i := 0; i < t.NumField(); i++ {
+			fld := t.Field(i)
+			if !fld.IsExported() {
+				continue
+			}
+			if strings.EqualFold(fld.Name, colName) ||
+				fld.Tag.Get("db") == colName ||
+				fld.Tag.Get("beam") == colName ||
+				fld.Tag.Get("json") == colName {
+				return v.Field(i).Interface(), fld.Type, true
 			}
 		}
-		if f.IsValid() {
-			val := f.Interface()
-			if vec, ok := val.(Vector); ok {
-				vals[i] = FormatVectorLiteral(vec)
-			} else if f32s, ok := val.([]float32); ok {
-				vals[i] = FormatVectorLiteral(f32s)
-			} else {
-				vals[i] = val
+
+	case reflect.Map:
+		kt := v.Type().Key()
+		if kt.Kind() != reflect.String {
+			return nil, nil, false
+		}
+		key := reflect.ValueOf(colName)
+		if key.Type() != kt {
+			key = key.Convert(kt)
+		}
+		if mv := v.MapIndex(key); mv.IsValid() {
+			return mv.Interface(), nil, true
+		}
+		for _, mk := range v.MapKeys() {
+			if strings.EqualFold(mk.String(), colName) {
+				return v.MapIndex(mk).Interface(), nil, true
 			}
-		} else {
+		}
+	}
+
+	return nil, nil, false
+}
+
+func (fn *writeFn) extractRowValues(item any) []any {
+	v := derefElement(item)
+	vals := make([]any, len(fn.columns))
+	for i, colName := range fn.columns {
+		val, _, ok := resolveColumn(v, colName)
+		if !ok {
 			vals[i] = nil
+			continue
+		}
+		switch vec := val.(type) {
+		case Vector:
+			vals[i] = FormatVectorLiteral(vec)
+		case []float32:
+			vals[i] = FormatVectorLiteral(vec)
+		default:
+			vals[i] = val
 		}
 	}
 	return vals
@@ -785,32 +938,15 @@ func (fn *writeFn) buildUnnestQueryForColumns(batch []any, columns []string) (st
 		columnArrays[i] = make([]any, len(batch))
 	}
 
-	columnTypes := make([]reflect.Type, len(columns))
 	for rowIdx, item := range batch {
-		v := reflect.ValueOf(item)
-		if v.Kind() == reflect.Ptr {
-			v = v.Elem()
-		}
+		v := derefElement(item)
 		for colIdx, colName := range columns {
-			f := v.FieldByName(colName)
-			if !f.IsValid() {
-				t := v.Type()
-				for j := 0; j < t.NumField(); j++ {
-					fld := t.Field(j)
-					if strings.EqualFold(fld.Name, colName) || fld.Tag.Get("db") == colName || fld.Tag.Get("beam") == colName || fld.Tag.Get("json") == colName {
-						f = v.Field(j)
-						columnTypes[colIdx] = fld.Type
-						break
-					}
-				}
-			} else {
-				columnTypes[colIdx] = f.Type()
-			}
-			if f.IsValid() {
-				columnArrays[colIdx][rowIdx] = f.Interface()
-			} else {
+			val, _, ok := resolveColumn(v, colName)
+			if !ok {
 				columnArrays[colIdx][rowIdx] = nil
+				continue
 			}
+			columnArrays[colIdx][rowIdx] = val
 		}
 	}
 

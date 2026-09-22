@@ -44,6 +44,12 @@ type ReadOptions struct {
 
 	// Custom network dialer (unexported from JSON to avoid serialization errors).
 	DialFunc DialFunc `beam:"-" json:"-"`
+
+	// RequiresDialFunc records that a custom dialer was configured. It is set
+	// automatically by Read and should not be assigned directly. Unlike
+	// DialFunc it survives serialization, which is what lets a worker detect
+	// that the dialer itself did not.
+	RequiresDialFunc bool `json:"requires_dial_func,omitempty"`
 }
 
 // ReadOption is a functional configuration option for ReadOptions.
