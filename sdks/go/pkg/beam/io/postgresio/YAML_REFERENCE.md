@@ -42,7 +42,7 @@ Do not edit this document manually; update the struct tags in the `schematransfo
 | `sslmode` | string | No | SSL mode (e.g. disable, require, verify-ca, verify-full). |
 | `sslrootcert` | string | No | Path to SSL root certificate file (PEM format) for verify-ca/verify-full. |
 | `conflict_keys` | list[string] | No | Columns used as primary or unique key conflict targets for UPSERT. |
-| `update_fields` | list[string] | No | Columns to update ON CONFLICT DO UPDATE. If empty, uses DO NOTHING. |
+| `update_fields` | list[string] | No | Subset of columns to set under write_mode UPSERT or UPDATE. Matched exactly and case-sensitively against column names. If empty, every non-conflict-key column is set. |
 | `max_batch_rows` | integer (int32) | No | Maximum rows per batch UNNEST statement (default: 5000). |
 | `max_batch_bytes` | integer (int32) | No | Maximum byte buffer threshold before flushing (default: 8MB). |
 | `use_pgbouncer` | boolean | No | Enable single-statement transaction pooling for PgBouncer compatibility. |
