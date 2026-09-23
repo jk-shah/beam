@@ -1,0 +1,54 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# Database Sequence & Identity Reconciliation in Declarative Beam YAML
+#
+# Use Case:
+# Bulk loading or logical replication populates primary key values directly without
+# advancing PostgreSQL sequence counters (SERIAL, BIGSERIAL, IDENTITY).
+# This pipeline sinks migrated data and computes the maximum primary key to generate
+# the required SELECT setval(...) statement, preventing primary key collisions at cutover.
+#
+# Execution:
+#   python3 -m apache_beam.yaml.main --yaml_pipeline_file=pipeline.yaml
+
+pipeline:
+  type: chain
+  transforms:
+    - type: Create
+      name: GenerateMigratedRecords
+      config:
+        elements:
+          - order_id: 100001
+            description: "order_migration_alpha"
+          - order_id: 100002
+            description: "order_migration_beta"
+          - order_id: 100050
+            description: "order_migration_gamma"
+
+    - type: WriteToPostgresIO
+      name: SinkMigratedOrders
+      config:
+        host: "localhost"
+        port: 5432
+        database: "beammeup"
+        username: "beam_navigator"
+        password_env_var: "PGPASSWORD"
+        table: "public.orders_sequence_demo"
+        conflict_keys: ["order_id"]
+        write_mode: "UPSERT"
+        max_batch_rows: 1000

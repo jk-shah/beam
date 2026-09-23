@@ -1,0 +1,131 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# Cross-Database Replication with Geo Fan-Out & PII Masking in Beam YAML
+#
+# Use Case:
+# Replicates customer accounts from a centralized PostgreSQL source to regional
+# destination databases (US, EU, APAC). Masks sensitive SSN and email fields in-flight,
+# partitions records by geographic region, and writes using SQL standard MERGE
+# with in-band EXPLAIN plan telemetry and PgBouncer transaction pooling compatibility.
+#
+# Execution:
+#   python3 -m apache_beam.yaml.main --yaml_pipeline_file=pipeline.yaml
+
+pipeline:
+  transforms:
+    - type: ReadFromPostgresCDC
+      name: ReadCentralCDC
+      config:
+        host: "localhost"
+        port: 5432
+        database: "central_db"
+        username: "beam_cdc"
+        password_env_var: "PGPASSWORD"
+        slot_name: "beam_geo_slot"
+        publication: "pub_customer_accounts"
+        failover_slot: true
+
+    - type: MapToFields
+      name: MaskPII
+      input: ReadCentralCDC
+      config:
+        language: python
+        fields:
+          account_id: account_id
+          customer_name: customer_name
+          ssn: "ssn[:3] + '-**-' + ssn[-4:] if len(ssn) >= 9 else '***-**-****'"
+          email: "email[0] + '***@' + email.split('@')[1] if '@' in email else '***@redacted.local'"
+          geo_region: geo_region
+          balance: balance
+          lsn: lsn
+          _op_type: _op_type
+
+    # Branch 1: US Region Fan-Out
+    - type: Filter
+      name: FilterUS
+      input: MaskPII
+      config:
+        language: sql
+        keep: "geo_region IN ('US', 'NA', 'USA', 'NORTH_AMERICA')"
+
+    - type: WriteToPostgresIO
+      name: WriteUSAccounts
+      input: FilterUS
+      config:
+        host: "localhost"
+        port: 5432
+        database: "us_accounts_db"
+        username: "beam_writer"
+        password_env_var: "PGPASSWORD"
+        table: "public.customer_accounts"
+        conflict_keys: ["account_id"]
+        write_mode: "MERGE"
+        op_column: "_op_type"
+        delete_op_value: "d"
+        use_pgbouncer: true
+        explain_analyze: true
+
+    # Branch 2: EU Region Fan-Out
+    - type: Filter
+      name: FilterEU
+      input: MaskPII
+      config:
+        language: sql
+        keep: "geo_region IN ('EU', 'EMEA', 'EUROPE', 'UK')"
+
+    - type: WriteToPostgresIO
+      name: WriteEUAccounts
+      input: FilterEU
+      config:
+        host: "localhost"
+        port: 5432
+        database: "eu_accounts_db"
+        username: "beam_writer"
+        password_env_var: "PGPASSWORD"
+        table: "public.customer_accounts"
+        conflict_keys: ["account_id"]
+        write_mode: "MERGE"
+        op_column: "_op_type"
+        delete_op_value: "d"
+        use_pgbouncer: true
+        explain_analyze: true
+
+    # Branch 3: APAC & Global Fan-Out
+    - type: Filter
+      name: FilterAPAC
+      input: MaskPII
+      config:
+        language: sql
+        keep: "geo_region NOT IN ('US', 'NA', 'USA', 'NORTH_AMERICA', 'EU', 'EMEA', 'EUROPE', 'UK')"
+
+    - type: WriteToPostgresIO
+      name: WriteAPACAccounts
+      input: FilterAPAC
+      config:
+        host: "localhost"
+        port: 5432
+        database: "apac_accounts_db"
+        username: "beam_writer"
+        password_env_var: "PGPASSWORD"
+        table: "public.customer_accounts"
+        conflict_keys: ["account_id"]
+        write_mode: "MERGE"
+        op_column: "_op_type"
+        delete_op_value: "d"
+        use_pgbouncer: true
+        explain_analyze: true

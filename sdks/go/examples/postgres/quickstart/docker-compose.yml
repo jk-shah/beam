@@ -1,0 +1,50 @@
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+services:
+  postgres:
+    image: postgres:17
+    container_name: quickstart-postgres
+    environment:
+      POSTGRES_DB: quickstart
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: secret
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_replication_slots=8
+      -c max_wal_senders=8
+      -c max_slot_wal_keep_size=1024MB
+    ports:
+      - "${POSTGRES_PORT:-5434}:5432"
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d quickstart"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  pipeline:
+    build:
+      context: ../../../../..
+      dockerfile: sdks/go/examples/postgres/quickstart/Dockerfile
+    container_name: quickstart-pipeline
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: secret
+    restart: on-failure

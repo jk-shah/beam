@@ -44,6 +44,7 @@
    - [Native Go Write & Upsert](#native-go-write--upsert)
    - [Native Go CDC Streaming](#native-go-cdc-streaming)
    - [Declarative Beam YAML Pipelines](#declarative-beam-yaml-pipelines)
+   - [Docker Compose Quickstart](#docker-compose-quickstart)
 4. [Configuration Reference](#4-configuration-reference)
    - [ReadOptions](#readoptions)
    - [WriteOptions](#writeoptions)
@@ -931,6 +932,20 @@ The Python façade uses a multi-tier expansion service resolver in the following
 #### YAML Schema Reference
 
 Apache Beam YAML pipelines invoke `WriteToPostgres` and `ReadFromPostgresCDC` directly. Configuration parameter descriptions, types, and defaults are documented in [YAML_REFERENCE.md](YAML_REFERENCE.md), which is programmatically verified against the in-process schema registry (`schematransform.DefaultRegistry()`) via `TestYAMLReference_ByteEquality` to prevent documentation drift.
+
+### Docker Compose Quickstart
+
+A self-contained demonstration environment is located in `examples/postgres/quickstart/`:
+
+```bash
+cd sdks/go/examples/postgres/quickstart
+docker compose up --build
+```
+
+This starts:
+* A PostgreSQL 17 database configured with `wal_level=logical`, a replication role (`beam_cdc`), and publication (`beam_pub`).
+* The `beam_cdc_health` monitoring view for WAL retention and slot tracking.
+* An Apache Beam pipeline streaming changes from `orders_source` to `orders_target` in real time.
 
 ### Known Limitations
 

@@ -1,0 +1,67 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# Customer 360 Relational Stream Join in Declarative Beam YAML
+#
+# Use Case:
+# Joins an order transaction stream with customer dimension records,
+# resolving customer loyalty tiers and sinking enriched orders with idempotent upsert.
+#
+# Execution:
+#   python3 -m apache_beam.yaml.main --yaml_pipeline_file=pipeline.yaml
+
+pipeline:
+  type: chain
+  transforms:
+    - type: ReadFromPostgresCDC
+      name: IngestOrdersCDC
+      config:
+        host: "localhost"
+        port: 5432
+        database: "beammeup"
+        username: "beam_navigator"
+        password_env_var: "PGPASSWORD"
+        slot_name: "orders_relational_slot"
+        publication: "orders_pub"
+
+    - type: Sql
+      name: RelationalCustomerJoin
+      config:
+        query: |
+          SELECT
+            orders.order_id,
+            orders.customer_id,
+            COALESCE(cust.customer_name, 'Unknown Customer') AS customer_name,
+            COALESCE(cust.customer_email, 'unknown@example.com') AS customer_email,
+            COALESCE(cust.loyalty_tier, 'STANDARD') AS loyalty_tier,
+            orders.item,
+            orders.amount,
+            CURRENT_TIMESTAMP AS enriched_at
+          FROM PCOLLECTION AS orders
+          LEFT JOIN public.customer_profiles AS cust ON orders.customer_id = cust.customer_id
+
+    - type: WriteToPostgresIO
+      name: SinkEnrichedOrders
+      config:
+        host: "localhost"
+        port: 5432
+        database: "beammeup"
+        username: "beam_navigator"
+        password_env_var: "PGPASSWORD"
+        table: "public.enriched_orders"
+        conflict_keys:
+          - "order_id"
