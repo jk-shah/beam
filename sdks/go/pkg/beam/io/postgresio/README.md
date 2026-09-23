@@ -484,10 +484,11 @@ pipeline:
 | `WithSSLRootCert(string)` | `""` | SSL root certificate file path or PEM data for verify-ca/verify-full |
 | `WithWriteMode(WriteMode)` | `WriteModeUpsert` | Mutation strategy: `WriteModeInsert`, `WriteModeUpsert`, `WriteModeUpdate`, `WriteModeMerge` |
 | `WithPrimaryKeyColumns(...string)` | `nil` | Primary key columns used for `ON CONFLICT` resolution |
+| `WithUpdateFields(...string)` | `nil` | Columns to update during `ON CONFLICT DO UPDATE` (defaults to all non-PK columns) |
 | `WithBatchSize(int)` | `5000` | Maximum rows per micro-batch flush |
 | `WithMaxBatchBytes(int)` | `8388608` (8 MB) | Maximum bytes per micro-batch flush |
 | `WithFlushInterval(Duration)` | `1s` | Maximum time between micro-batch flushes |
-| `WithPgBouncer(bool)` | `false` | Disables prepared statement caching for PgBouncer transaction pooling |
+| `WithPgBouncer(bool)` | `false` | Avoids session state under PgBouncer transaction pooling (downgrades Staged COPY to parameterized UNNEST) |
 | `WithDialFunc(DialFunc)` | `nil` | Custom network dialer (e.g., Cloud SQL Go Connector, AWS RDS IAM socket) |
 
 ### `CDCOptions`

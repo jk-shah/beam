@@ -28,7 +28,7 @@
 //  3. Session-level temporary tables leak across clients or persist indefinitely.
 //
 // Remediation:
-//  1. Configure postgresio.WithPgBouncer(true) to disable prepared statement caching.
+//  1. Configure postgresio.WithPgBouncer(true) to avoid session state under transaction pooling.
 //  2. Ensure all staging operations use transaction-scoped temporary tables
 //     (ON COMMIT DROP) so state is discarded immediately upon transaction commit.
 //  3. Maintain explicit transaction boundaries per sink micro-batch.
@@ -104,9 +104,8 @@ func main() {
 
 	// 2. Configure WriteOptions with PgBouncer compatibility
 	// Setting WithPgBouncer(true) guarantees:
-	// - Prepared statements are suppressed (uses simple protocol or unnamed queries)
-	// - Staging tables are created with ON COMMIT DROP
-	// - Connection state is completely reset per micro-batch transaction
+	// - Staged COPY is downgraded to parameterized UNNEST to eliminate session-scoped staging tables
+	// - Safe execution under transaction pooling where connections are reassigned across transactions
 	writeOptions := postgresio.NewWriteOptions(
 		postgresio.WithHost(*host),
 		postgresio.WithPort(*port),

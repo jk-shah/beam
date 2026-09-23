@@ -28,7 +28,7 @@ This directory provides production reference implementations for common operatio
 | Pattern Directory | Operational Challenge | PostgreSQL Architectural Constraint | Technical Remediation | Languages |
 | :--- | :--- | :--- | :--- | :--- |
 | [`backfill_cutover`](backfill_cutover) | Cold-start table migration | Logical slots only capture changes committed after slot creation | Consistent snapshot read (`EXPORT_SNAPSHOT`) combined with slot LSN cutover and key deduplication | Go, YAML, Python |
-| [`pgbouncer_compat`](pgbouncer_compat) | Connection pooler errors | Transaction pooling reassigns backend connections after every commit, breaking prepared statement caches | `WithPgBouncer(true)` disables statement caches and scopes staging tables to `ON COMMIT DROP` | Go, YAML, Python |
+| [`pgbouncer_compat`](pgbouncer_compat) | Connection pooler errors | Transaction pooling reassigns backend connections after every commit, breaking session-scoped staging tables | `WithPgBouncer(true)` avoids session state by downgrading Staged COPY to parameterized UNNEST | Go, YAML, Python |
 | [`partitioned_sink`](partitioned_sink) | Partitioned table upsert failures | Unique constraints and primary keys on partitioned tables must include all partition key columns | Composite conflict target (`order_id`, `order_date`) with upstream key sharding to minimize lock contention | Go, YAML, Python |
 | [`schema_evolution`](schema_evolution) | Mid-stream DDL crashes | Relation message schema changes cause crashes if unmapped columns are encountered | Resilient adaptive projection with defaults, dynamic column bags, and drift telemetry metrics | Go, YAML, Python |
 | [`failover_recovery`](failover_recovery) | Standby promotion slot loss | Pre-PG17 logical slots exist in memory/disk on the primary only and vanish upon failover | PostgreSQL 17 `WithCDCFailoverSlot(true)` synchronized standby slots with automatic reconnect | Go, YAML, Python |
@@ -60,8 +60,8 @@ Enterprise PostgreSQL deployments frequently route application connections throu
 - Session-level temporary tables leak or persist across transactions, consuming temp space.
 
 ### Solution
-1. **Prepared Statement Suppression**: Specifying `postgresio.WithPgBouncer(true)` (or `use_pgbouncer: true` in YAML) disables prepared statement caching and switches driver query dispatch to direct execution.
-2. **Transaction-Scoped Staging**: Staging tables created during bulk loading or upsert operations use `CREATE TEMP TABLE ... ON COMMIT DROP`. When the micro-batch transaction commits, PostgreSQL automatically drops the table and cleans up memory buffers.
+1. **Session State Avoidance**: Specifying `postgresio.WithPgBouncer(true)` (or `use_pgbouncer: true` in YAML) avoids session state under transaction pooling by downgrading the Staged COPY write method to parameterized UNNEST.
+2. **Transaction Isolation**: Using parameterized UNNEST batches inserts directly inside the transaction without creating session-scoped staging tables, guaranteeing stability across connection handoffs in transaction pooling.
 
 ---
 

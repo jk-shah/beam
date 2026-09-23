@@ -163,7 +163,7 @@ type CDCOptions struct {
 
 	// MaxSpooledBytes bounds the total size of streamed in-progress transactions
 	// the parser buffers before applying OversizedTxnPolicy.
-	// If 0, defaults to DefaultMaxSpooledTransactionBytes (64 MiB).
+	// If 0, defaults to DefaultMaxSpooledTransactionBytes (256 MiB).
 	MaxSpooledBytes int64
 
 	// OversizedTxnPolicy controls what happens when an in-progress streamed
