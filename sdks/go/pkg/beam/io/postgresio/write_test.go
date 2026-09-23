@@ -850,7 +850,9 @@ func TestWriteReturnsErrorOnQueryFailure(t *testing.T) {
 	// A batch that cannot be turned into a statement is a configuration fault,
 	// not a data fault: every later batch would fail identically. The bundle
 	// must fail rather than silently draining the input into the dead-letter
-	// output, but the rows are still surfaced there so they are recoverable.
+	// output. Nothing is emitted there, because a runner discards a failed
+	// bundle's pending outputs, so an emit on this path produces rows that no
+	// downstream transform ever observes.
 	var failedRows []FailedRow
 	emitFailed := func(f FailedRow) { failedRows = append(failedRows, f) }
 
@@ -863,8 +865,8 @@ func TestWriteReturnsErrorOnQueryFailure(t *testing.T) {
 	if !strings.Contains(err.Error(), "identifier cannot be empty") {
 		t.Errorf("expected error to contain 'identifier cannot be empty', got: %v", err)
 	}
-	if len(failedRows) != 1 {
-		t.Errorf("expected the rejected row to still reach the failed output, got %d", len(failedRows))
+	if len(failedRows) != 0 {
+		t.Errorf("emitted %d rows to the failed output on a bundle-failing path; those outputs are discarded with the bundle", len(failedRows))
 	}
 }
 

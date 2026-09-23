@@ -249,8 +249,12 @@ func TestWritePartitionMergeRefusesUnnestFallback(t *testing.T) {
 	if succeeded != 0 {
 		t.Errorf("emitted %d rows as written", succeeded)
 	}
-	if len(failed) != len(part.Rows) {
-		t.Errorf("routed %d of %d rows to the failed output; every row of a rejected batch must be recoverable", len(failed), len(part.Rows))
+	// A configuration fault fails the bundle, and Beam discards a failed
+	// bundle's pending outputs. Emitting here would produce rows that no
+	// downstream transform ever observes, which reads as a fallback and is
+	// not one. The returned error is the only outcome.
+	if len(failed) != 0 {
+		t.Errorf("emitted %d rows to the failed output on a bundle-failing path; those outputs are discarded with the bundle", len(failed))
 	}
 }
 
@@ -292,8 +296,10 @@ func TestWritePartitionMergeRefusesPartialRows(t *testing.T) {
 	if succeeded != 0 {
 		t.Errorf("emitted %d rows as written", succeeded)
 	}
-	if len(failed) != len(part.Rows) {
-		t.Errorf("routed %d of %d rows to the failed output", len(failed), len(part.Rows))
+	// As above: a configuration fault fails the bundle, so nothing is
+	// emitted to the dead-letter output.
+	if len(failed) != 0 {
+		t.Errorf("emitted %d rows to the failed output on a bundle-failing path; those outputs are discarded with the bundle", len(failed))
 	}
 }
 
