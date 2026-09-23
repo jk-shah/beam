@@ -19,7 +19,7 @@
 
 # Apache Beam Go SDK: PostgreSQLIO (`postgresio`)
 
-`postgresio` is a native Apache Beam Go SDK I/O connector providing high-throughput writing and upserts for PostgreSQL. It operates without Java Virtual Machine (JVM) dependencies or cross-language serialization overhead.
+`postgresio` is a native Apache Beam Go SDK I/O connector providing bounded batch reading, high-throughput writing, and upserts for PostgreSQL. It operates without Java Virtual Machine (JVM) dependencies or cross-language serialization overhead.
 
 > [!NOTE]
 > **Status: feature-complete with remediation stack applied.**
@@ -34,9 +34,13 @@
 1. [Architectural Overview](#1-architectural-overview)
 2. [Subsystem Architecture](#2-subsystem-architecture)
    - [A. High-Throughput Write Engine](#a-high-throughput-write-engine)
+   - [C. Bounded Batch Read Engine](#c-bounded-batch-read-engine)
+   - [E. Native Go SchemaTransform Framework & Expansion Service](#e-native-go-schematransform-framework--expansion-service)
 3. [Quickstart & Getting Started](#3-quickstart--getting-started)
+   - [Native Go Bounded Batch Read](#native-go-bounded-batch-read)
    - [Native Go Write & Upsert](#native-go-write--upsert)
 4. [Configuration Reference](#4-configuration-reference)
+   - [ReadOptions](#readoptions)
    - [WriteOptions](#writeoptions)
    - [Required privileges](#required-privileges)
    - [Security & TLS Configuration](#security--tls-configuration)
@@ -148,7 +152,73 @@ sequenceDiagram
 * **Connection Pool Management & CVE-2018-1058 Mitigation**: Clamps worker connection pools to 2 connections by default to prevent connection storms. Automatically injects `search_path=pg_catalog,pg_temp` into every connection DSN, closing search-path hijacking vulnerabilities across all pool connections.
 * **Dead-Letter Queue (DLQ)**: Separates successfully committed rows from rejected records, appending sanitized error messages and PostgreSQL SQL states without credential leakage. Every failure has exactly one outcome. A batch rejected by the *server* (a constraint violation, say) is emitted to `FailedRows` and the bundle continues. A batch that the current *configuration* can never write correctly — `MERGE` on the `UNNEST` path, `MERGE` over a partial row, or a row type naming a column that does not exist — fails the bundle instead, because retrying it against the same configuration would fail identically, and draining it to the DLQ would report success while hiding a misconfiguration. The DLQ is batch-granular: the failing statement is set-based, so PostgreSQL does not report which input row caused the error, and a job reprocessing the DLQ must expect already-applied rows in it.
 
+### C. Bounded Batch Read Engine
+* **Partition Planning & Dynamic Range Splitting**: `postgresio.Read` supports distributed parallel reads via `WithReadPartitions(col, lower, upper, numPartitions)`. Splits ranges across worker instances with overflow-safe arithmetic, using `beam.Reshuffle` to break worker fusion.
+* **Transaction-Pinned Cursor Streaming**: Uses server-side read-only transactions (`BEGIN TRANSACTION READ ONLY`) with `DECLARE NO SCROLL CURSOR` and `FETCH FORWARD 5000` to stream arbitrary table sizes with flat, bounded memory consumption.
+* **Type Reflection & Tag Mapping**: The `structRowMapper` maps PostgreSQL columns to struct fields using case-insensitive, underscore-insensitive matching and struct tags (`beam:`, `db:`, `column:`). Dynamic rows can be read into `PostgresRow` without predefined struct types via `postgresio.ReadRows` and `postgresio.QueryRows`.
+* **SQL Sanitization**: Enforces schema-qualified table names and validates identifier characters to prevent SQL injection.
+
+### E. Native Go SchemaTransform Framework
+* **Native Go Registration**: Provides `schematransform.GlobalRegisterTyped` mapping typed configuration structs to `SchemaTransform` providers.
+* **Standard URNs**:
+  * Write: `beam:schematransform:org.apache.beam:postgres_write:v1`
+  * Bounded Batch Read: `beam:schematransform:org.apache.beam:postgres_read:v1`
+
 ## 3. Quickstart & Getting Started
+
+### Native Go Bounded Batch Read
+
+```go
+package main
+
+import (
+	"context"
+	"flag"
+	"reflect"
+
+	"github.com/apache/beam/sdks/v2/go/pkg/beam"
+	"github.com/apache/beam/sdks/v2/go/pkg/beam/io/postgresio"
+	"github.com/apache/beam/sdks/v2/go/pkg/beam/log"
+	"github.com/apache/beam/sdks/v2/go/pkg/beam/x/beamx"
+)
+
+type Order struct {
+	OrderID    int64   `beam:"order_id" db:"order_id"`
+	CustomerID string  `beam:"customer_id" db:"customer_id"`
+	Amount     float64 `beam:"amount" db:"amount"`
+	Status     string  `beam:"status" db:"status"`
+}
+
+func logOrderFn(ctx context.Context, o Order) {
+	log.Infof(ctx, "Read Order: id=%d cust=%s amount=%.2f status=%s",
+		o.OrderID, o.CustomerID, o.Amount, o.Status)
+}
+
+func main() {
+	flag.Parse()
+	beam.Init()
+
+	p, s := beam.NewPipelineWithRoot()
+
+	opts := postgresio.NewReadOptions(
+		postgresio.WithReadHost("localhost"),
+		postgresio.WithReadPort(5432),
+		postgresio.WithReadDatabase("postgres"),
+		postgresio.WithReadUsername("beam_navigator"),
+		postgresio.WithReadPassword("beam_password"),
+		postgresio.WithReadPartitions("order_id", 1, 1000000, 4),
+	)
+
+	// Bounded batch read from table into typed struct
+	orders := postgresio.Read(s, "public.orders", reflect.TypeOf(Order{}), opts)
+
+	beam.ParDo0(s, logOrderFn, orders)
+
+	if err := beamx.Run(context.Background(), p); err != nil {
+		panic(err)
+	}
+}
+```
 
 ### Native Go Write & Upsert
 
@@ -203,6 +273,24 @@ func main() {
 ```
 
 ## 4. Configuration Reference
+
+### `ReadOptions`
+
+| Option | Default | Purpose |
+| :--- | :--- | :--- |
+| `WithReadHost(string)` | `""` | Target PostgreSQL host or IP |
+| `WithReadPort(int)` | `5432` | Target PostgreSQL port |
+| `WithReadDatabase(string)` | `""` | Target database name |
+| `WithReadUsername(string)` | `""` | Database user role |
+| `WithReadPassword(string)` | `""` | Database password |
+| `WithReadPasswordEnvVar(string)` | `""` | Environment variable name on worker to resolve password |
+| `WithReadSSLMode(string)` | `verify-full` | SSL connection mode (`disable`, `require`, `verify-ca`, `verify-full`) |
+| `WithReadSSLRootCert(string)` | `""` | SSL root certificate file path or PEM data |
+| `WithReadFetchSize(int)` | `5000` | Cursor fetch chunk size (`FETCH FORWARD <n>`) |
+| `WithReadMaxConnections(int)` | `2` | Maximum worker pool connections (prevents DB connection exhaustion) |
+| `WithReadQueryTimeout(Duration)` | `30m` | Query execution and cursor transaction statement timeout |
+| `WithReadPartitions(col, lower, upper, n)` | `""`, `0`, `0`, `0` | Parallel range partitioning configuration for distributed reads |
+| `WithReadDialFunc(DialFunc)` | `nil` | Custom network dialer (Cloud SQL Go Connector, AWS IAM socket) |
 
 ### `WriteOptions`
 
@@ -267,6 +355,15 @@ GRANT TEMPORARY ON DATABASE appdb TO beam_writer;
 > than silently opened unstamped, because an unstamped write is exactly the one a
 > bidirectional peer replays back.
 
+#### Reading (`postgresio.Read` / `postgresio.Query`)
+
+`SELECT` on every table referenced by the query. Partitioned reads issue the
+same query per range and need nothing further.
+
+```sql
+GRANT SELECT ON public.orders TO beam_reader;
+```
+
 ### Security & TLS Configuration
 
 `NewCDCOptions` defaults `sslmode` to `verify-full`. `verify-ca` is available
@@ -294,7 +391,7 @@ The connector is unreleased and experimental. The list below is what is still op
 
 | Area | Limitation | Impact |
 | :--- | :--- | :--- |
-| **`search_path`** | The write path pins `search_path=pg_catalog,pg_temp` on every pooled connection to close CVE-2018-1058, so an unqualified table name cannot resolve. | Table names must be written as `schema.table`. `postgresio.Write` rejects an unqualified name when the pipeline is constructed. |
+| **`search_path`** | The write path pins `search_path=pg_catalog,pg_temp` on every pooled connection to close CVE-2018-1058, so an unqualified table name cannot resolve. | Table names must be written as `schema.table`. `postgresio.Write` rejects an unqualified name when the pipeline is constructed, and the `postgres_write` SchemaTransform rejects it during configuration validation. |
 | **Driver** | Built on `lib/pq`. | Protocol features not implemented in `lib/pq` are unavailable. |
 
 ## 5. Contributor Guide: Codebase Map & Invariants
@@ -308,6 +405,7 @@ This section details internal design invariants for contributors maintaining or 
 | [`write.go`](write.go) | Sink | `writeFn` implementation, `buildUnnestQuery`, parameterized `UNNEST` array upsert execution. |
 | [`compactor.go`](compactor.go) | Sink | `BatchCompactor` micro-batch accumulator, LWW deduplication, composite primary key canonical sort. |
 | [`options.go`](options.go) | Config | `WriteOptions` definition, functional options, identifier sanitization. |
+| [`schematransform.go`](schematransform.go) | XLang | Go SchemaTransform providers for read and write transforms. |
 
 ### Life of a Write Mutation
 

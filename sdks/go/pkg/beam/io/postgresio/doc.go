@@ -26,6 +26,8 @@
 // The default WriteMethodStagedCopy also needs the TEMPORARY privilege on the
 // database, which PostgreSQL grants to PUBLIC unless it has been revoked.
 //
+// Reading needs SELECT on every table the query touches.
+//
 // WithReplicationOriginName is the one option that needs more than table
 // privileges: each connection runs pg_replication_origin_session_setup, which
 // is superuser-only unless EXECUTE has been granted, and the origin must
