@@ -293,3 +293,31 @@ func TestExtractPrimaryKeysAcceptsMapRows(t *testing.T) {
 		t.Errorf("struct row keyed %q but the equivalent map row keyed %q", structKey, mapKey)
 	}
 }
+
+// TestExtractPrimaryKeysMapEdgeCases confirms non-string map keys, custom string
+// key types, case-insensitive keys, and nil maps do not panic.
+func TestExtractPrimaryKeysMapEdgeCases(t *testing.T) {
+	type CustomKey string
+	customMap := map[CustomKey]any{
+		"ID":     int64(10),
+		"Region": "EU",
+	}
+	key, _ := ExtractPrimaryKeys(customMap, []string{"id", "region"})
+	if key == "" {
+		t.Errorf("expected valid key from custom string-typed map, got empty string")
+	}
+
+	nonStringMap := map[int]string{
+		1: "one",
+	}
+	keyNonString, _ := ExtractPrimaryKeys(nonStringMap, []string{"id"})
+	if keyNonString != "" {
+		t.Errorf("expected empty key from non-string keyed map, got %q", keyNonString)
+	}
+
+	var nilMap map[string]any
+	keyNil, _ := ExtractPrimaryKeys(nilMap, []string{"id"})
+	if keyNil != "" {
+		t.Errorf("expected empty key from nil map, got %q", keyNil)
+	}
+}

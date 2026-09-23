@@ -304,8 +304,27 @@ func ExtractPrimaryKeys(val any, pkCols []string) (string, []any) {
 	}
 
 	if v.Kind() == reflect.Map {
+		if v.IsNil() {
+			return "", nil
+		}
+		kt := v.Type().Key()
+		if kt.Kind() != reflect.String {
+			return "", nil
+		}
 		for i, col := range pkCols {
-			mapVal := v.MapIndex(reflect.ValueOf(col))
+			key := reflect.ValueOf(col)
+			if key.Type() != kt {
+				key = key.Convert(kt)
+			}
+			mapVal := v.MapIndex(key)
+			if !mapVal.IsValid() {
+				for _, mk := range v.MapKeys() {
+					if strings.EqualFold(mk.String(), col) {
+						mapVal = v.MapIndex(mk)
+						break
+					}
+				}
+			}
 			if mapVal.IsValid() {
 				sortKeys[i] = mapVal.Interface()
 				sb.WriteString(formatPKPart(sortKeys[i]))

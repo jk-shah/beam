@@ -178,6 +178,95 @@ func TestBuildUnnestQueryUpdate(t *testing.T) {
 	}
 }
 
+func TestBuildUnnestQueryUpdate_WithUpdateFields(t *testing.T) {
+	fn := &writeFn{
+		Table:          `"public"."orders"`,
+		Options:        NewWriteOptions(WithWriteMode(WriteModeUpdate), WithPrimaryKeyColumns("id"), WithUpdateFields("amount")),
+		Type:           beam.EncodedType{T: reflect.TypeOf(TestOrder{})},
+		PrimaryKeyCols: []string{"id"},
+		columns:        []string{"id", "region", "amount"},
+		colTypes: map[string]string{
+			"id":     "INT8",
+			"region": "TEXT",
+			"amount": "FLOAT8",
+		},
+	}
+
+	batch := []any{
+		TestOrder{ID: 1, Region: "US", Amount: 50.0},
+		TestOrder{ID: 2, Region: "EU", Amount: 75.0},
+	}
+
+	query, args, err := fn.buildUnnestQuery(batch)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !strings.HasPrefix(query, `UPDATE "public"."orders" AS target SET`) {
+		t.Errorf("expected UPDATE statement, got %q", query)
+	}
+	if !strings.Contains(query, `"amount" = source."amount"`) {
+		t.Errorf("expected SET clause on amount, got %q", query)
+	}
+	if strings.Contains(query, `"region" = source."region"`) {
+		t.Errorf("expected region to NOT be in SET clause when update_fields only names amount, got %q", query)
+	}
+	if strings.Contains(query, `"id" = source."id"`) && !strings.Contains(query, `WHERE target."id" = source."id"`) {
+		t.Errorf("expected primary key to be in WHERE clause, not SET, got %q", query)
+	}
+	if len(args) != 3 {
+		t.Errorf("expected 3 args, got %d", len(args))
+	}
+}
+
+func TestBuildStagedCopyMergeQueryUpdate(t *testing.T) {
+	fn := &writeFn{
+		Table:          `"public"."orders"`,
+		Options:        NewWriteOptions(WithWriteMode(WriteModeUpdate), WithPrimaryKeyColumns("id"), WithUpdateFields("amount")),
+		PrimaryKeyCols: []string{"id"},
+		columns:        []string{"id", "region", "amount"},
+	}
+
+	query, err := fn.buildStagedCopyMergeQuery("beam_stage_w1_test")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	wantPrefix := `UPDATE "public"."orders" SET "amount" = beam_stage_w1_test."amount" FROM beam_stage_w1_test WHERE "public"."orders"."id" = beam_stage_w1_test."id"`
+	if query != wantPrefix {
+		t.Errorf("buildStagedCopyMergeQuery() =\n  %q\nwant:\n  %q", query, wantPrefix)
+	}
+
+	// Without UpdateFields, all non-PK columns are updated
+	fnNoFilter := &writeFn{
+		Table:          `"public"."orders"`,
+		Options:        NewWriteOptions(WithWriteMode(WriteModeUpdate), WithPrimaryKeyColumns("id")),
+		PrimaryKeyCols: []string{"id"},
+		columns:        []string{"id", "region", "amount"},
+	}
+
+	queryAll, err := fnNoFilter.buildStagedCopyMergeQuery("beam_stage_w1_test")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(queryAll, `"region" = beam_stage_w1_test."region"`) || !strings.Contains(queryAll, `"amount" = beam_stage_w1_test."amount"`) {
+		t.Errorf("expected all non-pk columns in SET clause, got %q", queryAll)
+	}
+	if strings.Contains(queryAll, `"id" = beam_stage_w1_test."id"`) && !strings.Contains(queryAll, `WHERE "public"."orders"."id" = beam_stage_w1_test."id"`) {
+		t.Errorf("expected id in WHERE, not SET, got %q", queryAll)
+	}
+
+	// WriteModeUpdate requires PKs
+	fnNoPK := &writeFn{
+		Table:   `"public"."orders"`,
+		Options: NewWriteOptions(WithWriteMode(WriteModeUpdate)),
+		columns: []string{"id", "region", "amount"},
+	}
+	if _, err := fnNoPK.buildStagedCopyMergeQuery("beam_stage_w1_test"); err == nil {
+		t.Error("expected error when WriteModeUpdate has no primary keys, got nil")
+	}
+}
+
 func TestBuildUnnestQueryNullArray(t *testing.T) {
 	type ArrayOrder struct {
 		ID   int64    `db:"id"`
@@ -906,6 +995,56 @@ func drainRecordingWriteFn(t *testing.T, fn *writeFn) {
 	}
 	if err := fn.FinishBundle(ctx, noopSuccess, noopFailed); err != nil {
 		t.Fatalf("FinishBundle: %v", err)
+	}
+}
+
+func TestRecordingWriteFn_WriteModeUpdate_Execution(t *testing.T) {
+	rec := &stmtRecorder{}
+	fn := newRecordingWriteFn(rec,
+		WithWriteMode(WriteModeUpdate),
+		WithPrimaryKeyColumns("id"),
+		WithUpdateFields("amount"),
+	)
+	fn.PrimaryKeyCols = []string{"id"}
+
+	ctx := context.Background()
+	var successes []any
+	var failures []FailedRow
+	emitSuccess := func(x beam.X) { successes = append(successes, x) }
+	emitFailed := func(fr FailedRow) { failures = append(failures, fr) }
+
+	if err := fn.ProcessElement(ctx, TestOrder{ID: 10, Region: "US", Amount: 99.5}, emitSuccess, emitFailed); err != nil {
+		t.Fatalf("ProcessElement failed: %v", err)
+	}
+	if err := fn.FinishBundle(ctx, emitSuccess, emitFailed); err != nil {
+		t.Fatalf("FinishBundle failed: %v", err)
+	}
+
+	if len(failures) != 0 {
+		t.Fatalf("expected 0 failures, got %d", len(failures))
+	}
+	if len(successes) != 1 {
+		t.Fatalf("expected 1 success, got %d", len(successes))
+	}
+
+	stmts := rec.all()
+	if len(stmts) == 0 {
+		t.Fatalf("expected executed statements, got none")
+	}
+
+	updateIdx := rec.indexOf("UPDATE")
+	if updateIdx == -1 {
+		t.Fatalf("expected UPDATE statement, recorded: %v", stmts)
+	}
+	updateStmt := stmts[updateIdx]
+	if !strings.Contains(updateStmt, `"amount" = source."amount"`) {
+		t.Errorf("expected UPDATE statement to set amount, got: %s", updateStmt)
+	}
+	if strings.Contains(updateStmt, `"region" = source."region"`) {
+		t.Errorf("expected UPDATE statement to omit region when update_fields=[amount], got: %s", updateStmt)
+	}
+	if !strings.Contains(updateStmt, `WHERE target."id" = source."id"`) {
+		t.Errorf("expected UPDATE statement to have WHERE on primary key, got: %s", updateStmt)
 	}
 }
 

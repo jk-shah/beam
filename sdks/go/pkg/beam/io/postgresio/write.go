@@ -495,7 +495,7 @@ func (fn *writeFn) flushBatch(ctx context.Context, emitSuccess func(beam.X), emi
 		// type, not a transient fault, so the bundle fails rather than
 		// draining every batch to the dead-letter output under a
 		// misconfiguration that will repeat.
-		fn.failBatch(ctx, batch, err, emitFailed)
+		fn.failBatch(ctx, batch, err)
 		return err
 	}
 
@@ -507,10 +507,10 @@ func (fn *writeFn) flushBatch(ctx context.Context, emitSuccess func(beam.X), emi
 	return nil
 }
 
-// failBatch routes an entire batch to the dead-letter output. It is used by the
-// paths that cannot produce a correct write and must not retry or degrade: the
-// caller still returns the error so the bundle fails, but the rows are surfaced
-// on the failed-mutations output rather than disappearing.
+// failBatch logs an error and records metrics for a batch that cannot produce
+// a correct write. The caller returns an error to fail the bundle. It does not
+// emit to the dead-letter output because runner semantics discard bundle outputs
+// on error.
 //
 // This is deliberately distinct from the execution-failure path in
 // writePartition. A batch rejected here is rejected because the pipeline is
@@ -519,17 +519,10 @@ func (fn *writeFn) flushBatch(ctx context.Context, emitSuccess func(beam.X), emi
 // would drain every row of every batch into the dead-letter output while
 // reporting success, which hides a misconfiguration behind an apparently
 // healthy pipeline.
-func (fn *writeFn) failBatch(ctx context.Context, batch []any, err error, emitFailed func(FailedRow)) {
+func (fn *writeFn) failBatch(ctx context.Context, batch []any, err error) {
 	sinkFailedRows.Inc(ctx, int64(len(batch)))
 	msg := SanitizeErrorMessage(err)
 	log.Errorf(ctx, "postgresio: %s", msg)
-	for _, item := range batch {
-		emitFailed(FailedRow{
-			Row:          item,
-			ErrorMessage: msg,
-			SqlState:     "XX000",
-		})
-	}
 }
 
 func (fn *writeFn) writePartition(ctx context.Context, part writePartition, emitSuccess func(beam.X), emitFailed func(FailedRow)) error {
@@ -554,7 +547,7 @@ func (fn *writeFn) writePartition(ctx context.Context, part writePartition, emit
 				strings.Join(part.UnchangedColumns, ", "))
 		}
 		if err != nil {
-			fn.failBatch(ctx, batch, err, emitFailed)
+			fn.failBatch(ctx, batch, err)
 			return err
 		}
 	}
@@ -585,7 +578,7 @@ func (fn *writeFn) writePartition(ctx context.Context, part writePartition, emit
 		}
 		if mergeMode {
 			err := fmt.Errorf("postgresio: MERGE staged COPY failed: %w", copyErr)
-			fn.failBatch(ctx, batch, err, emitFailed)
+			fn.failBatch(ctx, batch, err)
 			return err
 		}
 		log.Warnf(ctx, "postgresio: staged COPY failed (%v), falling back to parameterized UNNEST", copyErr)
@@ -598,7 +591,7 @@ func (fn *writeFn) writePartition(ctx context.Context, part writePartition, emit
 		} else {
 			err = fmt.Errorf("postgresio: parameterized UNNEST build failed: %w", err)
 		}
-		fn.failBatch(ctx, batch, err, emitFailed)
+		fn.failBatch(ctx, batch, err)
 		return err
 	}
 
@@ -840,89 +833,15 @@ func (fn *writeFn) executeStagedCopy(ctx context.Context, batch []any) error {
 		return err
 	}
 
-	pkSet := make(map[string]bool)
-	sanitizedPks := make([]string, len(fn.PrimaryKeyCols))
-	for i, pk := range fn.PrimaryKeyCols {
-		san, err := SanitizeIdentifier(pk)
-		if err != nil {
-			return err
-		}
-		sanitizedPks[i] = san
-		pkSet[pk] = true
-	}
-
-	colsToUpdate := fn.columns
-	if len(fn.Options.UpdateFields) > 0 {
-		colsToUpdate = fn.Options.UpdateFields
-	}
-	updateClauses := make([]string, 0, len(colsToUpdate))
-	for _, col := range colsToUpdate {
-		if !pkSet[col] {
-			san, err := SanitizeIdentifier(col)
-			if err != nil {
-				return err
-			}
-			updateClauses = append(updateClauses, fmt.Sprintf("%s = EXCLUDED.%s", san, san))
+	if fn.Options.WriteMode == WriteModeMerge && len(batch) >= 1000 {
+		// Pre-analyze staging table to prevent optimizer from selecting sequential scans on large targets
+		if _, err := txn.ExecContext(ctx, fmt.Sprintf("ANALYZE %s", tempTable)); err != nil {
+			return fmt.Errorf("failed to analyze temp table %s: %w", tempTable, err)
 		}
 	}
-
-	colList := strings.Join(sanitizedCols, ", ")
-	var mergeSql string
-	if fn.Options.WriteMode == WriteModeMerge {
-		if len(batch) >= 1000 {
-			// Pre-analyze staging table to prevent optimizer from selecting sequential scans on large targets
-			if _, err := txn.ExecContext(ctx, fmt.Sprintf("ANALYZE %s", tempTable)); err != nil {
-				return fmt.Errorf("failed to analyze temp table %s: %w", tempTable, err)
-			}
-		}
-		// fn.Table was sanitized by Write and tempTable is generated, so both are
-		// passed to the variant that takes identifiers already in their quoted
-		// form. Handing fn.Table to buildMergeQuery would sanitize it a second
-		// time, and the quotes from the first pass are rejected as an injection
-		// attempt.
-		sanitizedTemp, err := SanitizeTableIdentifier(tempTable)
-		if err != nil {
-			return err
-		}
-		mergeSql, err = buildMergeQueryForSanitizedTables(fn.Table, sanitizedTemp, fn.columns, fn.PrimaryKeyCols, fn.Options.OpColumn, fn.Options.DeleteOpValue)
-		if err != nil {
-			return err
-		}
-	} else if fn.Options.WriteMode == WriteModeUpdate {
-		if len(sanitizedPks) == 0 {
-			return fmt.Errorf("postgresio: WriteModeUpdate requires primary key columns")
-		}
-		setClauses := make([]string, 0, len(fn.columns))
-		for _, col := range fn.columns {
-			if !pkSet[col] {
-				san, err := SanitizeIdentifier(col)
-				if err != nil {
-					return err
-				}
-				setClauses = append(setClauses, fmt.Sprintf("%s = %s.%s", san, tempTable, san))
-			}
-		}
-		if len(setClauses) == 0 {
-			setClauses = append(setClauses, fmt.Sprintf("%s = %s.%s", sanitizedPks[0], tempTable, sanitizedPks[0]))
-		}
-		whereClauses := make([]string, len(sanitizedPks))
-		for i, pk := range sanitizedPks {
-			whereClauses[i] = fmt.Sprintf("%s.%s = %s.%s", fn.Table, pk, tempTable, pk)
-		}
-		mergeSql = fmt.Sprintf("UPDATE %s SET %s FROM %s WHERE %s",
-			fn.Table, strings.Join(setClauses, ", "), tempTable, strings.Join(whereClauses, " AND "))
-	} else if fn.Options.WriteMode == WriteModeInsert {
-		mergeSql = fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM %s",
-			fn.Table, colList, colList, tempTable)
-	} else if len(sanitizedPks) == 0 {
-		mergeSql = fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM %s ON CONFLICT DO NOTHING",
-			fn.Table, colList, colList, tempTable)
-	} else if len(updateClauses) > 0 {
-		mergeSql = fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM %s ON CONFLICT (%s) DO UPDATE SET %s",
-			fn.Table, colList, colList, tempTable, strings.Join(sanitizedPks, ", "), strings.Join(updateClauses, ", "))
-	} else {
-		mergeSql = fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM %s ON CONFLICT (%s) DO NOTHING",
-			fn.Table, colList, colList, tempTable, strings.Join(sanitizedPks, ", "))
+	mergeSql, err := fn.buildStagedCopyMergeQuery(tempTable)
+	if err != nil {
+		return err
 	}
 
 	if fn.Options.ExplainAnalyze && shouldSampleExplain(fn.Options.ExplainSampleRate) {
@@ -939,6 +858,90 @@ func (fn *writeFn) executeStagedCopy(ctx context.Context, batch []any) error {
 	}
 
 	return txn.Commit()
+}
+
+func (fn *writeFn) buildStagedCopyMergeQuery(tempTable string) (string, error) {
+	sanitizedCols := make([]string, len(fn.columns))
+	for i, col := range fn.columns {
+		san, err := SanitizeIdentifier(col)
+		if err != nil {
+			return "", err
+		}
+		sanitizedCols[i] = san
+	}
+
+	sanitizedPks := make([]string, len(fn.PrimaryKeyCols))
+	pkSet := make(map[string]bool)
+	for i, pk := range fn.PrimaryKeyCols {
+		san, err := SanitizeIdentifier(pk)
+		if err != nil {
+			return "", err
+		}
+		sanitizedPks[i] = san
+		pkSet[pk] = true
+	}
+
+	colsToUpdate := fn.columns
+	if len(fn.Options.UpdateFields) > 0 {
+		colsToUpdate = fn.Options.UpdateFields
+	}
+	updateClauses := make([]string, 0, len(colsToUpdate))
+	for _, col := range colsToUpdate {
+		if !pkSet[col] {
+			san, err := SanitizeIdentifier(col)
+			if err != nil {
+				return "", err
+			}
+			updateClauses = append(updateClauses, fmt.Sprintf("%s = EXCLUDED.%s", san, san))
+		}
+	}
+
+	colList := strings.Join(sanitizedCols, ", ")
+	if fn.Options.WriteMode == WriteModeMerge {
+		sanitizedTemp, err := SanitizeTableIdentifier(tempTable)
+		if err != nil {
+			return "", err
+		}
+		return buildMergeQueryForSanitizedTables(fn.Table, sanitizedTemp, fn.columns, fn.PrimaryKeyCols, fn.Options.OpColumn, fn.Options.DeleteOpValue)
+	}
+	if fn.Options.WriteMode == WriteModeUpdate {
+		if len(sanitizedPks) == 0 {
+			return "", fmt.Errorf("postgresio: WriteModeUpdate requires primary key columns")
+		}
+		setClauses := make([]string, 0, len(colsToUpdate))
+		for _, col := range colsToUpdate {
+			if !pkSet[col] {
+				san, err := SanitizeIdentifier(col)
+				if err != nil {
+					return "", err
+				}
+				setClauses = append(setClauses, fmt.Sprintf("%s = %s.%s", san, tempTable, san))
+			}
+		}
+		if len(setClauses) == 0 {
+			setClauses = append(setClauses, fmt.Sprintf("%s = %s.%s", sanitizedPks[0], tempTable, sanitizedPks[0]))
+		}
+		whereClauses := make([]string, len(sanitizedPks))
+		for i, pk := range sanitizedPks {
+			whereClauses[i] = fmt.Sprintf("%s.%s = %s.%s", fn.Table, pk, tempTable, pk)
+		}
+		return fmt.Sprintf("UPDATE %s SET %s FROM %s WHERE %s",
+			fn.Table, strings.Join(setClauses, ", "), tempTable, strings.Join(whereClauses, " AND ")), nil
+	}
+	if fn.Options.WriteMode == WriteModeInsert {
+		return fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM %s",
+			fn.Table, colList, colList, tempTable), nil
+	}
+	if len(sanitizedPks) == 0 {
+		return fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM %s ON CONFLICT DO NOTHING",
+			fn.Table, colList, colList, tempTable), nil
+	}
+	if len(updateClauses) > 0 {
+		return fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM %s ON CONFLICT (%s) DO UPDATE SET %s",
+			fn.Table, colList, colList, tempTable, strings.Join(sanitizedPks, ", "), strings.Join(updateClauses, ", ")), nil
+	}
+	return fmt.Sprintf("INSERT INTO %s (%s) SELECT %s FROM %s ON CONFLICT (%s) DO NOTHING",
+		fn.Table, colList, colList, tempTable, strings.Join(sanitizedPks, ", ")), nil
 }
 
 // derefElement unwraps an input element down to the value that carries its
@@ -1110,6 +1113,9 @@ func estimateValueSize(v reflect.Value, depth int) int {
 		return total
 
 	case reflect.Map:
+		if v.IsNil() {
+			return 0
+		}
 		total := sliceHeaderSize
 		iter := v.MapRange()
 		for iter.Next() {
@@ -1264,6 +1270,11 @@ func (fn *writeFn) buildUnnestQueryForColumns(batch []any, columns []string) (st
 			pkSet[pk] = true
 		}
 
+		updateFieldsSet := make(map[string]bool)
+		for _, f := range fn.Options.UpdateFields {
+			updateFieldsSet[f] = true
+		}
+
 		var selectAsCols []string
 		var setClauses []string
 		var whereClauses []string
@@ -1276,7 +1287,7 @@ func (fn *writeFn) buildUnnestQueryForColumns(batch []any, columns []string) (st
 			selectAsCols = append(selectAsCols, fmt.Sprintf("%s AS %s", selectCols[i], san))
 			if pkSet[col] {
 				whereClauses = append(whereClauses, fmt.Sprintf("target.%s = source.%s", san, san))
-			} else {
+			} else if len(updateFieldsSet) == 0 || updateFieldsSet[col] {
 				setClauses = append(setClauses, fmt.Sprintf("%s = source.%s", san, san))
 			}
 		}
@@ -1385,9 +1396,14 @@ type ExplainPlanResult struct {
 	} `json:"Plan"`
 }
 
+// shouldSampleExplain reports whether a batch should trigger EXPLAIN (ANALYZE).
+// A rate <= 0 selects default sampling (0.001, or 0.1% of batches). A rate > 1.0
+// is clamped to 1.0 (every batch). Sampling is only invoked if ExplainAnalyze is true.
 func shouldSampleExplain(rate float64) bool {
 	if rate <= 0 {
 		rate = 0.001 // 0.1% default (1 in 1000 batches)
+	} else if rate > 1.0 {
+		rate = 1.0
 	}
 	return rand.Float64() < rate
 }

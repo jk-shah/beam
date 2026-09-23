@@ -498,7 +498,9 @@ func WithExplainAnalyze(enabled bool) Option {
 }
 
 // WithExplainSampleRate sets the sampling rate for EXPLAIN (ANALYZE, BUFFERS) [0.0 to 1.0].
-// If unset or <= 0, defaults to 0.001 (0.1% or 1 in 1000 batches).
+// If unset or <= 0, defaults to 0.001 (0.1% or 1 in 1000 batches). A rate > 1.0 is
+// clamped to 1.0. Note that sampling is only evaluated when WithExplainAnalyze(true) is
+// enabled; by default, EXPLAIN (ANALYZE) is disabled.
 func WithExplainSampleRate(rate float64) Option {
 	return func(o *WriteOptions) {
 		o.ExplainSampleRate = rate

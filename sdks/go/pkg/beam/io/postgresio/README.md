@@ -80,11 +80,11 @@
 |                  (WAL Logs, Logical Replication Slot, Tables)                     |
 +--------------------+---------------------------------------+----------------------+
                      |                                       ^
-        Logical CDC  | (pgoutput)                            | Parameterized
+        Logical CDC  | (pgoutput) [Planned]                  | Parameterized
         Replication  |                                       | UNNEST ($1::type[])
                      v                                       | Upserts
 +--------------------+-------------------+   +---------------+----------------------+
-|       postgresio.ReadCDC Source        |   |        postgresio.Write Sink         |
+|   postgresio.ReadCDC Source [Planned]  |   |        postgresio.Write Sink         |
 |  - Decoupled Heartbeat Goroutine       |   |  - BatchCompactor (LWW deduplication)|
 |  - pgoutput Binary Message Parser      |   |  - Canonical Composite PK Sorter     |
 |  - In-Flight XID Transaction Spooler   |   |  - Pool Clamping (2 conns default)   |
@@ -93,7 +93,7 @@
                      |                                       ^
                      v                                       |
 +--------------------+---------------------------------------+----------------------+
-|                      Apache Arrow Columnar Vectorized Engine                      |
+|             Apache Arrow Columnar Vectorized Engine [Planned]                     |
 |  - ArrowRecordBatch zero-copy conversion (0 allocs/op, amortized)                 |
 |  - Schema Reflection & Go Type Unnesting (cdc_range, arrays, jsonb)               |
 +-----------------------------------------------------------------------------------+
@@ -103,7 +103,7 @@
 |                     Beam Go SchemaTransform & Expansion Service                   |
 |  - URN: beam:schematransform:org.apache.beam:postgres_write:v1                    |
 |  - URN: beam:schematransform:org.apache.beam:postgres_read:v1                     |
-|  - URN: beam:schematransform:org.apache.beam:postgres_read_cdc:v1                 |
+|  - URN: beam:schematransform:org.apache.beam:postgres_read_cdc:v1 [Planned]       |
 |  - Cross-Language Portability (Beam YAML, Python SDK)                             |
 +-----------------------------------------------------------------------------------+
 ```
@@ -956,7 +956,6 @@ The connector is unreleased and experimental. The list below is what is still op
 | **Slot lag** | Retention is measured and published by default, but enforcement is not: the [circuit breaker](#wal-retention-circuit-breaker) is off until a budget is set, and it does not drop the slot, so WAL is not reclaimed by the breach itself. A bundle already blocked inside a downstream `emit` cannot be interrupted from outside. | Without a configured budget the database can still run out of WAL volume if a stalled pipeline is left unattended. Alert on `cdc_slot_retained_bytes` or the [health view](#beam_cdc_health-view), set `WithCDCMaxSlotLagBytes`, and configure `max_slot_wal_keep_size` server-side as a backstop. |
 | **Long transactions** | A checkpoint cannot land partway through a transaction, so `WithCDCCheckpointInterval` is advisory while one is open. A single very large transaction extends the invocation until its `COMMIT` frame arrives. | Acknowledgment latency, and the memory the parser holds for a streamed transaction, both scale with the largest transaction on the source. A connection that stops delivering mid-transaction is dropped after two minutes of silence and the bundle is retried. |
 | **Initial backfill** | Slot creation exports a consistent snapshot and `SlotCreationResult.SnapshotIsolationStatements` returns the statements needed to read it, but the connector does not run the backfill. | Pre-existing table rows require a separate read. Only changes after the slot's creation point arrive through CDC. |
-| **Replication origin on the write path** | The origin is selected once per pooled connection, so both the staged `COPY` and `UNNEST` paths stamp their writes. It cannot be combined with `WithPgBouncer`, because transaction pooling cannot guarantee a statement runs on a connection that selected it, and selecting it is superuser-only unless `EXECUTE` is granted. | Bi-directional topologies must connect directly to PostgreSQL and grant the origin function. `postgresio.Write` rejects the PgBouncer combination at construction. See [Required privileges](#required-privileges). |
 | **Driver** | Built on `lib/pq`. The CDC path implements the replication protocol directly rather than through `pgx` / `pglogrepl`. | Protocol features not implemented here are unavailable, and the wire decoder is maintained in-tree. |
 | **`search_path`** | The write path pins `search_path=pg_catalog,pg_temp` on every pooled connection to close CVE-2018-1058, so an unqualified table name cannot resolve. | Table names must be written as `schema.table`. `postgresio.Write` rejects an unqualified name when the pipeline is constructed, and the `postgres_write` SchemaTransform rejects it during configuration validation. |
 | **Failover slots** | Slots are created without `FAILOVER` unless `WithCDCFailoverSlot(true)` is set, because enabling it couples pipeline latency to standby replication. | With the default, a failover loses the slot and its position, and the pipeline restarts from whatever the new primary has. See [Failover slots](#failover-slots). |
