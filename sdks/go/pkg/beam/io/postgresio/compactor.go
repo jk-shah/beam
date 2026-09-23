@@ -318,11 +318,25 @@ func ExtractPrimaryKeys(val any, pkCols []string) (string, []any) {
 			}
 			mapVal := v.MapIndex(key)
 			if !mapVal.IsValid() {
+				// reflect.Value.MapKeys returns keys in an unspecified order,
+				// so a map carrying more than one spelling of the same column
+				// ("ID" and "Id", say) would otherwise resolve to a different
+				// entry on each call. The entity key produced here groups rows
+				// for last-write-wins compaction and orders them for deadlock
+				// avoidance, so an unstable choice would split one logical row
+				// across bundles. Taking the lexicographically smallest match
+				// makes the choice arbitrary but fixed.
+				var best reflect.Value
 				for _, mk := range v.MapKeys() {
-					if strings.EqualFold(mk.String(), col) {
-						mapVal = v.MapIndex(mk)
-						break
+					if !strings.EqualFold(mk.String(), col) {
+						continue
 					}
+					if !best.IsValid() || mk.String() < best.String() {
+						best = mk
+					}
+				}
+				if best.IsValid() {
+					mapVal = v.MapIndex(best)
 				}
 			}
 			if mapVal.IsValid() {

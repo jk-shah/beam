@@ -118,8 +118,20 @@ type WriteOptions struct {
 	WriteMethod    WriteMethod
 	PrimaryKeyCols []string
 	// UpdateFields specifies the subset of columns to update when WriteMode is
-	// WriteModeUpsert (ON CONFLICT DO UPDATE). If empty, all columns other than
-	// PrimaryKeyCols are updated.
+	// WriteModeUpsert (ON CONFLICT DO UPDATE) or WriteModeUpdate (UPDATE ...
+	// SET). If empty, all columns other than PrimaryKeyCols are updated.
+	// Primary key columns are always excluded from the SET clause, so naming
+	// one here has no effect.
+	//
+	// Names are matched against resolved column names exactly and
+	// case-sensitively; "Email" does not match the column email. This differs
+	// from the primary key lookup in ExtractPrimaryKeys, which falls back to a
+	// case-insensitive match. Write rejects a name that matches no column of
+	// the input type when the pipeline is constructed.
+	//
+	// The other write modes have no SET clause to restrict, so Write rejects
+	// this field when WriteMode is WriteModeInsert or WriteModeMerge rather
+	// than ignoring it.
 	UpdateFields          []string
 	BatchSize             int
 	MaxBatchBytes         int
@@ -394,8 +406,15 @@ func WithPrimaryKeyColumns(cols ...string) Option {
 }
 
 // WithUpdateFields specifies the subset of columns to update when WriteMode is
-// WriteModeUpsert (ON CONFLICT DO UPDATE). If empty or omitted, all non-primary
-// key columns are updated.
+// WriteModeUpsert (ON CONFLICT DO UPDATE) or WriteModeUpdate (UPDATE ... SET).
+// If empty or omitted, all non-primary key columns are updated. Primary key
+// columns are always excluded from the SET clause.
+//
+// Names must match the resolved column names exactly, including case:
+// WithUpdateFields("Email") does not select the column email. Write rejects a
+// name that matches no column of the input type, and rejects the option
+// entirely under WriteModeInsert and WriteModeMerge, which have no SET clause
+// to restrict.
 func WithUpdateFields(fields ...string) Option {
 	return func(o *WriteOptions) {
 		o.UpdateFields = append([]string(nil), fields...)

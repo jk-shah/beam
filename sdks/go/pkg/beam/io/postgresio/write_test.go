@@ -1327,6 +1327,163 @@ func TestWriteAcceptsEmptySSLModeAsDefault(t *testing.T) {
 	}
 }
 
+// TestWriteRejectsUnknownUpdateField covers the typo the reviewer described:
+// WithUpdateFields("emial") is a valid identifier, so SanitizeIdentifier passes
+// it through and PostgreSQL rejects the batch at flush time with `column
+// "emial" of relation "orders" does not exist`. The name is checkable against
+// the element type at construction, which is where every other write option is
+// checked.
+func TestWriteRejectsUnknownUpdateField(t *testing.T) {
+	for _, mode := range []WriteMode{WriteModeUpsert, WriteModeUpdate} {
+		t.Run(mode.String(), func(t *testing.T) {
+			opts := validWriteOpts()
+			opts.WriteMode = mode
+			opts.UpdateFields = []string{"emial"}
+
+			msg := writePanic(t, opts)
+			if msg == "" {
+				t.Fatal("Write accepted an update field naming no column; the batch would fail on a worker")
+			}
+			if !strings.Contains(msg, "emial") {
+				t.Errorf("panic does not quote the rejected field: %s", msg)
+			}
+			// The known set is what tells a reader what to write instead.
+			if !strings.Contains(msg, "amount") {
+				t.Errorf("panic does not list the known columns: %s", msg)
+			}
+		})
+	}
+}
+
+// TestWriteRejectsCaseMismatchedUpdateField pins the case-sensitivity contract.
+// The compactor's primary key lookup falls back to a case-insensitive match, so
+// a caller could reasonably expect "Amount" to select amount. It does not, and
+// the error has to say so rather than just report an unknown column.
+func TestWriteRejectsCaseMismatchedUpdateField(t *testing.T) {
+	opts := validWriteOpts()
+	opts.WriteMode = WriteModeUpsert
+	opts.UpdateFields = []string{"Amount"}
+
+	msg := writePanic(t, opts)
+	if msg == "" {
+		t.Fatal("Write accepted an update field differing from the column only by case")
+	}
+	if !strings.Contains(msg, "case-sensitive") {
+		t.Errorf("panic does not explain that matching is case-sensitive: %s", msg)
+	}
+	if !strings.Contains(msg, `"amount"`) {
+		t.Errorf("panic does not name the column the caller probably meant: %s", msg)
+	}
+}
+
+// TestWriteRejectsUpdateFieldsForModesWithoutSetClause covers the silent-ignore
+// case: Insert has no SET clause and MERGE builds its own, so UpdateFields is
+// read by nothing under either. Accepting it would let a pipeline that meant to
+// restrict which columns are overwritten run as though it had said nothing.
+func TestWriteRejectsUpdateFieldsForModesWithoutSetClause(t *testing.T) {
+	for _, mode := range []WriteMode{WriteModeInsert, WriteModeMerge} {
+		t.Run(mode.String(), func(t *testing.T) {
+			opts := validWriteOpts()
+			opts.WriteMode = mode
+			opts.UpdateFields = []string{"amount"}
+
+			msg := writePanic(t, opts)
+			if msg == "" {
+				t.Fatalf("Write silently ignored UpdateFields under %v", mode)
+			}
+			if !strings.Contains(msg, "UpdateFields") {
+				t.Errorf("panic does not name the ignored option: %s", msg)
+			}
+		})
+	}
+}
+
+// TestWriteAcceptsValidUpdateFields guards against the new checks rejecting the
+// cases they are meant to allow.
+func TestWriteAcceptsValidUpdateFields(t *testing.T) {
+	t.Run("upsert subset", func(t *testing.T) {
+		opts := validWriteOpts()
+		opts.WriteMode = WriteModeUpsert
+		opts.UpdateFields = []string{"amount", "region"}
+
+		if msg := writePanic(t, opts); msg != "" {
+			t.Fatalf("Write rejected update fields that name real columns: %s", msg)
+		}
+	})
+
+	// A primary key column is dropped from the SET clause rather than rejected,
+	// so naming one must still be accepted.
+	t.Run("primary key column", func(t *testing.T) {
+		opts := validWriteOpts()
+		opts.WriteMode = WriteModeUpsert
+		opts.UpdateFields = []string{"id", "amount"}
+
+		if msg := writePanic(t, opts); msg != "" {
+			t.Fatalf("Write rejected a primary key column in UpdateFields: %s", msg)
+		}
+	})
+
+	t.Run("unset", func(t *testing.T) {
+		opts := validWriteOpts()
+		opts.WriteMode = WriteModeMerge
+
+		if msg := writePanic(t, opts); msg != "" {
+			t.Fatalf("Write rejected MERGE with no UpdateFields: %s", msg)
+		}
+	})
+}
+
+// TestValidateUpdateFields exercises the checker directly, including the shapes
+// Write cannot reach: a non-struct element type yields no columns to check
+// against, and must not be turned into a rejection.
+func TestValidateUpdateFields(t *testing.T) {
+	columns := []string{"id", "region", "amount"}
+
+	tests := []struct {
+		name         string
+		updateFields []string
+		columns      []string
+		wantErr      bool
+	}{
+		{name: "empty update fields", updateFields: nil, columns: columns},
+		{name: "all known", updateFields: []string{"region", "amount"}, columns: columns},
+		{name: "unknown", updateFields: []string{"amount", "emial"}, columns: columns, wantErr: true},
+		{name: "case mismatch", updateFields: []string{"Amount"}, columns: columns, wantErr: true},
+		{name: "no columns resolved", updateFields: []string{"anything"}, columns: nil},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateUpdateFields(tc.updateFields, tc.columns)
+			if tc.wantErr && err == nil {
+				t.Fatal("expected an error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("expected no error, got %v", err)
+			}
+		})
+	}
+}
+
+// TestSetupRejectsUnknownUpdateField covers the backstop for a writeFn built
+// directly rather than through Write.
+func TestSetupRejectsUnknownUpdateField(t *testing.T) {
+	fn := &writeFn{
+		Table:          `"public"."orders"`,
+		Options:        NewWriteOptions(WithHost("localhost"), WithDatabase("testdb"), WithPrimaryKeyColumns("id"), WithUpdateFields("emial")),
+		Type:           beam.EncodedType{T: reflect.TypeOf(TestOrder{})},
+		PrimaryKeyCols: []string{"id"},
+	}
+
+	err := fn.Setup(context.Background())
+	if err == nil {
+		t.Fatal("Setup accepted an update field naming no column")
+	}
+	if !strings.Contains(err.Error(), "emial") {
+		t.Errorf("error does not quote the rejected field: %v", err)
+	}
+}
+
 // TestExtractRowValuesFromMap covers the panic the reviewer found:
 // ExtractPrimaryKeys accepted maps, but extractRowValues called FieldByName
 // unconditionally, so a map-shaped element took down the bundle.

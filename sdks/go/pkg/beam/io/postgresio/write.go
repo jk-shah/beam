@@ -175,7 +175,29 @@ func Write(s beam.Scope, table string, opts WriteOptions, col beam.PCollection) 
 	// dropped DialFunc and an unconfigured one are otherwise indistinguishable.
 	opts.RequiresDialFunc = opts.DialFunc != nil
 
+	// UpdateFields only reaches SQL through the two SET clauses: the upsert's
+	// ON CONFLICT DO UPDATE and the update's UPDATE ... SET. Insert has no SET
+	// clause, and MERGE builds its own from the primary key and the operation
+	// column, so under either mode the option is read by nothing. Accepting it
+	// silently would let a pipeline that intends to restrict which columns are
+	// overwritten run as though it had said nothing at all.
+	if len(opts.UpdateFields) > 0 &&
+		opts.WriteMode != WriteModeUpsert && opts.WriteMode != WriteModeUpdate {
+		panic(fmt.Sprintf("postgresio.Write: UpdateFields is only honored by WriteModeUpsert and "+
+			"WriteModeUpdate, but write mode is %v, which would ignore it. Remove WithUpdateFields, "+
+			"or select a write mode that has a SET clause to restrict.", opts.WriteMode))
+	}
+
 	elemType := col.Type().Type()
+
+	// Checked against the element type rather than the live table because the
+	// table is not reachable from the submitting process. Every column the
+	// writer can emit is derived from this type, so a name that is not in it
+	// cannot be written whatever the table looks like.
+	if err := validateUpdateFields(opts.UpdateFields, structColumns(elemType)); err != nil {
+		panic(fmt.Sprintf("postgresio.Write: %v", err))
+	}
+
 	fn := &writeFn{
 		Table:          sanitizedTable,
 		Options:        opts,
@@ -279,6 +301,15 @@ func (fn *writeFn) Setup(ctx context.Context) error {
 	fn.db = db
 	fn.compactor = NewBatchCompactor(fn.Options.BatchSize, fn.Options.MaxBatchBytes, fn.Options.FlushInterval)
 	fn.inspectColumns(fn.Type.T)
+
+	// Write already rejects this at construction. Repeating it here covers a
+	// writeFn assembled directly, and costs one pass over a slice that is
+	// almost always empty. Failing in Setup still beats failing at flush: the
+	// batch that would carry the bad identifier has not been accumulated yet.
+	if err := validateUpdateFields(fn.Options.UpdateFields, fn.columns); err != nil {
+		return fmt.Errorf("postgresio: %w", err)
+	}
+
 	if err := fn.inspectColumnTypes(ctx); err != nil {
 		return err
 	}
@@ -400,14 +431,29 @@ func toSnakeCase(name string) string {
 }
 
 func (fn *writeFn) inspectColumns(t reflect.Type) {
+	fn.columns = structColumns(t)
+}
+
+// structColumns derives the ordered list of PostgreSQL column names an element
+// type maps to, using the same tag precedence and snake_case fallback the
+// writer uses when it builds SQL.
+//
+// It is package level rather than a writeFn method so that Write can resolve
+// the columns in the submitting process, before any writeFn exists, and reject
+// a configuration that names a column the element type does not carry.
+// A type that is not a struct yields no columns.
+func structColumns(t reflect.Type) []string {
+	if t == nil {
+		return nil
+	}
 	if t.Kind() == reflect.Ptr {
 		t = t.Elem()
 	}
 	if t.Kind() != reflect.Struct {
-		return
+		return nil
 	}
 
-	fn.columns = make([]string, 0, t.NumField())
+	columns := make([]string, 0, t.NumField())
 	for i := 0; i < t.NumField(); i++ {
 		field := t.Field(i)
 		if !field.IsExported() {
@@ -428,8 +474,55 @@ func (fn *writeFn) inspectColumns(t reflect.Type) {
 		if !tagged {
 			colName = toSnakeCase(field.Name)
 		}
-		fn.columns = append(fn.columns, colName)
+		columns = append(columns, colName)
 	}
+	return columns
+}
+
+// validateUpdateFields reports a configuration error when UpdateFields names a
+// column the element type does not carry.
+//
+// UpdateFields is matched against resolved column names exactly and
+// case-sensitively, unlike the primary key lookup in ExtractPrimaryKeys, which
+// falls back to a case-insensitive match. A name that resolves to nothing is
+// not inert: on the upsert path it is emitted verbatim into
+// ON CONFLICT DO UPDATE SET, so PostgreSQL rejects the whole batch at flush
+// time with `column "emial" of relation "orders" does not exist`, and on the
+// update path it is silently dropped from the SET clause, so the column the
+// caller meant to write is never written at all. Both surface long after
+// submission, on a worker, which is why this runs at construction.
+//
+// An empty columns slice means the element type is not a struct, so there is
+// nothing to check against.
+func validateUpdateFields(updateFields, columns []string) error {
+	if len(updateFields) == 0 || len(columns) == 0 {
+		return nil
+	}
+
+	known := make(map[string]string, len(columns)) // lowercase -> canonical
+	exact := make(map[string]bool, len(columns))
+	for _, col := range columns {
+		exact[col] = true
+		lower := strings.ToLower(col)
+		if _, seen := known[lower]; !seen {
+			known[lower] = col
+		}
+	}
+
+	for _, f := range updateFields {
+		if exact[f] {
+			continue
+		}
+		if canonical, ok := known[strings.ToLower(f)]; ok {
+			return fmt.Errorf("update field %q does not match any column of the input type; "+
+				"matching is exact and case-sensitive, and the type declares %q. "+
+				"Known columns: %s", f, canonical, strings.Join(columns, ", "))
+		}
+		return fmt.Errorf("update field %q does not match any column of the input type. "+
+			"Column names come from the db, beam, or json struct tag, or from the snake_case "+
+			"form of the field name. Known columns: %s", f, strings.Join(columns, ", "))
+	}
+	return nil
 }
 
 func (fn *writeFn) inspectColumnTypes(ctx context.Context) error {

@@ -321,3 +321,40 @@ func TestExtractPrimaryKeysMapEdgeCases(t *testing.T) {
 		t.Errorf("expected empty key from nil map, got %q", keyNil)
 	}
 }
+
+// TestExtractPrimaryKeysAmbiguousCaseIsStable covers the nondeterminism the
+// reviewer noted in the case-insensitive fallback. reflect.Value.MapKeys
+// returns keys in an unspecified order, so a map holding both "ID" and "Id"
+// could resolve to a different value on each call. The entity key groups rows
+// for last-write-wins compaction and orders them for deadlock avoidance, so an
+// unstable choice would split one logical row across bundles and reorder locks
+// between workers. The pick is arbitrary, but it has to be fixed.
+func TestExtractPrimaryKeysAmbiguousCaseIsStable(t *testing.T) {
+	ambiguous := map[string]any{
+		"ID": int64(1),
+		"Id": int64(2),
+		"iD": int64(3),
+	}
+
+	first, _ := ExtractPrimaryKeys(ambiguous, []string{"id"})
+	if first == "" {
+		t.Fatal("expected a key from a map whose only matches differ by case")
+	}
+	// A single run can pass by luck; Go randomizes map iteration per range.
+	for i := 0; i < 100; i++ {
+		got, _ := ExtractPrimaryKeys(ambiguous, []string{"id"})
+		if got != first {
+			t.Fatalf("iteration %d keyed %q but the first call keyed %q; the fallback is order-dependent", i, got, first)
+		}
+	}
+
+	// An exact match must still win over any case-insensitive candidate.
+	withExact := map[string]any{
+		"ID": int64(1),
+		"id": int64(2),
+	}
+	exactKey, vals := ExtractPrimaryKeys(withExact, []string{"id"})
+	if len(vals) != 1 || vals[0] != int64(2) {
+		t.Errorf("exact key lookup returned %v (key %q), want the value under \"id\"", vals, exactKey)
+	}
+}

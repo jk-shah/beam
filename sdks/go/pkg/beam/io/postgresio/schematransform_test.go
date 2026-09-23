@@ -202,6 +202,59 @@ func TestPostgreSqlWriteConfig_Validation(t *testing.T) {
 			},
 			expectErr: false,
 		},
+		{
+			// INSERT has no SET clause, so update_fields is read by nothing.
+			name: "update fields under INSERT",
+			cfg: PostgreSqlWriteConfig{
+				Host:         "localhost",
+				Database:     "testdb",
+				Table:        "public.users",
+				Username:     "testuser",
+				WriteMode:    "INSERT",
+				UpdateFields: []string{"name"},
+			},
+			expectErr: true,
+		},
+		{
+			// MERGE derives its own SET clause from the key and op column.
+			name: "update fields under MERGE",
+			cfg: PostgreSqlWriteConfig{
+				Host:         "localhost",
+				Database:     "testdb",
+				Table:        "public.users",
+				Username:     "testuser",
+				WriteMode:    "MERGE",
+				ConflictKeys: []string{"id"},
+				UpdateFields: []string{"name"},
+			},
+			expectErr: true,
+		},
+		{
+			// An empty write_mode with no conflict_keys resolves to INSERT, so
+			// update_fields would be dropped without the rule catching it.
+			name: "update fields with defaulted mode and no conflict keys",
+			cfg: PostgreSqlWriteConfig{
+				Host:         "localhost",
+				Database:     "testdb",
+				Table:        "public.users",
+				Username:     "testuser",
+				UpdateFields: []string{"name"},
+			},
+			expectErr: true,
+		},
+		{
+			name: "update fields under UPDATE",
+			cfg: PostgreSqlWriteConfig{
+				Host:         "localhost",
+				Database:     "testdb",
+				Table:        "public.users",
+				Username:     "testuser",
+				WriteMode:    "UPDATE",
+				ConflictKeys: []string{"id"},
+				UpdateFields: []string{"name"},
+			},
+			expectErr: false,
+		},
 	}
 
 	for _, tt := range tests {

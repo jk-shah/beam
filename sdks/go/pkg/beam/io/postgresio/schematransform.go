@@ -76,7 +76,7 @@ type PostgreSqlWriteConfig struct {
 	SSLMode           string   `beam:"sslmode" doc:"SSL mode (e.g. disable, require, verify-ca, verify-full)."`
 	SSLRootCert       string   `beam:"sslrootcert" doc:"Path to SSL root certificate file (PEM format) for verify-ca/verify-full."`
 	ConflictKeys      []string `beam:"conflict_keys" doc:"Columns used as primary or unique key conflict targets for UPSERT."`
-	UpdateFields      []string `beam:"update_fields" doc:"Columns to update ON CONFLICT DO UPDATE. If empty, uses DO NOTHING."`
+	UpdateFields      []string `beam:"update_fields" doc:"Subset of columns to set under write_mode UPSERT or UPDATE. Matched exactly and case-sensitively against column names. If empty, every non-conflict-key column is set."`
 	MaxBatchRows      int32    `beam:"max_batch_rows" doc:"Maximum rows per batch UNNEST statement (default: 5000)."`
 	MaxBatchBytes     int32    `beam:"max_batch_bytes" doc:"Maximum byte buffer threshold before flushing (default: 8MB)."`
 	UsePgBouncer      bool     `beam:"use_pgbouncer" doc:"Enable single-statement transaction pooling for PgBouncer compatibility."`
@@ -146,6 +146,28 @@ func (c PostgreSqlWriteConfig) Validate() error {
 	for _, uf := range c.UpdateFields {
 		if _, err := SanitizeIdentifier(uf); err != nil {
 			return fmt.Errorf("invalid update_field %q: %w", uf, err)
+		}
+	}
+
+	// update_fields restricts a SET clause, and only UPSERT and UPDATE have
+	// one. An empty write_mode resolves to UPSERT when conflict_keys are given
+	// and to INSERT when they are not, so the degraded case has to be caught
+	// through the same rule rather than by the literal string.
+	if len(c.UpdateFields) > 0 {
+		effective := mode
+		if effective == "" {
+			if len(c.ConflictKeys) > 0 {
+				effective = "UPSERT"
+			} else {
+				effective = "INSERT"
+			}
+		}
+		if effective == "UPSERT" && len(c.ConflictKeys) == 0 {
+			effective = "INSERT"
+		}
+		if effective != "UPSERT" && effective != "UPDATE" {
+			return fmt.Errorf("update_fields is only honored by write_mode UPSERT and UPDATE, "+
+				"but this configuration resolves to %s, which would ignore it", effective)
 		}
 	}
 	return nil
