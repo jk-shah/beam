@@ -84,6 +84,40 @@ func TestPostgreSqlReadCDCConfig_Validation(t *testing.T) {
 			},
 			expectErr: true,
 		},
+		{
+			name: "invalid slot name with uppercase and spaces",
+			cfg: PostgreSqlReadCDCConfig{
+				Host:        "localhost",
+				Database:    "testdb",
+				SlotName:    "Bad Slot Name",
+				Publication: "pub1",
+				Username:    "testuser",
+			},
+			expectErr: true,
+		},
+		{
+			name: "invalid publication syntax",
+			cfg: PostgreSqlReadCDCConfig{
+				Host:        "localhost",
+				Database:    "testdb",
+				SlotName:    "slot1",
+				Publication: `bad"pub"name`,
+				Username:    "testuser",
+			},
+			expectErr: true,
+		},
+		{
+			name: "invalid sslmode",
+			cfg: PostgreSqlReadCDCConfig{
+				Host:        "localhost",
+				Database:    "testdb",
+				SlotName:    "slot1",
+				Publication: "pub1",
+				Username:    "testuser",
+				SSLMode:     "invalid_mode",
+			},
+			expectErr: true,
+		},
 	}
 
 	for _, tt := range tests {

@@ -1065,6 +1065,14 @@ func (s *cdcSession) close() error {
 func ReadCDC(s beam.Scope, opts ...CDCOption) beam.PCollection {
 	s = s.Scope("postgresio.ReadCDC")
 	cdcOpts := NewCDCOptions(opts...)
+	if cdcOpts.DialFunc != nil {
+		cdcOpts.RequiresDialFunc = true
+	}
+	if cdcOpts.TokenProvider != nil {
+		if _, isStatic := cdcOpts.TokenProvider.(*StaticTokenProvider); !isStatic {
+			cdcOpts.RequiresTokenProvider = true
+		}
+	}
 	if err := cdcOpts.Validate(); err != nil {
 		panic(fmt.Sprintf("invalid postgresio.CDCOptions: %v", err))
 	}

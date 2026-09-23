@@ -174,6 +174,12 @@ type NativeReplicationStream struct {
 
 // NewNativeReplicationStream connects to PostgreSQL in replication mode.
 func NewNativeReplicationStream(ctx context.Context, opts CDCOptions) (*NativeReplicationStream, error) {
+	if opts.RequiresDialFunc && opts.DialFunc == nil {
+		return nil, errDialFuncLost()
+	}
+	if opts.RequiresTokenProvider && opts.TokenProvider == nil {
+		return nil, errTokenProviderLost()
+	}
 	if err := opts.Validate(); err != nil {
 		return nil, err
 	}
@@ -417,6 +423,9 @@ func (s *NativeReplicationStream) handshake(ctx context.Context) error {
 }
 
 func (s *NativeReplicationStream) resolvePassword(ctx context.Context) (string, error) {
+	if s.opts.RequiresTokenProvider && s.opts.TokenProvider == nil {
+		return "", errTokenProviderLost()
+	}
 	if s.opts.TokenProvider != nil {
 		return s.opts.TokenProvider.GetPassword(ctx)
 	}

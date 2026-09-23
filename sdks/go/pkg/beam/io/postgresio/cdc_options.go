@@ -61,16 +61,18 @@ type CDCOptions struct {
 	// overhead. Defaults to DefaultCheckpointInterval.
 	CheckpointInterval time.Duration
 
-	CreateSlotIfMissing bool
-	ReplicaIdentityFull bool
-	TokenProvider       TokenProvider `beam:"-" json:"-"`
-	OriginFilter        string
-	DialFunc            DialFunc                 `beam:"-" json:"-"`
-	StreamFactory       ReplicationStreamFactory `beam:"-" json:"-"`
-	ProtoVersion        int
-	BinaryMode          *bool
-	StreamingMode       string
-	TwoPhaseCommit      bool
+	CreateSlotIfMissing   bool
+	ReplicaIdentityFull   bool
+	TokenProvider         TokenProvider `beam:"-" json:"-"`
+	RequiresTokenProvider bool          `json:"requires_token_provider,omitempty"`
+	OriginFilter          string
+	DialFunc              DialFunc                 `beam:"-" json:"-"`
+	RequiresDialFunc      bool                     `json:"requires_dial_func,omitempty"`
+	StreamFactory         ReplicationStreamFactory `beam:"-" json:"-"`
+	ProtoVersion          int
+	BinaryMode            *bool
+	StreamingMode         string
+	TwoPhaseCommit        bool
 
 	// FailoverSlot requests that the replication slot be synchronized to
 	// standbys, so it survives a failover. Requires PostgreSQL 17 or newer;
@@ -449,6 +451,9 @@ func WithCDCReplicaIdentityFull(full bool) CDCOption {
 func WithCDCTokenProvider(provider TokenProvider) CDCOption {
 	return func(o *CDCOptions) {
 		o.TokenProvider = provider
+		if _, isStatic := provider.(*StaticTokenProvider); !isStatic && provider != nil {
+			o.RequiresTokenProvider = true
+		}
 	}
 }
 
@@ -456,7 +461,16 @@ func WithCDCTokenProvider(provider TokenProvider) CDCOption {
 func WithCDCDialFunc(dial DialFunc) CDCOption {
 	return func(o *CDCOptions) {
 		o.DialFunc = dial
+		o.RequiresDialFunc = dial != nil
 	}
+}
+
+// errTokenProviderLost reports a dynamic TokenProvider that was configured at
+// pipeline construction but did not reach this worker.
+func errTokenProviderLost() error {
+	return fmt.Errorf("postgresio: a dynamic TokenProvider was configured but did not reach this worker. " +
+		"A TokenProvider interface cannot be serialized across workers. On a distributed runner, " +
+		"configure static credentials or use an ambient authentication proxy (such as Cloud SQL Auth Proxy)")
 }
 
 // WithCDCStreamFactory registers a pluggable replication stream factory (used in testing).

@@ -97,11 +97,24 @@ func (c PostgreSqlReadCDCConfig) Validate() error {
 	if c.SlotName == "" {
 		return errors.New("slot_name cannot be empty")
 	}
+	if !validSlotRegex.MatchString(c.SlotName) {
+		return fmt.Errorf("invalid slot_name %q: must match ^[a-z0-9_]{1,63}$", c.SlotName)
+	}
 	if c.Publication == "" {
 		return errors.New("publication cannot be empty")
 	}
+	if _, err := SanitizeIdentifier(c.Publication); err != nil {
+		return fmt.Errorf("invalid publication name %q: %w", c.Publication, err)
+	}
 	if c.Username == "" {
 		return errors.New("username cannot be empty")
+	}
+	sslMode := c.SSLMode
+	if sslMode == "" {
+		sslMode = DefaultSSLMode
+	}
+	if err := validateSSLMode(sslMode); err != nil {
+		return fmt.Errorf("invalid sslmode: %w", err)
 	}
 	if c.OriginFilter != "" && c.OriginFilter != "all" && c.OriginFilter != "none" {
 		return fmt.Errorf("origin_filter must be 'all' or 'none', got %q", c.OriginFilter)
@@ -158,7 +171,19 @@ func (t *postgreSqlReadCDCTransform) BuildTransform(s beam.Scope, _ map[string]b
 		opts = append(opts, WithCDCPublicationTables(t.cfg.PublicationTables...))
 	}
 
-	cdcCol := ReadCDC(s, opts...)
+	var cdcCol beam.PCollection
+	var buildErr error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				buildErr = fmt.Errorf("postgres_read_cdc configuration error: %v", r)
+			}
+		}()
+		cdcCol = ReadCDC(s, opts...)
+	}()
+	if buildErr != nil {
+		return nil, buildErr
+	}
 
 	if t.cfg.OutputFormat == "arrow" {
 		batchRows := 4096

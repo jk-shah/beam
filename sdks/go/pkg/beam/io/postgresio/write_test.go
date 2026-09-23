@@ -71,6 +71,42 @@ func TestBuildUnnestQueryUpsert(t *testing.T) {
 	}
 }
 
+func TestBuildUnnestQueryUpsert_WithUpdateFields(t *testing.T) {
+	fn := &writeFn{
+		Table: `"public"."orders"`,
+		Options: NewWriteOptions(
+			WithWriteMode(WriteModeUpsert),
+			WithPrimaryKeyColumns("id"),
+			WithUpdateFields("amount"),
+		),
+		Type:           beam.EncodedType{T: reflect.TypeOf(TestOrder{})},
+		PrimaryKeyCols: []string{"id"},
+		columns:        []string{"id", "region", "amount"},
+		colTypes: map[string]string{
+			"id":     "INT8",
+			"region": "TEXT",
+			"amount": "FLOAT8",
+		},
+	}
+
+	batch := []any{
+		TestOrder{ID: 1, Region: "US", Amount: 100.0},
+	}
+
+	query, _, err := fn.buildUnnestQuery(batch)
+	if err != nil {
+		t.Fatalf("unexpected error building unnest query: %v", err)
+	}
+
+	expectedConflict := `ON CONFLICT ("id") DO UPDATE SET "amount" = EXCLUDED."amount"`
+	if !strings.Contains(query, expectedConflict) {
+		t.Errorf("expected conflict clause %q in query: %q", expectedConflict, query)
+	}
+	if strings.Contains(query, "EXCLUDED.\"region\"") {
+		t.Errorf("expected query NOT to update region when UpdateFields is set to [amount], got %q", query)
+	}
+}
+
 func TestBuildUnnestQueryInsertOnly(t *testing.T) {
 	fn := &writeFn{
 		Table:          `"orders"`,

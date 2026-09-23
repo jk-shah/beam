@@ -105,8 +105,48 @@ func (c PostgreSqlWriteConfig) Validate() error {
 	if !strings.Contains(c.Table, ".") {
 		return fmt.Errorf("table %q must be schema-qualified, for example %q", c.Table, "public."+c.Table)
 	}
+	if _, err := SanitizeTableIdentifier(c.Table); err != nil {
+		return fmt.Errorf("invalid table name %q: %w", c.Table, err)
+	}
 	if c.Username == "" {
 		return errors.New("username cannot be empty")
+	}
+	sslMode := c.SSLMode
+	if sslMode == "" {
+		sslMode = DefaultSSLMode
+	}
+	if err := validateSSLMode(sslMode); err != nil {
+		return fmt.Errorf("invalid sslmode: %w", err)
+	}
+	mode := strings.ToUpper(c.WriteMode)
+	switch mode {
+	case "", "INSERT", "UPSERT", "UPDATE", "MERGE":
+	default:
+		return fmt.Errorf("unknown write_mode %q; expected INSERT, UPSERT, UPDATE, or MERGE", c.WriteMode)
+	}
+	if mode == "UPDATE" && len(c.ConflictKeys) == 0 {
+		return errors.New("write_mode UPDATE requires conflict_keys (primary key columns)")
+	}
+	if mode == "MERGE" && c.UsePgBouncer {
+		return errors.New("write_mode MERGE cannot be combined with use_pgbouncer")
+	}
+	if c.ReplicationOrigin != "" {
+		if !originNameRegex.MatchString(c.ReplicationOrigin) {
+			return fmt.Errorf("invalid replication_origin name %q (must match %s)", c.ReplicationOrigin, originNameRegex.String())
+		}
+		if c.UsePgBouncer {
+			return errors.New("replication_origin cannot be combined with use_pgbouncer")
+		}
+	}
+	for _, pk := range c.ConflictKeys {
+		if _, err := SanitizeIdentifier(pk); err != nil {
+			return fmt.Errorf("invalid conflict_key %q: %w", pk, err)
+		}
+	}
+	for _, uf := range c.UpdateFields {
+		if _, err := SanitizeIdentifier(uf); err != nil {
+			return fmt.Errorf("invalid update_field %q: %w", uf, err)
+		}
 	}
 	return nil
 }
@@ -144,6 +184,7 @@ func (t *postgreSqlWriteTransform) BuildTransform(s beam.Scope, inputs map[strin
 		SSLRootCert:           t.cfg.SSLRootCert,
 		WriteMethod:           WriteMethodStagedCopy,
 		PrimaryKeyCols:        t.cfg.ConflictKeys,
+		UpdateFields:          t.cfg.UpdateFields,
 		BatchSize:             int(t.cfg.MaxBatchRows),
 		MaxBatchBytes:         int(t.cfg.MaxBatchBytes),
 		UsePgBouncer:          t.cfg.UsePgBouncer,
@@ -171,7 +212,20 @@ func (t *postgreSqlWriteTransform) BuildTransform(s beam.Scope, inputs map[strin
 		}
 	}
 
-	res := Write(s, t.cfg.Table, opts, in)
+	var res WriteResult
+	var buildErr error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				buildErr = fmt.Errorf("postgres_write configuration error: %v", r)
+			}
+		}()
+		res = Write(s, t.cfg.Table, opts, in)
+	}()
+	if buildErr != nil {
+		return nil, buildErr
+	}
+
 	errorCol := beam.ParDo(s, formatFailedRowFn, res.FailedRows)
 	return map[string]beam.PCollection{
 		schematransform.MainOutputTag:  res.SuccessfulRows,
@@ -339,6 +393,14 @@ func (c PostgreSqlReadConfig) Validate() error {
 	if norm.Table != "" && !strings.Contains(norm.Table, ".") {
 		return fmt.Errorf("table %q must be schema-qualified, for example %q", norm.Table, "public."+norm.Table)
 	}
+	if norm.Table != "" {
+		if _, err := SanitizeTableIdentifier(norm.Table); err != nil {
+			return fmt.Errorf("invalid table name %q: %w", norm.Table, err)
+		}
+	}
+	if err := validateSSLMode(norm.SSLMode); err != nil {
+		return fmt.Errorf("invalid sslmode: %w", err)
+	}
 	if norm.NumPartitions > 0 {
 		if norm.Query != "" {
 			return errors.New("partitioning is supported only for table reads, not arbitrary queries")
@@ -376,10 +438,21 @@ func (t *postgreSqlReadTransform) BuildTransform(s beam.Scope, _ map[string]beam
 	readOpts := NewReadOptions(opts...)
 
 	var col beam.PCollection
-	if t.cfg.Table != "" {
-		col = ReadRows(s, t.cfg.Table, readOpts)
-	} else {
-		col = QueryRows(s, t.cfg.Query, readOpts)
+	var buildErr error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				buildErr = fmt.Errorf("postgres_read configuration error: %v", r)
+			}
+		}()
+		if t.cfg.Table != "" {
+			col = ReadRows(s, t.cfg.Table, readOpts)
+		} else {
+			col = QueryRows(s, t.cfg.Query, readOpts)
+		}
+	}()
+	if buildErr != nil {
+		return nil, buildErr
 	}
 
 	return map[string]beam.PCollection{

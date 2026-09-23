@@ -851,8 +851,12 @@ func (fn *writeFn) executeStagedCopy(ctx context.Context, batch []any) error {
 		pkSet[pk] = true
 	}
 
-	updateClauses := make([]string, 0, len(fn.columns))
-	for _, col := range fn.columns {
+	colsToUpdate := fn.columns
+	if len(fn.Options.UpdateFields) > 0 {
+		colsToUpdate = fn.Options.UpdateFields
+	}
+	updateClauses := make([]string, 0, len(colsToUpdate))
+	for _, col := range colsToUpdate {
 		if !pkSet[col] {
 			san, err := SanitizeIdentifier(col)
 			if err != nil {
@@ -1315,8 +1319,12 @@ func (fn *writeFn) buildUnnestQueryForColumns(batch []any, columns []string) (st
 				pkSet[pk] = true
 			}
 
-			updateClauses := make([]string, 0, len(columns))
-			for _, col := range columns {
+			colsToUpdate := columns
+			if len(fn.Options.UpdateFields) > 0 {
+				colsToUpdate = fn.Options.UpdateFields
+			}
+			updateClauses := make([]string, 0, len(colsToUpdate))
+			for _, col := range colsToUpdate {
 				if !pkSet[col] {
 					san, err := SanitizeIdentifier(col)
 					if err != nil {

@@ -89,6 +89,119 @@ func TestPostgreSqlWriteConfig_Validation(t *testing.T) {
 			},
 			expectErr: true,
 		},
+		{
+			name: "invalid table syntax",
+			cfg: PostgreSqlWriteConfig{
+				Host:     "localhost",
+				Database: "testdb",
+				Table:    `public."bad"table"`,
+				Username: "testuser",
+			},
+			expectErr: true,
+		},
+		{
+			name: "invalid write mode",
+			cfg: PostgreSqlWriteConfig{
+				Host:      "localhost",
+				Database:  "testdb",
+				Table:     "public.users",
+				Username:  "testuser",
+				WriteMode: "INVALID",
+			},
+			expectErr: true,
+		},
+		{
+			name: "write mode UPDATE without conflict keys",
+			cfg: PostgreSqlWriteConfig{
+				Host:      "localhost",
+				Database:  "testdb",
+				Table:     "public.users",
+				Username:  "testuser",
+				WriteMode: "UPDATE",
+			},
+			expectErr: true,
+		},
+		{
+			name: "write mode MERGE with pgbouncer",
+			cfg: PostgreSqlWriteConfig{
+				Host:         "localhost",
+				Database:     "testdb",
+				Table:        "public.users",
+				Username:     "testuser",
+				WriteMode:    "MERGE",
+				UsePgBouncer: true,
+			},
+			expectErr: true,
+		},
+		{
+			name: "replication origin with pgbouncer",
+			cfg: PostgreSqlWriteConfig{
+				Host:              "localhost",
+				Database:          "testdb",
+				Table:             "public.users",
+				Username:          "testuser",
+				ReplicationOrigin: "my_origin",
+				UsePgBouncer:      true,
+			},
+			expectErr: true,
+		},
+		{
+			name: "invalid replication origin name",
+			cfg: PostgreSqlWriteConfig{
+				Host:              "localhost",
+				Database:          "testdb",
+				Table:             "public.users",
+				Username:          "testuser",
+				ReplicationOrigin: "bad name with spaces!",
+			},
+			expectErr: true,
+		},
+		{
+			name: "invalid sslmode",
+			cfg: PostgreSqlWriteConfig{
+				Host:     "localhost",
+				Database: "testdb",
+				Table:    "public.users",
+				Username: "testuser",
+				SSLMode:  "bogus",
+			},
+			expectErr: true,
+		},
+		{
+			name: "invalid conflict key",
+			cfg: PostgreSqlWriteConfig{
+				Host:         "localhost",
+				Database:     "testdb",
+				Table:        "public.users",
+				Username:     "testuser",
+				ConflictKeys: []string{`bad"id`},
+			},
+			expectErr: true,
+		},
+		{
+			name: "invalid update field",
+			cfg: PostgreSqlWriteConfig{
+				Host:         "localhost",
+				Database:     "testdb",
+				Table:        "public.users",
+				Username:     "testuser",
+				ConflictKeys: []string{"id"},
+				UpdateFields: []string{`bad"field`},
+			},
+			expectErr: true,
+		},
+		{
+			name: "valid with update fields",
+			cfg: PostgreSqlWriteConfig{
+				Host:         "localhost",
+				Database:     "testdb",
+				Table:        "public.users",
+				Username:     "testuser",
+				ConflictKeys: []string{"id"},
+				UpdateFields: []string{"name", "status"},
+			},
+			expectErr: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -236,4 +349,37 @@ func TestOptions_PasswordResolution(t *testing.T) {
 			t.Errorf("ResolvePassword() = %q, want pgpass_fallback", got)
 		}
 	})
+}
+
+func TestPostgreSqlWriteTransform_BuildTransform_StructuredError(t *testing.T) {
+	p := beam.NewPipeline()
+	s := p.Root()
+	in := beam.Create(s, "test")
+
+	// Missing input collection
+	tf := &postgreSqlWriteTransform{cfg: PostgreSqlWriteConfig{
+		Host:     "localhost",
+		Database: "testdb",
+		Table:    "public.users",
+		Username: "testuser",
+	}}
+	_, err := tf.BuildTransform(s, map[string]beam.PCollection{})
+	if err == nil {
+		t.Error("expected error when input collection is missing, got nil")
+	}
+
+	// Misconfiguration that would otherwise panic inside Write
+	inputs := map[string]beam.PCollection{schematransform.MainInputTag: in}
+	tfMergePgBouncer := &postgreSqlWriteTransform{cfg: PostgreSqlWriteConfig{
+		Host:         "localhost",
+		Database:     "testdb",
+		Table:        "public.users",
+		Username:     "testuser",
+		WriteMode:    "MERGE",
+		UsePgBouncer: true,
+	}}
+	_, err = tfMergePgBouncer.BuildTransform(s, inputs)
+	if err == nil {
+		t.Error("expected structured error for MERGE + PgBouncer, got nil")
+	}
 }

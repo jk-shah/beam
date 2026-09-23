@@ -16,7 +16,10 @@
 package postgresio
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"net"
 	"strings"
 	"testing"
 	"time"
@@ -161,5 +164,140 @@ func TestOptionsJSONSerializationPreservesPasswordForDistributedWorkers(t *testi
 	}
 	if roundTrip.Password != "worker_secret_key_123" {
 		t.Errorf("expected worker JSON deserialization to preserve password, got %q", roundTrip.Password)
+	}
+}
+
+func TestCDCOptions_DialFuncMarkerSurvivesSerialization(t *testing.T) {
+	dummyDial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return nil, fmt.Errorf("unused")
+	}
+	opts := NewCDCOptions(
+		WithCDCHost("localhost"),
+		WithCDCSlotName("beam_slot"),
+		WithCDCPublication("pub"),
+		WithCDCDialFunc(dummyDial),
+	)
+	if !opts.RequiresDialFunc {
+		t.Error("WithCDCDialFunc did not set RequiresDialFunc")
+	}
+
+	data, err := json.Marshal(opts)
+	if err != nil {
+		t.Fatalf("failed to marshal CDCOptions: %v", err)
+	}
+	var roundTrip CDCOptions
+	if err := json.Unmarshal(data, &roundTrip); err != nil {
+		t.Fatalf("failed to unmarshal CDCOptions: %v", err)
+	}
+	if roundTrip.DialFunc != nil {
+		t.Error("DialFunc closure should not have survived JSON serialization")
+	}
+	if !roundTrip.RequiresDialFunc {
+		t.Error("RequiresDialFunc marker should have survived JSON serialization")
+	}
+}
+
+func TestCDCOptions_TokenProviderMarkerSurvivesSerialization(t *testing.T) {
+	dummyToken := &mockTokenProvider{token: "dynamic_token_123"}
+	opts := NewCDCOptions(
+		WithCDCHost("localhost"),
+		WithCDCSlotName("beam_slot"),
+		WithCDCPublication("pub"),
+		WithCDCTokenProvider(dummyToken),
+	)
+	if !opts.RequiresTokenProvider {
+		t.Error("WithCDCTokenProvider did not set RequiresTokenProvider for non-static provider")
+	}
+
+	data, err := json.Marshal(opts)
+	if err != nil {
+		t.Fatalf("failed to marshal CDCOptions: %v", err)
+	}
+	var roundTrip CDCOptions
+	if err := json.Unmarshal(data, &roundTrip); err != nil {
+		t.Fatalf("failed to unmarshal CDCOptions: %v", err)
+	}
+	if roundTrip.TokenProvider != nil {
+		t.Error("TokenProvider interface should not have survived JSON serialization")
+	}
+	if !roundTrip.RequiresTokenProvider {
+		t.Error("RequiresTokenProvider marker should have survived JSON serialization")
+	}
+
+	// StaticTokenProvider should not set RequiresTokenProvider because its password serializes
+	staticToken := NewStaticTokenProvider("static_pass")
+	optsStatic := NewCDCOptions(
+		WithCDCSlotName("beam_slot"),
+		WithCDCPublication("pub"),
+		WithCDCTokenProvider(staticToken),
+	)
+	if optsStatic.RequiresTokenProvider {
+		t.Error("StaticTokenProvider should not set RequiresTokenProvider")
+	}
+}
+
+type mockTokenProvider struct {
+	token string
+}
+
+func (m *mockTokenProvider) GetPassword(ctx context.Context) (string, error) {
+	return m.token, nil
+}
+
+func TestCDCOptions_LostDialerAndTokenProviderErrors(t *testing.T) {
+	ctx := context.Background()
+
+	// 1. Lost dialer
+	optsLostDial := CDCOptions{
+		Host:             "localhost",
+		Port:             5432,
+		Database:         "testdb",
+		SlotName:         "beam_slot",
+		Publication:      "pub",
+		Username:         "user",
+		RequiresDialFunc: true,
+		DialFunc:         nil,
+	}
+
+	_, err := NewNativeReplicationStream(ctx, optsLostDial)
+	if err == nil || !strings.Contains(err.Error(), "DialFunc") {
+		t.Errorf("expected errDialFuncLost from NewNativeReplicationStream, got %v", err)
+	}
+
+	_, err = newSQLPreflightQuerier(optsLostDial)
+	if err == nil || !strings.Contains(err.Error(), "DialFunc") {
+		t.Errorf("expected errDialFuncLost from newSQLPreflightQuerier, got %v", err)
+	}
+
+	_, err = newSQLSlotQuerier(optsLostDial)
+	if err == nil || !strings.Contains(err.Error(), "DialFunc") {
+		t.Errorf("expected errDialFuncLost from newSQLSlotQuerier, got %v", err)
+	}
+
+	// 2. Lost token provider
+	optsLostToken := CDCOptions{
+		Host:                  "localhost",
+		Port:                  5432,
+		Database:              "testdb",
+		SlotName:              "beam_slot",
+		Publication:           "pub",
+		Username:              "user",
+		RequiresTokenProvider: true,
+		TokenProvider:         nil,
+	}
+
+	_, err = NewNativeReplicationStream(ctx, optsLostToken)
+	if err == nil || !strings.Contains(err.Error(), "TokenProvider") {
+		t.Errorf("expected errTokenProviderLost from NewNativeReplicationStream, got %v", err)
+	}
+
+	_, err = newSQLPreflightQuerier(optsLostToken)
+	if err == nil || !strings.Contains(err.Error(), "TokenProvider") {
+		t.Errorf("expected errTokenProviderLost from newSQLPreflightQuerier, got %v", err)
+	}
+
+	_, err = newSQLSlotQuerier(optsLostToken)
+	if err == nil || !strings.Contains(err.Error(), "TokenProvider") {
+		t.Errorf("expected errTokenProviderLost from newSQLSlotQuerier, got %v", err)
 	}
 }

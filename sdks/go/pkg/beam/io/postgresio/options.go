@@ -106,17 +106,21 @@ func errDialFuncLost() error {
 // WriteOptions configures connection pooling, write mutation modes, batch thresholds,
 // and safety guards for writing to PostgreSQL.
 type WriteOptions struct {
-	Host                  string
-	Port                  int
-	Database              string
-	Username              string
-	Password              string `beam:"password,secret" json:"password,omitempty"`
-	PasswordEnvVar        string `json:"password_env_var,omitempty"`
-	SSLMode               string
-	SSLRootCert           string
-	WriteMode             WriteMode
-	WriteMethod           WriteMethod
-	PrimaryKeyCols        []string
+	Host           string
+	Port           int
+	Database       string
+	Username       string
+	Password       string `beam:"password,secret" json:"password,omitempty"`
+	PasswordEnvVar string `json:"password_env_var,omitempty"`
+	SSLMode        string
+	SSLRootCert    string
+	WriteMode      WriteMode
+	WriteMethod    WriteMethod
+	PrimaryKeyCols []string
+	// UpdateFields specifies the subset of columns to update when WriteMode is
+	// WriteModeUpsert (ON CONFLICT DO UPDATE). If empty, all columns other than
+	// PrimaryKeyCols are updated.
+	UpdateFields          []string
 	BatchSize             int
 	MaxBatchBytes         int
 	FlushInterval         time.Duration
@@ -386,6 +390,15 @@ func WithWriteMode(mode WriteMode) Option {
 func WithPrimaryKeyColumns(cols ...string) Option {
 	return func(o *WriteOptions) {
 		o.PrimaryKeyCols = cols
+	}
+}
+
+// WithUpdateFields specifies the subset of columns to update when WriteMode is
+// WriteModeUpsert (ON CONFLICT DO UPDATE). If empty or omitted, all non-primary
+// key columns are updated.
+func WithUpdateFields(fields ...string) Option {
+	return func(o *WriteOptions) {
+		o.UpdateFields = append([]string(nil), fields...)
 	}
 }
 

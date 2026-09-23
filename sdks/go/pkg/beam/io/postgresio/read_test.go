@@ -732,6 +732,29 @@ func TestPostgreSqlReadConfig_Validation(t *testing.T) {
 			expectErr: true,
 			errSubstr: "lower_bound (1) must be less than upper_bound (0)",
 		},
+		{
+			name: "invalid sslmode",
+			cfg: PostgreSqlReadConfig{
+				Host:     "localhost",
+				Database: "testdb",
+				Table:    "public.orders",
+				Username: "postgres",
+				SSLMode:  "invalid_mode",
+			},
+			expectErr: true,
+			errSubstr: "invalid sslmode",
+		},
+		{
+			name: "invalid table syntax",
+			cfg: PostgreSqlReadConfig{
+				Host:     "localhost",
+				Database: "testdb",
+				Table:    `public."bad"table"`,
+				Username: "postgres",
+			},
+			expectErr: true,
+			errSubstr: "invalid table name",
+		},
 	}
 
 	for _, tc := range tests {

@@ -192,17 +192,35 @@ type sqlPreflightQuerier struct {
 }
 
 func newSQLPreflightQuerier(opts CDCOptions) (*sqlPreflightQuerier, error) {
+	if opts.RequiresDialFunc && opts.DialFunc == nil {
+		return nil, errDialFuncLost()
+	}
+	if opts.RequiresTokenProvider && opts.TokenProvider == nil {
+		return nil, errTokenProviderLost()
+	}
 	sslMode := opts.SSLMode
 	if sslMode == "" {
 		sslMode = DefaultSSLMode
 	}
+	password := opts.ResolvePassword()
+	if opts.TokenProvider != nil {
+		if p, err := opts.TokenProvider.GetPassword(context.Background()); err == nil && p != "" {
+			password = p
+		}
+	}
 	// Reuses the sink's DSN builder so this connection inherits the same
 	// value escaping and the same pinned search_path.
-	dsn := buildWriteDSN(opts.Host, opts.Port, opts.Database, opts.Username, opts.ResolvePassword(), sslMode, opts.SSLRootCert)
+	dsn := buildWriteDSN(opts.Host, opts.Port, opts.Database, opts.Username, password, sslMode, opts.SSLRootCert)
 
-	db, err := sql.Open("postgres", dsn)
-	if err != nil {
-		return nil, fmt.Errorf("postgresio: failed to open preflight connection: %w", err)
+	var db *sql.DB
+	if opts.DialFunc != nil {
+		db = sql.OpenDB(&pqConnector{dialer: &pqDialerAdapter{dialFunc: opts.DialFunc}, dsn: dsn})
+	} else {
+		var err error
+		db, err = sql.Open("postgres", dsn)
+		if err != nil {
+			return nil, fmt.Errorf("postgresio: failed to open preflight connection: %w", err)
+		}
 	}
 	// Preflight is a handful of catalog reads that run once and then the
 	// connection is closed, so one is enough.
