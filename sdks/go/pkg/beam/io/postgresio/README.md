@@ -19,14 +19,15 @@
 
 # Apache Beam Go SDK: PostgreSQLIO (`postgresio`)
 
-`postgresio` is a native Apache Beam Go SDK I/O connector providing bounded batch reading, high-throughput writing, and upserts for PostgreSQL. It operates without Java Virtual Machine (JVM) dependencies or cross-language serialization overhead.
+`postgresio` is a native Apache Beam Go SDK I/O connector providing high-throughput writing, upserts, Apache Arrow columnar processing, and Change Data Capture (CDC) streaming for PostgreSQL. It operates without Java Virtual Machine (JVM) dependencies or cross-language serialization overhead.
 
 > [!NOTE]
 > **Status: feature-complete with remediation stack applied.**
 >
-> Core operational guardrails are active and verified: TLS defaults to `verify-full`, connection pooling prevents worker storms, and deadlocks are minimized via in-memory batch compaction, canonical primary key sorting, and an exponential backoff retry loop.
+> Core operational guardrails are active and verified: replication slots are durably acknowledged via bundle finalization callbacks, TLS defaults to `verify-full` with custom root CA and client cert auth, authentication supports native SCRAM-SHA-256 and IAM tokens, and a client-side WAL retention circuit breaker severs stalled replication streams before the primary can run out of disk space. Initial consistent snapshots are exported during slot creation; backfill of pre-existing rows can be staged in tandem.
 >
-> Read [Security & TLS Configuration](#security--tls-configuration) for production configuration best practices.
+> Read [Security & TLS Configuration](#security--tls-configuration) and [WAL Retention Circuit Breaker](#wal-retention-circuit-breaker) for production configuration best practices.
+
 ---
 
 ## Table of Contents
@@ -34,24 +35,37 @@
 1. [Architectural Overview](#1-architectural-overview)
 2. [Subsystem Architecture](#2-subsystem-architecture)
    - [A. High-Throughput Write Engine](#a-high-throughput-write-engine)
+   - [B. Change Data Capture (CDC) Streaming Engine](#b-change-data-capture-cdc-streaming-engine)
    - [C. Bounded Batch Read Engine](#c-bounded-batch-read-engine)
+   - [D. Columnar Apache Arrow Vectorized Engine](#d-columnar-apache-arrow-vectorized-engine)
    - [E. Native Go SchemaTransform Framework & Expansion Service](#e-native-go-schematransform-framework--expansion-service)
 3. [Quickstart & Getting Started](#3-quickstart--getting-started)
    - [Native Go Bounded Batch Read](#native-go-bounded-batch-read)
    - [Native Go Write & Upsert](#native-go-write--upsert)
+   - [Native Go CDC Streaming](#native-go-cdc-streaming)
 4. [Configuration Reference](#4-configuration-reference)
    - [ReadOptions](#readoptions)
    - [WriteOptions](#writeoptions)
+   - [CDCOptions](#cdcoptions)
+   - [Checkpointing & Acknowledgment](#checkpointing--acknowledgment)
    - [Required privileges](#required-privileges)
    - [Security & TLS Configuration](#security--tls-configuration)
+   - [Failover slots](#failover-slots)
+   - [WAL retention circuit breaker](#wal-retention-circuit-breaker)
+   - [DBA operational surface](#dba-operational-surface)
    - [Known Limitations](#known-limitations)
 5. [Contributor Guide: Codebase Map & Invariants](#5-contributor-guide-codebase-map--invariants)
    - [File Inventory & Responsibilities](#file-inventory--responsibilities)
    - [Life of a Write Mutation](#life-of-a-write-mutation)
+   - [Life of a CDC Event](#life-of-a-cdc-event)
    - [Serialization & Struct Tag Invariants](#serialization--struct-tag-invariants)
    - [Memory Model & Allocation Constraints](#memory-model--allocation-constraints)
 6. [Testing & Verification Runbook](#6-testing--verification-runbook)
    - [Unit Testing](#unit-testing)
+   - [Acceptance Suite](#acceptance-suite)
+   - [Integration Testing against PostgreSQL 18](#integration-testing-against-postgresql-18)
+   - [Benchmarks & Performance Profiling](#benchmarks--performance-profiling)
+   - [Operational Troubleshooting & Slot Recovery](#operational-troubleshooting--slot-recovery)
 
 ---
 
@@ -89,6 +103,48 @@
 |  - URN: beam:schematransform:org.apache.beam:postgres_read_cdc:v1 [Planned]       |
 |  - Cross-Language Portability (Beam YAML, Python SDK)                             |
 +-----------------------------------------------------------------------------------+
+```
+
+### Native CDC Streaming Sequence Diagram
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant PG as PostgreSQL Engine (WAL Sender)
+    participant Slot as Logical Replication Slot
+    participant Client as Beam Go StreamClient
+    participant Filter as Server/Client Origin Filter
+    participant SDF as CDCSourceFn (Splittable DoFn)
+    participant Batcher as Arrow Vectorized Batcher
+    participant Worker as Downstream Worker / State
+
+    Note over PG,Client: Session Initialization & SSL Handshake
+    Client->>PG: SSLRequest (0x04d2162f) -> StartupMessage (beam_navigator)
+    Client->>PG: IDENTIFY_SYSTEM
+    PG-->>Client: systemid, timeline, xlogpos, dbname
+    Client->>Slot: START_REPLICATION SLOT beam_cdc_slot LOGICAL 0/0 (proto_version '2', publication_names 'pub', origin 'none')
+
+    rect rgb(240, 248, 255)
+        Note over PG,Client: Streaming WAL Protocol Loop
+        loop Every Change Event & Standby Keepalive
+            PG->>Client: CopyData Message 'w' (WAL Data: XLogData [startLSN, endLSN, serverTime])
+            Client->>Client: Parse pgoutput (Relation / Insert / Update / Delete / Commit)
+            Client->>Filter: Check origin (Local vs Tagged Origin)
+            alt Origin Matches Filter Condition
+                Filter-->>Client: Suppress / Drop event (avoid circular replication loops)
+            else Valid Event
+                Client->>SDF: ChangeEvent (Row, Schema, LSN)
+                SDF->>Batcher: Buffer into RecordBatch
+                Batcher->>Worker: Emit Arrow RecordBatch / Row PCollection
+            end
+
+            PG->>Client: CopyData Message 'k' (Primary Keepalive: walEnd, serverTime, replyRequested)
+            opt replyRequested or Standby Timeout (10s)
+                Client->>PG: Standby Status Update (flushedLSN, appliedLSN, clientTime, reply=0)
+                Note over PG,Slot: PostgreSQL advances confirmed_flush_lsn & reclaims WAL segments
+            end
+        end
+    end
 ```
 
 ### Staged COPY Upsert Sequence Diagram
@@ -152,17 +208,32 @@ sequenceDiagram
 * **Connection Pool Management & CVE-2018-1058 Mitigation**: Clamps worker connection pools to 2 connections by default to prevent connection storms. Automatically injects `search_path=pg_catalog,pg_temp` into every connection DSN, closing search-path hijacking vulnerabilities across all pool connections.
 * **Dead-Letter Queue (DLQ)**: Separates successfully committed rows from rejected records, appending sanitized error messages and PostgreSQL SQL states without credential leakage. Every failure has exactly one outcome. A batch rejected by the *server* (a constraint violation, say) is emitted to `FailedRows` and the bundle continues. A batch that the current *configuration* can never write correctly — `MERGE` on the `UNNEST` path, `MERGE` over a partial row, or a row type naming a column that does not exist — fails the bundle instead, because retrying it against the same configuration would fail identically, and draining it to the DLQ would report success while hiding a misconfiguration. The DLQ is batch-granular: the failing statement is set-based, so PostgreSQL does not report which input row caused the error, and a job reprocessing the DLQ must expect already-applied rows in it.
 
+### B. Change Data Capture (CDC) Streaming Engine
+* **Pure Go `pgoutput` Binary Decoder with In-Flight Spooling**: Binary decoder implementing PostgreSQL's logical streaming replication protocol (`pgoutput`). Parses protocol frames directly into typed `ChangeEvent` structs. Uncommitted changes inside streamed transactions (`Stream Start 'S'`) are buffered in memory until `Stream Commit ('c')` and discarded on `Stream Abort ('A')`.
+* **Server-Side & Client-Side Origin Filtering**: Supports `WithCDCOriginFilter("none")`, negotiating `(origin 'none')` with PostgreSQL 16+ during `START_REPLICATION` and filtering non-local replication origin records on client workers.
+* **PostgreSQL Wire SSLRequest Negotiation**: Issues raw protocol handshake `80877103` prior to `StartupMessage`, establishing TLS via `tls.Client` before transmitting credentials or parameters. Handles cleartext, MD5, and SCRAM-SHA-256 authentication, including channel binding, so default PostgreSQL 14+ installations connect without configuration changes. `sslmode` defaults to `verify-full`. See [Security & TLS Configuration](#security--tls-configuration).
+* **Decoupled Keepalive Heartbeat**: A dedicated background goroutine sends periodic `StandbyStatusUpdate` ('r') messages to prevent PostgreSQL's `wal_sender_timeout` (60s) from dropping the connection during downstream backpressure. The goroutine is owned by the replication session, so it survives across `ProcessElement` calls and does not reconnect on every checkpoint. The `FlushLSN` it reports is advanced only from a `BundleFinalization` callback, and `ProcessElement` returns on a bounded interval so those bundles finalize. See [Checkpointing & Acknowledgment](#checkpointing--acknowledgment).
+* **Single-Consumer Slot Invariant with Auto-Partitioned Fanout**: Strictly maintains a single connection (`Parallelism = 1`) at the replication slot boundary (`active_pid` exclusivity), feeding downstream parallel worker clusters via `postgresio.PartitionByPrimaryKey` and `beam.Reshuffle`.
+* **Stateful Out-of-Line TOAST Reassembly**: Under `REPLICA IDENTITY DEFAULT`, unmodified large columns are omitted by PostgreSQL as `'u'`. `postgresio.ReassembleToast` uses Beam runner state (`state.Value[ChangeEvent]`) to cache baseline tuples and patch unmodified TOAST fields on `UPDATE` events.
+* **Dynamic Cloud IAM Token Renewal**: Integrates the `TokenProvider` interface to automatically refresh credentials across worker reconnects for AWS RDS IAM (15-min expiry) and Google Cloud SQL / AlloyDB (60-min expiry).
+
 ### C. Bounded Batch Read Engine
 * **Partition Planning & Dynamic Range Splitting**: `postgresio.Read` supports distributed parallel reads via `WithReadPartitions(col, lower, upper, numPartitions)`. Splits ranges across worker instances with overflow-safe arithmetic, using `beam.Reshuffle` to break worker fusion.
 * **Transaction-Pinned Cursor Streaming**: Uses server-side read-only transactions (`BEGIN TRANSACTION READ ONLY`) with `DECLARE NO SCROLL CURSOR` and `FETCH FORWARD 5000` to stream arbitrary table sizes with flat, bounded memory consumption.
 * **Type Reflection & Tag Mapping**: The `structRowMapper` maps PostgreSQL columns to struct fields using case-insensitive, underscore-insensitive matching and struct tags (`beam:`, `db:`, `column:`). Dynamic rows can be read into `PostgresRow` without predefined struct types via `postgresio.ReadRows` and `postgresio.QueryRows`.
 * **SQL Sanitization**: Enforces schema-qualified table names and validates identifier characters to prevent SQL injection.
 
+### D. Columnar Apache Arrow Vectorized Engine
+* **Micro-Batch Columnar Buffers**: Groups individual row events into contiguous Apache Arrow `RecordBatch` structures (`arrow_batcher.go`).
+* **Amortized Allocation-Free Decoding**: Recycles field builder buffers across micro-batches, so `BenchmarkArrowBatching` reports **0 allocs/op**. Buffer growth still allocates, so bytes/op is not zero; the invariant is that no allocation happens per record in the steady state. See [Benchmarks & Performance Profiling](#benchmarks--performance-profiling) for how to measure it on your own hardware.
+* **PostgreSQL Complex Type Support**: Supports native Arrow columnar conversion for discrete and unbounded ranges (`int4range`, `numrange`, `tsrange`), multi-dimensional Postgres arrays (`int[]`, `text[]`), and JSONB documents.
+
 ### E. Native Go SchemaTransform Framework
 * **Native Go Registration**: Provides `schematransform.GlobalRegisterTyped` mapping typed configuration structs to `SchemaTransform` providers.
 * **Standard URNs**:
   * Write: `beam:schematransform:org.apache.beam:postgres_write:v1`
   * Bounded Batch Read: `beam:schematransform:org.apache.beam:postgres_read:v1`
+  * CDC Stream: `beam:schematransform:org.apache.beam:postgres_read_cdc:v1`
 
 ## 3. Quickstart & Getting Started
 
@@ -272,6 +343,60 @@ func main() {
 }
 ```
 
+### Native Go CDC Streaming
+
+```go
+package main
+
+import (
+	"context"
+	"flag"
+	"time"
+
+	"github.com/apache/beam/sdks/v2/go/pkg/beam"
+	"github.com/apache/beam/sdks/v2/go/pkg/beam/io/postgresio"
+	"github.com/apache/beam/sdks/v2/go/pkg/beam/log"
+	"github.com/apache/beam/sdks/v2/go/pkg/beam/x/beamx"
+)
+
+func logChangeFn(ctx context.Context, evt postgresio.ChangeEvent) {
+	log.Infof(ctx, "CDC Event: op=%s table=%s lsn=%d after=%v",
+		evt.Operation, evt.FullTableName(), evt.LSN, evt.After)
+}
+
+func main() {
+	flag.Parse()
+	beam.Init()
+
+	p, s := beam.NewPipelineWithRoot()
+
+	// 1. Single-consumer logical replication stream
+	changes := postgresio.ReadCDC(s,
+		postgresio.WithCDCHost("localhost"),
+		postgresio.WithCDCPort(5432),
+		postgresio.WithCDCDatabase("postgres"),
+		postgresio.WithCDCUsername("scotty"),
+		postgresio.WithCDCPassword("beam_password"),
+		postgresio.WithCDCSlotName("beam_streaming_slot"),
+		postgresio.WithCDCPublication("beam_orders_pub"),
+		postgresio.WithCDCHeartbeatInterval(10*time.Second),
+	)
+
+	// 2. Partition and fanout downstream across cluster workers
+	partitioned := postgresio.PartitionByPrimaryKey(s, changes)
+
+	// 3. Reassemble out-of-line TOAST values from state cache
+	hydrated := postgresio.ReassembleToast(s, partitioned)
+
+	// 4. Downstream processing
+	beam.ParDo0(s, logChangeFn, hydrated)
+
+	if err := beamx.Run(context.Background(), p); err != nil {
+		panic(err)
+	}
+}
+```
+
 ## 4. Configuration Reference
 
 ### `ReadOptions`
@@ -311,6 +436,59 @@ func main() {
 | `WithFlushInterval(Duration)` | `1s` | Maximum time between micro-batch flushes |
 | `WithPgBouncer(bool)` | `false` | Avoids session state under PgBouncer transaction pooling (downgrades Staged COPY to parameterized UNNEST) |
 | `WithDialFunc(DialFunc)` | `nil` | Custom network dialer (e.g., Cloud SQL Go Connector, AWS RDS IAM socket) |
+
+### `CDCOptions`
+
+| Option | Default | Purpose |
+| :--- | :--- | :--- |
+| `WithCDCHost(string)` | `""` | PostgreSQL host or IP |
+| `WithCDCPort(int)` | `5432` | PostgreSQL port |
+| `WithCDCDatabase(string)` | `""` | Database name |
+| `WithCDCUsername(string)` | `""` | Replication username |
+| `WithCDCPassword(string)` | `""` | Replication password |
+| `WithCDCSlotName(string)` | `""` | Replication slot name (`^[a-z0-9_]{1,63}$`) |
+| `WithCDCPublication(string)` | `""` | Publication name |
+| `WithCDCStartLSN(uint64)` | `0` | Starting Log Sequence Number (LSN) |
+| `WithCDCHeartbeatInterval(Duration)` | `10s` | Frequency of StandbyStatusUpdate keepalives (`<60s`) |
+| `WithCDCCheckpointInterval(Duration)` | `5s` | How long the source reads before returning so the bundle can finalize. Upper bound on how long the slot goes unacknowledged when idle. Advisory while a transaction is open — see [Checkpointing](#checkpointing--acknowledgment). |
+| `WithCDCReplicaIdentityFull(bool)` | `false` | Signals source tables use `REPLICA IDENTITY FULL` |
+| `WithCDCTokenProvider(TokenProvider)` | `nil` | Dynamic credential refresh provider for IAM / OAuth2 |
+| `WithCDCDialFunc(DialFunc)` | `nil` | Custom network dialer |
+| `WithCDCSSLMode(string)` | `verify-full` — see [Security](#security--tls-configuration) | `disable`, `require`, `verify-ca`, or `verify-full` |
+| `WithCDCFailoverSlot(bool)` | `false` | Creates the slot with `FAILOVER` so PostgreSQL 17 and later synchronize it to a standby. Requires server major version 17; slot creation fails on an older server rather than downgrading. See [Failover slots](#failover-slots). |
+| `WithCDCMaxSlotLagBytes(uint64)` | `0` (disabled) | Retention budget for the slot. When exceeded, the configured policy applies. See [WAL retention circuit breaker](#wal-retention-circuit-breaker). |
+| `WithCDCSlotLagPolicy(SlotLagPolicy)` | `SlotLagFailPipeline` | `SlotLagFailPipeline` fails the pipeline and severs the replication session; `SlotLagLogOnly` records the breach and continues. Only consulted when a budget is set. |
+| `WithCDCSlotLagCheckInterval(Duration)` | `30s` | How often retention is measured. Clamped to a minimum of `1s`. |
+
+### Checkpointing & Acknowledgment
+
+The source is an unbounded splittable DoFn. `ProcessElement` returns a
+`ProcessContinuation` so the bundle can finalize, and the replication slot's
+`confirmed_flush_lsn` is advanced only from the `BundleFinalization` callback.
+Nothing is acknowledged before the runner reports the corresponding output
+durable.
+
+Checkpoints land only on transaction boundaries. pgoutput stamps every change
+in a transaction with the LSN of its `BEGIN` record, and the restriction
+tracker addresses positions as a single LSN, so a residual restriction created
+partway through a transaction would resume past that shared LSN. PostgreSQL
+does not redeliver a transaction whose commit LSN precedes the requested start
+position, so the remainder would be lost.
+
+Two consequences:
+
+- `WithCDCCheckpointInterval` is advisory while a transaction is open. The
+  invocation reads on to the `COMMIT` frame. A stall timeout of two minutes
+  bounds this, and every frame received resets it, so a transaction of any
+  size completes as long as it keeps arriving.
+- A transaction that is only partly received — because the server ended the
+  copy stream, or the connection failed — is excluded from the acknowledgment
+  candidate. The slot stays at the last completed transaction and the server
+  redelivers the incomplete one.
+
+Server keepalives are acknowledgeable only when no transaction is open. This is
+what lets a slot whose publication covers only quiet tables keep up with global
+WAL, without acknowledging a position past records the parser is still holding.
 
 ### Required privileges
 
@@ -364,6 +542,33 @@ same query per range and need nothing further.
 GRANT SELECT ON public.orders TO beam_reader;
 ```
 
+#### CDC streaming (`postgresio.ReadCDC`)
+
+| Requirement | Scope | Why |
+| --- | --- | --- |
+| `REPLICATION` attribute (or superuser) | role | Required to open a replication connection and to create or read a replication slot. |
+| `LOGIN` attribute | role | The connector connects as this role. |
+| A `replication` entry in `pg_hba.conf` | server | Replication connections are matched by a separate `pg_hba.conf` database keyword. |
+| `wal_level = logical` | server | Logical decoding produces nothing otherwise. Requires a restart. |
+| `SELECT` on each published table | tables | Needed to copy initial table data. |
+| `CREATE` on the database | database | Only if you let the connector emit DDL for a publication; creating it yourself as the table owner avoids this. |
+
+```sql
+CREATE ROLE beam_cdc WITH LOGIN REPLICATION PASSWORD '...';
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO beam_cdc;
+-- As the table owner:
+CREATE PUBLICATION beam_pub FOR TABLE public.orders;
+```
+
+The preflight checks read `pg_catalog.pg_settings`, `pg_replication_slots`,
+`pg_publication` and `pg_publication_tables`. These are readable by `PUBLIC`
+and need no grant.
+
+> [!NOTE]
+> Replication slots are **cluster-wide**, not per-database, and a role with
+> `REPLICATION` can read any slot in the cluster. Treat it as a privileged
+> account even though it holds no table-level write privileges.
+
 ### Security & TLS Configuration
 
 `NewCDCOptions` defaults `sslmode` to `verify-full`. `verify-ca` is available
@@ -385,14 +590,266 @@ The security difference is not small. Managed PostgreSQL providers sign every te
 
 Google Cloud SQL documents `sslmode=verify-full` and added per-instance CAs and custom SAN values specifically to support it. Azure Database for PostgreSQL recommends full certificate and hostname verification, offering `verify-ca` only where Private Endpoint DNS makes hostname matching impossible. The `prefer` default in libpq is inherited backwards compatibility, and upstream explicitly describes it as *"not recommended in secure deployments."*
 
+### Failover slots
+
+PostgreSQL 17 added `FAILOVER` to `CREATE_REPLICATION_SLOT`. A slot created with
+it is synchronized to physical standbys, so a logical consumer keeps its
+position across a failover instead of restarting from the new primary's state.
+
+The option is off by default. On a primary that lists standbys in
+`synchronized_standby_slots`, a failover-enabled logical slot withholds changes
+until those standbys have received the WAL. That makes end-to-end pipeline
+latency a function of physical replication lag, which is a change most existing
+deployments would not expect.
+
+```go
+opts := postgresio.NewCDCOptions(
+    postgresio.WithCDCSlotName("beam_streaming_slot"),
+    postgresio.WithCDCCreateSlotIfMissing(true),
+    postgresio.WithCDCFailoverSlot(true),
+)
+```
+
+Enabling the option against a server older than 17 is an error rather than a
+silent downgrade. Reporting success for a slot that is not actually
+failover-safe would leave the operator relying on a guarantee they do not have.
+
+### WAL retention circuit breaker
+
+A replication slot pins WAL on the primary until the consumer acknowledges it.
+If a pipeline stalls, is drained, or is suspended, the slot keeps its position
+and the primary keeps accumulating WAL. Left unattended this exhausts the WAL
+volume, which affects every workload on that server, not just the pipeline.
+
+The circuit breaker bounds that exposure. It is **off by default**; set a budget
+to enable it:
+
+```go
+opts := postgresio.NewCDCOptions(
+    postgresio.WithCDCSlotName("beam_streaming_slot"),
+    postgresio.WithCDCMaxSlotLagBytes(16*1024*1024*1024), // 16 GiB
+    postgresio.WithCDCSlotLagPolicy(postgresio.SlotLagFailPipeline),
+    postgresio.WithCDCSlotLagCheckInterval(30*time.Second),
+)
+```
+
+**What is measured.** Retention is measured from the slot's `restart_lsn`, not
+its `confirmed_flush_lsn`. `restart_lsn` is the oldest WAL the server must keep
+for the slot, which is what determines disk consumption; `confirmed_flush_lsn`
+is further ahead and understates it.
+
+The measurement runs on a **separate connection**, not the replication
+connection. Frames on the replication connection are only read while
+`ProcessElement` is executing, so a stalled pipeline stops updating the
+in-process view of the server's WAL position. Deriving the budget from that view
+would go blind in precisely the situation the breaker exists for.
+
+On a standby the query anchors to `pg_last_wal_receive_lsn()` instead of
+`pg_current_wal_lsn()`, which raises an error during recovery.
+
+**What happens on a breach.** Under `SlotLagFailPipeline` the monitor closes the
+replication session and latches the breach. Closing the session stops the
+keepalives and releases the walsender, which marks the slot inactive
+server-side — the state DBA tooling and `max_slot_wal_keep_size` key on. The
+next `ProcessElement` invocation returns the breach as an error; an invocation
+already running stops at its next transaction boundary. The latch clears on its
+own if a later measurement comes in under budget, so a backlog that drains does
+not fail the pipeline permanently.
+
+The slot is **not** dropped. Dropping it would reclaim the WAL but discard the
+pipeline's position permanently, and the connector has no backfill to recover
+from that. See [Known Limitations](#known-limitations).
+
+**Privileges.** `pg_replication_slots` carries no privilege restriction, so no
+additional grant is needed to read retention. Reading
+`max_slot_wal_keep_size` from `pg_settings` is likewise unrestricted; if it
+cannot be read the monitor continues without the startup comparison.
+
+> [!IMPORTANT]
+> The breaker complements the server-side `max_slot_wal_keep_size` setting, it
+> does not replace it. The server setting protects the database by invalidating
+> the slot, which silently destroys the pipeline's position. The client-side
+> breaker fails loudly first and leaves the slot recoverable. Configure both. If
+> the client budget is larger than the server limit the server acts first, and
+> the monitor logs a warning at startup.
+
+> [!WARNING]
+> A bundle already blocked inside a downstream `emit` cannot be interrupted from
+> outside. The breaker severs the replication session and reports on the next
+> scheduling boundary, but it cannot force a wedged bundle to return.
+
+### DBA operational surface
+
+Running CDC against a production primary requires a role, a publication, a way
+to watch what the slot costs the server, and a way to find out that the server
+is misconfigured before the pipeline is submitted. This section covers all four.
+
+#### Provisioning script
+
+`PostgresProvisioningScript` renders the SQL a DBA runs once. The connector
+never executes it: it is returned as text so it can be reviewed, edited and
+applied through whatever change process the database is under. Nothing in the
+connector issues DDL except replication slot creation, which is separately
+gated behind `WithCDCCreateSlotIfMissing`.
+
+```go
+script, err := postgresio.PostgresProvisioningScript(postgresio.ProvisioningConfig{
+    Role:        "beam_cdc",
+    Database:    "orders_db",
+    Publication: "beam_orders_pub",
+    Tables:      []string{"public.orders", "public.order_items"},
+})
+```
+
+The script creates the login role, grants `CONNECT`, creates the publication
+over the named tables, and creates the monitoring view described below. The
+password is emitted as a `psql` variable rather than a literal, so the output
+can be committed to a runbook:
+
+```
+psql -v cdc_password="$(cat secret)" -f provision.sql
+```
+
+`SELECT` on the published tables is **not** granted. Logical decoding reads WAL
+through the walsender rather than reading tables through the executor;
+PostgreSQL requires `SELECT` only to copy the initial table data, and this
+connector performs no initial backfill. The `USAGE` and `SELECT` statements are
+emitted commented out, as a pair, for the case where the same role will run a
+backfill by other means — one without the other grants nothing usable. Set
+`IncludeBackfillGrants: true` to emit them uncommented.
+
+#### `beam_cdc_health` view
+
+The script creates a view over `pg_replication_slots`. `pg_replication_slots`
+carries no privilege restriction, so the view is readable without additional
+grants, and it is cluster-wide, so one view covers every logical slot on the
+server.
+
+```sql
+SELECT slot_name, health, retained_pretty, xmin_horizon_age
+FROM beam_cdc_health
+WHERE health <> 'ok';
+```
+
+> [!IMPORTANT]
+> Alert on `health`, not on `retained_bytes`. Slot invalidation clears
+> `restart_lsn`, `pg_wal_lsn_diff` of NULL is NULL, so an alert written as
+> `retained_bytes > threshold` stops firing at the moment the slot becomes
+> unrecoverable. `health` is never NULL and distinguishes `ok`, `inactive`,
+> `unreserved` and `lost`.
+
+The same classification is available to a Go program without SQL:
+
+```go
+report, err := postgresio.SlotHealth(ctx, opts)
+if report.Status == postgresio.SlotStatusLost {
+    // Terminal: the server has discarded WAL the slot required.
+}
+```
+
+`SlotHealth` is a package-level function, not a method on the source, because a
+driver program cannot call methods on a DoFn that is serialized and executing on
+a worker. It opens a short-lived connection and closes it before returning.
+
+#### Preflight validation
+
+Before the replication protocol is dialled, the connector checks that the server
+can actually serve the pipeline, and reports what is wrong by name rather than
+letting the handshake fail with a protocol error.
+
+| Check | Outcome if wrong |
+| :--- | :--- |
+| `wal_level = logical` | **Fails** the pipeline, naming the setting and that it needs a restart. |
+| `max_replication_slots` headroom | **Fails** if the slot does not exist and the table is full. Passes when the slot already exists, which consumes no headroom. |
+| Publication exists | **Fails**, naming the publication and the `CREATE PUBLICATION` statement. |
+| Publication has tables | **Warns**. An empty `FOR ALL TABLES` publication is legal on a schema whose tables are created later. |
+| `REPLICA IDENTITY` is usable | **Warns**, naming the tables. It constrains only `UPDATE` and `DELETE`, and the connector cannot know whether the pipeline consumes them. |
+
+A check that cannot be completed — the query errors, the role cannot read the
+catalog, or the whole sequence exceeds its timeout — is logged and the pipeline
+proceeds. A diagnostic must not become an availability dependency: a catalog
+read stuck behind unrelated DDL should not stop a pipeline that would otherwise
+run. Every check logs one line whether it passes or fails, because a silent
+preflight cannot be distinguished from one that never ran.
+
+Preflight runs on the single worker that opens the replication stream, not in
+`Setup`. `Setup` executes on every worker the runner initialises, so validating
+there would open one connection per worker against the primary at the same
+instant and can exhaust `max_connections`.
+
+`WithCDCPreflight(true)` additionally runs the same checks on the machine that
+builds the pipeline, before submission. It is off by default because that
+requires the submitting machine to reach the database, which a Dataflow Flex
+Template and `TokenProvider` both assume it cannot.
+
+#### Publisher row security
+
+The replication connection sends `row_security=off` by default.
+
+A replication role that is neither `SUPERUSER` nor `BYPASSRLS` — which is what
+least privilege produces — evaluates row security policies during logical
+decoding, so a table owner can cause expressions to run inside the replication
+session. With `row_security=off`, PostgreSQL halts replication rather than
+executing such a policy.
+
+> [!WARNING]
+> This means a pipeline reading a table whose owner later adds an RLS policy
+> stops, loudly, instead of continuing under the policy.
+> `WithCDCAllowPublisherRowSecurity(true)` restores the permissive behaviour.
+> Use it only where every table owner in the publication is trusted, or where a
+> published table legitimately carries a policy and halting is unacceptable.
+
+#### Metrics
+
+Metrics are published in the `postgresio` namespace with snake_case names.
+
+| Metric | Kind | Meaning |
+| :--- | :--- | :--- |
+| `cdc_processed_records` | counter | Change events emitted downstream. |
+| `cdc_filtered_origin_records` | counter | Events dropped by `WithCDCOriginFilter`. |
+| `cdc_confirmed_flush_lsn` | gauge | Last position acknowledged to the server. |
+| `cdc_server_wal_end_lsn` | gauge | Server WAL position as last reported on the replication connection. |
+| `cdc_slot_retained_bytes` | gauge | WAL the server is holding for this slot, measured from `restart_lsn`. |
+| `cdc_slot_wal_status` | gauge | Slot `wal_status` as an ordinal: reserved, extended, unreserved, lost. |
+| `cdc_slot_xmin_horizon_age` | gauge | Transactions elapsed since the oldest catalog transaction the slot pins. |
+| `cdc_slot_lag_check_failures` | counter | Retention measurements that could not be taken. |
+| `cdc_slot_lag_breaches` | counter | Times the configured budget was exceeded. |
+| `sink_written_rows` | counter | Rows committed by the sink. |
+| `sink_failed_rows` | counter | Rows the sink could not commit. Routed to the dead-letter output on an execution failure; on a configuration failure the bundle fails instead, so the counter increments but no row is emitted. |
+| `sink_deadlock_retries` | counter | Sink transactions retried after SQLState 40P01. |
+
+`cdc_slot_retained_bytes` and `cdc_slot_xmin_horizon_age` come from the slot
+monitor, which runs **by default** and is independent of the circuit breaker:
+measuring what the slot costs is useful even when nothing enforces a budget.
+`WithCDCSlotMonitoring(false)` turns it off, at the cost of losing both.
+Monitoring costs one connection per pipeline, not per worker — it starts on the
+single worker that reads the stream and caps itself at one open connection.
+
+> [!NOTE]
+> `cdc_server_wal_end_lsn` only advances while a bundle is executing, because
+> frames are read from the replication connection only inside `ProcessElement`.
+> It freezes when a pipeline stalls and must not be used to detect one. Use
+> `cdc_slot_retained_bytes`, which is measured on a separate connection, or the
+> `health` column of the view.
+
 ### Known Limitations
 
-The connector is unreleased and experimental. The list below is what is still open.
+The connector is unreleased and experimental. The list below is what is still open; the [acceptance suite](#acceptance-suite) covers the items that have been fixed and fails if any of them regresses.
 
 | Area | Limitation | Impact |
 | :--- | :--- | :--- |
+| **Slot lag** | Retention is measured and published by default, but enforcement is not: the [circuit breaker](#wal-retention-circuit-breaker) is off until a budget is set, and it does not drop the slot, so WAL is not reclaimed by the breach itself. A bundle already blocked inside a downstream `emit` cannot be interrupted from outside. | Without a configured budget the database can still run out of WAL volume if a stalled pipeline is left unattended. Alert on `cdc_slot_retained_bytes` or the [health view](#beam_cdc_health-view), set `WithCDCMaxSlotLagBytes`, and configure `max_slot_wal_keep_size` server-side as a backstop. |
+| **Long transactions** | A checkpoint cannot land partway through a transaction, so `WithCDCCheckpointInterval` is advisory while one is open. A single very large transaction extends the invocation until its `COMMIT` frame arrives. | Acknowledgment latency, and the memory the parser holds for a streamed transaction, both scale with the largest transaction on the source. A connection that stops delivering mid-transaction is dropped after two minutes of silence and the bundle is retried. |
+| **Initial backfill** | Slot creation exports a consistent snapshot and `SlotCreationResult.SnapshotIsolationStatements` returns the statements needed to read it, but the connector does not run the backfill. | Pre-existing table rows require a separate read. Only changes after the slot's creation point arrive through CDC. |
+| **Driver** | Built on `lib/pq`. The CDC path implements the replication protocol directly rather than through `pgx` / `pglogrepl`. | Protocol features not implemented here are unavailable, and the wire decoder is maintained in-tree. |
 | **`search_path`** | The write path pins `search_path=pg_catalog,pg_temp` on every pooled connection to close CVE-2018-1058, so an unqualified table name cannot resolve. | Table names must be written as `schema.table`. `postgresio.Write` rejects an unqualified name when the pipeline is constructed, and the `postgres_write` SchemaTransform rejects it during configuration validation. |
-| **Driver** | Built on `lib/pq`. | Protocol features not implemented in `lib/pq` are unavailable. |
+| **Failover slots** | Slots are created without `FAILOVER` unless `WithCDCFailoverSlot(true)` is set, because enabling it couples pipeline latency to standby replication. | With the default, a failover loses the slot and its position, and the pipeline restarts from whatever the new primary has. See [Failover slots](#failover-slots). |
+| **Single consumer** | PostgreSQL admits one connection per replication slot, so the LSN restriction is never split. | Read throughput is bounded by one worker. Parallelism comes from `PartitionByPrimaryKey` downstream, not from the source. |
+| **Delivery semantics** | At-least-once. After a restart the server resumes from `confirmed_flush_lsn`, which can replay records the pipeline already emitted. | Downstream consumers must deduplicate. Each event carries a deterministic `EventID` for that purpose. |
+
+
+---
+
 
 ## 5. Contributor Guide: Codebase Map & Invariants
 
@@ -405,7 +862,19 @@ This section details internal design invariants for contributors maintaining or 
 | [`write.go`](write.go) | Sink | `writeFn` implementation, `buildUnnestQuery`, parameterized `UNNEST` array upsert execution. |
 | [`compactor.go`](compactor.go) | Sink | `BatchCompactor` micro-batch accumulator, LWW deduplication, composite primary key canonical sort. |
 | [`options.go`](options.go) | Config | `WriteOptions` definition, functional options, identifier sanitization. |
-| [`schematransform.go`](schematransform.go) | XLang | Go SchemaTransform providers for read and write transforms. |
+| [`cdc_source.go`](cdc_source.go) | CDC | Single-consumer `cdcSourceFn`, decoupled heartbeat loop, bundle commit callbacks. |
+| [`cdc_stream.go`](cdc_stream.go) | CDC | `ReplicationStream` interface and its native implementation: connection setup and the `START_REPLICATION` handshake, written directly against the PostgreSQL wire protocol. |
+| [`cdc_types.go`](cdc_types.go) | CDC | `ChangeEvent`, `ColumnValue`, `OpType`, custom JSON coder registrations. |
+| [`cdc_spooler.go`](cdc_spooler.go) | CDC | In-flight transaction spooling (`TransactionMessage`), commit/abort boundary isolation. |
+| [`cdc_demux.go`](cdc_demux.go) | CDC | Downstream routing transforms (`FilterByTable`, `FilterBySchema`, `FilterByOrigin`). |
+| [`cdc_toast.go`](cdc_toast.go) | CDC | Stateful TOAST hydration using Beam runner state (`state.Value`). |
+| [`cdc_slot_creation.go`](cdc_slot_creation.go) | CDC | `CREATE_REPLICATION_SLOT` and `DROP_REPLICATION_SLOT`, exported snapshot, two-phase and `FAILOVER` options. |
+| [`cdc_slot_health.go`](cdc_slot_health.go) | CDC | `SlotHealth` and `SlotHealthReport`: classification of a slot's retention state. |
+| [`cdc_slot_monitor.go`](cdc_slot_monitor.go) | CDC | Out-of-band retention measurement, `SlotLagPolicy`, and the WAL retention circuit breaker. |
+| [`arrow_batcher.go`](arrow_batcher.go) | Arrow | Columnar conversion of CDC change events to Apache Arrow `RecordBatch` micro-batches. |
+| [`arrow_decoder.go`](arrow_decoder.go) | Arrow | Zero-copy conversion from Arrow RecordBatches back to typed Beam structs or rows. |
+| [`arrow_types.go`](arrow_types.go) | Arrow | `ArrowBatchRecord`, schema representations, batch options. |
+| [`schematransform.go`](schematransform.go) | XLang | Go SchemaTransform providers for read CDC and write transforms. |
 
 ### Life of a Write Mutation
 
@@ -449,6 +918,37 @@ PCollection<T>
 +-------------------------------------------------------+
 ```
 
+### Life of a CDC Event
+
+```
+PostgreSQL Write-Ahead Log (WAL)
+      |
+      v
++-------------------------------------------------------+
+| [Replication stream: native pgoutput wire protocol]   |
+| 1. Worker connects with START_REPLICATION             |
+| 2. Background goroutine sends StandbyStatusUpdate     |
+|    (ticks every HeartbeatInterval, preserves FlushLSN)|
++-------------------------------------------------------+
+      |
+      v
++-------------------------------------------------------+
+| [cdcSourceFn.ProcessElement]                          |
+| 1. Parse pgoutput binary messages (B, C, R, I, U, D)  |
+| 2. Spool uncommitted mutations by XID                 |
+| 3. On Commit: Materialize and emit ChangeEvents       |
+| 4. Bundle commit callback advances confirmedCommitLSN |
++-------------------------------------------------------+
+      |
+      v
++-------------------------------------------------------+
+| [Arrow Micro-Batcher] (Optional / Vectorized Engine)  |
+| 1. Group events by target relation                    |
+| 2. Populate pre-allocated columnar Arrow builders     |
+| 3. Emit ArrowRecordBatch to downstream transforms     |
++-------------------------------------------------------+
+```
+
 ### Serialization & Struct Tag Invariants
 
 When working with Beam Go DoFns and schema-registered types:
@@ -475,6 +975,7 @@ When working with Beam Go DoFns and schema-registered types:
 
 ### Memory Model & Allocation Constraints
 
+* **Arrow Buffer Reuse**: The Arrow batcher uses pre-allocated memory pools. When modifying `arrow_batcher.go`, ensure slice allocations occur during builder initialization, not inside per-element iteration loops.
 * **Connection Pool Bounding**: `WriteOptions.MaxConnections` defaults to 2 per worker, so that a pipeline scaling out to hundreds of Beam workers does not exhaust the server's `max_connections`. `WithMaxConnections` raises it; raise the server's budget to match before doing so.
 
 ---
@@ -490,5 +991,79 @@ cd sdks/go/pkg/beam/io/postgresio
 go test -v -race -count=1 ./...
 ```
 
-This includes unit tests for identifier sanitization against SQL injection, credential redaction, batch compaction collapse and deadlock-avoiding sort order, and primary key determinism.
+This includes `cdc_invariants_test.go`, which locks in guarantees that already hold and must not regress: identifier sanitization against SQL injection, replication slot name and heartbeat validation, credential redaction in `CDCOptions.String()` and `SanitizeErrorMessage`, batch compaction collapse and deadlock-avoiding sort order, and `PrimaryKeyString` determinism. A failure there means a change has broken an existing guarantee.
 
+### Acceptance Suite
+
+`cdc_acceptance_test.go` encodes the behavior the connector must have for each defect that has been fixed. It runs as part of the default suite above — there is no separate command and no build tag.
+
+The suite is hermetic — no containers, no ports, runs in milliseconds. It combines wire-level tests over `net.Pipe` (for example, asserting that the first bytes sent on a new connection are the `SSLRequest` packet rather than a cleartext startup packet), behavioral tests (asserting LSN-aware conflict resolution in the compactor), and source-level guards for defects that no behavioral test can reach.
+
+> [!IMPORTANT]
+> These tests are regression guards, not aspirational specifications. Weakening an assertion to get a green run reintroduces the defect the test was written to prevent.
+
+
+### Integration Testing against PostgreSQL 18
+
+Integration tests require a running PostgreSQL instance with logical replication enabled:
+
+1. **PostgreSQL Configuration (`postgresql.conf`)**:
+   ```ini
+   wal_level = logical
+   max_replication_slots = 10
+   max_wal_senders = 10
+   track_commit_timestamp = on
+   ```
+
+2. **Execute Complex End-to-End Pipeline Tests**:
+   ```bash
+   go test -v -race -run TestGoComplexPipeline_PostgresToPostgres
+   ```
+
+3. **Execute Crash-Restart & Resiliency Tests** (requires a live PostgreSQL instance):
+   ```bash
+   python3 sdks/go/examples/postgres/verify_resilience_and_recovery.py
+   ```
+
+### Benchmarks & Performance Profiling
+
+Run the Apache Arrow vectorized decoding and micro-batching benchmarks:
+
+```bash
+go test -run XXX -bench=BenchmarkArrowBatching -benchmem -count=3 ./pkg/beam/io/postgresio/
+```
+
+The invariant this guards is **0 allocs/op**: the field builders are recycled
+across micro-batches, so the steady state must not allocate per record. A
+change that makes this non-zero is a regression.
+
+Latency is hardware-dependent and is not asserted. For reference, on an AMD
+EPYC 7B12 with Go 1.26.6 the batcher measures ~260 ns/op at 0 allocs/op.
+
+### Operational Troubleshooting & Slot Recovery
+
+1. **Replication Slot Lag Accumulation**:
+   Query the [health view](#beam_cdc_health-view) the provisioning script
+   creates, which classifies every logical slot and does not go NULL when a slot
+   is lost:
+   ```sql
+   SELECT slot_name, health, retained_pretty, xmin_horizon_age
+   FROM beam_cdc_health
+   WHERE health <> 'ok';
+   ```
+   Without the view, measure from `restart_lsn` rather than
+   `confirmed_flush_lsn`. `restart_lsn` is the oldest WAL the server must keep
+   for the slot, which is what determines disk consumption;
+   `confirmed_flush_lsn` runs ahead of it and understates the cost:
+   ```sql
+   SELECT slot_name, active, wal_status,
+          pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) AS retained_bytes
+   FROM pg_replication_slots;
+   ```
+2. **Manually Advancing Confirmed LSN**:
+   If a dead worker accumulated WAL and needs to be fast-forwarded to drain disk space:
+   ```sql
+   SELECT pg_replication_slot_advance('beam_streaming_slot', pg_current_wal_lsn());
+   ```
+3. **Ambiguous `UNNEST` Function Signature (`SQLState 42725`)**:
+   Ensure all parameter placeholders in custom queries have explicit type casts: `SELECT * FROM UNNEST($1::bigint[], $2::text[])`.
