@@ -43,6 +43,7 @@
    - [Native Go Bounded Batch Read](#native-go-bounded-batch-read)
    - [Native Go Write & Upsert](#native-go-write--upsert)
    - [Native Go CDC Streaming](#native-go-cdc-streaming)
+   - [Declarative Beam YAML Pipelines](#declarative-beam-yaml-pipelines)
 4. [Configuration Reference](#4-configuration-reference)
    - [ReadOptions](#readoptions)
    - [WriteOptions](#writeoptions)
@@ -53,6 +54,7 @@
    - [Failover slots](#failover-slots)
    - [WAL retention circuit breaker](#wal-retention-circuit-breaker)
    - [DBA operational surface](#dba-operational-surface)
+   - [Python & YAML Cross-Language Surface](#python--yaml-cross-language-surface)
    - [Known Limitations](#known-limitations)
 5. [Contributor Guide: Codebase Map & Invariants](#5-contributor-guide-codebase-map--invariants)
    - [File Inventory & Responsibilities](#file-inventory--responsibilities)
@@ -228,12 +230,15 @@ sequenceDiagram
 * **Amortized Allocation-Free Decoding**: Recycles field builder buffers across micro-batches, so `BenchmarkArrowBatching` reports **0 allocs/op**. Buffer growth still allocates, so bytes/op is not zero; the invariant is that no allocation happens per record in the steady state. See [Benchmarks & Performance Profiling](#benchmarks--performance-profiling) for how to measure it on your own hardware.
 * **PostgreSQL Complex Type Support**: Supports native Arrow columnar conversion for discrete and unbounded ranges (`int4range`, `numrange`, `tsrange`), multi-dimensional Postgres arrays (`int[]`, `text[]`), and JSONB documents.
 
-### E. Native Go SchemaTransform Framework
+### E. Native Go SchemaTransform Framework & Expansion Service
 * **Native Go Registration**: Provides `schematransform.GlobalRegisterTyped` mapping typed configuration structs to `SchemaTransform` providers.
 * **Standard URNs**:
   * Write: `beam:schematransform:org.apache.beam:postgres_write:v1`
   * Bounded Batch Read: `beam:schematransform:org.apache.beam:postgres_read:v1`
   * CDC Stream: `beam:schematransform:org.apache.beam:postgres_read_cdc:v1`
+* **Expansion Service**: Serves the gRPC `ExpansionService` protocol, allowing Beam YAML and Python pipelines to execute Go-native PostgreSQL transforms. Any Beam SDK that speaks the expansion protocol can connect, but only the YAML and Python paths are covered by tests in this contribution.
+
+---
 
 ## 3. Quickstart & Getting Started
 
@@ -396,6 +401,54 @@ func main() {
 	}
 }
 ```
+
+### Declarative Beam YAML Pipelines
+
+Beam YAML allows specifying complete ETL pipelines between PostgreSQL tables without writing SDK code:
+
+```yaml
+pipeline:
+  type: chain
+  transforms:
+    - type: ReadFromPostgres
+      name: ReadSourceOrders
+      config:
+        url: "jdbc:postgresql://localhost:5432/postgres"
+        table: "test_pipelines.source_orders"
+        username: "beam_navigator"
+        password: "beam_password"
+
+    - type: Filter
+      name: FilterCompletedOrders
+      config:
+        language: python
+        keep: "status == 'COMPLETED' and float(amount) >= 100.0"
+
+    - type: MapToFields
+      name: TransformAndMask
+      config:
+        language: python
+        fields:
+          order_id: "int(order_id)"
+          customer_id: "str(customer_id)"
+          masked_email: "customer_email[:3] + '***@' + customer_email.split('@')[1] if '@' in customer_email else '***'"
+          net_amount: "round(float(amount) * 0.975, 2)"
+          processing_fee: "round(float(amount) * 0.025, 2)"
+          customer_tier: "'VIP' if float(amount) >= 1000.0 else 'STANDARD'"
+          status: "str(status)"
+
+    - type: WriteToPostgres
+      name: WriteTransformedOrders
+      config:
+        url: "jdbc:postgresql://localhost:5432/postgres"
+        table: "test_pipelines.target_orders_transformed"
+        username: "beam_navigator"
+        password: "beam_password"
+        primary_keys: ["order_id"]
+        write_method: "UPSERT"
+```
+
+---
 
 ## 4. Configuration Reference
 
@@ -831,6 +884,53 @@ single worker that reads the stream and caps itself at one open connection.
 > It freezes when a pipeline stalls and must not be used to detect one. Use
 > `cdc_slot_retained_bytes`, which is measured on a separate connection, or the
 > `health` column of the view.
+
+### Python & YAML Cross-Language Surface
+
+The Go `postgresio` connector is accessible from Python and Apache Beam YAML pipelines via SchemaTransforms and the standalone Go expansion service.
+
+#### Python Façade
+
+Import from `apache_beam.io.postgres_cdc`:
+
+```python
+from apache_beam.io.postgres_cdc import ReadFromPostgresCDC, WriteToPostgres
+
+# Continuous Change Data Capture streaming
+with beam.Pipeline(options=opts) as p:
+    events = p | ReadFromPostgresCDC(
+        host="localhost",
+        database="shop",
+        slot_name="beam_slot",
+        publication="beam_pub",
+        username="beam_cdc",
+        password_env_var="PGPASSWORD",
+    )
+
+# Bulk writing with Dead-Letter Queue output
+with beam.Pipeline(options=opts) as p:
+    res = rows | WriteToPostgres(
+        host="localhost",
+        database="shop",
+        table="public.orders",
+        username="beam_writer",
+        password_env_var="PGPASSWORD",
+        conflict_keys=["order_id"],
+    )
+    # Access DLQ failed rows
+    res.failed_rows | beam.Map(logging.error)
+```
+
+The Python façade uses a multi-tier expansion service resolver in the following evaluation order:
+1. Explicit `expansion_service` parameter passed to the transform.
+2. `BEAM_GO_EXPANSION_SERVICE` environment variable (host:port endpoint or binary path).
+3. Sibling `beam-go-expansion-service` binary in `PATH` or virtual environment `bin/`.
+4. Cached pre-built binary at `~/.apache_beam/cache/bin/beam-go-expansion-service`.
+5. Source compilation via `go build -mod=readonly` from a Beam repository checkout. **Opt-in only** — enable it by setting `BEAM_GO_EXPANSION_SERVICE_ALLOW_BUILD=1` or passing `allow_build=True`. It is not automatic because invoking a compiler during pipeline graph construction is a side effect well outside the expected cost of applying a PTransform.
+
+#### YAML Schema Reference
+
+Apache Beam YAML pipelines invoke `WriteToPostgres` and `ReadFromPostgresCDC` directly. Configuration parameter descriptions, types, and defaults are documented in [YAML_REFERENCE.md](YAML_REFERENCE.md), which is programmatically verified against the in-process schema registry (`schematransform.DefaultRegistry()`) via `TestYAMLReference_ByteEquality` to prevent documentation drift.
 
 ### Known Limitations
 
