@@ -22,6 +22,14 @@
 // Do not delete or weaken a test to make it pass. Several of these guard
 // defects that affect the source database, not just the pipeline.
 //
+// Ten of these are named with a TestSourceGuard_ prefix. They do not exercise
+// the connector: each reads a source file and asserts that a string is present
+// or absent. They cover regressions whose real behaviour needs a live server, a
+// full SASL exchange, or a running replication slot, and they are deliberately
+// crude. Treat one as a tripwire against a specific known defect, not as
+// evidence the behaviour is correct -- a guard that greps for a type OID is
+// satisfied by a comment that happens to mention the number.
+//
 // Tests requiring a live PostgreSQL server (snapshot consistency, WAL
 // retention under load, catalog bloat, TOAST round-trips, the PG 13-18 matrix)
 // are specified in the engineering plan and belong in a testcontainers-backed
@@ -326,10 +334,10 @@ func TestSCRAMSHA256IsSupported(t *testing.T) {
 	}
 }
 
-// TestMD5IsNotTheOnlyPasswordMechanism guards against a regression that would
+// TestSourceGuard_CDCStreamMentionsSCRAM guards against a regression that would
 // re-narrow authentication to md5 only. It is a source-level check because the
 // alternative is a full SASL exchange against a live server.
-func TestMD5IsNotTheOnlyPasswordMechanism(t *testing.T) {
+func TestSourceGuard_CDCStreamMentionsSCRAM(t *testing.T) {
 	src, err := os.ReadFile("cdc_stream.go")
 	if err != nil {
 		t.Skipf("cannot read cdc_stream.go: %v", err)
@@ -446,7 +454,7 @@ func TestCompactorBreaksLSNTiesDeterministically(t *testing.T) {
 
 // --- P0-1: WAL acknowledgment ---
 
-// TestBundleFinalizationShortcutIsAbsent is a source-level guard for the
+// TestSourceGuard_CDCSourceHasNoNilBundleFinalizationBranch is a source-level guard for the
 // single most dangerous property of this connector.
 //
 // FINDING P0-1, and the meta-finding that the test suite cannot catch it.
@@ -461,7 +469,7 @@ func TestCompactorBreaksLSNTiesDeterministically(t *testing.T) {
 // Any fix must delete this shortcut so that tests and production share one
 // acknowledgment path. This check is deliberately crude: it fails while the
 // shortcut exists, and keeps failing if anyone reintroduces it.
-func TestBundleFinalizationShortcutIsAbsent(t *testing.T) {
+func TestSourceGuard_CDCSourceHasNoNilBundleFinalizationBranch(t *testing.T) {
 	src, err := os.ReadFile("cdc_source.go")
 	if err != nil {
 		t.Skipf("cannot read cdc_source.go: %v", err)
@@ -480,12 +488,12 @@ func TestBundleFinalizationShortcutIsAbsent(t *testing.T) {
 	}
 }
 
-// TestProcessElementIsNotAnUnboundedLoop guards the structural fix in WS-2.
+// TestSourceGuard_CDCSourceMentionsProcessContinuation guards the structural fix in WS-2.
 //
 // FINDING P0-1. A bundle can only finalize if ProcessElement returns. The
 // rewritten source must return an sdf.ProcessContinuation at a commit boundary
 // rather than looping forever.
-func TestProcessElementIsNotAnUnboundedLoop(t *testing.T) {
+func TestSourceGuard_CDCSourceMentionsProcessContinuation(t *testing.T) {
 	src, err := os.ReadFile("cdc_source.go")
 	if err != nil {
 		t.Skipf("cannot read cdc_source.go: %v", err)
@@ -498,13 +506,13 @@ func TestProcessElementIsNotAnUnboundedLoop(t *testing.T) {
 	}
 }
 
-// TestCDCSourceDeclaresAWatermarkEstimator guards the windowing fix.
+// TestSourceGuard_CDCSourceMentionsWatermarkEstimator guards the windowing fix.
 //
 // FINDING P0-2. The package declares no watermark estimator, so the runner has
 // no event-time signal from the CDC source. Downstream fixed or sliding
 // windows cannot close reliably, which is why the streaming aggregation
 // example cannot be trusted today.
-func TestCDCSourceDeclaresAWatermarkEstimator(t *testing.T) {
+func TestSourceGuard_CDCSourceMentionsWatermarkEstimator(t *testing.T) {
 	src, err := os.ReadFile("cdc_source.go")
 	if err != nil {
 		t.Skipf("cannot read cdc_source.go: %v", err)
@@ -517,7 +525,7 @@ func TestCDCSourceDeclaresAWatermarkEstimator(t *testing.T) {
 
 // --- P0-5: slot lifecycle ---
 
-// TestCreateSlotIfMissingIsNotADeadOption guards an exported option that
+// TestSourceGuard_PackageMentionsCreateReplicationSlot guards an exported option that
 // currently does nothing.
 //
 // FINDING P0-5. WithCDCCreateSlotIfMissing sets a field that no code reads.
@@ -525,7 +533,7 @@ func TestCDCSourceDeclaresAWatermarkEstimator(t *testing.T) {
 // bootstrap, so a pipeline pointed at an existing table silently receives only
 // changes that occur after it starts. Pre-existing rows are never emitted and
 // nothing warns.
-func TestCreateSlotIfMissingIsNotADeadOption(t *testing.T) {
+func TestSourceGuard_PackageMentionsCreateReplicationSlot(t *testing.T) {
 	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Skipf("cannot enumerate package sources: %v", err)
@@ -556,14 +564,14 @@ func TestCreateSlotIfMissingIsNotADeadOption(t *testing.T) {
 
 // --- P1-2: TOAST ---
 
-// TestToastSentinelIsNotAStringLiteral guards against poisoning typed columns.
+// TestSourceGuard_ParserHasNoUnchangedToastLiteral guards against poisoning typed columns.
 //
 // FINDING P1-2. The parser writes the literal Go string "<unchanged_toast>"
 // into the value map for an unchanged TOAST column. For a non-text column that
 // value is not merely wrong, it is untypeable, and the cold-start reassembly
 // path converts it to nil -- silently nulling large columns in the target.
 // Absence must be represented structurally, not by an in-band magic string.
-func TestToastSentinelIsNotAStringLiteral(t *testing.T) {
+func TestSourceGuard_ParserHasNoUnchangedToastLiteral(t *testing.T) {
 	src, err := os.ReadFile("pgoutput_parser.go")
 	if err != nil {
 		t.Skipf("cannot read pgoutput_parser.go: %v", err)
@@ -578,13 +586,13 @@ func TestToastSentinelIsNotAStringLiteral(t *testing.T) {
 
 // --- P1-4 / P2-1: sink hygiene ---
 
-// TestSinkDoesNotUseDeprecatedCopyIn guards the sink write path.
+// TestSourceGuard_WriteHasNoPqCopyIn guards the sink write path.
 //
 // FINDING P2-1. pq.CopyIn is formally deprecated, and it double-quotes an
 // identifier that the caller has already quoted. FINDING P1-4 is adjacent: the
 // upsert path creates and drops a temporary table per micro-batch, churning
 // pg_class and pg_attribute and degrading planning for the whole instance.
-func TestSinkDoesNotUseDeprecatedCopyIn(t *testing.T) {
+func TestSourceGuard_WriteHasNoPqCopyIn(t *testing.T) {
 	src, err := os.ReadFile("write.go")
 	if err != nil {
 		t.Skipf("cannot read write.go: %v", err)
@@ -595,11 +603,11 @@ func TestSinkDoesNotUseDeprecatedCopyIn(t *testing.T) {
 	}
 }
 
-// TestSinkDoesNotCreateATempTablePerBatch guards against catalog bloat.
+// TestSourceGuard_WriteTruncatesIfItCreatesTempTable guards against catalog bloat.
 //
 // FINDING P1-4. The staging table must be created once per session and
 // truncated between batches, not created and dropped per flush.
-func TestSinkDoesNotCreateATempTablePerBatch(t *testing.T) {
+func TestSourceGuard_WriteTruncatesIfItCreatesTempTable(t *testing.T) {
 	src, err := os.ReadFile("write.go")
 	if err != nil {
 		t.Skipf("cannot read write.go: %v", err)
@@ -614,14 +622,14 @@ func TestSinkDoesNotCreateATempTablePerBatch(t *testing.T) {
 	}
 }
 
-// TestOriginSetupErrorIsNotDiscarded guards bidirectional loop prevention.
+// TestSourceGuard_OriginSelectionCallShape guards bidirectional loop prevention.
 //
 // FINDING P1-5. The origin selection used to be issued inside the write
 // transaction with its result assigned to blank identifiers. It now happens
 // once per connection in options.go, but the hazard is the same in both
 // places: a swallowed error hands back a connection whose writes are
 // unstamped, and a bidirectional peer replays every one of them back.
-func TestOriginSetupErrorIsNotDiscarded(t *testing.T) {
+func TestSourceGuard_OriginSelectionCallShape(t *testing.T) {
 	src, err := os.ReadFile("write.go")
 	if err != nil {
 		t.Skipf("cannot read write.go: %v", err)
@@ -661,14 +669,14 @@ func TestOriginSetupErrorIsNotDiscarded(t *testing.T) {
 
 // --- P1-3: type fidelity ---
 
-// TestBinaryDecoderHandlesNumericUUIDAndInterval guards decoding.
+// TestSourceGuard_ParserMentionsNumericUUIDAndIntervalOIDs guards decoding.
 //
 // FINDING P1-3. In binary mode the decoder has no case for NUMERIC (OID 1700),
 // UUID (2950) or INTERVAL (1186), so those columns fall through to the default
 // branch and are emitted as raw wire bytes. NUMERIC is the money type; silently
 // handing back an opaque byte slice is a data-fidelity failure for exactly the
 // workload most likely to adopt this connector.
-func TestBinaryDecoderHandlesNumericUUIDAndInterval(t *testing.T) {
+func TestSourceGuard_ParserMentionsNumericUUIDAndIntervalOIDs(t *testing.T) {
 	src, err := os.ReadFile("pgoutput_parser.go")
 	if err != nil {
 		t.Skipf("cannot read pgoutput_parser.go: %v", err)
