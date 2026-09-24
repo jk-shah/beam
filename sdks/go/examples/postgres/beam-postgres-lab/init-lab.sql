@@ -40,6 +40,13 @@ BEGIN
     IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'beam_transporter') THEN
         CREATE ROLE beam_transporter WITH LOGIN PASSWORD 'beam_transporter_pass';
     END IF;
+    -- beam_test is not a tutorial role. It is the identity the connector's own
+    -- live integration tests authenticate as (see section 8). REPLICATION is
+    -- required because the CDC test calls pg_create_logical_replication_slot,
+    -- which a plain LOGIN role cannot do.
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'beam_test') THEN
+        CREATE ROLE beam_test WITH LOGIN REPLICATION PASSWORD 'beam_test';
+    END IF;
 END $$;
 
 -- 2. Create regional databases and secondary operational databases
@@ -469,3 +476,85 @@ INSERT INTO public.olap_transactions (transaction_id, region, category, amount) 
 ('T-07', 'EU-WEST', 'ELECTRONICS', 900.00),
 ('T-08', 'EU-WEST', 'GROCERY', 45.00),
 ('T-09', 'EU-WEST', 'GROCERY', 65.00);
+
+-- 8. Fixtures for the Go connector's live integration suite
+--
+-- Everything above this line serves the tutorials. This section exists only so
+-- that the integration tests in sdks/go/pkg/beam/io/postgresio can run against
+-- the lab instead of being skipped.
+--
+-- Those tests connect as beam_test/beam_test to the "postgres" database on
+-- port 5432. The lab publishes 55432 by default to avoid colliding with a
+-- developer's own server, so set POSTGRES_PORT=5432 in .env before bringing the
+-- stack up if you intend to run them. See README.md.
+--
+-- The tests populate and truncate these tables themselves; they are created
+-- empty here because the tests assume the shapes already exist.
+\c postgres
+
+CREATE SCHEMA IF NOT EXISTS test_pipelines AUTHORIZATION beam_test;
+
+-- Read fixture, and the input for both write branches of the complex pipeline
+-- test. That test seeds 20 canonical rows itself when the table is empty.
+CREATE TABLE IF NOT EXISTS test_pipelines.source_orders (
+    order_id       BIGINT PRIMARY KEY,
+    customer_id    VARCHAR(64)      NOT NULL,
+    customer_email VARCHAR(255)     NOT NULL,
+    amount         DOUBLE PRECISION NOT NULL,
+    status         VARCHAR(32)      NOT NULL,
+    country_code   VARCHAR(8)       NOT NULL,
+    items_count    INTEGER          NOT NULL,
+    created_at     TIMESTAMPTZ      NOT NULL DEFAULT NOW()
+);
+
+-- Sink for the enrichment and PII-masking branch. order_id is the conflict key
+-- the test passes as PrimaryKeyCols, so it needs a unique constraint for
+-- ON CONFLICT to resolve.
+CREATE TABLE IF NOT EXISTS test_pipelines.target_orders_transformed (
+    order_id       BIGINT PRIMARY KEY,
+    customer_id    VARCHAR(64)      NOT NULL,
+    masked_email   VARCHAR(255)     NOT NULL,
+    net_amount     DOUBLE PRECISION NOT NULL,
+    processing_fee DOUBLE PRECISION NOT NULL,
+    customer_tier  VARCHAR(32)      NOT NULL,
+    status         VARCHAR(32)      NOT NULL,
+    country_code   VARCHAR(8)       NOT NULL,
+    items_count    INTEGER          NOT NULL,
+    processed_at   TIMESTAMPTZ      NOT NULL DEFAULT NOW()
+);
+
+-- Sink for the filtering branch. FilterHighValueFn emits SourceOrder unchanged,
+-- so this mirrors source_orders rather than the transformed shape.
+CREATE TABLE IF NOT EXISTS test_pipelines.target_orders_filtered (
+    order_id       BIGINT PRIMARY KEY,
+    customer_id    VARCHAR(64)      NOT NULL,
+    customer_email VARCHAR(255)     NOT NULL,
+    amount         DOUBLE PRECISION NOT NULL,
+    status         VARCHAR(32)      NOT NULL,
+    country_code   VARCHAR(8)       NOT NULL,
+    items_count    INTEGER          NOT NULL,
+    created_at     TIMESTAMPTZ      NOT NULL DEFAULT NOW()
+);
+
+-- Target for the staged-COPY throughput test, which writes 25,000 rows through
+-- executeStagedCopy. It lives in public because that test names it explicitly.
+CREATE TABLE IF NOT EXISTS public.migrated_transactions (
+    id        BIGINT PRIMARY KEY,
+    code      VARCHAR(64)      NOT NULL,
+    amount    DOUBLE PRECISION NOT NULL,
+    region    VARCHAR(64)      NOT NULL,
+    tier      VARCHAR(32)      NOT NULL,
+    loaded_at TIMESTAMPTZ      NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE test_pipelines.source_orders             OWNER TO beam_test;
+ALTER TABLE test_pipelines.target_orders_transformed OWNER TO beam_test;
+ALTER TABLE test_pipelines.target_orders_filtered    OWNER TO beam_test;
+ALTER TABLE public.migrated_transactions             OWNER TO beam_test;
+
+GRANT CONNECT ON DATABASE postgres TO beam_test;
+-- CREATE on the database is what lets the CDC test issue CREATE PUBLICATION.
+GRANT CREATE ON DATABASE postgres TO beam_test;
+-- The CDC test creates and drops its own table in test_pipelines.
+GRANT USAGE, CREATE ON SCHEMA test_pipelines TO beam_test;
+GRANT USAGE, CREATE ON SCHEMA public TO beam_test;
