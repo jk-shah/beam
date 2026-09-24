@@ -144,7 +144,7 @@ func TestMain(m *testing.M) {
 }
 
 func TestGoComplexPipeline_PostgresToPostgres(t *testing.T) {
-	connStr := "host=localhost port=5432 user=beam_test dbname=postgres sslmode=disable"
+	connStr := "host=localhost port=5432 user=beam_test password=beam_test dbname=postgres sslmode=disable"
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
 		t.Skipf("skipping: cannot connect to local postgres: %v", err)
@@ -210,7 +210,7 @@ func TestGoComplexPipeline_PostgresToPostgres(t *testing.T) {
 		Port:     5432,
 		Database: "postgres",
 		Username: "beam_test",
-		Password: "beam_password",
+		Password: "beam_test",
 		// The sink defaults to verify-full. This fixture talks to a local
 		// server over loopback whose certificate is issued for the machine's
 		// own hostname, so verification of "localhost" cannot succeed. The
@@ -229,7 +229,7 @@ func TestGoComplexPipeline_PostgresToPostgres(t *testing.T) {
 		Port:           5432,
 		Database:       "postgres",
 		Username:       "beam_test",
-		Password:       "beam_password",
+		Password:       "beam_test",
 		SSLMode:        SSLModeDisable,
 		WriteMode:      WriteModeUpsert,
 		PrimaryKeyCols: []string{"order_id"},

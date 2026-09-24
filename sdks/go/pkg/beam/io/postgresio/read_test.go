@@ -810,7 +810,7 @@ func TestPostgreSqlReadProvider_Registration(t *testing.T) {
 }
 
 func checkIntegrationPostgres(t *testing.T) *sql.DB {
-	connStr := "host=localhost port=5432 user=beam_test dbname=postgres sslmode=disable"
+	connStr := "host=localhost port=5432 user=beam_test password=beam_test dbname=postgres sslmode=disable"
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
 		t.Skipf("skipping live database test: failed to open postgres connection: %v", err)
@@ -843,6 +843,7 @@ func TestPostgreSqlRead_TableIntegration(t *testing.T) {
 		WithReadPort(5432),
 		WithReadDatabase("postgres"),
 		WithReadUsername("beam_test"),
+		WithReadPassword("beam_test"),
 		WithReadSSLMode("disable"),
 		WithReadFetchSize(5),
 	)
@@ -875,6 +876,7 @@ func TestPostgreSqlRead_QueryIntegration(t *testing.T) {
 		WithReadPort(5432),
 		WithReadDatabase("postgres"),
 		WithReadUsername("beam_test"),
+		WithReadPassword("beam_test"),
 		WithReadSSLMode("disable"),
 		WithReadFetchSize(5),
 	)
@@ -910,6 +912,7 @@ func TestPostgreSqlRead_PartitionedIntegration(t *testing.T) {
 		WithReadPort(5432),
 		WithReadDatabase("postgres"),
 		WithReadUsername("beam_test"),
+		WithReadPassword("beam_test"),
 		WithReadSSLMode("disable"),
 		WithReadFetchSize(5),
 		WithReadPartitions("order_id", minID, maxID, 4),
@@ -943,6 +946,7 @@ func TestPostgreSqlRead_ReadRowsIntegration(t *testing.T) {
 		WithReadPort(5432),
 		WithReadDatabase("postgres"),
 		WithReadUsername("beam_test"),
+		WithReadPassword("beam_test"),
 		WithReadSSLMode("disable"),
 		WithReadFetchSize(5),
 	)
