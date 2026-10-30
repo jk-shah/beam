@@ -25,6 +25,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+import yaml
+
 import apache_beam as beam
 from apache_beam.cli import main as cli
 from apache_beam.options.pipeline_options import PipelineOptions
@@ -69,8 +71,12 @@ pipeline:
 def _run_cli(argv):
   """Runs `beam` with argv; returns (exit code, stdout, stderr)."""
   out, err = io.StringIO(), io.StringIO()
-  with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-    code = cli.main(argv)
+  env = {}
+  if 'BEAM_CONFIG' not in os.environ and 'BEAM_NO_CONFIG' not in os.environ:
+    env['BEAM_NO_CONFIG'] = '1'
+  with mock.patch.dict(os.environ, env):
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+      code = cli.main(argv)
   return code, out.getvalue(), err.getvalue()
 
 
@@ -361,6 +367,109 @@ class SqlCliTest(unittest.TestCase):
       code, _, err = _run_cli(['sql'])
     self.assertEqual(code, cli.EXIT_MISSING_PACKAGE)
     self.assertEqual(err.strip(), 'error: Java 11+ required')
+
+
+@unittest.skipIf(yaml_main is None, 'requires the [yaml] extra')
+class ConfigCliTest(unittest.TestCase):
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp()
+    self.addCleanup(shutil.rmtree, self.tmp)
+    self.cfg_path = os.path.join(self.tmp, '.beam', 'config.yaml')
+    env_patcher = mock.patch.dict(
+        os.environ,
+        {
+            'BEAM_CONFIG': self.cfg_path,
+            'BEAM_PROFILE': '',
+            'BEAM_NO_CONFIG': '',
+        },
+        clear=False)
+    env_patcher.start()
+    self.addCleanup(env_patcher.stop)
+
+  def test_cli_crud_and_unknown_flag_rejection(self):
+    code, _, _ = _run_cli(['config', 'set', 'runner', 'DirectRunner'])
+    self.assertEqual(code, cli.EXIT_OK)
+
+    code, out, _ = _run_cli(['config', 'get', 'runner'])
+    self.assertEqual(code, cli.EXIT_OK)
+    self.assertEqual(out.strip(), 'DirectRunner')
+
+    code, _, _ = _run_cli(['config', 'get', 'temp_location'])
+    self.assertEqual(code, cli.EXIT_PIPELINE_FAILED)
+
+    code, _, err = _run_cli(
+        ['config', 'set', 'runner', 'DirectRunner', '--profle', 'dev'])
+    self.assertEqual(code, cli.EXIT_USAGE)
+    self.assertIn('unrecognized arguments: --profle dev', err)
+
+    code, _, err = _run_cli(['config', 'set', 'password', 'secret'])
+    self.assertEqual(code, cli.EXIT_USAGE)
+    self.assertIn('refusing to store secret option', err)
+
+  def test_applies_to_run_pipe_and_sql_with_precedence(self):
+    _run_cli(['config', 'set', 'runner', 'DirectRunner'])
+    _run_cli(['config', 'set', 'project', 'cfg-proj'])
+
+    input_csv = os.path.join(self.tmp, 'users.csv')
+    with open(input_csv, 'w') as f:
+      f.write('name,age\nAda,36\n')
+
+    # `beam pipe --dry-run` keeps stdout pure YAML while logging the applied
+    # profile options to stderr.
+    out_json = os.path.join(self.tmp, 'out', 'users.json')
+    code, out, err = _run_cli(
+        ['pipe', '--from', input_csv, '--to', out_json, '--dry-run'])
+    self.assertEqual(code, cli.EXIT_OK, err)
+    self.assertIn('pipeline', yaml.safe_load(out))
+    self.assertIn("Using config profile 'default'", err)
+    self.assertIn('--project=cfg-proj', err)
+
+    # Explicit CLI flags override configured defaults, and `--no-config`
+    # suppresses configured defaults completely.
+    pipeline_path = os.path.join(self.tmp, 'pipeline.yaml')
+    run_out = os.path.join(self.tmp, 'run_out', 'users')
+    with open(pipeline_path, 'w') as f:
+      f.write(
+          'options:\n  runner: DirectRunner\n' + PIPELINE % {
+              'input': input_csv, 'output': run_out
+          })
+    with mock.patch.object(yaml_main,
+                           'build_pipeline_components_from_argv',
+                           side_effect=ValueError('stop')) as build:
+      _run_cli(['run', pipeline_path, '--runner=PrismRunner'])
+    self.assertEqual(
+        build.call_args.args[0],
+        [
+            '--yaml_pipeline_file=' + pipeline_path,
+            '--project=cfg-proj',
+            '--runner=PrismRunner',
+        ])
+
+    with mock.patch.object(yaml_main,
+                           'build_pipeline_components_from_argv',
+                           side_effect=ValueError('stop')) as build:
+      _run_cli(['run', pipeline_path, '--no-config'])
+    self.assertEqual(
+        build.call_args.args[0], ['--yaml_pipeline_file=' + pipeline_path])
+
+    # A pipeline file's own `options:` block overrides `config.yaml`.
+    _run_cli(['config', 'set', 'runner', 'NoSuchRunner'])
+    code, _, err = _run_cli(['run', pipeline_path])
+    self.assertEqual(code, cli.EXIT_OK, err)
+    self.assertEqual(len(_read_lines(run_out)), 1)
+
+    # `beam sql` inherits `DataflowRunner` as `dataflow`, except for `--list-*`.
+    _run_cli(['config', 'set', 'runner', 'DataflowRunner'])
+    with mock.patch('apache_beam.cli.sql.run', return_value=0) as mock_sql:
+      code, _, err = _run_cli(['sql', '--io', 'csv'])
+    self.assertEqual(code, cli.EXIT_OK)
+    self.assertEqual(mock_sql.call_args.kwargs['runner'], 'dataflow')
+    self.assertIn("Using config profile 'default'", err)
+
+    with mock.patch('apache_beam.cli.sql.run', return_value=0) as mock_sql:
+      code, _, err = _run_cli(['sql', '--list-versions'])
+    self.assertEqual(code, cli.EXIT_OK)
+    self.assertEqual(err, '')
 
 
 if __name__ == '__main__':

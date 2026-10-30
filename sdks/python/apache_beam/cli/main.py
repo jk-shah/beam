@@ -31,6 +31,11 @@ that pipeline instead, ready to save, edit and `beam run`.
 `beam sql` launches the interactive Apache Beam SQL shell (`BeamSqlLine`),
 caching shaded JARs in `~/.beam/cache/` compatibly with `scripts/beam-sql.sh`.
 
+`beam config` manages named profiles of default `PipelineOptions` in
+`~/.beam/config.yaml` (using Beam YAML's `options:` schema). Explicit CLI
+flags and a pipeline file's `options:` block always override saved defaults,
+and `--no-config` (`BEAM_NO_CONFIG=1`) ignores them.
+
 On top of that, the CLI gives command-line users and scripts what they rely on:
 errors without tracebacks unless `--verbose` is given, documented exit codes,
 Ctrl-C cancelling the pipeline, and a last line naming the runner that ran it.
@@ -45,6 +50,7 @@ import traceback
 import yaml
 
 import apache_beam as beam
+from apache_beam.cli import config
 from apache_beam.cli import pipe_spec
 from apache_beam.cli import sql
 from apache_beam.io.filesystems import FileSystems
@@ -103,6 +109,26 @@ Builds a shaded Beam SQL JAR once with Maven Wrapper and caches it in
 Every other argument is passed through to BeamSqlLine.
 """ + _EXIT_CODES
 
+_CONFIG_EPILOG = """\
+examples:
+  beam config set runner DataflowRunner
+  beam config set project my-gcp-project
+  beam config list
+  beam config set runner PrismRunner --profile dev
+  beam config use dev
+  beam config unset temp_location
+
+Stores named profiles in ~/.beam/config.yaml using Beam YAML's options:
+mapping. Explicit CLI flags and a pipeline file's options: block always
+override saved defaults. Pass --no-config (or set BEAM_NO_CONFIG=1) on
+beam run, beam pipe, or beam sql to ignore ~/.beam/config.yaml.
+
+exit codes:
+  0    success
+  1    option not set (beam config get)
+  2    usage or validation error
+"""
+
 
 def main(argv=None):
   """Runs the `beam` command and returns its exit code."""
@@ -112,16 +138,29 @@ def main(argv=None):
   logging.getLogger().setLevel(logging.INFO)
   try:
     if args.command == 'run':
-      return _run(args.file, extra_args, args.verbose)
+      return _run(args, extra_args)
     if args.command == 'pipe':
       return _pipe(args, extra_args, argv[argv.index('pipe') + 1:])
-    return _sql(args, extra_args)
+    if args.command == 'sql':
+      return _sql(args, extra_args)
+    return _config(args, extra_args)
   except _CliError as e:
     print(f'error: {e}', file=sys.stderr)
     return e.exit_code
   except KeyboardInterrupt:
     print('error: interrupted', file=sys.stderr)
     return EXIT_INTERRUPTED
+
+
+def _add_config_selection_args(parser):
+  parser.add_argument(
+      '--profile',
+      metavar='NAME',
+      help='configuration profile from ~/.beam/config.yaml')
+  parser.add_argument(
+      '--no-config',
+      action='store_true',
+      help='ignore saved options in ~/.beam/config.yaml')
 
 
 def _build_parser():
@@ -149,6 +188,7 @@ def _build_parser():
       'filesystem such as gs://')
   run.add_argument(
       '--verbose', action='store_true', help='show tracebacks for errors')
+  _add_config_selection_args(run)
 
   pipe = commands.add_parser(
       'pipe',
@@ -193,6 +233,7 @@ def _build_parser():
       help='check the pipeline and print it as YAML instead of running it')
   pipe.add_argument(
       '--verbose', action='store_true', help='show tracebacks for errors')
+  _add_config_selection_args(pipe)
 
   sql_parser = commands.add_parser(
       'sql',
@@ -209,7 +250,7 @@ def _build_parser():
       help='Beam release version for SQL artifacts (default: installed SDK)')
   sql_parser.add_argument(
       '--runner',
-      default='direct',
+      default=None,
       metavar='RUNNER',
       help='runner to include: direct (default) or dataflow')
   sql_parser.add_argument(
@@ -235,6 +276,59 @@ def _build_parser():
       '--debug',
       action='store_true',
       help='print Maven and Java commands as they run')
+  _add_config_selection_args(sql_parser)
+
+  config_parser = commands.add_parser(
+      'config',
+      help='manage default pipeline options in ~/.beam/config.yaml',
+      description=(
+          'Manage named profiles of default PipelineOptions in '
+          '~/.beam/config.yaml.'),
+      epilog=_CONFIG_EPILOG,
+      formatter_class=argparse.RawDescriptionHelpFormatter,
+      allow_abbrev=False)
+  actions = config_parser.add_subparsers(
+      dest='config_action', required=True, metavar='ACTION')
+
+  set_p = actions.add_parser(
+      'set', help='set a default pipeline option', allow_abbrev=False)
+  set_p.add_argument(
+      'option',
+      metavar='OPTION',
+      help='PipelineOptions name (for example runner or temp_location)')
+  set_p.add_argument('value', metavar='VALUE', help='option value')
+  set_p.add_argument(
+      '--profile',
+      metavar='NAME',
+      help='profile to modify (default: active profile)')
+
+  get_p = actions.add_parser(
+      'get', help='print a configured option value', allow_abbrev=False)
+  get_p.add_argument('option', metavar='OPTION', help='PipelineOptions name')
+  get_p.add_argument(
+      '--profile',
+      metavar='NAME',
+      help='profile to read (default: active profile)')
+
+  unset_p = actions.add_parser(
+      'unset', help='remove a configured option', allow_abbrev=False)
+  unset_p.add_argument('option', metavar='OPTION', help='PipelineOptions name')
+  unset_p.add_argument(
+      '--profile',
+      metavar='NAME',
+      help='profile to modify (default: active profile)')
+
+  list_p = actions.add_parser(
+      'list', help='show configured options for a profile', allow_abbrev=False)
+  list_p.add_argument(
+      '--profile',
+      metavar='NAME',
+      help='profile to list (default: active profile)')
+
+  use_p = actions.add_parser(
+      'use', help='switch the active profile', allow_abbrev=False)
+  use_p.add_argument(
+      'profile_name', metavar='PROFILE', help='profile name to make active')
   return parser
 
 
@@ -245,24 +339,48 @@ class _CliError(Exception):
     self.exit_code = exit_code
 
 
+def _config(args, extra_args):
+  if extra_args:
+    raise _CliError(
+        f'unrecognized arguments: {" ".join(extra_args)}', EXIT_USAGE)
+  try:
+    return config.run_command(args)
+  except config.ConfigError as e:
+    raise _CliError(str(e), e.exit_code) from None
+
+
+def _resolve_config_args(args, pipeline_args):
+  try:
+    return config.resolve_pipeline_args(
+        pipeline_args, profile=args.profile, no_config=args.no_config)
+  except config.ConfigError as e:
+    raise _CliError(str(e), e.exit_code) from None
+
+
 def _sql(args, sqlline_args):
   if sqlline_args and sqlline_args[0] == '--':
     sqlline_args = sqlline_args[1:]
   try:
+    if args.list_versions or args.list_ios or args.list_runners:
+      runner = args.runner or 'direct'
+    else:
+      runner = config.configured_sql_runner(
+          args.runner, profile=args.profile, no_config=args.no_config)
     return sql.run(
         version=args.version,
-        runner=args.runner,
+        runner=runner,
         ios=args.ios,
         list_versions=args.list_versions,
         list_ios=args.list_ios,
         list_runners=args.list_runners,
         debug=args.debug,
         sqlline_args=sqlline_args)
-  except sql.SqlError as e:
+  except (sql.SqlError, config.ConfigError) as e:
     raise _CliError(str(e), e.exit_code) from None
 
 
-def _run(file, pipeline_args, verbose):
+def _run(args, pipeline_args):
+  file = args.file
   # Paths with a scheme (gs://, s3://, ...) are opened by Beam's filesystems
   # when the pipeline is built, which reports its own errors for them.
   if '://' not in file and not os.path.isfile(file):
@@ -273,9 +391,10 @@ def _run(file, pipeline_args, verbose):
       hint = '\n  pipeline options go after FILE, written as --flag=value'
     raise _CliError(f'no such file: {file!r}{hint}', EXIT_USAGE)
 
+  resolved_args = _resolve_config_args(args, pipeline_args)
   options, pipeline = _build(
-      ['--yaml_pipeline_file=' + file] + pipeline_args, verbose)
-  result = _execute(pipeline, verbose)
+      ['--yaml_pipeline_file=' + file] + resolved_args, args.verbose)
+  result = _execute(pipeline, args.verbose)
   print(f'Done. Ran {_describe_runner(options, result)}.')
   return EXIT_OK
 
@@ -294,9 +413,10 @@ def _pipe(args, pipeline_args, pipe_argv):
   # A dry run makes every check a real run makes, including building the
   # pipeline, so that it predicts whether `beam run` on its output will work.
   _refuse_existing_output(pipe.output_prefix)
+  resolved_args = _resolve_config_args(args, pipeline_args)
   options, pipeline = _build(
       ['--yaml_pipeline=' + yaml.safe_dump(pipe.spec, sort_keys=False)] +
-      pipeline_args,
+      resolved_args,
       args.verbose)
   _warn_if_local_paths([args.source, args.sink], options)
   if args.dry_run:
