@@ -29,6 +29,7 @@ import yaml
 
 import apache_beam as beam
 from apache_beam.cli import main as cli
+from apache_beam.cli import sql
 from apache_beam.options.pipeline_options import PipelineOptions
 
 try:
@@ -363,7 +364,7 @@ class SqlCliTest(unittest.TestCase):
 
   def test_maps_sql_error_to_cli_exit_code_without_traceback(self):
     with mock.patch('apache_beam.cli.sql.run',
-                    side_effect=cli.sql.SqlError('Java 11+ required', 4)):
+                    side_effect=sql.SqlError('Java 11+ required', 4)):
       code, _, err = _run_cli(['sql'])
     self.assertEqual(code, cli.EXIT_MISSING_PACKAGE)
     self.assertEqual(err.strip(), 'error: Java 11+ required')
@@ -378,6 +379,7 @@ class ConfigCliTest(unittest.TestCase):
     env_patcher = mock.patch.dict(
         os.environ,
         {
+            'BEAM_HOME': os.path.join(self.tmp, '.beam'),
             'BEAM_CONFIG': self.cfg_path,
             'BEAM_PROFILE': '',
             'BEAM_NO_CONFIG': '',

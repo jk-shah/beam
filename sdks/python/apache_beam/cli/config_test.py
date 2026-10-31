@@ -47,6 +47,7 @@ class ConfigTest(unittest.TestCase):
     env_patcher = mock.patch.dict(
         os.environ,
         {
+            'BEAM_HOME': os.path.join(self.tmp, '.beam'),
             'BEAM_CONFIG': self.cfg_path,
             'BEAM_PROFILE': '',
             'BEAM_NO_CONFIG': '',
@@ -247,6 +248,31 @@ class ConfigTest(unittest.TestCase):
     with contextlib.redirect_stderr(err):
       self.assertEqual(config.configured_sql_runner(None), 'direct')
     self.assertEqual(err.getvalue(), '')
+
+  def test_option_catalog_disk_cache(self):
+    cache_file = os.path.join(self.tmp, '.beam', 'cache', 'opts.json')
+    config._cached_option_catalog.cache_clear()
+    self.addCleanup(config._cached_option_catalog.cache_clear)
+
+    by_dest, by_flag = config._cached_option_catalog(cache_file)
+    self.assertTrue(os.path.isfile(cache_file))
+    self.assertIn('runner', by_dest)
+    self.assertEqual(by_flag['pubsub_root_url'][0], 'pubsubRootUrl')
+
+    config._cached_option_catalog.cache_clear()
+    with mock.patch.object(config,
+                           '_introspect_pipeline_options',
+                           side_effect=AssertionError('should hit disk cache')):
+      warm_dest, warm_flag = config._cached_option_catalog(cache_file)
+    self.assertEqual(warm_dest['pubsubRootUrl'], by_dest['pubsubRootUrl'])
+    self.assertEqual(warm_flag['streaming'], by_flag['streaming'])
+
+    # Corrupt cache gracefully regenerates via live introspection.
+    with open(cache_file, 'w', encoding='utf-8') as f:
+      f.write('{corrupt json')
+    config._cached_option_catalog.cache_clear()
+    regen_dest, _ = config._cached_option_catalog(cache_file)
+    self.assertIn('runner', regen_dest)
 
 
 if __name__ == '__main__':

@@ -42,20 +42,11 @@ Ctrl-C cancelling the pipeline, and a last line naming the runner that ran it.
 """
 
 import argparse
+import glob
 import logging
 import os
 import sys
 import traceback
-
-import yaml
-
-import apache_beam as beam
-from apache_beam.cli import config
-from apache_beam.cli import pipe_spec
-from apache_beam.cli import sql
-from apache_beam.io.filesystems import FileSystems
-from apache_beam.options.pipeline_options import StandardOptions
-from apache_beam.runners.runner import PipelineState
 
 # Exit codes, also listed in `--help`. Usage errors use 2, the code argparse
 # itself exits with.
@@ -340,6 +331,7 @@ class _CliError(Exception):
 
 
 def _config(args, extra_args):
+  from . import config
   if extra_args:
     raise _CliError(
         f'unrecognized arguments: {" ".join(extra_args)}', EXIT_USAGE)
@@ -350,6 +342,7 @@ def _config(args, extra_args):
 
 
 def _resolve_config_args(args, pipeline_args):
+  from . import config
   try:
     return config.resolve_pipeline_args(
         pipeline_args, profile=args.profile, no_config=args.no_config)
@@ -358,6 +351,8 @@ def _resolve_config_args(args, pipeline_args):
 
 
 def _sql(args, sqlline_args):
+  from . import config
+  from . import sql
   if sqlline_args and sqlline_args[0] == '--':
     sqlline_args = sqlline_args[1:]
   try:
@@ -401,6 +396,7 @@ def _run(args, pipeline_args):
 
 def _pipe(args, pipeline_args, pipe_argv):
   """Runs `beam pipe`; `pipe_argv` is its command line, for --dry-run."""
+  from . import pipe_spec
   try:
     pipe = pipe_spec.build_pipe_spec(
         args.source,
@@ -414,10 +410,12 @@ def _pipe(args, pipeline_args, pipe_argv):
   # pipeline, so that it predicts whether `beam run` on its output will work.
   _refuse_existing_output(pipe.output_prefix)
   resolved_args = _resolve_config_args(args, pipeline_args)
-  options, pipeline = _build(
-      ['--yaml_pipeline=' + yaml.safe_dump(pipe.spec, sort_keys=False)] +
-      resolved_args,
-      args.verbose)
+  import yaml
+  dumper = getattr(yaml, 'CSafeDumper', yaml.SafeDumper)
+  options, pipeline = _build([
+      '--yaml_pipeline=' + yaml.dump(pipe.spec, Dumper=dumper, sort_keys=False)
+  ] + resolved_args,
+                             args.verbose)
   _warn_if_local_paths([args.source, args.sink], options)
   if args.dry_run:
     # The YAML goes to stdout and every message to stderr, so that
@@ -453,6 +451,10 @@ def _refuse_existing_output(prefix):
 
 
 def _matching_files(prefix):
+  if '://' not in prefix:
+    return sorted(
+        p for p in glob.glob(glob.escape(prefix) + '*') if os.path.isfile(p))
+  from apache_beam.io.filesystems import FileSystems
   try:
     match = FileSystems.match([prefix + '*'])[0]
   except ValueError as e:
@@ -483,6 +485,7 @@ def _warn_if_local_paths(paths, options):
   path refers to each worker's own disk or container. The job can then
   succeed while reading nothing, or write where the user never looks.
   """
+  from apache_beam.options.pipeline_options import StandardOptions
   runner = options.view_as(StandardOptions).runner
   local = [path for path in paths if '://' not in path]
   if local and _runner_name(runner) not in _LOCAL_RUNNERS:
@@ -500,10 +503,11 @@ def _build(yaml_main_argv, verbose):
   `yaml_main_argv` is what `python -m apache_beam.yaml.main` would receive.
   Building also validates the YAML and expands cross-language transforms.
   """
-  # Beam YAML is imported here, not at the top of the module, because it needs
-  # the [yaml] extra; a missing extra is then reported with exit code 4 and a
-  # hint instead of a traceback.
+  # Beam and Beam YAML are imported here, not at the top of the module, so
+  # fast CLI paths remain instant and a missing [yaml] extra is reported with
+  # exit code 4 and a hint instead of a traceback.
   try:
+    import apache_beam as beam
     from apache_beam.yaml import main as yaml_main
   except ImportError as e:
     _maybe_print_traceback(verbose)
@@ -536,6 +540,7 @@ def _build(yaml_main_argv, verbose):
 
 def _execute(pipeline, verbose):
   """Runs a built pipeline until it finishes; returns its result."""
+  from apache_beam.runners.runner import PipelineState
   try:
     result = pipeline.run()
     try:
@@ -620,6 +625,7 @@ def _describe_runner(options, result):
   pipeline on Prism and falls back to the Python direct runner when Prism
   can't run it. The type of the result tells the two apart.
   """
+  from apache_beam.options.pipeline_options import StandardOptions
   runner = options.view_as(StandardOptions).runner
   if _runner_name(runner) != 'direct':
     return f'on {runner}'

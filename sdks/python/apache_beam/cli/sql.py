@@ -37,9 +37,8 @@ import textwrap
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
+from pathlib import Path
 from xml.sax.saxutils import escape as xml_escape
-
-from apache_beam import version as beam_version
 
 # Exit codes matching `apache_beam.cli.main`.
 _EXIT_FAILED = 1
@@ -65,6 +64,23 @@ _RUNNER_ARTIFACTS = {
 }
 
 _VALID_ARTIFACT_PART = re.compile(r'^[a-z0-9][a-z0-9._-]*$')
+
+
+def _installed_beam_version() -> str:
+  """Reads the installed `apache-beam` version without importing the SDK."""
+  version_file = Path(__file__).resolve().parents[1] / 'version.py'
+  if version_file.is_file():
+    match = re.search(
+        r"__version__\s*=\s*['\"]([^'\"]+)['\"]",
+        version_file.read_text(encoding='utf-8'))
+    if match:
+      return match.group(1)
+  import importlib.metadata
+  try:
+    return importlib.metadata.version('apache-beam')
+  except importlib.metadata.PackageNotFoundError:
+    from apache_beam import version as beam_version
+    return beam_version.__version__
 
 
 def run(
@@ -123,7 +139,7 @@ def _resolve_version(version):
     if not _VALID_ARTIFACT_PART.match(version.lower()):
       raise SqlError(f'invalid Beam version {version!r}', _EXIT_USAGE)
     return version
-  installed = beam_version.__version__
+  installed = _installed_beam_version()
   if '.dev' not in installed and 'rc' not in installed:
     return installed
   # A development checkout (`2.XX.0.dev`) has no published Maven JARs; fall

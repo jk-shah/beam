@@ -34,15 +34,13 @@ Safety rules:
 import argparse
 import difflib
 import functools
+import json
 import os
 import re
 import sys
+from pathlib import Path
 from typing import Any
 from typing import NamedTuple
-
-import yaml
-
-from apache_beam.options.pipeline_options import PipelineOptions
 
 _EXIT_NOT_FOUND = 1
 _EXIT_USAGE = 2
@@ -84,15 +82,31 @@ def _all_subclasses(cls):
   return result
 
 
-@functools.lru_cache(maxsize=1)
-def _option_catalog(
-) -> tuple[dict[str, _OptionMeta], dict[str, tuple[str, bool | None]]]:
-  """Introspects all `PipelineOptions` subclasses once.
+def _installed_beam_version() -> str:
+  version_file = Path(__file__).resolve().parents[1] / 'version.py'
+  if version_file.is_file():
+    match = re.search(
+        r"__version__\s*=\s*['\"]([^'\"]+)['\"]",
+        version_file.read_text(encoding='utf-8'))
+    if match:
+      return match.group(1)
+  import importlib.metadata
+  try:
+    return importlib.metadata.version('apache-beam')
+  except importlib.metadata.PackageNotFoundError:
+    return 'unknown'
 
-  Returns `(by_dest, by_flag)` where `by_dest` maps canonical option names to
-  their serialization metadata and `by_flag` maps stripped CLI flag names (such
-  as `'no_use_public_ips'`) to `(dest, implied_bool_or_none)`.
-  """
+
+def _option_cache_path() -> str:
+  beam_home = os.path.expanduser(os.environ.get('BEAM_HOME', '~/.beam'))
+  return os.path.join(
+      beam_home, 'cache', f'pipeline_options-{_installed_beam_version()}.json')
+
+
+def _introspect_pipeline_options(
+) -> tuple[dict[str, _OptionMeta], dict[str, tuple[str, bool | None]]]:
+  from apache_beam.options.pipeline_options import PipelineOptions
+
   parser = argparse.ArgumentParser(add_help=False, conflict_handler='resolve')
   for sub in _all_subclasses(PipelineOptions):
     sub._add_argparse_args(parser)
@@ -131,6 +145,63 @@ def _option_catalog(
   return by_dest, by_flag
 
 
+@functools.lru_cache(maxsize=4)
+def _cached_option_catalog(
+    cache_key: str,
+) -> tuple[dict[str, _OptionMeta], dict[str, tuple[str, bool | None]]]:
+  if cache_key == ':live:':
+    return _introspect_pipeline_options()
+
+  try:
+    with open(cache_key, encoding='utf-8') as f:
+      raw = json.load(f)
+    by_dest = {k: _OptionMeta(**v) for k, v in raw['by_dest'].items()}
+    by_flag = {k: (v[0], v[1]) for k, v in raw['by_flag'].items()}
+    return by_dest, by_flag
+  except (OSError, ValueError, KeyError, TypeError):
+    pass
+
+  by_dest, by_flag = _introspect_pipeline_options()
+  tmp_path = f'{cache_key}.{os.getpid()}.part'
+  try:
+    os.makedirs(os.path.dirname(cache_key), mode=0o700, exist_ok=True)
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    payload = {
+        'by_dest': {
+            k: v._asdict()
+            for k, v in by_dest.items()
+        },
+        'by_flag': {
+            k: [v[0], v[1]]
+            for k, v in by_flag.items()
+        },
+    }
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+      json.dump(payload, f)
+    os.replace(tmp_path, cache_key)
+  except OSError:
+    if os.path.exists(tmp_path):
+      try:
+        os.remove(tmp_path)
+      except OSError:
+        pass
+  return by_dest, by_flag
+
+
+def _option_catalog(
+) -> tuple[dict[str, _OptionMeta], dict[str, tuple[str, bool | None]]]:
+  """Returns `(by_dest, by_flag)` for `PipelineOptions`, using disk cache.
+
+  When `apache_beam` is not yet imported, reads
+  `~/.beam/cache/pipeline_options-<version>.json` so `beam config set` runs in
+  ~30ms without importing the full SDK.
+  """
+  key = (
+      ':live:' if 'apache_beam.options.pipeline_options' in sys.modules else
+      _option_cache_path())
+  return _cached_option_catalog(key)
+
+
 def run_command(args, config_path=None):
   """Executes `beam config <action>` and returns an exit code."""
   path = _default_config_path(config_path)
@@ -157,7 +228,12 @@ def run_command(args, config_path=None):
     return 0
 
   if action == 'get':
-    dest = _canonical_dest(args.option, warn_unknown=False)
+    stripped = _validate_option_key(args.option)
+    if not options:
+      return _EXIT_NOT_FOUND
+    dest = (
+        stripped if stripped in options else _canonical_dest(
+            args.option, warn_unknown=False))
     if dest not in options:
       return _EXIT_NOT_FOUND
     val = options[dest]
@@ -170,14 +246,20 @@ def run_command(args, config_path=None):
     return 0
 
   if action == 'unset':
-    dest = _canonical_dest(args.option, warn_unknown=False)
-    options.pop(dest, None)
+    stripped = _validate_option_key(args.option)
+    if options:
+      dest = (
+          stripped if stripped in options else _canonical_dest(
+              args.option, warn_unknown=False))
+      options.pop(dest, None)
     _save_config(path, data)
     return 0
 
   # action == 'list'
+  import yaml
+  dumper = getattr(yaml, 'CSafeDumper', yaml.SafeDumper)
   print(f'# Profile: {profile} ({path})')
-  print(yaml.safe_dump({'options': options}, sort_keys=False), end='')
+  print(yaml.dump({'options': options}, Dumper=dumper, sort_keys=False), end='')
   return 0
 
 
@@ -279,9 +361,11 @@ def _load_config(path) -> dict[str, Any]:
             }
         }
     }
+  import yaml
+  loader = getattr(yaml, 'CSafeLoader', yaml.SafeLoader)
   try:
     with open(path, encoding='utf-8') as f:
-      loaded = yaml.safe_load(f) or {}
+      loaded = yaml.load(f, Loader=loader) or {}
   except (OSError, yaml.YAMLError) as e:
     raise ConfigError(f'could not read {path}: {e}', _EXIT_USAGE) from None
   if not isinstance(loaded, dict):
@@ -292,6 +376,8 @@ def _load_config(path) -> dict[str, Any]:
 
 
 def _save_config(path, data):
+  import yaml
+  dumper = getattr(yaml, 'CSafeDumper', yaml.SafeDumper)
   parent = os.path.dirname(path)
   if parent:
     os.makedirs(parent, mode=0o700, exist_ok=True)
@@ -299,7 +385,7 @@ def _save_config(path, data):
   try:
     fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, 'w', encoding='utf-8') as f:
-      yaml.safe_dump(data, f, sort_keys=False)
+      yaml.dump(data, f, Dumper=dumper, sort_keys=False)
     os.replace(tmp_path, path)
   except OSError as e:
     if os.path.exists(tmp_path):
@@ -317,7 +403,7 @@ def _parse_bool(raw, option_name):
       f'option {option_name!r} expects true or false, got {raw!r}', _EXIT_USAGE)
 
 
-def _canonical_dest(raw_option, warn_unknown=True):
+def _validate_option_key(raw_option: str) -> str:
   stripped = raw_option.strip().lstrip('-')
   if not _VALID_KEY_RE.match(stripped):
     raise ConfigError(f'invalid option name {raw_option!r}', _EXIT_USAGE)
@@ -326,7 +412,11 @@ def _canonical_dest(raw_option, warn_unknown=True):
         f'refusing to store secret option {stripped!r} in plain-text config; '
         'use credentials providers or environment variables instead',
         _EXIT_USAGE)
+  return stripped
 
+
+def _canonical_dest(raw_option, warn_unknown=True):
+  stripped = _validate_option_key(raw_option)
   by_dest, by_flag = _option_catalog()
   if stripped in by_flag:
     return by_flag[stripped][0]

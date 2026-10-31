@@ -418,6 +418,7 @@ if __name__ == '__main__':
       author=PACKAGE_AUTHOR,
       author_email=PACKAGE_EMAIL,
       packages=setuptools.find_packages(),
+      py_modules=['_apache_beam_cli'],
       package_data={
           'apache_beam': [
               '*/*.pyx',
@@ -434,8 +435,9 @@ if __name__ == '__main__':
       },
       ext_modules=extensions,
       entry_points={
-          # Experimental; see apache_beam/cli/main.py.
-          'console_scripts': ['beam = apache_beam.cli.main:main'],
+          # Experimental; _apache_beam_cli defers importing apache_beam so that
+          # `beam --help`, `beam config`, and `beam sql` start immediately.
+          'console_scripts': ['beam = _apache_beam_cli:main'],
       },
       install_requires=[
           'cryptography>=50.0.0',

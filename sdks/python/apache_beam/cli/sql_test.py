@@ -196,7 +196,9 @@ class SqlShellTest(unittest.TestCase):
         '<version>2.76.0-SNAPSHOT</version>'
         '</versions></versioning></metadata>')
     with (
-        mock.patch.object(sql.beam_version, '__version__', '2.76.0.dev'),
+        mock.patch.object(sql,
+                          '_installed_beam_version',
+                          return_value='2.76.0.dev'),
         mock.patch.object(sql, '_fetch_text', return_value=metadata),
         contextlib.redirect_stderr(io.StringIO()),
     ):
