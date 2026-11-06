@@ -327,6 +327,47 @@ class RunTest(unittest.TestCase):
     self.assertIn('Cancelled the pipeline.', err)
 
 
+class SqlCliTest(unittest.TestCase):
+  def test_forwards_flags_and_strips_double_dash_for_sqlline(self):
+    with mock.patch.object(cli.sql, 'run', return_value=0) as sql_run:
+      code, _, _ = _run_cli([
+          'sql',
+          '--version',
+          '2.75.0',
+          '--runner',
+          'dataflow',
+          '--io',
+          'csv',
+          '--io',
+          'parquet',
+          '--debug',
+          '--',
+          '-e',
+          'SELECT 1',
+      ])
+    self.assertEqual(code, cli.EXIT_OK)
+    sql_run.assert_called_once_with(
+        version='2.75.0',
+        runner='dataflow',
+        ios=['csv', 'parquet'],
+        list_versions=False,
+        list_ios=False,
+        list_runners=False,
+        debug=True,
+        sqlline_args=['-e', 'SELECT 1'])
+
+  def test_maps_sql_error_to_cli_exit_code_without_traceback(self):
+    with mock.patch.object(
+        cli.sql,
+        'run',
+        side_effect=cli.sql.SqlError('java not found', 4),
+    ):
+      code, _, err = _run_cli(['sql'])
+    self.assertEqual(code, cli.EXIT_MISSING_PACKAGE)
+    self.assertIn('error: java not found', err)
+    self.assertNotIn('Traceback', err)
+
+
 class HelpersTest(unittest.TestCase):
   def test_cancel_failure_is_reported(self):
     result = mock.Mock()
