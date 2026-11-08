@@ -43,6 +43,11 @@ def render_llms_txt() -> str:
 4. Never embed passwords or tokens in URIs or CLI flags (`UriError` exit 2). Use
    Application Default Credentials (ADC), environment variables
    (`BEAM_POSTGRES_USER` / `BEAM_POSTGRES_PASSWORD`), or `0600` `--from-opt-file`.
+5. Right-size execution: keep `<100 MB` local/single-file runs on the default
+   local runner (never launch `DataflowRunner` VMs for tiny datasets); use
+   `--runner=DataflowRunner` / `FlinkRunner` / `SparkRunner` for multi-GB,
+   cross-network, or unbounded streaming workloads, and always bound
+   `beam tail -f` with `-n <LIMIT>` or `--duration <SEC>` in synchronous tools.
 
 ## 2. Subcommands
 - `beam inspect <URI> [--sample N] [--stats] [--search STR] [--json]`
@@ -62,7 +67,7 @@ def render_llms_txt() -> str:
     Sharded Beam outputs (`<prefix>-00000-of-NNNNN`) are auto-resolved.
 - `beam package <FILE.yaml | FILE.py | -> --to <gs://.../spec.json> [flags] [--json]`
     Zero-Docker `<1s` Flex Template packager for Beam YAML (auto-extracts Jinja
-    `{{ vars }}` into `metadata.parameters`) and AST-introspected single-image
+    `{{{{ vars }}}}` into `metadata.parameters`) and AST-introspected single-image
     Flex Template bundle generator for Python pipelines (no handwritten
     `Dockerfile` or `metadata.json`).
 - `beam diff <LEFT_URI> <RIGHT_URI> [--key COL ...] [--rtol F] [--atol F] [--json]`
@@ -85,6 +90,7 @@ def render_llms_txt() -> str:
 - `0`   Success (`diff` datasets match; `pipe`/`run` completed or submitted)
 - `1`   Pipeline execution failure or `--assert-counts` conservation failure
 - `2`   Usage, validation, schema, or inline-credential security error
+- `3`   Feature or flag combination unsupported on selected runner
 - `4`   Missing optional Python extra or Java runtime (`next_actions` shows fix)
 - `6`   `beam diff` / `beam pipe --verify` detected data mismatch
 - `7`   `--wait-timeout` / `beam wait --timeout` expired (`detached: true` on remote)

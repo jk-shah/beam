@@ -192,6 +192,45 @@ beam pipe \
 
 ---
 
-## 8. Architecture & Contributing Upstream
+## 8. Universal URIs, Safe Expressions & Exit Code Contract
+
+### Universal URI Grammar
+
+| System | URI Syntax | Notes |
+| :--- | :--- | :--- |
+| **Local / Cloud Files** | `./orders.csv`, `gs://bucket/path/*.parquet`, `s3://...`, `azfs://...`, `hdfs://...` | Auto-infers `csv`, `json`/`jsonl`, `parquet`, `avro`; resolves `-00000-of-NNNNN` shards automatically |
+| **Delta Lake** | `delta://gs://bucket/tables/orders` or `delta:///local/orders?version=3` | Pure-Python `_delta_log` reader, time travel (`?version=N`), `--zero-copy`, and Change Data Feed |
+| **Apache Iceberg v2** | `iceberg://ns.orders?warehouse=gs://bucket/wh` | Supports `warehouse`, `catalog=biglake`, and `catalog=rest`, plus Merge-on-Read `equality-deletes` |
+| **BigQuery** | `bigquery://PROJECT.DATASET.TABLE` | `$0` metadata/`dryRun` inspection, Storage Read API, `FILE_LOADS`/`STREAMING_INSERTS`, and Storage Write API `_default` CDC |
+| **PostgreSQL / MySQL** | `postgres://HOST:5432/DB?table=public.orders`, `mysql://HOST:3306/DB?table=orders` | Inline `user:pass@` rejected (`exit 2`); use `BEAM_POSTGRES_USER` / `BEAM_POSTGRES_PASSWORD` or `0600` `--from-opt-file` |
+| **Cloud Spanner** | `spanner://PROJECT/INSTANCE/DB?table=Orders` or `?change_stream=OrdersStream` | Batch reads and Spanner Change Streams (`--cdc`) |
+| **Pub/Sub & Kafka** | `pubsub://projects/PROJ/topics/T`, `pubsub://projects/PROJ/subscriptions/S`, `kafka://HOST:9092/TOPIC` | Non-destructive peek, live `tail -f` follow, and streaming `beam pipe` |
+
+### Safe `--where` & `--select` Expressions
+* **Operators**: `AND`, `OR`, `NOT`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `IN (...)`, `IS NULL`, `IS NOT NULL`, `+`, `-`, `*`, `/` (blocks `**`, `<<`, sequence repetition `*`, and `_`-prefixed attributes).
+* **Scalar Helpers**: `lower`, `upper`, `strip`, `len`, `coalesce`, `abs`, `round`, `int`, `float`, `str`, `bool`.
+
+### Deterministic Exit Codes
+
+| Exit Code | Constant | Meaning |
+| :--- | :--- | :--- |
+| `0` | `EXIT_OK` | Success (`beam diff` datasets match; pipeline completed) |
+| `1` | `EXIT_PIPELINE_FAILED` | Pipeline execution failed or `--assert-counts` row conservation failed |
+| `2` | `EXIT_USAGE` | CLI usage, YAML schema, AST expression, existing-output, or inline-secret error |
+| `3` | `EXIT_CAPABILITY` | Feature or flag combination unsupported on selected runner |
+| `4` | `EXIT_MISSING_PACKAGE` | Missing optional Python extra or Java 11–25 runtime (`next_actions` gives exact fix) |
+| `6` | `EXIT_DIFF_MISMATCH` | `beam diff` or `beam pipe --verify` detected schema, key, or value drift |
+| `7` | `EXIT_TIMEOUT` | `--wait-timeout` / `beam wait --timeout` expired (`detached: true` on remote) |
+| `8` | `EXIT_COST_LIMIT` | Pre-flight `--max-bytes` scan guardrail exceeded |
+| `130` | `EXIT_SIGINT` | Interrupted (`SIGINT` / `Ctrl-C`) |
+
+---
+
+## 9. Architecture & Documentation Links
+
+* **Official Beam Website CLI Reference**: [`website/www/site/content/en/documentation/sdks/cli.md`](../../../website/www/site/content/en/documentation/sdks/cli.md)
+* **CLI Module Map & Test Runner (`101` tests)**: [`sdks/python/apache_beam/cli/README.md`](../apache_beam/cli/README.md)
+* **AI Coding Agent Skill**: [`.agents/skills/apache-beam-cli/SKILL.md`](../../../.agents/skills/apache-beam-cli/SKILL.md)
 
 All CLI source modules live directly in their upstream target path [`sdks/python/apache_beam/cli/`](../apache_beam/cli/README.md) so individual PR slices cherry-pick cleanly onto `apache/beam:master` ([apache/beam#40891](https://github.com/apache/beam/issues/40891)). This `sdks/python/cli-preview/` package is a lightweight pure-Python overlay that lets anyone install and test the full future CLI experience against released PyPI `apache-beam` wheels in seconds.
+

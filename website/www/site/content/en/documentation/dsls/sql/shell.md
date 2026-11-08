@@ -26,11 +26,24 @@ This page describes how to work with the shell, but does not focus on specific f
 
 ## Quickstart
 
-The easiest way to get started with the Beam SQL shell is using the `beam-sql.sh` script:
+You can launch the Beam SQL shell either through the Python
+[Apache Beam CLI](/documentation/sdks/cli/) (`beam sql`) or the standalone
+`beam-sql.sh` script (both share the `~/.beam/cache/` JAR cache):
+
+### Using the `beam` CLI
+
+If you already have `apache-beam[yaml]` installed in Python (plus Java 11+ on
+your `PATH` or `JAVA_HOME`):
+
+```bash
+beam sql --io csv --io parquet
+# Or run a one-shot query directly:
+beam sql -e "SELECT 1 AS id, 'hello' AS greeting"
+```
 
 ### Using beam-sql.sh Script
 
-The `beam-sql.sh` script automatically downloads and sets up the Beam SQL shell with all dependencies.
+The `beam-sql.sh` script automatically downloads and sets up the Beam SQL shell with all dependencies without requiring Python.
 
 #### Installation
 

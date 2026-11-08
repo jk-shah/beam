@@ -97,11 +97,16 @@ This file defines a simple pipeline with two transforms:
 
 ### Run the pipeline
 
-To execute the pipeline, run the following Python command:
+To execute the pipeline with the [Apache Beam CLI](../cli/), run:
 
 ```sh
-python -m apache_beam.yaml.main --yaml_pipeline_file=pipeline.yaml
+beam run pipeline.yaml
 ```
+
+(Equivalently, you can invoke the module directly via
+`python -m apache_beam.yaml.main --yaml_pipeline_file=pipeline.yaml`. You can
+also generate a Beam YAML file from a one-liner data movement command with
+`beam pipe --from input.csv --to output.parquet --emit-yaml > pipeline.yaml`.)
 
 The output should contain log statements similar to the following:
 

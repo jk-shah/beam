@@ -31,8 +31,9 @@
 > ```
 > *(Standard `pip`: `python3 -m venv .venv-beam && source .venv-beam/bin/activate && pip install -U pip && pip install "apache-beam-cli-preview[gcp] @ git+https://github.com/jk-shah/beam.git@beam-cli-preview#subdirectory=sdks/python/cli-preview"`)*
 >
-> * **Full User Guide & Recipes**: [`sdks/python/cli-preview/README.md`](sdks/python/cli-preview/README.md)
-> * **CLI Source & Architecture (`100` unit tests)**: [`sdks/python/apache_beam/cli/README.md`](sdks/python/apache_beam/cli/README.md)
+> * **Full User Guide & Quickstart (`cli-preview`)**: [`sdks/python/cli-preview/README.md`](sdks/python/cli-preview/README.md)
+> * **Official CLI Reference Documentation**: [`website/www/site/content/en/documentation/sdks/cli.md`](website/www/site/content/en/documentation/sdks/cli.md)
+> * **CLI Source & Architecture (`101` unit tests)**: [`sdks/python/apache_beam/cli/README.md`](sdks/python/apache_beam/cli/README.md)
 > * **AI Coding Agent Skill**: [`.agents/skills/apache-beam-cli/SKILL.md`](.agents/skills/apache-beam-cli/SKILL.md) (or run `beam --llms-txt`)
 
 [Apache Beam](http://beam.apache.org/) is a unified model for defining both batch and streaming data-parallel processing pipelines, as well as a set of language-specific SDKs for constructing pipelines and Runners for executing them on distributed processing backends, including [Apache Flink](http://flink.apache.org/), [Apache Spark](http://spark.apache.org/), [Google Cloud Dataflow](http://cloud.google.com/dataflow/), and [Hazelcast Jet](https://hazelcast.com/).

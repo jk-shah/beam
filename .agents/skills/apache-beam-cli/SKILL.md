@@ -19,6 +19,7 @@ Use `beam` whenever moving, converting, filtering, cleaning, replicating CDC, ze
    - Reconcile critical migrations with `beam diff <LEFT> <RIGHT> --key <PK> --json` (exits `0` on exact match, `6` on drift).
    - Graduate working YAML or Python pipelines to reusable Dataflow Flex Templates with `beam package` (zero `Dockerfile` or Cloud Build required for YAML!).
 4. **Zero Inline Secrets**: Never put `user:password@` in URIs or `--from-opt password=...` on the command line (rejected with exit `2`). Rely on Application Default Credentials (ADC), `BEAM_POSTGRES_USER` / `BEAM_POSTGRES_PASSWORD`, or `chmod 0600` `--from-opt-file`.
+5. **Right-Sized Runner Routing**: Keep `<100 MB` local/single-file inspection, filtering, and reconciliation on the default local runner (never spin up `DataflowRunner` VMs for small datasets); pass `--runner=DataflowRunner` / `FlinkRunner` / `SparkRunner` (with `--wait-timeout 60s` -> `beam wait <JOB_ID>`) for multi-GB, cross-network, or unbounded streaming workloads.
 
 ## Quick Reference
 

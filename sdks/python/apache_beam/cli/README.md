@@ -58,9 +58,29 @@ This package implements the `beam` (and `apache-beam`) command-line interface tr
 
 ---
 
-## 4. Running the Automated Test Suite (`100` Tests)
+## 4. Exit Code Contract (`output.py`)
 
-After installing the preview overlay (`sdks/python/cli-preview`) into a virtual environment, run the full CLI unit, `<90 ms` startup-isolation, pipeline integration, Lakehouse/CDC, and adversarial security test suite from the repository root:
+| Exit Code | Constant | Meaning |
+| :--- | :--- | :--- |
+| `0` | `EXIT_OK` | Command succeeded (`beam diff` datasets matched; pipeline completed) |
+| `1` | `EXIT_PIPELINE_FAILED` | Pipeline execution failed or `--assert-counts` conservation failed |
+| `2` | `EXIT_USAGE` | CLI usage, YAML schema, AST expression, existing-output, or inline-secret error |
+| `3` | `EXIT_CAPABILITY` | Feature/flag unsupported on the selected runner |
+| `4` | `EXIT_MISSING_PACKAGE` | Missing optional Python extra or Java 11–25 runtime (`next_actions` gives fix) |
+| `6` | `EXIT_DIFF_MISMATCH` | `beam diff` or `beam pipe --verify` found schema, key, or value drift |
+| `7` | `EXIT_TIMEOUT` | `--wait-timeout` / `beam wait --timeout` expired (`detached: true` on remote) |
+| `8` | `EXIT_COST_LIMIT` | Pre-flight `--max-bytes` scan guardrail exceeded |
+| `130` | `EXIT_SIGINT` | Interrupted (`SIGINT` / `Ctrl-C`) |
+
+---
+
+## 5. Documentation & Running the Automated Test Suite (`101` Tests)
+
+* **Preview Quickstart & Recipes**: [`sdks/python/cli-preview/README.md`](../../cli-preview/README.md)
+* **Website CLI Reference**: [`website/www/site/content/en/documentation/sdks/cli.md`](../../../../website/www/site/content/en/documentation/sdks/cli.md)
+* **AI Agent Skill**: [`.agents/skills/apache-beam-cli/SKILL.md`](../../../../.agents/skills/apache-beam-cli/SKILL.md)
+
+After installing the preview overlay (`sdks/python/cli-preview`) into a virtual environment, run the full `101`-test CLI unit, `<90 ms` startup-isolation, pipeline integration, Lakehouse/CDC, and adversarial security suite from the repository root:
 
 ```bash
 python -m unittest discover -s sdks/python/apache_beam/cli -p '*_test.py'
