@@ -437,7 +437,10 @@ if __name__ == '__main__':
       entry_points={
           # Experimental; _apache_beam_cli defers importing apache_beam so that
           # `beam --help`, `beam config`, and `beam sql` start immediately.
-          'console_scripts': ['beam = _apache_beam_cli:main'],
+          'console_scripts': [
+              'beam = _apache_beam_cli:main',
+              'apache-beam = _apache_beam_cli:main',
+          ],
       },
       install_requires=[
           'cryptography>=50.0.0',
