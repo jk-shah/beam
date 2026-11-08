@@ -1,9 +1,10 @@
 # Apache Beam CLI (`apache_beam.cli`) — Preview Source Overview
 
-> **Quick Try (No C++ / Go / Gradle Build Required)**: If you want to install and try `beam` right away in `<10s`, see [`sdks/python/cli-preview/README.md`](../../cli-preview/README.md):
+> **Quick Try (No C++ / Go / Gradle Build Required)**: If you want to install and try `beam` right away in `<10s`, see [`sdks/python/cli-preview/README.md`](../../cli-preview/README.md) ([`PREVIEW_DEMO.md`](../../cli-preview/PREVIEW_DEMO.md)):
 > ```bash
-> uv venv .venv-beam && source .venv-beam/bin/activate
-> uv pip install "apache-beam-cli-preview[gcp] @ git+https://github.com/jk-shah/beam.git@beam-cli-preview#subdirectory=sdks/python/cli-preview"
+> uv venv .venv-beam-cli && source .venv-beam-cli/bin/activate
+> uv pip install "apache-beam[yaml,gcp]>=2.71.0" pyarrow fastavro
+> uv pip install "git+https://github.com/jk-shah/beam.git@beam-cli-preview#subdirectory=sdks/python/cli-preview"
 > beam-demo
 > ```
 

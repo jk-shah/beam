@@ -2,27 +2,39 @@
 
 > **Branch**: [`jk-shah/beam@beam-cli-preview`](https://github.com/jk-shah/beam/tree/beam-cli-preview/sdks/python/cli-preview) · **Upstream Tracking Issue**: [apache/beam#40891](https://github.com/apache/beam/issues/40891)
 >
-> Installs a `<90 ms` cold-start `beam` (and `apache-beam`) CLI binary on top of released PyPI `apache-beam>=2.75.0` wheels—**no repo clone, no C++ compiler, no Go toolchain, and no Gradle build required**.
+> Installs a `<90 ms` cold-start `beam` (and `apache-beam`) CLI binary on top of released PyPI `apache-beam>=2.71.0` wheels—**no repo clone, no C++ compiler, no Go toolchain, and no Gradle build required**.
 
 ---
 
 ## 1. Try It in 10 Seconds (Fresh Venv, Zero Repo Clone)
 
-### Option A: `uv` (Recommended — ~3 seconds)
+Install regular released `apache-beam` from PyPI **first**, then install the `cli-preview` overlay on top of it (this resolves prebuilt PyPI binary wheels first and ensures the preview `beam` / `apache-beam` entrypoints take precedence):
+
+### Option A: `uv` (Recommended — ~3–5 seconds)
 ```bash
-uv venv .venv-beam
-source .venv-beam/bin/activate
-uv pip install "apache-beam-cli-preview[gcp] @ git+https://github.com/jk-shah/beam.git@beam-cli-preview#subdirectory=sdks/python/cli-preview"
+# 1. Create & activate a clean Python 3.10+ virtual environment
+uv venv .venv-beam-cli && source .venv-beam-cli/bin/activate
+
+# 2. Install regular released Apache Beam + format extras from PyPI first
+uv pip install "apache-beam[yaml,gcp]>=2.71.0" pyarrow fastavro
+
+# 3. Install the CLI preview overlay from GitHub on top of Apache Beam
+uv pip install "git+https://github.com/jk-shah/beam.git@beam-cli-preview#subdirectory=sdks/python/cli-preview"
 ```
 
-*(Local-only without GCP connectors: drop `[gcp]` -> `uv pip install "apache-beam-cli-preview @ git+https://github.com/jk-shah/beam.git@beam-cli-preview#subdirectory=sdks/python/cli-preview"`)*
+*(Local-only without GCP connectors: drop `,gcp` in step 2 -> `uv pip install "apache-beam[yaml]>=2.71.0" pyarrow fastavro`)*
 
 ### Option B: Standard `pip`
 ```bash
-python3 -m venv .venv-beam
-source .venv-beam/bin/activate
+# 1. Create & activate a clean Python 3.10+ virtual environment
+python3 -m venv .venv-beam-cli && source .venv-beam-cli/bin/activate
 pip install --upgrade pip
-pip install "apache-beam-cli-preview[gcp] @ git+https://github.com/jk-shah/beam.git@beam-cli-preview#subdirectory=sdks/python/cli-preview"
+
+# 2. Install regular released Apache Beam + format extras from PyPI first
+pip install "apache-beam[yaml,gcp]>=2.71.0" pyarrow fastavro
+
+# 3. Install the CLI preview overlay from GitHub on top of Apache Beam
+pip install "git+https://github.com/jk-shah/beam.git@beam-cli-preview#subdirectory=sdks/python/cli-preview"
 ```
 
 ### Run the 10-Step Interactive Showcase Immediately (`~10s`)

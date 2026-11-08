@@ -23,15 +23,16 @@
 > ### Try the New Apache Beam CLI Preview (`beam-cli-preview` Branch — [apache/beam#40891](https://github.com/apache/beam/issues/40891))
 > Co-workers, Beam community members, and AI coding agents can install and try the full `<90 ms` `beam` CLI roadmap in a fresh virtual environment in **~3–10 seconds**—**no repo clone, C++ compiler, Go toolchain, or Gradle build required**:
 > ```bash
-> uv venv .venv-beam && source .venv-beam/bin/activate
-> uv pip install "apache-beam-cli-preview[gcp] @ git+https://github.com/jk-shah/beam.git@beam-cli-preview#subdirectory=sdks/python/cli-preview"
+> uv venv .venv-beam-cli && source .venv-beam-cli/bin/activate
+> uv pip install "apache-beam[yaml,gcp]>=2.71.0" pyarrow fastavro
+> uv pip install "git+https://github.com/jk-shah/beam.git@beam-cli-preview#subdirectory=sdks/python/cli-preview"
 >
 > # Run the interactive 10-step showcase (ETL, DLQ, diff, Flex Templates, tail -f, Zero-Copy Iceberg, CDC):
 > beam-demo
 > ```
-> *(Standard `pip`: `python3 -m venv .venv-beam && source .venv-beam/bin/activate && pip install -U pip && pip install "apache-beam-cli-preview[gcp] @ git+https://github.com/jk-shah/beam.git@beam-cli-preview#subdirectory=sdks/python/cli-preview"`)*
+> *(Standard `pip`: `python3 -m venv .venv-beam-cli && source .venv-beam-cli/bin/activate && pip install -U pip && pip install "apache-beam[yaml,gcp]>=2.71.0" pyarrow fastavro && pip install "git+https://github.com/jk-shah/beam.git@beam-cli-preview#subdirectory=sdks/python/cli-preview"`)*
 >
-> * **Full User Guide & Quickstart (`cli-preview`)**: [`sdks/python/cli-preview/README.md`](sdks/python/cli-preview/README.md)
+> * **Full User Guide & Quickstart (`cli-preview`)**: [`sdks/python/cli-preview/README.md`](sdks/python/cli-preview/README.md) ([`PREVIEW_DEMO.md`](sdks/python/cli-preview/PREVIEW_DEMO.md))
 > * **Official CLI Reference Documentation**: [`website/www/site/content/en/documentation/sdks/cli.md`](website/www/site/content/en/documentation/sdks/cli.md)
 > * **CLI Source & Architecture (`101` unit tests)**: [`sdks/python/apache_beam/cli/README.md`](sdks/python/apache_beam/cli/README.md)
 > * **AI Coding Agent Skill**: [`.agents/skills/apache-beam-cli/SKILL.md`](.agents/skills/apache-beam-cli/SKILL.md) (or run `beam --llms-txt`)
