@@ -712,7 +712,7 @@ def cli_write_to_bigquery(
             'BigQuery --if-exists=replace (WRITE_TRUNCATE) requires '
             '--temp_location=gs://<bucket>/tmp for atomic file loads')
 
-      if write_disposition == 'WRITE_EMPTY' and not temp_loc:
+      if write_disposition == 'WRITE_EMPTY' and (not temp_loc or error_handling):
         from google.api_core import exceptions as gcp_exceptions
         from google.cloud import bigquery as gcp_bq
         from . import uris

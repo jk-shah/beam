@@ -416,11 +416,35 @@ def wait_for_job(
 
     upper = state_str.upper()
     if upper in _TERMINAL_SUCCESS_STATES:
+      outputs_obj = dict(record.get('outputs') or {})
+      out_pfx = outputs_obj.get('output_prefix')
+      dlq_pfx = outputs_obj.get('dlq_prefix')
+      if out_pfx or dlq_pfx:
+        try:
+          from apache_beam.io.filesystems import FileSystems
+          from apache_beam.options.pipeline_options import PipelineOptions
+          FileSystems.set_options(PipelineOptions([f'--project={proj}']))
+          if out_pfx:
+            written = sorted(
+                m.path
+                for m in FileSystems.match([out_pfx + '*'])[0].metadata_list)
+            outputs_obj['files'] = written
+            outputs_obj['file_count'] = len(written)
+          if dlq_pfx:
+            dlq_files = sorted(
+                m.path
+                for m in FileSystems.match([dlq_pfx + '*'])[0].metadata_list)
+            outputs_obj['dlq_files'] = dlq_files
+          record['outputs'] = outputs_obj
+        except Exception:  # pylint: disable=broad-except
+          pass
+
       # Run deferred post-checks (`assert_counts` / `verify_diff`) if persisted!
       post = record.get('post_checks') or {}
       if post.get('assert_counts'):
         err_msg = check_assert_counts(counters)
         if err_msg:
+          _atomic_write_json(_jobs_dir() / f'{safe_id}.json', record)
           return EXIT_PIPELINE_FAILED, {
               **record,
               'post_check_error': err_msg,
@@ -428,14 +452,20 @@ def wait_for_job(
       if post.get('verify_diff'):
         from . import diff
         v_cfg = post['verify_diff']
+        v_right = (out_pfx + '*' if out_pfx else v_cfg['right'])
         diff_code, diff_report = diff.run_diff(
             v_cfg['left'],
-            v_cfg['right'],
+            v_right,
             keys=v_cfg.get('keys'),
             default_project=proj)
+        diff_report.pop('untrusted_data', None)
+        outputs_obj['verify'] = diff_report
+        record['outputs'] = outputs_obj
         record['verify_diff'] = diff_report
+        _atomic_write_json(_jobs_dir() / f'{safe_id}.json', record)
         if diff_code != 0:
           return diff_code, record
+      _atomic_write_json(_jobs_dir() / f'{safe_id}.json', record)
       return EXIT_OK, record
 
     if upper in _TERMINAL_FAILURE_STATES:

@@ -414,6 +414,139 @@ class InspectCheckIoDoctorTailJobsTest(unittest.TestCase):
     self.assertEqual(
         env_ey['outputs']['plan_hash'], env_chk['outputs']['plan_hash'])
 
+  def test_preview_wheel_staging_and_worker_unpickle_roundtrip(self):
+    import subprocess
+    import sys
+    import zipfile
+    from apache_beam.internal import pickler
+
+    preview_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), '..', '..', 'cli-preview'))
+    if preview_root not in sys.path:
+      sys.path.insert(0, preview_root)
+    from apache_beam_cli_preview import launcher
+
+    cache_dir = os.path.join(self.tmp, 'wheel_cache')
+    with mock.patch.dict(os.environ, {'BEAM_CACHE_DIR': cache_dir}):
+      whl_path = launcher.ensure_preview_wheel()
+      self.assertTrue(os.path.isfile(whl_path))
+      with zipfile.ZipFile(whl_path, 'r') as zf:
+        names = set(zf.namelist())
+      self.assertIn('apache_beam_cli_preview.pth', names)
+      self.assertIn('apache_beam_cli_preview/_worker_bootstrap.py', names)
+      self.assertIn('apache_beam_cli_preview/_bundled_cli/main.py', names)
+      self.assertIn('apache_beam_cli_preview/_bundled_cli/dlq.py', names)
+      self.assertIn('apache_beam_cli_preview/_bundled_cli/diff.py', names)
+
+      injected = launcher.maybe_inject_dataflow_worker_args(
+          ['--runner=DataflowRunner', '--project=p'])
+      self.assertIn(f'--extra_package={whl_path}', injected)
+      self.assertIn(
+          '--beam_plugin=apache_beam_cli_preview._worker_bootstrap', injected)
+      self.assertEqual(
+          injected, launcher.maybe_inject_dataflow_worker_args(injected))
+
+      # Simulate a remote Dataflow worker container (without repo `sdks/python`
+      # `apache_beam/cli` if extracted into an isolated site dir) unpickling
+      # DoFns/PTransforms from both `apache_beam.cli.*` and `_apache_beam_cli_pkg.*`!
+      from apache_beam.cli import dlq
+      csv_sample = os.path.join(self.tmp, 's.csv')
+      with open(csv_sample, 'w', encoding='utf-8') as f:
+        f.write('id,v\n1,10\n')
+      payload = pickler.dumps((
+          dlq.read_csv_with_dlq(csv_sample),
+          dlq.cli_count_rows('rows_written'),
+          dlq.cli_write_to_bigquery('p:d.t'),
+      ))
+      payload_file = os.path.join(self.tmp, 'pickled.bin')
+      with open(payload_file, 'wb') as f:
+        f.write(payload)
+
+      worker_site = os.path.join(self.tmp, 'worker_site')
+      with zipfile.ZipFile(whl_path, 'r') as zf:
+        zf.extractall(worker_site)
+
+      check_code = (
+          'import sys; '
+          f'sys.path.insert(0, {worker_site!r}); '
+          'import apache_beam_cli_preview._worker_bootstrap; '
+          'from apache_beam.internal import pickler; '
+          'import _apache_beam_cli_pkg.diff as fast_diff; '
+          'import apache_beam.typehints.arrow_type_compatibility as atc; '
+          'import apache_beam.yaml.yaml_mapping as ym; '
+          f'objs = pickler.loads(open({payload_file!r}, "rb").read()); '
+          'assert len(objs) == 3; '
+          'assert getattr(atc.PyarrowBatchConverter, "_cli_preview_patched", False); '
+          'assert getattr(ym.validate_generic_expression, "_cli_preview_patched", False); '
+          'assert callable(fast_diff.run_diff)'
+      )
+      proc = subprocess.run(
+          [sys.executable, '-c', check_code],
+          capture_output=True,
+          text=True,
+          check=False)
+      self.assertEqual(proc.returncode, 0, proc.stderr)
+
+  def test_remote_diff_requires_temp_location_and_wait_resolves_output_files(self):
+    from apache_beam.cli import jobs
+    left = os.path.join(self.tmp, 'l.csv')
+    right = os.path.join(self.tmp, 'r.csv')
+    with open(left, 'w', encoding='utf-8') as f:
+      f.write('id,val\n1,a\n2,b\n')
+    with open(right, 'w', encoding='utf-8') as f:
+      f.write('id,val\n1,a\n2,b\n')
+
+    # 1. `beam diff --runner=DataflowRunner` without `--temp_location` fails fast.
+    rc_d, env_d, _ = _run_json([
+        'diff', left, right, '--key', 'id', '--runner=DataflowRunner'
+    ])
+    self.assertEqual(rc_d, cli.EXIT_USAGE)
+    self.assertIn('--temp_location', env_d['error']['message'])
+
+    # 2. `jobs.wait_for_job` resolves sharded `output_prefix` & `verify_diff`.
+    shard = os.path.join(self.tmp, 'out.csv-00000-of-00001')
+    with open(shard, 'w', encoding='utf-8') as f:
+      f.write('id,val\n1,a\n2,b\n')
+    dlq_shard = os.path.join(self.tmp, 'dlq.json-00000-of-00001')
+    with open(dlq_shard, 'w', encoding='utf-8') as f:
+      f.write('')
+
+    with mock.patch.dict(os.environ, {'BEAM_HOME': self.tmp}):
+      jobs.record_job_submission(
+          '2026-11-08_job-verify',
+          runner='DataflowRunner',
+          state='JOB_STATE_RUNNING',
+          command='pipe',
+          project='demo-proj',
+          region='us-central1',
+          post_checks={
+              'assert_counts': True,
+              'verify_diff': {
+                  'left': left,
+                  'right': os.path.join(self.tmp, 'out.csv'),
+                  'keys': ['id'],
+              },
+          },
+          outputs={
+              'output_prefix': os.path.join(self.tmp, 'out.csv'),
+              'dlq_prefix': os.path.join(self.tmp, 'dlq.json'),
+          })
+      code, rec = jobs.wait_for_job(
+          '2026-11-08_job-verify',
+          poll_interval=0.01,
+          query_fn=lambda jid, p, r: (
+              'JOB_STATE_DONE',
+              {
+                  'rows_read': 2,
+                  'rows_filtered_out': 0,
+                  'dlq_rows': 0,
+                  'rows_written': 2,
+              }))
+      self.assertEqual(code, cli.EXIT_OK)
+      self.assertEqual(rec['outputs']['file_count'], 1)
+      self.assertEqual(len(rec['outputs']['dlq_files']), 1)
+      self.assertTrue(rec['outputs']['verify']['match'])
+
 
 if __name__ == '__main__':
   unittest.main()

@@ -222,7 +222,22 @@ def classify_error(
     error_type = 'InterruptedError'
   else:
     error_type = 'PipelineExecutionError'
-    if command == 'pipe':
+    if re.search(
+        r'(custom subnet mode|networkInterfaces\[0\]\.subnetwork|'
+        r'vmExternalIpAccess|no_use_public_ips)',
+        message,
+        re.IGNORECASE):
+      next_actions.append({
+          'command': (
+              f'beam {command or "pipe"} ... '
+              '--subnetwork=regions/<REGION>/subnetworks/default '
+              '--no_use_public_ips'),
+          'description': (
+              'Specify an explicit regional VPC subnetwork and disable worker '
+              'public IPs for enterprise GCP org policies.'),
+          'requires_human': False,
+      })
+    elif command == 'pipe':
       next_actions.append({
           'command': 'beam pipe ... --dlq ./dlq/errors.json',
           'description': 'Route malformed or failing records to a dead-letter sink.',

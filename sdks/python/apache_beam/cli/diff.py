@@ -510,6 +510,10 @@ def run_diff(
       'fnapirunner', 'directrunner', 'direct', 'prismrunner', 'prism',
       'bundlebaseddirectrunner')
   temp_loc = opts.view_as(GoogleCloudOptions).temp_location
+  if remote_runner and not temp_loc:
+    raise uris.UriError(
+        f'beam diff on remote runner {std_opts.runner!r} requires '
+        '--temp_location=gs://<bucket>/tmp so workers can write the summary')
   tmp_dir: str | None = None
   if remote_runner and temp_loc:
     out_file_prefix = (
@@ -517,6 +521,8 @@ def run_diff(
   else:
     tmp_dir = tempfile.mkdtemp(prefix='beam-diff-')
     out_file_prefix = os.path.join(tmp_dir, 'summary')
+  job_id: str | None = None
+  final_state = 'DONE'
   try:
     pipeline = beam.Pipeline(options=opts)
     left_pcoll = _read_endpoint_pcoll(pipeline, 'ReadLeft', left_ep)
@@ -545,7 +551,19 @@ def run_diff(
         | 'WriteSummary' >> beam.io.WriteToText(
             out_file_prefix, num_shards=1, shard_name_template=''))
     res = pipeline.run()
-    res.wait_until_finish()
+    wait_st = res.wait_until_finish()
+    if wait_st:
+      final_state = str(wait_st)
+    for attr in ('job_id', '_job_id'):
+      val = getattr(res, attr, None)
+      if callable(val):
+        try:
+          val = val()
+        except Exception:  # pylint: disable=broad-except
+          val = None
+      if isinstance(val, str) and val.strip():
+        job_id = val.strip()
+        break
 
     summary: dict[str, Any] = {
         'left_rows': 0,
@@ -590,6 +608,8 @@ def run_diff(
       'rtol': rtol,
       'atol': atol,
       'summary': summary,
+      'job_id': job_id,
+      'state': final_state,
       'untrusted_data': output.wrap_untrusted_rows(
           samples, truncated=len(samples) >= 10) if samples else None,
   }

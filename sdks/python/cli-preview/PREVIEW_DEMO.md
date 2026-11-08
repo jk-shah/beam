@@ -79,3 +79,31 @@ Give your agent either:
 4. **Row Conservation & Distributed Verification**:
    - `--assert-counts` proves `rows_read == rows_written + rows_filtered_out + dlq_rows` across stage fusion boundaries.
    - `beam diff` reconciles arbitrarily large sharded CSV, JSON, Parquet, Avro, and BigQuery datasets in $O(1)$ worker memory (`NaN == NaN`, normalized `Decimal`, configurable `--rtol`/`--atol`), automatically resolving sharded `-00000-of-NNNNN` output prefixes.
+
+---
+
+## 5. Running on Google Cloud Dataflow (`DataflowRunner`)
+
+`apache-beam-cli-preview` automatically synthesizes and stages its pure-Python worker wheel (`<5 ms`) + `--beam_plugin` runtime hooks onto remote Dataflow SDK workers whenever `--runner=DataflowRunner` is passed—no manual `--extra_package` flags needed:
+
+```bash
+beam pipe \
+  --from "gs://<BUCKET>/raw/*.csv" \
+  --to "bigquery://<PROJECT>.<DATASET>.<TABLE>" \
+  --where "country == 'US' and amount >= 100" \
+  --select "id,country,amount" \
+  --dlq "gs://<BUCKET>/dlq/bad.json" \
+  --assert-counts \
+  --wait-timeout 10s \
+  --runner=DataflowRunner \
+  --project=<PROJECT> \
+  --region=us-central1 \
+  --temp_location="gs://<BUCKET>/tmp" \
+  --json
+
+# Poll detached job until JOB_STATE_DONE and run deferred post-checks:
+beam wait <JOB_ID> --json
+```
+
+*(Enterprise GCP org tip: if your VPC uses custom subnet mode or blocks external worker IPs, append `--subnetwork=regions/<REGION>/subnetworks/default --no_use_public_ips`.)*
+

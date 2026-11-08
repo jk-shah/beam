@@ -1150,7 +1150,8 @@ def _diff(args, extra_args, *, json_session, t0: float) -> int:
   from . import cost_guard
   from . import diff
   from . import uris
-  resolved_args = _resolve_config_args(args, extra_args)
+  resolved_args = _maybe_stage_preview_worker_args(
+      _resolve_config_args(args, extra_args))
   proj = _extract_project_from_args(resolved_args)
   diff_runner = _extract_runner_from_args(resolved_args) or 'FnApiRunner'
   try:
@@ -1187,6 +1188,8 @@ def _diff(args, extra_args, *, json_session, t0: float) -> int:
     raise _CliError(f'diff failed: {_summarize(e)}', EXIT_PIPELINE_FAILED) from None
 
   untrusted = report.pop('untrusted_data', None)
+  diff_job_id = report.pop('job_id', None)
+  diff_state = report.pop('state', None)
   summary = report['summary']
   if json_session.enabled:
     json_session.emit(
@@ -1195,6 +1198,8 @@ def _diff(args, extra_args, *, json_session, t0: float) -> int:
             command='diff',
             exit_code=rc,
             runner=diff_runner,
+            job_id=diff_job_id,
+            state=diff_state,
             duration_ms=int((time.monotonic() - t0) * 1000),
             metrics={
                 'left_rows': summary['left_rows'],
@@ -1303,6 +1308,20 @@ def _cancel_cmd(args, extra_args, *, json_session, t0: float) -> int:
   return EXIT_OK
 
 
+def _maybe_stage_preview_worker_args(
+    resolved_args: list[str], *, dry_run: bool = False) -> list[str]:
+  """Auto-stages the preview `.whl` onto remote Dataflow workers when active."""
+  if dry_run:
+    return resolved_args
+  if _runner_name(_extract_runner_from_args(resolved_args)) != 'dataflow':
+    return resolved_args
+  preview_launcher = sys.modules.get('apache_beam_cli_preview.launcher')
+  if preview_launcher is not None and hasattr(
+      preview_launcher, 'maybe_inject_dataflow_worker_args'):
+    return preview_launcher.maybe_inject_dataflow_worker_args(resolved_args)
+  return resolved_args
+
+
 def _run(args, pipeline_args, *, json_session, t0: float) -> int:
   from . import jobs
   file = args.file
@@ -1317,7 +1336,8 @@ def _run(args, pipeline_args, *, json_session, t0: float) -> int:
     stdin_yaml = sys.stdin.read()
     if not stdin_yaml.strip():
       raise _CliError('stdin (-) is empty; expected Beam YAML pipeline', EXIT_USAGE)
-    resolved_args = _resolve_config_args(args, pipeline_args)
+    resolved_args = _maybe_stage_preview_worker_args(
+        _resolve_config_args(args, pipeline_args), dry_run=bool(args.dry_run))
     if args.allow_stdin_jinja and not args.no_jinja:
       return _run_yaml(
           ['--yaml_pipeline=' + stdin_yaml] + resolved_args,
@@ -1343,7 +1363,8 @@ def _run(args, pipeline_args, *, json_session, t0: float) -> int:
       hint = '\n  custom pipeline options go after FILE, written as --flag=value'
     raise _CliError(f'no such file: {file!r}{hint}', EXIT_USAGE)
 
-  resolved_args = _resolve_config_args(args, pipeline_args)
+  resolved_args = _maybe_stage_preview_worker_args(
+      _resolve_config_args(args, pipeline_args), dry_run=bool(args.dry_run))
   if args.no_jinja and '://' not in file:
     with open(file, encoding='utf-8') as f:
       raw_yaml = f.read()
@@ -1393,7 +1414,8 @@ def _pipe(
     except ValueError as e:
       raise _CliError(str(e), EXIT_USAGE) from None
 
-  resolved_args = _resolve_config_args(args, pipeline_args)
+  resolved_args = _maybe_stage_preview_worker_args(
+      _resolve_config_args(args, pipeline_args), dry_run=bool(args.dry_run))
   default_proj = _extract_project_from_args(resolved_args)
   explicit_runner = _extract_runner_from_args(resolved_args)
   is_local_runner = _runner_name(explicit_runner) in _LOCAL_RUNNERS
@@ -1402,7 +1424,7 @@ def _pipe(
   # when `--dry-run` is emitting clean minimal YAML without `--assert-counts`.
   want_counters = bool(
       args.assert_counts or (json_session.enabled and not args.dry_run))
-  prefer_py_bq = bool(is_local_runner and not args.dry_run)
+  prefer_py_bq = bool(not args.dry_run or args.dlq)
 
   try:
     pipe = pipe_spec.build_pipe_spec(
@@ -2007,11 +2029,14 @@ def _summarize(error, max_lines=10):
   if type(error) is not RuntimeError and not message.startswith(
       type(error).__name__):
     message = f'{type(error).__name__}: {message}'
+  has_tb = _PYTHON_TRACEBACK in message
   lines = [
-      line.rstrip() for line in message.splitlines()
-      if line.strip() and not line[0].isspace()
+      line.strip() if not has_tb else line.rstrip()
+      for line in message.splitlines()
+      if line.strip() and (
+          not line[0].isspace() if has_tb else not line.startswith('  '))
   ]
-  if any(_PYTHON_TRACEBACK in line for line in lines):
+  if has_tb and any(_PYTHON_TRACEBACK in line for line in lines):
     context = lines[0].split(_PYTHON_TRACEBACK)[0].rstrip()
     causes = [
         line for line in lines if _PYTHON_TRACEBACK not in line and
