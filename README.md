@@ -19,6 +19,22 @@
 
 # Apache Beam
 
+> [!TIP]
+> ### Try the New Apache Beam CLI Preview (`beam-cli-preview` Branch — [apache/beam#40891](https://github.com/apache/beam/issues/40891))
+> Co-workers, Beam community members, and AI coding agents can install and try the full `<90 ms` `beam` CLI roadmap in a fresh virtual environment in **~3–10 seconds**—**no repo clone, C++ compiler, Go toolchain, or Gradle build required**:
+> ```bash
+> uv venv .venv-beam && source .venv-beam/bin/activate
+> uv pip install "apache-beam-cli-preview[gcp] @ git+https://github.com/jk-shah/beam.git@beam-cli-preview#subdirectory=sdks/python/cli-preview"
+>
+> # Run the interactive 10-step showcase (ETL, DLQ, diff, Flex Templates, tail -f, Zero-Copy Iceberg, CDC):
+> beam-demo
+> ```
+> *(Standard `pip`: `python3 -m venv .venv-beam && source .venv-beam/bin/activate && pip install -U pip && pip install "apache-beam-cli-preview[gcp] @ git+https://github.com/jk-shah/beam.git@beam-cli-preview#subdirectory=sdks/python/cli-preview"`)*
+>
+> * **Full User Guide & Recipes**: [`sdks/python/cli-preview/README.md`](sdks/python/cli-preview/README.md)
+> * **CLI Source & Architecture (`100` unit tests)**: [`sdks/python/apache_beam/cli/README.md`](sdks/python/apache_beam/cli/README.md)
+> * **AI Coding Agent Skill**: [`.agents/skills/apache-beam-cli/SKILL.md`](.agents/skills/apache-beam-cli/SKILL.md) (or run `beam --llms-txt`)
+
 [Apache Beam](http://beam.apache.org/) is a unified model for defining both batch and streaming data-parallel processing pipelines, as well as a set of language-specific SDKs for constructing pipelines and Runners for executing them on distributed processing backends, including [Apache Flink](http://flink.apache.org/), [Apache Spark](http://spark.apache.org/), [Google Cloud Dataflow](http://cloud.google.com/dataflow/), and [Hazelcast Jet](https://hazelcast.com/).
 
 ## 🚀 Quick Start (Beginner Friendly)

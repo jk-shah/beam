@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "apache-beam-cli-preview"
 version = "0.1.0"
 description = "Fast (<90ms) pure-Python preview overlay for the Apache Beam CLI (`beam` & `apache-beam`)."
-readme = "PREVIEW_DEMO.md"
+readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 dependencies = [
@@ -23,6 +23,7 @@ gcp = [
 [project.scripts]
 beam = "apache_beam_cli_preview.launcher:main"
 apache-beam = "apache_beam_cli_preview.launcher:main"
+beam-demo = "apache_beam_cli_preview.demo:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

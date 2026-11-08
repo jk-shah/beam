@@ -45,9 +45,10 @@ class _SdistWithCliBundle(_sdist):
       _copy_cli_sources(
           src_cli,
           Path(base_dir) / 'apache_beam_cli_preview' / '_bundled_cli')
-    demo_sh = here / 'demo_showcase.sh'
-    if demo_sh.is_file():
-      shutil.copy2(demo_sh, Path(base_dir) / 'demo_showcase.sh')
+    for extra_file in ('demo_showcase.sh', 'PREVIEW_DEMO.md'):
+      src_extra = here / extra_file
+      if src_extra.is_file():
+        shutil.copy2(src_extra, Path(base_dir) / extra_file)
 
 
 class _BuildPyWithCliBundle(_build_py):

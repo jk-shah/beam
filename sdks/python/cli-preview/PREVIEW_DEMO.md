@@ -1,13 +1,14 @@
 # Apache Beam CLI Preview (`beam` & `apache-beam`)
 
-> **Status**: Experimental full-roadmap preview on [`jk-shah/beam@beam-cli-preview`](https://github.com/jk-shah/beam/tree/beam-cli-preview/sdks/python/cli-preview).
-> Installs a `<90 ms` cold-start `beam` (and `apache-beam`) CLI binary on top of released PyPI `apache-beam>=2.75.0` wheels—**no repo clone, no C++ compiler, and no Gradle build required**.
+> **Branch**: [`jk-shah/beam@beam-cli-preview`](https://github.com/jk-shah/beam/tree/beam-cli-preview/sdks/python/cli-preview) · **Upstream Tracking Issue**: [apache/beam#40891](https://github.com/apache/beam/issues/40891)
+>
+> Installs a `<90 ms` cold-start `beam` (and `apache-beam`) CLI binary on top of released PyPI `apache-beam>=2.75.0` wheels—**no repo clone, no C++ compiler, no Go toolchain, and no Gradle build required**.
 
 ---
 
-## 1. Try It Now (Fresh Venv, Zero Repo Clone)
+## 1. Try It in 10 Seconds (Fresh Venv, Zero Repo Clone)
 
-### Option A: `uv` (Fastest)
+### Option A: `uv` (Recommended — ~3 seconds)
 ```bash
 uv venv .venv-beam
 source .venv-beam/bin/activate
@@ -24,15 +25,17 @@ pip install --upgrade pip
 pip install "apache-beam-cli-preview[gcp] @ git+https://github.com/jk-shah/beam.git@beam-cli-preview#subdirectory=sdks/python/cli-preview"
 ```
 
-### Run the 8-Step Interactive Showcase Immediately (`~8s`)
+### Run the 10-Step Interactive Showcase Immediately (`~10s`)
 ```bash
-python -m apache_beam_cli_preview.demo
+beam-demo
+# (or: python -m apache_beam_cli_preview.demo)
 ```
 
 Or explore interactively:
 ```bash
 beam --version --json
 beam doctor --json
+beam io list --json
 beam --llms-txt | head -n 45
 ```
 
@@ -41,23 +44,24 @@ beam --llms-txt | head -n 45
 ## 2. Test It with Your AI Coding Agent (Claude Code / Gemini / Cursor / Codex)
 
 Give your agent either:
-1. **Zero-Config Discovery**: Tell the agent *"Use `/path/to/.venv-beam/bin/beam` (run `beam --llms-txt` first to learn its contract) to inspect, clean, and reconcile `<dataset>`."*
-2. **Agent Skill (`SKILL.md`)**: Copy [`.agents/skills/apache-beam-cli/SKILL.md`](https://github.com/jk-shah/beam/blob/beam-cli-preview/.agents/skills/apache-beam-cli/SKILL.md) into your workspace's `.agents/skills/apache-beam-cli/SKILL.md`.
+1. **Zero-Config Self-Discovery**: Tell the agent:
+   > *"Use `/path/to/.venv-beam/bin/beam` (run `beam --llms-txt` first to learn its contract, exit codes, and URI schemes) to inspect, clean, and reconcile `<dataset>`."*
+2. **Agent Skill (`SKILL.md`)**: Copy [`.agents/skills/apache-beam-cli/SKILL.md`](../../.agents/skills/apache-beam-cli/SKILL.md) into your workspace's `.agents/skills/apache-beam-cli/SKILL.md`.
 
 ---
 
-## 3. Complete Command Surface
+## 3. Complete Command & Connector Surface
 
 | Command | Purpose | Cold Start |
 | :--- | :--- | :--- |
 | `beam --llms-txt` | Self-documenting Markdown manual + exit codes + URI syntax for AI agents | `<60 ms` |
 | `beam doctor` | Checks Python extras, Java runtime, JAR/Prism cache, and GCP ADC credentials | `<90 ms` |
-| `beam io list` / `describe` | Lists & describes all Universal URI connectors and required options | `<60 ms` |
-| `beam inspect <URI>` | Schema, size, row count, column `--stats`, `--search`, and sanitized samples | `<90 ms` (local) |
+| `beam io list` / `describe` | Lists & describes Universal URI connectors (`csv`, `json`, `parquet`, `avro`, `delta`, `iceberg`, `bigquery`, `postgres`, `mysql`, `spanner`, `pubsub`, `kafka`) | `<60 ms` |
+| `beam inspect <URI>` | Schema, size, row count, column `--stats`, `--search`, `delta://`/`iceberg://` snapshots, and sanitized samples | `<90 ms` (local) |
 | `beam check <FILE\|->` | Fast static YAML & provider trust check (`--plan` for full Beam graph expansion) | `<80 ms` (static) |
-| `beam pipe --from <A> --to <B>` | Zero-code ETL with `--where`, `--select`, `--dlq`, `--max-bytes`, `--assert-counts`, `--verify` | Local or Cloud |
-| `beam diff <LEFT> <RIGHT>` | Distributed $O(1)$-memory key/hash dataset reconciliation (`EXIT_DIFF_MISMATCH = 6`) | Local or Cloud |
-| `beam tail [-f] <URI>` | Bounded stream peek OR live `tail -f` follow (`pubsub://`, `kafka://`, `gs://`/local shards) | `<65 ms` |
+| `beam pipe --from <A> --to <B>` | Zero-code ETL, `--where`, `--select`, `--dlq`, `--max-bytes`, `--assert-counts`, `--verify`, `--zero-copy`, and `--cdc --primary-key` | Local or Cloud |
+| `beam diff <LEFT> <RIGHT>` | Distributed $O(1)$-memory key/hash reconciliation across files, `delta://`, `iceberg://`, and `bigquery://` (`EXIT_DIFF_MISMATCH = 6`) | Local or Cloud |
+| `beam tail [-f] <URI>` | Bounded stream peek OR live `tail -f` follow (`pubsub://`, `kafka://`, `delta://`, `iceberg://`, `gs://`/local shards) | `<65 ms` |
 | `beam package <FILE\|->` | Zero-Docker YAML Flex Templates (`<2 s`) & zero-boilerplate Python AST Flex bundles | `<65 ms` |
 | `beam run <FILE\|->` | Runs Beam YAML pipelines (`--no-jinja` default on stdin to block SSTI) | Local or Cloud |
 | `beam wait <JOB_ID>` | Polls detached remote jobs and runs deferred `--assert-counts` / `--verify` checks | `<90 ms` |
@@ -75,11 +79,11 @@ Give your agent either:
 2. **Prompt-Injection Quarantine (`untrusted_data`)**:
    - Sampled rows from `inspect`, `tail`, and `diff` live strictly inside `untrusted_data.rows` (or `record` with `untrusted_data: true` in `tail -f` NDJSON) with ANSI/OSC escapes, C0/C1 control codes, Unicode BiDi overrides, and Unicode Tag characters (`U+E0000..U+E007F`) stripped.
 3. **Cost & Mutation Guardrails**:
-   - `--max-bytes 10GB` fails closed with exit code `8` (`EXIT_COST_LIMIT`) *before* launching any job (`$0` `tables.get` metadata fast path + `$0` `dryRun` fallback for BigQuery `VIEW`s).
+   - `--max-bytes 10GB` fails closed with exit code `8` (`EXIT_COST_LIMIT`) *before* launching any job (`$0` `tables.get` metadata fast path + `$0` `dryRun` fallback for BigQuery `VIEW`s and `EXTERNAL` tables).
    - Never overwrites existing files or non-empty BigQuery tables by default (`--if-exists={fail,replace,append}`).
 4. **Row Conservation & Distributed Verification**:
    - `--assert-counts` proves `rows_read == rows_written + rows_filtered_out + dlq_rows` across stage fusion boundaries.
-   - `beam diff` reconciles arbitrarily large sharded CSV, JSON, Parquet, Avro, and BigQuery datasets in $O(1)$ worker memory (`NaN == NaN`, normalized `Decimal`, configurable `--rtol`/`--atol`), automatically resolving sharded `-00000-of-NNNNN` output prefixes.
+   - `beam diff` reconciles arbitrarily large sharded CSV, JSON, Parquet, Avro, Delta Lake, Apache Iceberg v2, and BigQuery datasets in $O(1)$ worker memory (`NaN == NaN`, normalized `Decimal`, configurable `--rtol`/`--atol`), automatically resolving sharded `-00000-of-NNNNN` output prefixes.
 
 ---
 
@@ -186,4 +190,8 @@ beam pipe \
   --emit-yaml | beam package - --to "gs://<BUCKET>/templates/pg_to_bq_cdc.json" --json
 ```
 
+---
 
+## 8. Architecture & Contributing Upstream
+
+All CLI source modules live directly in their upstream target path [`sdks/python/apache_beam/cli/`](../apache_beam/cli/README.md) so individual PR slices cherry-pick cleanly onto `apache/beam:master` ([apache/beam#40891](https://github.com/apache/beam/issues/40891)). This `sdks/python/cli-preview/` package is a lightweight pure-Python overlay that lets anyone install and test the full future CLI experience against released PyPI `apache-beam` wheels in seconds.
