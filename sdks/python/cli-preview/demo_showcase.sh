@@ -123,4 +123,26 @@ touch "${WORK_DIR}/live_events.jsonl"
 wait
 
 echo ""
+echo "10) Zero-Copy Iceberg v2 Registration (--zero-copy) & Debezium CDC (--cdc)"
+"${BEAM_BIN}" pipe \
+  --from "${WORK_DIR}/clean/orders.parquet" \
+  --to "iceberg://lake.orders_zc?warehouse=${WORK_DIR}/iceberg_wh" \
+  --zero-copy \
+  --json
+cat > "${WORK_DIR}/cdc_events.jsonl" <<'EOF'
+{"op":"c","source":{"lsn":101},"after":{"id":1,"email":"ada@example.com","amount":149.95}}
+{"op":"c","source":{"lsn":102},"after":{"id":2,"email":"bob@example.com","amount":50.00}}
+{"op":"u","source":{"lsn":105},"after":{"id":1,"email":"ada@example.com","amount":199.95}}
+{"op":"d","source":{"lsn":106},"before":{"id":2,"email":"bob@example.com","amount":50.00},"after":null}
+EOF
+"${BEAM_BIN}" pipe \
+  --from "${WORK_DIR}/cdc_events.jsonl" \
+  --to "iceberg://lake.orders_cdc?warehouse=${WORK_DIR}/iceberg_wh" \
+  --cdc \
+  --primary-key id \
+  --runner=FnApiRunner \
+  --json
+"${BEAM_BIN}" inspect "iceberg://lake.orders_cdc?warehouse=${WORK_DIR}/iceberg_wh" --json
+
+echo ""
 echo "Showcase completed successfully!"

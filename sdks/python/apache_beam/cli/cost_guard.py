@@ -109,6 +109,31 @@ def estimate_endpoint_bytes(
   """Returns `{'estimated_bytes': int|None, 'method': str, ...}` for a source."""
   if endpoint.kind == 'file':
     return _estimate_file_bytes(endpoint.raw, stop_after_bytes=stop_after_bytes)
+  if endpoint.kind == 'delta':
+    from . import lakehouse
+    ver = endpoint.config.get('version')
+    snap = lakehouse.parse_delta_log(
+        endpoint.config['table'],
+        target_version=int(ver) if ver is not None else None)
+    return {
+        'estimated_bytes': int(snap['estimated_bytes']),
+        'file_count': len(snap['active_files']),
+        'row_count': snap['row_count'],
+        'method': 'delta_log',
+    }
+  if endpoint.kind == 'iceberg':
+    from . import lakehouse
+    try:
+      tdir = lakehouse.resolve_iceberg_table_dir(
+          endpoint.config, default_project=default_project)
+      st = lakehouse.load_iceberg_state(tdir)
+      return {
+          'estimated_bytes': int(st['estimated_bytes']),
+          'file_count': len(st['data_files']),
+          'method': 'iceberg_metadata',
+      }
+    except (FileNotFoundError, lakehouse.LakehouseError):
+      return {'estimated_bytes': None, 'method': 'iceberg_catalog'}
   if endpoint.kind == 'bigquery':
     return _estimate_bigquery_bytes(endpoint, default_project=default_project)
   if endpoint.kind == 'postgres':

@@ -51,6 +51,16 @@ class PipeSpec(NamedTuple):
   is_unbounded: bool = False
 
 
+def _normalize_primary_keys(primary_keys: Iterable[str] | None) -> list[str]:
+  out: list[str] = []
+  for raw_pk in primary_keys or ():
+    for part in str(raw_pk).split(','):
+      col = part.strip()
+      if col and col not in out:
+        out.append(col)
+  return out
+
+
 def build_pipe_spec(
     source: str,
     sink: str,
@@ -70,30 +80,46 @@ def build_pipe_spec(
     known_source_columns: set[str] | None = None,
     include_counters: bool = False,
     prefer_python_bigquery_sink: bool = False,
+    cdc: bool = False,
+    primary_keys: Iterable[str] | None = None,
+    cdc_format: str = 'auto',
+    cdc_op_col: str | None = None,
+    cdc_seq_col: str | None = None,
+    zero_copy: bool = False,
+    prefer_python_lakehouse_and_cdc: bool = False,
 ) -> PipeSpec:
   """Returns the `PipeSpec` for `beam pipe`."""
   if if_exists not in ('fail', 'append', 'replace'):
     raise PipeSpecError(
         f'invalid --if-exists mode {if_exists!r}; use fail, append, or replace')
 
+  pks = _normalize_primary_keys(primary_keys)
+  if cdc_format not in ('auto', 'debezium', 'flat'):
+    raise PipeSpecError(
+        f'invalid --cdc-format {cdc_format!r}; use auto, debezium, or flat')
+
   try:
     parsed_from_opts = uris.parse_kv_options(
         from_opts, from_opt_file, '--from-opt')
     parsed_to_opts = uris.parse_kv_options(to_opts, to_opt_file, '--to-opt')
+    raw_cdc_fields = parsed_from_opts.pop('fields', None) if cdc else None
     src_ep = uris.parse_endpoint(
         source,
         is_read=True,
         explicit_format=from_format,
         options=parsed_from_opts,
         default_project=default_project,
-        allow_sniff=True)
+        allow_sniff=True,
+        cdc=cdc)
     dst_ep = uris.parse_endpoint(
         sink,
         is_read=False,
         explicit_format=to_format,
         options=parsed_to_opts,
         if_exists=if_exists,
-        default_project=default_project)
+        default_project=default_project,
+        cdc=cdc,
+        zero_copy=zero_copy)
     dlq_ep = (
         uris.parse_endpoint(
             dlq_sink,
@@ -107,17 +133,113 @@ def build_pipe_spec(
   except uris.UriError as e:
     raise PipeSpecError(str(e)) from None
 
+  if zero_copy:
+    if cdc or where or select or dlq_ep is not None:
+      raise PipeSpecError(
+          '--zero-copy registers existing Parquet files in-place without '
+          'rewriting data, so it cannot be combined with --cdc, --where, '
+          '--select, or --dlq')
+    if dst_ep.kind != 'iceberg':
+      raise PipeSpecError(
+          f'--zero-copy requires an iceberg:// destination, got {dst_ep.raw!r}')
+    if src_ep.kind != 'delta' and not (
+        src_ep.kind == 'file' and src_ep.format == 'parquet'):
+      raise PipeSpecError(
+          '--zero-copy requires a delta:// table or Parquet file/glob source, '
+          f'got {src_ep.raw!r}')
+
+    # Build canonical `IcebergAddFiles` YAML representation for `--emit-yaml`.
+    zc_steps: list[dict[str, Any]] = []
+    zc_providers: list[dict[str, Any]] = []
+    if src_ep.kind == 'delta':
+      active_paths: list[dict[str, str]] = []
+      try:
+        from . import lakehouse
+        snap = lakehouse.parse_delta_log(
+            src_ep.config['table'],
+            target_version=(
+                int(src_ep.config['version'])
+                if src_ep.config.get('version') is not None else None))
+        active_paths = [{'path': f['path']} for f in snap['active_files']]
+      except Exception:  # pylint: disable=broad-except
+        active_paths = []
+      if active_paths:
+        zc_steps.append({'type': 'Create', 'config': {'elements': active_paths}})
+      else:
+        pat = src_ep.config['table'].rstrip('/') + '/*.parquet'
+        zc_steps.extend([
+            {'type': 'ReadMatchFiles', 'config': {'file_pattern': pat}},
+            {
+                'type': 'MapToFields',
+                'config': {
+                    'language': 'python',
+                    'fields': {
+                        'path': {
+                            'callable': 'lambda row: row.path',
+                            'output_type': 'string',
+                        }
+                    },
+                },
+            },
+        ])
+        zc_providers.append({
+            'type': 'python',
+            'config': {},
+            'transforms': {'ReadMatchFiles': 'apache_beam.io.fileio.MatchFiles'},
+        })
+    else:
+      zc_steps.extend([
+          {
+              'type': 'ReadMatchFiles',
+              'config': {'file_pattern': src_ep.config['path']},
+          },
+          {
+              'type': 'MapToFields',
+              'config': {
+                  'language': 'python',
+                  'fields': {
+                      'path': {
+                          'callable': 'lambda row: row.path',
+                          'output_type': 'string',
+                      }
+                  },
+              },
+          },
+      ])
+      zc_providers.append({
+          'type': 'python',
+          'config': {},
+          'transforms': {'ReadMatchFiles': 'apache_beam.io.fileio.MatchFiles'},
+      })
+    zc_steps.append({'type': 'IcebergAddFiles', 'config': dict(dst_ep.config)})
+    zc_spec: dict[str, Any] = {
+        'pipeline': {'type': 'chain', 'transforms': zc_steps}
+    }
+    if zc_providers:
+      zc_spec['providers'] = zc_providers
+    return PipeSpec(
+        spec=zc_spec,
+        output_prefix=None,
+        source_endpoint=src_ep,
+        sink_endpoint=dst_ep,
+        dlq_endpoint=None,
+        requires_java_xlang=True,
+        is_unbounded=False)
+
+  if cdc and dst_ep.kind in ('bigquery', 'iceberg') and not pks:
+    raise PipeSpecError(
+        f'--cdc targeting {dst_ep.kind}:// requires --primary-key <col>')
+
   if dst_ep.kind == 'file' and if_exists == 'append':
     raise PipeSpecError(
         '--if-exists=append is only supported for table/stream sinks '
-        '(such as bigquery:// or postgres://); file sinks write immutable '
-        'shards (use a new prefix or --if-exists=replace)')
+        '(such as bigquery://, iceberg://, or postgres://); file sinks write '
+        'immutable shards (use a new prefix or --if-exists=replace)')
 
   try:
     where_cfg = (
         expressions.compile_where(where, known_columns=known_source_columns)[0]
         if where else None)
-    # After `--where`, `--select` still sees the same source columns.
     select_cfg = (
         expressions.compile_select(
             select, known_columns=known_source_columns)[0]
@@ -125,18 +247,157 @@ def build_pipe_spec(
   except expressions.ExpressionError as e:
     raise PipeSpecError(str(e)) from None
 
+  if cdc and select_cfg is not None and prefer_python_lakehouse_and_cdc:
+    # Preserve normalized CDC metadata columns through `--select` projections.
+    sel_fields = dict(select_cfg.get('fields') or {})
+    for mcol, mtype in (
+        ('beam_cdc_op', 'string'),
+        ('beam_cdc_seq', 'int64'),
+        ('beam_cdc_hex_seq', 'string'),
+    ):
+      sel_fields.setdefault(
+          mcol,
+          {
+              'callable': f"def _keep(row):\n  return getattr(row, '{mcol}')\n",
+              'output_type': mtype,
+          })
+    select_cfg = {**select_cfg, 'fields': sel_fields}
+
   needs_cli_provider = False
+  src_type = src_ep.yaml_type
+  src_cfg = dict(src_ep.config)
+  src_java = src_ep.is_java_xlang
+
   sink_type = dst_ep.yaml_type
+  sink_cfg = dict(dst_ep.config)
   sink_java = dst_ep.is_java_xlang
-  if prefer_python_bigquery_sink and dst_ep.kind == 'bigquery':
-    sink_type = 'CliWriteToBigQuery'
-    sink_java = False
-    needs_cli_provider = True
+
+  cdc_norm_cfg: dict[str, Any] | None = None
+  if cdc:
+    from . import cdc as cdc_mod
+    resolved_cdc_fields: list[tuple[str, str]] = []
+    if raw_cdc_fields is not None:
+      try:
+        resolved_cdc_fields = cdc_mod.parse_fields_shorthand(
+            str(raw_cdc_fields))
+      except ValueError as e:
+        raise PipeSpecError(str(e)) from None
+    elif src_ep.kind == 'file' and src_ep.format == 'json':
+      resolved_cdc_fields = cdc_mod.infer_cdc_jsonl_fields(
+          src_ep.config['path'],
+          cdc_format=cdc_format,
+          op_col=cdc_op_col,
+          seq_col=cdc_seq_col,
+          primary_keys=pks)
+      if not resolved_cdc_fields and prefer_python_lakehouse_and_cdc:
+        resolved_cdc_fields = cdc_mod.infer_target_table_fields(
+            dst_ep, default_project=default_project)
+    elif src_ep.kind in ('pubsub', 'kafka') and 'schema' not in src_ep.config:
+      if prefer_python_lakehouse_and_cdc:
+        resolved_cdc_fields = cdc_mod.infer_target_table_fields(
+            dst_ep, default_project=default_project)
+        if not resolved_cdc_fields:
+          raise PipeSpecError(
+              f'streaming CDC source {src_ep.raw!r} has no static schema and '
+              f'target {dst_ep.raw!r} does not exist yet; pass --from-opt '
+              'fields="id:int,col:str,..." (or create the target table first)')
+      else:
+        resolved_cdc_fields = [(pk, 'str') for pk in pks]
+
+    if resolved_cdc_fields and pks:
+      known_fnames = {c for c, _ in resolved_cdc_fields}
+      missing_pks = [pk for pk in pks if pk not in known_fnames]
+      if missing_pks:
+        raise PipeSpecError(
+            f'--primary-key column(s) {missing_pks} not found in CDC fields '
+            f'{sorted(known_fnames)}')
+
+    if prefer_python_lakehouse_and_cdc:
+      cdc_norm_cfg = {
+          'primary_key': pks,
+          'cdc_format': cdc_format,
+      }
+      if cdc_op_col:
+        cdc_norm_cfg['op_col'] = cdc_op_col
+      if cdc_seq_col:
+        cdc_norm_cfg['seq_col'] = cdc_seq_col
+      if resolved_cdc_fields:
+        cdc_norm_cfg['fields_spec'] = [
+            [cname, ckind] for cname, ckind in resolved_cdc_fields
+        ]
+
+  if prefer_python_lakehouse_and_cdc:
+    if src_ep.kind == 'delta':
+      src_type = 'ReadFromDeltaCdcPy' if cdc else 'ReadFromDeltaPy'
+      src_java = False
+      needs_cli_provider = True
+    elif src_ep.kind == 'iceberg':
+      src_type = 'ReadFromIcebergCdcPy' if cdc else 'ReadFromIcebergPy'
+      src_java = False
+      needs_cli_provider = True
+    elif cdc and src_ep.kind == 'file' and src_ep.format == 'json':
+      src_type = 'ReadFromText'
+      src_cfg = {'path': src_ep.config['path']}
+      src_java = False
+    elif cdc and src_ep.kind == 'pubsub' and 'schema' not in src_ep.config:
+      src_type = 'ReadFromPubSub'
+      src_cfg = {**src_ep.config, 'format': 'STRING'}
+      src_java = False
+
+    if cdc_norm_cfg is not None:
+      needs_cli_provider = True
+
+    if dst_ep.kind == 'iceberg':
+      sink_type = 'CliWriteToIceberg'
+      sink_cfg = dict(dst_ep.config)
+      sink_cfg['if_exists'] = 'append' if (cdc and if_exists == 'fail') else if_exists
+      if cdc:
+        sink_cfg.setdefault('mode', 'merge-on-read')
+        sink_cfg.setdefault('equality_columns', pks)
+        sink_cfg.setdefault('change_type_column', 'beam_cdc_op')
+        sink_cfg.setdefault('sequence_number_column', 'beam_cdc_seq')
+      sink_java = False
+      needs_cli_provider = True
+    elif dst_ep.kind == 'bigquery' and cdc:
+      sink_type = 'CliWriteToBigQueryCDC'
+      sink_cfg = {
+          'table': dst_ep.config['table'],
+          'primary_key': pks,
+          'write_disposition': dst_ep.config.get(
+              'write_disposition', 'WRITE_APPEND'),
+      }
+      sink_java = False
+      needs_cli_provider = True
+    elif prefer_python_bigquery_sink and dst_ep.kind == 'bigquery':
+      sink_type = 'CliWriteToBigQuery'
+      sink_java = False
+      needs_cli_provider = True
+  else:
+    # Portable Beam YAML export (`--emit-yaml` / `--dry-run`)
+    if dst_ep.kind == 'iceberg' and cdc:
+      sink_cfg.setdefault('mode', 'merge-on-read')
+      sink_cfg.setdefault('equality_columns', pks)
+      sink_cfg.setdefault(
+          'change_type_column',
+          cdc_op_col or (
+              '_change_type' if src_ep.kind in ('delta', 'iceberg') else 'op'))
+      sink_cfg.setdefault(
+          'sequence_number_column',
+          cdc_seq_col or (
+              '_commit_version' if src_ep.kind == 'delta' else
+              '_commit_snapshot_sequence_number'
+              if src_ep.kind == 'iceberg' else 'ts_ms'))
+    elif dst_ep.kind == 'bigquery' and cdc:
+      sink_cfg['primary_key'] = pks
+    elif prefer_python_bigquery_sink and dst_ep.kind == 'bigquery':
+      sink_type = 'CliWriteToBigQuery'
+      sink_java = False
+      needs_cli_provider = True
 
   # Pure Java-to-Java fast path: skip Python counter stages unless explicitly
   # requested (`include_counters=True` when `--assert-counts` or Python stage).
   pure_java_pipe = (
-      src_ep.is_java_xlang and sink_java and not where_cfg and
+      src_java and sink_java and cdc_norm_cfg is None and not where_cfg and
       not select_cfg and not dlq_ep)
   inject_counters = bool(include_counters) and not pure_java_pipe
   if inject_counters:
@@ -146,8 +407,8 @@ def build_pipe_spec(
   if dlq_ep is None:
     chain_steps: list[dict[str, Any]] = [
         {
-            'type': src_ep.yaml_type,
-            'config': dict(src_ep.config),
+            'type': src_type,
+            'config': src_cfg,
         }
     ]
     if inject_counters:
@@ -156,6 +417,11 @@ def build_pipe_spec(
           'config': {
               'counter': 'rows_read'
           },
+      })
+    if cdc_norm_cfg is not None:
+      chain_steps.append({
+          'type': 'CliNormalizeCdc',
+          'config': dict(cdc_norm_cfg),
       })
     if where_cfg is not None:
       if inject_counters:
@@ -184,7 +450,7 @@ def build_pipe_spec(
       })
     chain_steps.append({
         'type': sink_type,
-        'config': dict(dst_ep.config),
+        'config': sink_cfg,
     })
 
     spec: dict[str, Any] = {
@@ -201,7 +467,7 @@ def build_pipe_spec(
         source_endpoint=src_ep,
         sink_endpoint=dst_ep,
         dlq_endpoint=None,
-        requires_java_xlang=src_ep.is_java_xlang or sink_java,
+        requires_java_xlang=src_java or sink_java,
         is_unbounded=src_ep.is_unbounded)
 
   # Non-linear DAG when `--dlq` IS active!
@@ -209,8 +475,6 @@ def build_pipe_spec(
   dag_transforms: list[dict[str, Any]] = []
   dlq_norm_refs: list[str] = []
 
-  src_type = src_ep.yaml_type
-  src_cfg = dict(src_ep.config)
   source_counts_internally = False
   if src_ep.kind == 'file' and src_ep.format == 'csv':
     src_type = 'ReadCsvWithDlq'
@@ -220,11 +484,14 @@ def build_pipe_spec(
     }
     src_cfg['error_handling'] = {'output': 'errors'}
     source_counts_internally = True
-  elif src_ep.kind == 'file' and src_ep.format == 'json':
+  elif src_ep.kind == 'file' and src_ep.format == 'json' and not cdc:
     src_type = 'ReadJsonWithDlq'
     src_cfg = {'path': src_cfg['path'], 'error_handling': {'output': 'errors'}}
     source_counts_internally = True
-  elif src_type in dlq.TRANSFORMS_SUPPORTING_ERROR_HANDLING:
+  elif (
+      src_type in dlq.TRANSFORMS_SUPPORTING_ERROR_HANDLING
+      and not (cdc and src_type == 'ReadFromPubSub'
+               and src_cfg.get('format') == 'STRING')):
     src_cfg['error_handling'] = {'output': 'errors'}
 
   dag_transforms.append({'name': 'ReadSource', 'type': src_type, 'config': src_cfg})
@@ -249,6 +516,21 @@ def build_pipe_spec(
         },
     })
     current_ref = 'CountRead'
+
+  if cdc_norm_cfg is not None:
+    norm_cdc = dict(cdc_norm_cfg)
+    norm_cdc['error_handling'] = {'output': 'errors'}
+    dag_transforms.append({
+        'name': 'NormalizeCdc',
+        'type': 'CliNormalizeCdc',
+        'input': current_ref,
+        'config': norm_cdc,
+    })
+    dag_transforms.append(
+        dlq.build_dlq_normalizer_transform(
+            'NormalizeCdcDlq', 'NormalizeCdc.errors', 'NormalizeCdc'))
+    dlq_norm_refs.append('NormalizeCdcDlq')
+    current_ref = 'NormalizeCdc.good'
 
   if where_cfg is not None:
     if inject_counters:
@@ -322,9 +604,9 @@ def build_pipe_spec(
     })
     current_ref = 'CountPreSink'
 
-  dst_cfg = dict(dst_ep.config)
+  dst_cfg = dict(sink_cfg)
   if sink_type in dlq.TRANSFORMS_SUPPORTING_ERROR_HANDLING or (
-      sink_type == 'CliWriteToBigQuery'):
+      sink_type in ('CliWriteToBigQuery', 'CliWriteToBigQueryCDC')):
     dst_cfg['error_handling'] = {'output': 'errors'}
     dag_transforms.append({
         'name': 'WriteSink',
@@ -390,7 +672,7 @@ def build_pipe_spec(
       sink_endpoint=dst_ep,
       dlq_endpoint=dlq_ep,
       requires_java_xlang=(
-          src_ep.is_java_xlang or sink_java or dlq_ep.is_java_xlang),
+          src_java or sink_java or dlq_ep.is_java_xlang),
       is_unbounded=src_ep.is_unbounded)
 
 

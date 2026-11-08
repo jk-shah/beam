@@ -146,6 +146,8 @@ _CLI_ZERO_FLAGS = {
         '--dry-run',
         '--dry_run',
         '--emit-yaml',
+        '--cdc',
+        '--zero-copy',
         '--assert-counts',
         '--verify',
         '--verbose',
@@ -191,6 +193,10 @@ _CLI_ONE_FLAGS = {
         '--to-opt-file',
         '--max-bytes',
         '--verify-key',
+        '--primary-key',
+        '--cdc-format',
+        '--cdc-op-col',
+        '--cdc-seq-col',
         '--wait-timeout',
         '--profile',
     ]),
@@ -198,6 +204,8 @@ _CLI_ONE_FLAGS = {
         '--key',
         '--left-format',
         '--right-format',
+        '--left-opt',
+        '--right-opt',
         '--rtol',
         '--atol',
         '--max-bytes',
@@ -210,6 +218,7 @@ _CLI_ONE_FLAGS = {
         '--duration',
         '--poll-interval',
         '--max-scanned-bytes',
+        '--from-opt',
         '--project',
     ]),
     'package': frozenset([
@@ -634,6 +643,34 @@ def _build_parser():
       metavar='COL',
       help='primary key column for --verify reconciliation (repeatable)')
   pipe.add_argument(
+      '--cdc',
+      action='store_true',
+      help='enable cross-engine Change Data Capture (UPSERT + DELETE propagation)')
+  pipe.add_argument(
+      '--primary-key',
+      dest='primary_keys',
+      action='append',
+      default=[],
+      metavar='COL',
+      help='primary key column(s) for --cdc upserts/deletes (repeatable or comma-separated)')
+  pipe.add_argument(
+      '--cdc-format',
+      choices=['auto', 'debezium', 'flat'],
+      default='auto',
+      help='CDC envelope format: auto (default), debezium, or flat')
+  pipe.add_argument(
+      '--cdc-op-col',
+      metavar='COL',
+      help='operation column name for flat CDC events (default: _change_type or op)')
+  pipe.add_argument(
+      '--cdc-seq-col',
+      metavar='COL',
+      help='sequence/version column name for flat CDC events')
+  pipe.add_argument(
+      '--zero-copy',
+      action='store_true',
+      help='register existing Parquet or delta:// files into iceberg:// without copying data')
+  pipe.add_argument(
       '--dry-run',
       '--dry_run',
       '--emit-yaml',
@@ -665,6 +702,20 @@ def _build_parser():
       help='key column(s) to join on (repeatable; omit for multiset hash diff)')
   diff_p.add_argument('--left-format', metavar='FMT', help='left file format')
   diff_p.add_argument('--right-format', metavar='FMT', help='right file format')
+  diff_p.add_argument(
+      '--left-opt',
+      dest='left_opts',
+      action='append',
+      default=[],
+      metavar='KEY=VAL',
+      help='left endpoint connector option (repeatable)')
+  diff_p.add_argument(
+      '--right-opt',
+      dest='right_opts',
+      action='append',
+      default=[],
+      metavar='KEY=VAL',
+      help='right endpoint connector option (repeatable)')
   diff_p.add_argument(
       '--rtol',
       type=float,
@@ -792,6 +843,13 @@ def _build_parser():
       default='64MB',
       metavar='SIZE',
       help='byte cap for sampled payloads (default: 64MB)')
+  tail_p.add_argument(
+      '--from-opt',
+      dest='from_opts',
+      action='append',
+      default=[],
+      metavar='KEY=VAL',
+      help='source connector option (repeatable)')
   tail_p.add_argument('--project', metavar='PROJECT', help='default GCP project')
 
   # 9. `beam wait`
@@ -1257,6 +1315,7 @@ def _tail(args, extra_args, *, json_session, t0: float) -> int:
         follow=follow,
         poll_interval=args.poll_interval,
         max_scanned_bytes=args.max_scanned_bytes,
+        from_opts=args.from_opts,
         default_project=args.project,
         on_record=on_record)
   except tail.TailError as e:
@@ -1459,6 +1518,8 @@ def _diff(args, extra_args, *, json_session, t0: float) -> int:
         keys=args.keys,
         left_format=args.left_format,
         right_format=args.right_format,
+        left_opts=args.left_opts,
+        right_opts=args.right_opts,
         rtol=args.rtol,
         atol=args.atol,
         max_bytes=args.max_bytes,
@@ -1741,7 +1802,14 @@ def _pipe(
         to_opt_file=args.to_opt_file,
         default_project=default_proj,
         include_counters=want_counters,
-        prefer_python_bigquery_sink=prefer_py_bq)
+        prefer_python_bigquery_sink=prefer_py_bq,
+        cdc=bool(args.cdc),
+        primary_keys=args.primary_keys,
+        cdc_format=args.cdc_format,
+        cdc_op_col=args.cdc_op_col,
+        cdc_seq_col=args.cdc_seq_col,
+        zero_copy=bool(args.zero_copy),
+        prefer_python_lakehouse_and_cdc=bool(not args.dry_run))
   except pipe_spec.PipeSpecError as e:
     raise _CliError(str(e), EXIT_USAGE) from None
 
@@ -1773,6 +1841,75 @@ def _pipe(
     except ValueError as e:
       raise _CliError(str(e), EXIT_USAGE) from None
 
+  # Zero-Copy Parquet / Delta Lake -> Apache Iceberg v2 metadata registration
+  # (`<100 ms` pure-Python manifest synthesis with `bytes_copied == 0`).
+  if args.zero_copy and not args.dry_run:
+    from . import lakehouse
+    if ('://' in args.source or '://' in args.sink or any(
+        '://' in str(x) for x in (args.to_opts or ()))):
+      from apache_beam.io.filesystems import FileSystems
+      from apache_beam.options.pipeline_options import PipelineOptions
+      FileSystems.set_options(PipelineOptions(resolved_args))
+    try:
+      zc_res = lakehouse.register_zero_copy_to_iceberg(
+          pipe.source_endpoint,
+          pipe.sink_endpoint,
+          if_exists=args.if_exists,
+          default_project=default_proj)
+    except (lakehouse.LakehouseError, FileNotFoundError, ValueError) as e:
+      raise _CliError(str(e), EXIT_USAGE) from None
+    except ImportError as e:
+      raise _CliError(
+          f'a required package is missing: {e}', EXIT_MISSING_PACKAGE) from None
+    except Exception as e:  # pylint: disable=broad-except
+      _maybe_print_traceback(args.verbose)
+      raise _CliError(
+          f'zero-copy registration failed: {_summarize(e)}',
+          EXIT_PIPELINE_FAILED) from None
+
+    zc_metrics = {
+        'rows_read': int(zc_res['rows_registered']),
+        'rows_written': int(zc_res['rows_registered']),
+        'rows_filtered_out': 0,
+        'dlq_rows': 0,
+        'bytes_copied': 0,
+    }
+    if args.verify:
+      from . import diff
+      diff_rc, diff_rep = diff.run_diff(
+          args.source,
+          args.sink,
+          keys=args.verify_keys,
+          left_opts=args.from_opts,
+          right_opts=args.to_opts,
+          pipeline_args=resolved_args,
+          default_project=default_proj)
+      diff_rep.pop('untrusted_data', None)
+      zc_res['verify'] = diff_rep
+      if diff_rc != EXIT_OK:
+        raise _CliError(
+            f'--verify detected mismatch between {args.source} and {args.sink}',
+            EXIT_DIFF_MISMATCH,
+            extra={'outputs': zc_res, 'metrics': zc_metrics})
+
+    if json_session.enabled:
+      json_session.emit(
+          output.build_envelope(
+              ok=True,
+              command='pipe',
+              exit_code=EXIT_OK,
+              runner='zero_copy_metadata',
+              state='DONE',
+              duration_ms=int((time.monotonic() - t0) * 1000),
+              metrics=zc_metrics,
+              outputs=zc_res))
+    else:
+      print(
+          f"Zero-copy registered {zc_res['rows_registered']} row(s) across "
+          f"{len(zc_res['registered_files'])} Parquet file(s) into Iceberg v2 "
+          f"at {zc_res['metadata_path']} (bytes_copied=0).")
+    return EXIT_OK
+
   # Local existing-output check runs before importing `apache_beam` (`<50 ms`),
   # skipped on `--dry-run` / `--emit-yaml` which never writes output!
   if (pipe.output_prefix is not None and '://' not in pipe.output_prefix and
@@ -1795,6 +1932,8 @@ def _pipe(
           'left': args.source,
           'right': args.sink,
           'keys': list(args.verify_keys),
+          'left_opts': list(args.from_opts),
+          'right_opts': list(args.to_opts),
       } if args.verify else None,
   }
 
@@ -1846,6 +1985,7 @@ def _run_yaml(
     import apache_beam as beam
     from apache_beam.options.pipeline_options import CrossLanguageOptions
     from apache_beam.options.pipeline_options import GoogleCloudOptions
+    from apache_beam.options.pipeline_options import PipelineOptions
     from apache_beam.options.pipeline_options import StandardOptions
     from apache_beam.runners.runner import PipelineState
     from apache_beam.utils import subprocess_server
@@ -1868,46 +2008,66 @@ def _run_yaml(
   warnings_list: list[str] = []
   try:
     with contextlib.ExitStack() as stack:
-      try:
-        if direct_yaml_text is not None:
-          # Safe direct YAML compile: bypasses `expand_jinja()` completely so
-          # untrusted `--where`, file paths, or stdin YAML cannot trigger SSTI!
-          options, constructor = (
-              yaml_main.build_pipeline_components_from_yaml(
-                  direct_yaml_text,
-                  yaml_or_pipeline_argv,
-                  validate_schema='generic'))
-          display_data = {'yaml': direct_yaml_text}
-        else:
-          options, constructor, display_data = (
-              yaml_main.build_pipeline_components_from_argv(
-                  yaml_or_pipeline_argv))
+      skip_xlang_dry_expand = False
+      if dry_run_yaml is not None and requires_java_xlang:
+        from . import sql as sql_mod
+        try:
+          sql_mod._find_java()
+        except sql_mod.SqlError:
+          skip_xlang_dry_expand = True
 
-        stack.enter_context(
-            subprocess_server.JavaJarServer.beam_services(
-                options.view_as(CrossLanguageOptions).beam_services))
-        stack.enter_context(
-            subprocess_server.SubprocessServer.cache_subprocesses())
-        pipeline = beam.Pipeline(options=options, display_data=display_data)
-        if output_prefix is not None and if_exists == 'fail' and dry_run_yaml is None:
-          _refuse_existing_output(output_prefix, verbose)
-        elif (output_prefix is not None and if_exists == 'replace' and
-              dry_run_yaml is None):
-          _remove_existing_output_for_replace(output_prefix)
-        constructor(pipeline)
-      except _CliError:
-        raise
-      except ImportError as e:
-        _maybe_print_traceback(verbose)
-        raise _CliError(
-            f'a required package is missing: {e}\n'
-            '  install the extra the pipeline needs, for example: '
-            "pip install 'apache-beam[yaml,gcp]'",
-            EXIT_MISSING_PACKAGE) from None
-      except Exception as e:  # pylint: disable=broad-except
-        _maybe_print_traceback(verbose)
-        raise _CliError(
-            f'could not build the pipeline: {e}', EXIT_USAGE) from None
+      if skip_xlang_dry_expand:
+        options = PipelineOptions(yaml_or_pipeline_argv)
+      else:
+        try:
+          if direct_yaml_text is not None:
+            # Safe direct YAML compile: bypasses `expand_jinja()` completely so
+            # untrusted `--where`, file paths, or stdin YAML cannot trigger SSTI!
+            options, constructor = (
+                yaml_main.build_pipeline_components_from_yaml(
+                    direct_yaml_text,
+                    yaml_or_pipeline_argv,
+                    validate_schema='generic'))
+            display_data = {'yaml': direct_yaml_text}
+          else:
+            options, constructor, display_data = (
+                yaml_main.build_pipeline_components_from_argv(
+                    yaml_or_pipeline_argv))
+
+          stack.enter_context(
+              subprocess_server.JavaJarServer.beam_services(
+                  options.view_as(CrossLanguageOptions).beam_services))
+          stack.enter_context(
+              subprocess_server.SubprocessServer.cache_subprocesses())
+          pipeline = beam.Pipeline(options=options, display_data=display_data)
+          if output_prefix is not None and if_exists == 'fail' and dry_run_yaml is None:
+            _refuse_existing_output(output_prefix, verbose)
+          elif (output_prefix is not None and if_exists == 'replace' and
+                dry_run_yaml is None):
+            _remove_existing_output_for_replace(output_prefix)
+          constructor(pipeline)
+        except _CliError:
+          raise
+        except ImportError as e:
+          _maybe_print_traceback(verbose)
+          raise _CliError(
+              f'a required package is missing: {e}\n'
+              '  install the extra the pipeline needs, for example: '
+              "pip install 'apache-beam[yaml,gcp]'",
+              EXIT_MISSING_PACKAGE) from None
+        except Exception as e:  # pylint: disable=broad-except
+          if dry_run_yaml is not None and requires_java_xlang and any(
+              tok in str(e) for tok in (
+                  'Unknown type or missing provider',
+                  'Unknown transform type',
+                  'Unknown type or urn',
+                  'Java',
+                  'Service failed to start')):
+            options = PipelineOptions(yaml_or_pipeline_argv)
+          else:
+            _maybe_print_traceback(verbose)
+            raise _CliError(
+                f'could not build the pipeline: {e}', EXIT_USAGE) from None
 
       if local_paths:
         warnings_list.extend(_warn_if_local_paths(local_paths, options))
@@ -2101,6 +2261,8 @@ def _run_yaml(
           v_cfg['left'],
           v_right,
           keys=v_cfg.get('keys'),
+          left_opts=v_cfg.get('left_opts'),
+          right_opts=v_cfg.get('right_opts'),
           default_project=gcp_opts.project)
       diff_rep.pop('untrusted_data', None)
       outputs_dict['verify'] = diff_rep

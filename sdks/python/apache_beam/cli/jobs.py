@@ -283,10 +283,14 @@ def finalize_cli_row_metrics(raw_counters: dict[str, int]) -> dict[str, int]:
   filter_dlq_rows = int(raw_counters.get('filter_dlq_rows', 0))
   if 'dlq_rows' in raw_counters or dlq_rows > 0:
     out['dlq_rows'] = dlq_rows
-  if 'pre_filter_rows' in raw_counters or 'post_filter_rows' in raw_counters:
+  cdc_skipped = int(raw_counters.get('cdc_preimage_skipped', 0))
+  if (
+      'pre_filter_rows' in raw_counters or 'post_filter_rows' in raw_counters
+      or cdc_skipped > 0):
     pre_f = int(raw_counters.get('pre_filter_rows', 0))
     post_f = int(raw_counters.get('post_filter_rows', 0))
-    out['rows_filtered_out'] = max(0, pre_f - post_f - filter_dlq_rows)
+    out['rows_filtered_out'] = (
+        max(0, pre_f - post_f - filter_dlq_rows) + cdc_skipped)
   if 'pre_sink_rows' in raw_counters or 'rows_read' in raw_counters:
     pre_sink = int(raw_counters.get('pre_sink_rows', 0))
     out['rows_written'] = max(0, pre_sink - sink_dlq_rows)

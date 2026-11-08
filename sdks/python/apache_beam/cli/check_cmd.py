@@ -104,12 +104,9 @@ def run_check(
         'type': t['type'],
     })
 
-  _builtin_cli_targets = frozenset([
-      'apache_beam.cli.dlq.read_csv_with_dlq',
-      'apache_beam.cli.dlq.read_json_with_dlq',
-      'apache_beam.cli.dlq.cli_count_rows',
-      'apache_beam.cli.dlq.cli_write_to_bigquery',
-  ])
+  from . import dlq
+  _builtin_cli_targets = frozenset(
+      dlq.cli_yaml_provider_spec()['transforms'].values())
   providers_list = spec.get('providers') or []
   has_custom_providers = bool(providers_list)
   has_untrusted_providers = False

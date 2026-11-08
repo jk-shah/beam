@@ -51,6 +51,7 @@ TRANSFORMS_SUPPORTING_ERROR_HANDLING = frozenset([
     'ReadFromKafka',
     'WriteToKafka',
     'WriteToBigQuery',
+    'WriteToBigQueryCDC',
     'ReadFromSpanner',
     'WriteToSpanner',
 ])
@@ -194,7 +195,7 @@ def build_dlq_normalizer_transform(
 
 
 def cli_yaml_provider_spec() -> dict[str, Any]:
-  """Provider block enabling `ReadCsvWithDlq`, `ReadJsonWithDlq`, `CountRows`."""
+  """Provider block enabling built-in pure-Python CLI sources, CDC, & sinks."""
   return {
       'type': 'python',
       'config': {},
@@ -203,6 +204,21 @@ def cli_yaml_provider_spec() -> dict[str, Any]:
           'ReadJsonWithDlq': 'apache_beam.cli.dlq.read_json_with_dlq',
           'CliCountRows': 'apache_beam.cli.dlq.cli_count_rows',
           'CliWriteToBigQuery': 'apache_beam.cli.dlq.cli_write_to_bigquery',
+          'ReadFromDeltaPy': 'apache_beam.cli.lakehouse.cli_read_from_delta',
+          'ReadFromDeltaCdcPy': (
+              'apache_beam.cli.lakehouse.cli_read_from_delta_cdc'
+          ),
+          'ReadFromIcebergPy': (
+              'apache_beam.cli.lakehouse.cli_read_from_iceberg'
+          ),
+          'ReadFromIcebergCdcPy': (
+              'apache_beam.cli.lakehouse.cli_read_from_iceberg_cdc'
+          ),
+          'CliWriteToIceberg': 'apache_beam.cli.lakehouse.cli_write_to_iceberg',
+          'CliNormalizeCdc': 'apache_beam.cli.cdc.cli_normalize_cdc',
+          'CliWriteToBigQueryCDC': (
+              'apache_beam.cli.cdc.cli_write_to_bigquery_cdc'
+          ),
       },
   }
 

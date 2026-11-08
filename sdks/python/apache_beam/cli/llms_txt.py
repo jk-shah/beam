@@ -50,23 +50,24 @@ def render_llms_txt() -> str:
 - `beam tail [-f] [-n N] <URI> [--duration 5s] [--max-scanned-bytes 64MB] [--json]`
     Non-destructive bounded stream peek (default `5s` / `-n 5` for agents) or live
     follow (`-f` / `--follow` like Unix `tail -f`, streaming NDJSON across
-    `pubsub://`, `kafka://`, and local/`gs://` streaming or DLQ files).
+    `pubsub://`, `kafka://`, `delta://`, `iceberg://`, and local/`gs://` files).
 - `beam pipe --from <URI> --to <URI> [flags] [pipeline_options]`
     Move, convert, filter (`--where`), project (`--select`), quarantine dirty rows
     (`--dlq`), enforce scan budget (`--max-bytes`), verify conservation
-    (`--assert-counts`), or reconcile output (`--verify`). Pass `--emit-yaml`
-    (alias `--dry-run`) to validate and print portable Beam YAML without running
-    (with `--json`, YAML is returned in `outputs.yaml`). Sharded Beam outputs
-    (`<prefix>-00000-of-NNNNN`) are auto-resolved when `<prefix>` is passed to
-    `inspect`, `pipe --from`, or `diff`. In sandboxed/CI environments without
-    loopback ports, pass `--runner=FnApiRunner` for fast in-process execution.
+    (`--assert-counts`), reconcile output (`--verify`), apply cross-engine CDC
+    upserts/deletes (`--cdc --primary-key COL`), or register existing Parquet /
+    `delta://` files into `iceberg://` in `<100ms` with `0` bytes copied
+    (`--zero-copy`). Pass `--emit-yaml` (alias `--dry-run`) to validate and print
+    portable Beam YAML without running (with `--json`, YAML is in `outputs.yaml`).
+    Sharded Beam outputs (`<prefix>-00000-of-NNNNN`) are auto-resolved.
 - `beam package <FILE.yaml | FILE.py | -> --to <gs://.../spec.json> [flags] [--json]`
     Zero-Docker `<1s` Flex Template packager for Beam YAML (auto-extracts Jinja
     `{{ vars }}` into `metadata.parameters`) and AST-introspected single-image
     Flex Template bundle generator for Python pipelines (no handwritten
     `Dockerfile` or `metadata.json`).
 - `beam diff <LEFT_URI> <RIGHT_URI> [--key COL ...] [--rtol F] [--atol F] [--json]`
-    Distributed O(1)-memory key/multiset reconciliation (`0` match, `6` drift).
+    Distributed O(1)-memory key/multiset reconciliation across files, `delta://`,
+    `iceberg://`, and `bigquery://` (`0` match, `6` drift).
 - `beam check <FILE.yaml | -> [--plan [--trust-providers]] [--json]`
     Offline SafeLoader YAML validator + deterministic `plan_hash` (`sha256`).
 - `beam run <FILE.yaml | -> [--no-jinja] [--wait-timeout DUR] [--json]`
@@ -92,11 +93,12 @@ def render_llms_txt() -> str:
 
 ## 4. Universal URI Grammar
 - Local / Cloud Files: `./users.csv`, `gs://bucket/path/*.parquet`, `s3://...`, `azfs://...`
-- BigQuery: `bigquery://PROJECT.DATASET.TABLE` (options via `--from-opt row_restriction=...`)
-- PostgreSQL: `postgres://HOST:5432/DB?table=public.users` (auth via env or `--from-opt-file`)
-- Pub/Sub: `pubsub://projects/PROJECT/subscriptions/SUB` or `.../topics/TOPIC`
-- Kafka: `kafka://HOST:9092/TOPIC`
-- Iceberg: `iceberg://CATALOG.NAMESPACE.TABLE`
+- Delta Lake: `delta://gs://bucket/tables/orders` or `delta:///local/orders?version=3`
+- Iceberg v2: `iceberg://ns.orders?warehouse=gs://bucket/wh` or `?catalog=biglake&warehouse=gs://...`
+- BigQuery: `bigquery://PROJECT.DATASET.TABLE` (CDC UPSERT/DELETE via `--cdc --primary-key id`)
+- PostgreSQL / MySQL: `postgres://HOST:5432/DB?table=public.users`, `mysql://HOST:3306/DB?table=orders`
+- Cloud Spanner: `spanner://PROJECT/INSTANCE/DB?change_stream=orders_cs`
+- Pub/Sub & Kafka: `pubsub://projects/PROJECT/subscriptions/SUB`, `kafka://HOST:9092/TOPIC`
 
 ## 5. Safe `--where` & `--select` Expressions
 - `--where "status == 'PAID' AND amount >= 100 AND deleted_at IS NULL"`
@@ -105,16 +107,26 @@ def render_llms_txt() -> str:
   `strip`, `len`, `coalesce`, `abs`, `round`, `int`, `float`, `str`, `bool`.)
 - `--select "user_id, lower(email) AS email, round(amount * 1.08, 2) AS total"`
 
-## 6. Canonical Agent Workflow Example
+## 6. Canonical Agent Workflow Examples
 ```bash
+# 1. Inspect, guard, clean, and reconcile CSV -> BigQuery
 beam inspect gs://my-bucket/raw/orders.csv --json
 beam pipe --from gs://my-bucket/raw/orders.csv \\
           --to bigquery://my-proj.analytics.orders_clean \\
           --dlq gs://my-bucket/dlq/orders_bad.json \\
           --where "amount > 0 AND order_id IS NOT NULL" \\
           --max-bytes 10GB --assert-counts --json
-beam diff gs://my-bucket/stage/orders.parquet \\
-          bigquery://my-proj.analytics.orders_clean --key order_id --json
+
+# 2. Zero-copy Delta Lake -> Iceberg v2 registration (0 bytes copied) + diff
+beam pipe --from delta://gs://my-bucket/delta/orders \\
+          --to "iceberg://lake.orders?warehouse=gs://my-bucket/iceberg" \\
+          --zero-copy --verify --verify-key order_id --json
+
+# 3. Cross-engine CDC (Debezium / Delta CDF -> BigQuery UPSERT/DELETE or Iceberg MoR)
+beam pipe --from pubsub://projects/my-proj/subscriptions/orders-cdc \\
+          --to bigquery://my-proj.analytics.orders_live \\
+          --cdc --primary-key order_id --dlq gs://my-bucket/dlq/cdc_bad.json \\
+          --from-opt fields="order_id:int,customer:str,amount:float" --json
 ```
 """
 

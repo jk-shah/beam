@@ -59,6 +59,17 @@ def run_inspect(
       allow_sniff=True)
   scan_budget = cost_guard.parse_byte_size(max_scanned_bytes)
 
+  if ep.kind == 'delta':
+    from . import lakehouse
+    return lakehouse.inspect_delta_table(
+        ep, sample_count=sample_count, search_term=search_term)
+  if ep.kind == 'iceberg':
+    from . import lakehouse
+    return lakehouse.inspect_iceberg_table(
+        ep,
+        sample_count=sample_count,
+        search_term=search_term,
+        default_project=default_project)
   if ep.kind == 'bigquery':
     return _inspect_bigquery(
         ep,

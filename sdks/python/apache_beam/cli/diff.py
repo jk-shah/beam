@@ -148,8 +148,52 @@ def _read_endpoint_pcoll(pipeline, label: str, ep: uris.ParsedEndpoint):
   import apache_beam as beam
 
   if ep.kind == 'bigquery':
+    from apache_beam.io.gcp.bigquery import ReadFromBigQuery
+    from apache_beam.options.pipeline_options import GoogleCloudOptions
     from apache_beam.yaml import yaml_io
-    return pipeline | label >> yaml_io.read_from_bigquery(**ep.config)
+
+    bq_cfg = dict(ep.config)
+    if bq_cfg.get('query'):
+      return pipeline | label >> ReadFromBigQuery(
+          query=str(bq_cfg['query']),
+          use_standard_sql=True,
+          method=ReadFromBigQuery.Method.DIRECT_READ)
+
+    needs_sql_view = False
+    sql_query = None
+    try:
+      from google.cloud import bigquery as gcp_bq
+      def_proj = pipeline.options.view_as(GoogleCloudOptions).project
+      _, proj, ds, tbl_name = uris.normalize_bq_table_spec(
+          str(bq_cfg['table']), default_project=def_proj)
+      client = gcp_bq.Client(project=proj)
+      eff_proj = proj or client.project
+      tbl = client.get_table(f'{eff_proj}.{ds}.{tbl_name}')
+      t_type = str(getattr(tbl, 'table_type', 'TABLE') or 'TABLE').upper()
+      constraints = getattr(tbl, 'table_constraints', None)
+      has_pk = getattr(constraints, 'primary_key', None) is not None
+      if t_type != 'TABLE' or has_pk:
+        needs_sql_view = True
+        sql_query = f'SELECT * FROM `{eff_proj}.{ds}.{tbl_name}`'
+        if bq_cfg.get('row_restriction'):
+          sql_query += f" WHERE {bq_cfg['row_restriction']}"
+    except Exception:  # pylint: disable=broad-except
+      needs_sql_view = False
+
+    if needs_sql_view and sql_query:
+      return pipeline | label >> ReadFromBigQuery(
+          query=sql_query,
+          use_standard_sql=True,
+          method=ReadFromBigQuery.Method.DIRECT_READ)
+    return pipeline | label >> yaml_io.read_from_bigquery(**bq_cfg)
+
+  if ep.kind == 'delta':
+    from . import lakehouse
+    return pipeline | label >> lakehouse.cli_read_from_delta(**ep.config)
+
+  if ep.kind == 'iceberg':
+    from . import lakehouse
+    return pipeline | label >> lakehouse.cli_read_from_iceberg(**ep.config)
 
   if ep.kind == 'file':
     path = ep.config['path']
@@ -169,8 +213,8 @@ def _read_endpoint_pcoll(pipeline, label: str, ep: uris.ParsedEndpoint):
               lambda line: [json.loads(line)] if line.strip() else []))
 
   raise uris.UriError(
-      f'beam diff currently supports file paths/globs and bigquery:// URIs; '
-      f'got {ep.raw!r}')
+      f'beam diff currently supports file paths/globs, delta://, iceberg://, '
+      f'and bigquery:// URIs; got {ep.raw!r}')
 
 
 def run_diff(
@@ -180,6 +224,8 @@ def run_diff(
     keys: Iterable[str] | None = None,
     left_format: str | None = None,
     right_format: str | None = None,
+    left_opts: Iterable[str] | None = None,
+    right_opts: Iterable[str] | None = None,
     rtol: float = 0.0,
     atol: float = 0.0,
     max_bytes: str | None = None,
@@ -207,16 +253,21 @@ def run_diff(
   from apache_beam.io.filesystems import FileSystems
   FileSystems.set_options(opts)
 
+  parsed_left_opts = uris.parse_kv_options(left_opts, None, '--left-opt')
+  parsed_right_opts = uris.parse_kv_options(right_opts, None, '--right-opt')
+
   left_ep = uris.parse_endpoint(
       left_uri,
       is_read=True,
       explicit_format=left_format,
+      options=parsed_left_opts,
       default_project=proj,
       allow_sniff=True)
   right_ep = uris.parse_endpoint(
       right_uri,
       is_read=True,
       explicit_format=right_format,
+      options=parsed_right_opts,
       default_project=proj,
       allow_sniff=True)
 

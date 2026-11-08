@@ -46,7 +46,7 @@ class UriError(ValueError):
 
 
 class ParsedEndpoint(NamedTuple):
-  kind: str  # 'file', 'bigquery', 'postgres', 'pubsub', 'kafka', 'iceberg'
+  kind: str  # 'file', 'bigquery', 'postgres', 'mysql', 'spanner', 'pubsub', 'kafka', 'iceberg', 'delta'
   scheme: str
   raw: str
   format: str | None
@@ -58,8 +58,17 @@ class ParsedEndpoint(NamedTuple):
 
 
 FILE_SCHEMES = frozenset(['gs', 's3', 'azfs', 'hdfs', 'file'])
-NON_FILE_SCHEMES = frozenset(
-    ['bigquery', 'postgres', 'postgresql', 'pubsub', 'kafka', 'iceberg'])
+NON_FILE_SCHEMES = frozenset([
+    'bigquery',
+    'postgres',
+    'postgresql',
+    'mysql',
+    'spanner',
+    'pubsub',
+    'kafka',
+    'iceberg',
+    'delta',
+])
 ALL_SCHEMES = FILE_SCHEMES | NON_FILE_SCHEMES
 
 FILE_FORMATS = {
@@ -245,6 +254,24 @@ def parse_pubsub_uri(uri: str) -> tuple[str, str]:
       'pubsub://projects/<project>/subscriptions/<subscription>')
 
 
+def parse_spanner_uri(uri: str) -> tuple[str, str, str, dict[str, str]]:
+  """Parses `spanner://projects/P/instances/I/databases/D?...` or `spanner://P/I/D?...`."""
+  reject_inline_credentials(uri)
+  parsed = urllib.parse.urlsplit(uri)
+  raw_path = (parsed.netloc + parsed.path).strip('/')
+  parts = [p for p in raw_path.split('/') if p]
+  qparams = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=False))
+  if (len(parts) == 6 and parts[0] == 'projects' and
+      parts[2] == 'instances' and parts[4] == 'databases'):
+    return parts[1], parts[3], parts[5], qparams
+  if len(parts) == 3 and parts[0] != 'projects':
+    return parts[0], parts[1], parts[2], qparams
+  raise UriError(
+      f'invalid Spanner URI {uri!r}; expected '
+      'spanner://projects/<project>/instances/<instance>/databases/<database>'
+      '?table=<table> (or spanner://<project>/<instance>/<database>?...)')
+
+
 def parse_endpoint(
     location: str,
     *,
@@ -254,6 +281,8 @@ def parse_endpoint(
     if_exists: str = 'fail',
     default_project: str | None = None,
     allow_sniff: bool = False,
+    cdc: bool = False,
+    zero_copy: bool = False,
 ) -> ParsedEndpoint:
   """Parses a `--from` or `--to` location into a `ParsedEndpoint`."""
   if not location or not location.strip():
@@ -327,64 +356,138 @@ def parse_endpoint(
           'replace': 'WRITE_TRUNCATE',
       }
       cfg.setdefault('create_disposition', 'CREATE_IF_NEEDED')
-      cfg.setdefault('write_disposition', disp_map.get(if_exists, 'WRITE_EMPTY'))
+      cfg.setdefault(
+          'write_disposition',
+          'WRITE_APPEND' if (cdc and if_exists == 'fail') else
+          disp_map.get(if_exists, 'WRITE_EMPTY'))
+    bq_yaml_type = (
+        'WriteToBigQueryCDC' if (not is_read and cdc) else verb + 'BigQuery')
     return ParsedEndpoint(
         kind='bigquery',
         scheme='bigquery',
         raw=location,
         format='bigquery',
-        yaml_type=verb + 'BigQuery',
+        yaml_type=bq_yaml_type,
         config=cfg,
         output_prefix=None,
         is_java_xlang=not is_read,
         is_unbounded=False)
 
-  # 3. Postgres (`postgres://host:port/db?table=public.users`)
-  if scheme in ('postgres', 'postgresql'):
+  # 3. Postgres & MySQL (`postgres://host:port/db?table=...`, `mysql://...`)
+  if scheme in ('postgres', 'postgresql', 'mysql'):
+    is_pg = scheme in ('postgres', 'postgresql')
+    norm_kind = 'postgres' if is_pg else 'mysql'
+    default_port = 5432 if is_pg else 3306
+    label_db = 'Postgres' if is_pg else 'MySql'
     parsed = urllib.parse.urlsplit(location)
     if not parsed.hostname or not parsed.path.strip('/'):
       raise UriError(
-          f'invalid Postgres URI {location!r}; expected '
-          'postgres://HOST[:PORT]/DATABASE?table=TABLE')
+          f'invalid {label_db} URI {location!r}; expected '
+          f'{norm_kind}://HOST[:PORT]/DATABASE?table=TABLE')
     qparams = dict(
         urllib.parse.parse_qsl(parsed.query, keep_blank_values=False))
     table_name = opts.pop('table', None) or qparams.pop('table', None)
     query_sql = opts.pop('query', None)
-    if not table_name and not (is_read and query_sql):
+    if not table_name and not (is_read and query_sql and not cdc):
       raise UriError(
-          f'Postgres URI {location!r} requires ?table=TABLE (or --from-opt '
-          'query="SELECT ...")')
-    port_str = f':{parsed.port}' if parsed.port else ':5432'
+          f'{label_db} URI {location!r} requires ?table=TABLE'
+          + ('' if cdc else ' (or --from-opt query="SELECT ...")'))
+    port_num = parsed.port or default_port
     db_name = parsed.path.lstrip('/')
+    env_prefix = 'BEAM_POSTGRES' if is_pg else 'BEAM_MYSQL'
+    user = opts.pop('username', None) or os.environ.get(f'{env_prefix}_USER')
+    pwd = opts.pop('password', None) or os.environ.get(f'{env_prefix}_PASSWORD')
+
+    if is_read and cdc:
+      conn_props = list(opts.pop('connection_properties', None) or [])
+      if not any(str(p).startswith('database.dbname=') for p in conn_props):
+        conn_props.append(f'database.dbname={db_name}')
+      if is_pg and not any(
+          str(p).startswith('plugin.name=') for p in conn_props):
+        conn_props.append('plugin.name=pgoutput')
+      for qk, qv in qparams.items():
+        conn_props.append(f'{qk}={qv}')
+      deb_cfg: dict[str, Any] = {
+          'connector': 'POSTGRES' if is_pg else 'MYSQL',
+          'host': parsed.hostname,
+          'port': port_num,
+          'table': table_name,
+          'connection_properties': conn_props,
+      }
+      if user:
+        deb_cfg['username'] = user
+      if pwd:
+        deb_cfg['password'] = pwd
+      deb_cfg.update(opts)
+      unbounded_cdc = not (
+          'max_number_of_records' in deb_cfg or 'max_time_to_run' in deb_cfg)
+      return ParsedEndpoint(
+          kind=norm_kind,
+          scheme=norm_kind,
+          raw=location,
+          format='debezium',
+          yaml_type='ReadFromDebezium',
+          config=deb_cfg,
+          output_prefix=None,
+          is_java_xlang=True,
+          is_unbounded=unbounded_cdc)
+
+    jdbc_sub = 'postgresql' if is_pg else 'mysql'
     jdbc_query = urllib.parse.urlencode(qparams)
-    jdbc_url = f'jdbc:postgresql://{parsed.hostname}{port_str}/{db_name}'
+    jdbc_url = f'jdbc:{jdbc_sub}://{parsed.hostname}:{port_num}/{db_name}'
     if jdbc_query:
       jdbc_url = f'{jdbc_url}?{jdbc_query}'
 
-    cfg: dict[str, Any] = {'url': jdbc_url}
+    cfg = {'url': jdbc_url}
     if table_name:
       cfg['table'] = table_name
     if query_sql:
       cfg['query'] = query_sql
-    user = opts.pop('username', None) or os.environ.get('BEAM_POSTGRES_USER')
-    pwd = opts.pop('password', None) or os.environ.get('BEAM_POSTGRES_PASSWORD')
     if user:
       cfg['username'] = user
     if pwd:
       cfg['password'] = pwd
     cfg.update(opts)
     return ParsedEndpoint(
-        kind='postgres',
-        scheme='postgres',
+        kind=norm_kind,
+        scheme=norm_kind,
         raw=location,
         format='jdbc',
-        yaml_type=verb + 'Postgres',
+        yaml_type=verb + label_db,
         config=cfg,
         output_prefix=None,
         is_java_xlang=True,
         is_unbounded=False)
 
-  # 4. Pub/Sub (`pubsub://projects/P/topics/T` or `.../subscriptions/S`)
+  # 4. Cloud Spanner (`spanner://projects/P/instances/I/databases/D?table=T`)
+  if scheme == 'spanner':
+    sp_proj, sp_inst, sp_db, qparams = parse_spanner_uri(location)
+    sp_cfg: dict[str, Any] = {
+        'project': sp_proj,
+        'instance': sp_inst,
+        'database': sp_db,
+    }
+    for qk, qv in qparams.items():
+      sp_cfg[qk] = _coerce_opt_value(qv)
+    sp_cfg.update(opts)
+    is_sp_cdc = bool(is_read and (cdc or 'change_stream' in sp_cfg))
+    if not is_sp_cdc and not sp_cfg.get('table') and not (
+        is_read and sp_cfg.get('query')):
+      raise UriError(
+          f'Spanner URI {location!r} requires ?table=TABLE '
+          '(or ?change_stream=STREAM for CDC)')
+    return ParsedEndpoint(
+        kind='spanner',
+        scheme='spanner',
+        raw=location,
+        format='spanner_cdc' if is_sp_cdc else 'spanner',
+        yaml_type='ReadFromSpannerCDC' if is_sp_cdc else verb + 'Spanner',
+        config=sp_cfg,
+        output_prefix=None,
+        is_java_xlang=True,
+        is_unbounded=bool(is_sp_cdc and 'end_at' not in sp_cfg))
+
+  # 5. Pub/Sub (`pubsub://projects/P/topics/T` or `.../subscriptions/S`)
   if scheme == 'pubsub':
     ps_kind, ps_resource = parse_pubsub_uri(location)
     if not is_read and ps_kind != 'topic':
@@ -403,7 +506,7 @@ def parse_endpoint(
         is_java_xlang=False,
         is_unbounded=is_read)
 
-  # 5. Kafka (`kafka://host:port/topic`)
+  # 6. Kafka (`kafka://host:port/topic`)
   if scheme == 'kafka':
     parsed = urllib.parse.urlsplit(location)
     topic = parsed.path.strip('/')
@@ -429,16 +532,97 @@ def parse_endpoint(
         is_java_xlang=True,
         is_unbounded=is_read)
 
-  # 6. Iceberg (`iceberg://catalog.namespace.table` or `--*-opt catalog_name=...`)
+  # 7. Delta Lake (`delta:///path/to/table` or `delta://gs://bucket/table`)
+  if scheme == 'delta':
+    if not is_read:
+      raise UriError(
+          f'writing directly to {location!r} is not supported; write to '
+          'iceberg:// (e.g. iceberg://namespace.table?warehouse=...) or '
+          'parquet instead')
+    raw_rest = location[len('delta://'):]
+    path_part, _, query_str = raw_rest.partition('?')
+    path_part = path_part.strip()
+    if not path_part:
+      raise UriError(
+          f'invalid Delta Lake URI {location!r}; expected '
+          'delta://<local_path_or_gs_uri>')
+    if '://' in path_part:
+      reject_inline_credentials(path_part)
+    qparams = dict(urllib.parse.parse_qsl(query_str, keep_blank_values=False))
+    delta_cfg: dict[str, Any] = {'table': path_part}
+    for qk, qv in qparams.items():
+      delta_cfg[qk] = _coerce_opt_value(qv)
+    delta_cfg.update(opts)
+    return ParsedEndpoint(
+        kind='delta',
+        scheme='delta',
+        raw=location,
+        format='delta_cdc' if cdc else 'delta',
+        yaml_type='ReadFromDeltaCDC' if cdc else 'ReadFromDelta',
+        config=delta_cfg,
+        output_prefix=None,
+        is_java_xlang=True,
+        is_unbounded=False)
+
+  # 8. Iceberg (`iceberg://namespace.table?warehouse=...` or `?catalog=biglake&...`)
   parsed = urllib.parse.urlsplit(location)
-  raw_ident = (parsed.netloc + parsed.path).strip('/')
+  if not parsed.netloc and parsed.path.startswith('/'):
+    raw_ident = parsed.path.rstrip('/')
+  else:
+    raw_ident = (parsed.netloc + parsed.path).strip('/')
+  if not raw_ident:
+    raise UriError(
+        f'invalid Iceberg URI {location!r}; expected '
+        'iceberg://NAMESPACE.TABLE?warehouse=gs://bucket/warehouse')
+  qparams = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=False))
+  cat_shortcut = str(
+      opts.pop('catalog', None) or qparams.pop('catalog', '') or
+      '').strip().lower()
+  warehouse_val = opts.pop('warehouse', None) or qparams.pop('warehouse', None)
+  rest_uri = opts.pop('uri', None) or qparams.pop('uri', None)
+  cat_props = dict(opts.pop('catalog_properties', None) or {})
+
+  if cat_shortcut == 'biglake':
+    opts.setdefault('catalog_name', 'biglake')
+    cat_props.setdefault('type', 'rest')
+    cat_props.setdefault(
+        'uri',
+        str(rest_uri or 'https://biglake.googleapis.com/iceberg/v1/restcatalog'))
+    cat_props.setdefault('rest.auth.type', 'google')
+    if warehouse_val:
+      cat_props.setdefault('warehouse', str(warehouse_val))
+    if default_project:
+      cat_props.setdefault('header.x-goog-user-project', default_project)
+  elif cat_shortcut == 'rest' or rest_uri:
+    opts.setdefault('catalog_name', cat_shortcut or 'rest')
+    cat_props.setdefault('type', 'rest')
+    if rest_uri:
+      cat_props.setdefault('uri', str(rest_uri))
+    if warehouse_val:
+      cat_props.setdefault('warehouse', str(warehouse_val))
+  elif warehouse_val:
+    opts.setdefault('catalog_name', cat_shortcut or 'hadoop')
+    cat_props.setdefault('type', 'hadoop')
+    cat_props.setdefault('warehouse', str(warehouse_val))
+
+  for qk, qv in qparams.items():
+    opts.setdefault(qk, _coerce_opt_value(qv))
+  if cat_props:
+    opts['catalog_properties'] = cat_props
+
   cfg = {'table': raw_ident, **opts}
+  if is_read and cdc:
+    ice_yaml_type = 'ReadFromIcebergCDC'
+  elif not is_read and zero_copy:
+    ice_yaml_type = 'IcebergAddFiles'
+  else:
+    ice_yaml_type = verb + 'Iceberg'
   return ParsedEndpoint(
       kind='iceberg',
       scheme='iceberg',
       raw=location,
-      format='iceberg',
-      yaml_type=verb + 'Iceberg',
+      format='iceberg_cdc' if (is_read and cdc) else 'iceberg',
+      yaml_type=ice_yaml_type,
       config=cfg,
       output_prefix=None,
       is_java_xlang=True,

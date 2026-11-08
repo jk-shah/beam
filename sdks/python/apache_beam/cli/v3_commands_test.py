@@ -820,7 +820,577 @@ class InspectCheckIoDoctorTailJobsTest(unittest.TestCase):
       fake_topic_sub.acknowledge.assert_called_once()
       fake_topic_sub.delete_subscription.assert_called_once()
 
+  def test_delta_and_iceberg_zero_copy_inspect_cost_guard_and_diff(self):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    delta_dir = os.path.join(self.tmp, 'delta_orders')
+    log_dir = os.path.join(delta_dir, '_delta_log')
+    os.makedirs(log_dir, exist_ok=True)
+
+    # Write 2 Parquet files in commit 0, then replace part-0 with part-2 in commit 1!
+    p0 = os.path.join(delta_dir, 'part-0.parquet')
+    p1 = os.path.join(delta_dir, 'part-1.parquet')
+    p2 = os.path.join(delta_dir, 'part-2.parquet')
+    pq.write_table(
+        pa.table({
+            'id': pa.array([1, 2], type=pa.int64()),
+            'customer': pa.array(['Ada', 'Grace'], type=pa.string()),
+            'amount': pa.array([10.5, 20.0], type=pa.float64()),
+        }),
+        p0)
+    pq.write_table(
+        pa.table({
+            'id': pa.array([3], type=pa.int64()),
+            'customer': pa.array(['Linus'], type=pa.string()),
+            'amount': pa.array([30.25], type=pa.float64()),
+        }),
+        p1)
+    pq.write_table(
+        pa.table({
+            'id': pa.array([1, 2], type=pa.int64()),
+            'customer': pa.array(['Ada', 'Grace'], type=pa.string()),
+            'amount': pa.array([15.0, 25.5], type=pa.float64()),
+        }),
+        p2)
+
+    schema_str = json.dumps({
+        'type': 'struct',
+        'fields': [
+            {'name': 'id', 'type': 'long', 'nullable': False, 'metadata': {}},
+            {'name': 'customer', 'type': 'string', 'nullable': True, 'metadata': {}},
+            {'name': 'amount', 'type': 'double', 'nullable': True, 'metadata': {}},
+        ],
+    })
+    with open(os.path.join(log_dir, '00000000000000000000.json'), 'w', encoding='utf-8') as f:
+      f.write(json.dumps({'protocol': {'minReaderVersion': 1, 'minWriterVersion': 2}}) + '\n')
+      f.write(json.dumps({
+          'metaData': {
+              'id': 'delta-tbl-1',
+              'schemaString': schema_str,
+              'partitionColumns': [],
+              'configuration': {},
+          }
+      }) + '\n')
+      f.write(json.dumps({
+          'add': {
+              'path': 'part-0.parquet',
+              'size': os.path.getsize(p0),
+              'modificationTime': 1700000000000,
+              'dataChange': True,
+              'stats': json.dumps({'numRecords': 2}),
+          }
+      }) + '\n')
+      f.write(json.dumps({
+          'add': {
+              'path': 'part-1.parquet',
+              'size': os.path.getsize(p1),
+              'modificationTime': 1700000000000,
+              'dataChange': True,
+              'stats': json.dumps({'numRecords': 1}),
+          }
+      }) + '\n')
+
+    with open(os.path.join(log_dir, '00000000000000000001.json'), 'w', encoding='utf-8') as f:
+      f.write(json.dumps({
+          'remove': {
+              'path': 'part-0.parquet',
+              'deletionTimestamp': 1700000001000,
+              'dataChange': True,
+          }
+      }) + '\n')
+      f.write(json.dumps({
+          'add': {
+              'path': 'part-2.parquet',
+              'size': os.path.getsize(p2),
+              'modificationTime': 1700000001000,
+              'dataChange': True,
+              'stats': json.dumps({'numRecords': 2}),
+          }
+      }) + '\n')
+
+    delta_uri = f'delta://{delta_dir}'
+
+    # 1. Inspect latest Delta version (1) and time-travel version (0).
+    rc_i, env_i, _ = _run_json(['inspect', delta_uri])
+    self.assertEqual(rc_i, cli.EXIT_OK)
+    self.assertEqual(env_i['outputs']['kind'], 'delta')
+    self.assertEqual(env_i['outputs']['snapshot_version'], 1)
+    self.assertEqual(env_i['outputs']['row_count'], 3)
+    self.assertEqual(env_i['outputs']['file_count'], 2)
+    rows_v1 = sorted(env_i['untrusted_data']['rows'], key=lambda r: r['id'])
+    self.assertEqual([r['amount'] for r in rows_v1], [15.0, 25.5, 30.25])
+
+    rc_v0, env_v0, _ = _run_json(['inspect', f'{delta_uri}?version=0'])
+    self.assertEqual(rc_v0, cli.EXIT_OK)
+    rows_v0 = sorted(env_v0['untrusted_data']['rows'], key=lambda r: r['id'])
+    self.assertEqual([r['amount'] for r in rows_v0], [10.5, 20.0, 30.25])
+
+    # 2. Cost guard `--max-bytes 10B` blocks before reading/copying (`EXIT_COST_LIMIT = 8`).
+    wh_dir = os.path.join(self.tmp, 'iceberg_wh')
+    iceberg_uri = f'iceberg://lake.orders_zc?warehouse={wh_dir}'
+    rc_cg, env_cg, _ = _run_json([
+        'pipe', '--from', delta_uri, '--to', iceberg_uri, '--zero-copy',
+        '--max-bytes', '10B'
+    ])
+    self.assertEqual(rc_cg, cli.EXIT_COST_LIMIT)
+    self.assertGreater(env_cg['estimated_bytes'], 10)
+
+    # 3. Zero-copy Delta -> Iceberg v2 registration + `--verify`!
+    rc_zc, env_zc, _ = _run_json([
+        'pipe', '--from', delta_uri, '--to', iceberg_uri, '--zero-copy',
+        '--verify', '--verify-key', 'id'
+    ])
+    self.assertEqual(rc_zc, cli.EXIT_OK)
+    self.assertEqual(env_zc['runner'], 'zero_copy_metadata')
+    self.assertEqual(env_zc['outputs']['bytes_copied'], 0)
+    self.assertEqual(env_zc['outputs']['rows_registered'], 3)
+    self.assertTrue(env_zc['outputs']['verify']['match'])
+    with open(env_zc['outputs']['metadata_path'], encoding='utf-8') as mf:
+      meta_json = json.load(mf)
+    self.assertEqual(meta_json['format-version'], 2)
+    self.assertIn('schema.name-mapping.default', meta_json['properties'])
+
+    # 4. Inspect & diff the resulting Iceberg v2 table directly!
+    rc_ii, env_ii, _ = _run_json(['inspect', iceberg_uri])
+    self.assertEqual(rc_ii, cli.EXIT_OK)
+    self.assertEqual(env_ii['outputs']['kind'], 'iceberg')
+    self.assertEqual(env_ii['outputs']['row_count'], 3)
+
+    rc_df, env_df, _ = _run_json(['diff', delta_uri, iceberg_uri, '--key', 'id'])
+    self.assertEqual(rc_df, cli.EXIT_OK)
+    self.assertTrue(env_df['outputs']['match'])
+
+  def test_cross_engine_cdc_debezium_dlq_and_iceberg_merge_on_read(self):
+    cdc_jsonl = os.path.join(self.tmp, 'debezium_orders.jsonl')
+    events = [
+        json.dumps({
+            'op': 'c',
+            'ts_ms': 1001,
+            'source': {'lsn': 101},
+            'after': {'id': 1, 'customer': 'Ada', 'amount': 10.5},
+        }),
+        json.dumps({
+            'op': 'c',
+            'ts_ms': 1002,
+            'source': {'lsn': 102},
+            'after': {'id': 2, 'customer': 'Grace', 'amount': 20.0},
+        }),
+        json.dumps({
+            'op': 'c',
+            'ts_ms': 1003,
+            'source': {'lsn': 103},
+            'after': {'id': 3, 'customer': 'Linus', 'amount': 30.0},
+        }),
+        '{corrupt_json_poison_pill',
+        json.dumps({
+            'op': 'c',
+            'ts_ms': 1004,
+            'after': {'id': None, 'customer': 'MissingPK', 'amount': 5.0},
+        }),
+        json.dumps({
+            'op': 'u',
+            'ts_ms': 1005,
+            'source': {'lsn': 105},
+            'before': {'id': 2, 'customer': 'Grace', 'amount': 20.0},
+            'after': {'id': 2, 'customer': 'Grace', 'amount': 99.5},
+        }),
+        json.dumps({
+            'op': 'd',
+            'ts_ms': 1006,
+            'source': {'lsn': 106},
+            'before': {'id': 3, 'customer': 'Linus', 'amount': 30.0},
+            'after': None,
+        }),
+    ]
+    with open(cdc_jsonl, 'w', encoding='utf-8') as f:
+      f.write('\n'.join(events) + '\n')
+
+    wh_dir = os.path.join(self.tmp, 'wh_cdc')
+    iceberg_cdc_uri = f'iceberg://lake.orders_cdc?warehouse={wh_dir}'
+    dlq_path = os.path.join(self.tmp, 'cdc_dlq.json')
+
+    rc, env, err = _run_json([
+        'pipe',
+        '--from',
+        cdc_jsonl,
+        '--to',
+        iceberg_cdc_uri,
+        '--cdc',
+        '--primary-key',
+        'id',
+        '--dlq',
+        dlq_path,
+        '--assert-counts',
+        '--runner=FnApiRunner',
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, f'err={err} env={env}')
+    self.assertEqual(env['metrics']['rows_read'], 7)
+    self.assertEqual(env['metrics']['dlq_rows'], 2)
+    self.assertEqual(env['metrics']['rows_written'], 5)
+
+    # Verify Iceberg v2 Merge-on-Read state: 2 live rows (id=1 @ 10.5, id=2 @ 99.5; id=3 deleted!).
+    rc_insp, env_insp, _ = _run_json(['inspect', iceberg_cdc_uri])
+    self.assertEqual(rc_insp, cli.EXIT_OK)
+    self.assertEqual(env_insp['outputs']['row_count'], 2)
+    self.assertGreaterEqual(env_insp['outputs']['delete_file_count'], 1)
+    self.assertEqual(env_insp['outputs']['identifier_columns'], ['id'])
+    live_rows = sorted(env_insp['untrusted_data']['rows'], key=lambda r: r['id'])
+    self.assertEqual(
+        live_rows,
+        [
+            {'id': 1, 'customer': 'Ada', 'amount': 10.5},
+            {'id': 2, 'customer': 'Grace', 'amount': 99.5},
+        ])
+
+    # Reconcile against golden expected JSONL via `beam diff`!
+    expected_jsonl = os.path.join(self.tmp, 'expected_post_cdc.jsonl')
+    with open(expected_jsonl, 'w', encoding='utf-8') as f:
+      f.write(json.dumps({'id': 1, 'customer': 'Ada', 'amount': 10.5}) + '\n')
+      f.write(json.dumps({'id': 2, 'customer': 'Grace', 'amount': 99.5}) + '\n')
+    rc_d, env_d, _ = _run_json([
+        'diff', iceberg_cdc_uri, expected_jsonl, '--key', 'id'
+    ])
+    self.assertEqual(rc_d, cli.EXIT_OK)
+    self.assertTrue(env_d['outputs']['match'])
+
+    # Append a second CDC batch (delete id=1, insert id=4) with `--if-exists=append`!
+    cdc_batch_2 = os.path.join(self.tmp, 'debezium_orders_2.jsonl')
+    with open(cdc_batch_2, 'w', encoding='utf-8') as f:
+      f.write(json.dumps({
+          'op': 'd',
+          'ts_ms': 2001,
+          'before': {'id': 1, 'customer': 'Ada', 'amount': 10.5},
+          'after': None,
+      }) + '\n')
+      f.write(json.dumps({
+          'op': 'c',
+          'ts_ms': 2002,
+          'after': {'id': 4, 'customer': 'Margaret', 'amount': 42.0},
+      }) + '\n')
+    rc2, env2, err2 = _run_json([
+        'pipe',
+        '--from',
+        cdc_batch_2,
+        '--to',
+        iceberg_cdc_uri,
+        '--cdc',
+        '--primary-key',
+        'id',
+        '--if-exists=append',
+        '--assert-counts',
+        '--runner=FnApiRunner',
+    ])
+    self.assertEqual(rc2, cli.EXIT_OK, f'err={err2} env={env2}')
+    rc_i2, env_i2, _ = _run_json(['inspect', iceberg_cdc_uri])
+    self.assertEqual(rc_i2, cli.EXIT_OK)
+    live_rows_2 = sorted(env_i2['untrusted_data']['rows'], key=lambda r: r['id'])
+    self.assertEqual(
+        live_rows_2,
+        [
+            {'id': 2, 'customer': 'Grace', 'amount': 99.5},
+            {'id': 4, 'customer': 'Margaret', 'amount': 42.0},
+        ])
+
+  def test_delta_cdf_to_iceberg_cdc_and_live_lakehouse_tail_follow(self):
+    import threading
+    import time as time_mod
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from apache_beam.cli import lakehouse
+
+    # 1. Delta Change Data Feed (`cdc` action with `insert`, `update_preimage`,
+    #    `update_postimage`, `delete`) -> Iceberg v2 Merge-on-Read!
+    cdf_root = os.path.join(self.tmp, 'delta_cdf_tbl')
+    cdf_log = os.path.join(cdf_root, '_delta_log')
+    os.makedirs(cdf_log, exist_ok=True)
+    cdf_file = os.path.join(cdf_root, 'cdf-0.parquet')
+    pq.write_table(
+        pa.table({
+            'id': pa.array([10, 20, 20, 30, 30], type=pa.int64()),
+            'name': pa.array(['A', 'B_old', 'B_new', 'C', 'C'], type=pa.string()),
+            '_change_type': pa.array(
+                ['insert', 'update_preimage', 'update_postimage', 'insert', 'delete'],
+                type=pa.string()),
+            '_commit_version': pa.array([1, 2, 2, 1, 3], type=pa.int64()),
+        }),
+        cdf_file)
+    schema_str = json.dumps({
+        'type': 'struct',
+        'fields': [
+            {'name': 'id', 'type': 'long', 'nullable': False, 'metadata': {}},
+            {'name': 'name', 'type': 'string', 'nullable': True, 'metadata': {}},
+        ],
+    })
+    with open(os.path.join(cdf_log, '00000000000000000000.json'), 'w', encoding='utf-8') as f:
+      f.write(json.dumps({
+          'metaData': {
+              'id': 'cdf-1',
+              'schemaString': schema_str,
+              'partitionColumns': [],
+              'configuration': {'delta.enableChangeDataFeed': 'true'},
+          }
+      }) + '\n')
+      f.write(json.dumps({
+          'cdc': {
+              'path': 'cdf-0.parquet',
+              'size': os.path.getsize(cdf_file),
+              'dataChange': False,
+          }
+      }) + '\n')
+
+    wh_dir = os.path.join(self.tmp, 'wh_from_cdf')
+    ice_uri = f'iceberg://lake.from_cdf?warehouse={wh_dir}'
+    rc, env, err = _run_json([
+        'pipe',
+        '--from',
+        f'delta://{cdf_root}',
+        '--to',
+        ice_uri,
+        '--cdc',
+        '--primary-key',
+        'id',
+        '--assert-counts',
+        '--runner=FnApiRunner',
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, f'err={err} env={env}')
+    # 5 raw CDF rows -> 1 `update_preimage` filtered out -> 4 CDC ops written!
+    self.assertEqual(env['metrics']['rows_read'], 5)
+    self.assertEqual(env['metrics']['rows_filtered_out'], 1)
+    self.assertEqual(env['metrics']['rows_written'], 4)
+
+    rc_i, env_i, _ = _run_json(['inspect', ice_uri])
+    self.assertEqual(rc_i, cli.EXIT_OK)
+    rows_live = sorted(env_i['untrusted_data']['rows'], key=lambda r: r['id'])
+    self.assertEqual(rows_live, [{'id': 10, 'name': 'A'}, {'id': 20, 'name': 'B_new'}])
+
+    # 2. Live `beam tail -f` following new Iceberg v2 snapshot commits!
+    tdir = os.path.join(wh_dir, 'lake', 'from_cdf')
+
+    def _commit_later():
+      time_mod.sleep(0.15)
+      new_pq = os.path.join(tdir, 'data', 'live-append.parquet')
+      df_entry = lakehouse.write_parquet_with_field_ids(
+          new_pq,
+          [{'id': 50, 'name': 'LiveCommit'}],
+          [
+              {'id': 1, 'name': 'id', 'type': 'long', 'nullable': False},
+              {'id': 2, 'name': 'name', 'type': 'string', 'nullable': True},
+          ])
+      lakehouse.commit_iceberg_snapshot(
+          tdir,
+          iceberg_fields=[
+              {'id': 1, 'name': 'id', 'type': 'long', 'nullable': False},
+              {'id': 2, 'name': 'name', 'type': 'string', 'nullable': True},
+          ],
+          identifier_columns=['id'],
+          new_data_files=[df_entry])
+
+    t = threading.Thread(target=_commit_later, daemon=True)
+    t.start()
+    out_buf = io.StringIO()
+    err_buf = io.StringIO()
+    with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+      rc_tail = cli.main([
+          'tail', '-f', '-n', '1', '--poll-interval', '0.05', '--duration', '5s',
+          ice_uri, '--json'
+      ])
+    t.join(timeout=2.0)
+    self.assertEqual(rc_tail, cli.EXIT_OK)
+    lines = [json.loads(ln) for ln in out_buf.getvalue().strip().splitlines() if ln.strip()]
+    self.assertEqual(len(lines), 2)
+    self.assertEqual(lines[0]['event'], 'record')
+    self.assertEqual(lines[0]['record']['id'], 50)
+    self.assertEqual(lines[0]['record']['name'], 'LiveCommit')
+    self.assertEqual(lines[1]['outputs']['mode'], 'lakehouse_commit_follow')
+
+  def test_bigquery_cdc_sequence_normalization_and_storage_write_sink(self):
+    import re
+    from types import SimpleNamespace
+    from apache_beam.cli import cdc as cdc_mod
+
+    bq_seq_re = re.compile(r'^[0-9A-Fa-f]{1,16}(?:/[0-9A-Fa-f]{1,16}){0,3}$')
+    _, hex_1 = cdc_mod.to_bq_hex_sequence(1)
+    _, hex_2 = cdc_mod.to_bq_hex_sequence(2)
+    _, hex_100 = cdc_mod.to_bq_hex_sequence(100)
+    self.assertRegex(hex_1, bq_seq_re)
+    self.assertLess(hex_1, hex_2)
+    self.assertLess(hex_2, hex_100)
+
+    # Postgres WAL LSNs (`0/16B3748` < `0/16B3750` < `1/0000001`).
+    _, lsn_a = cdc_mod.to_bq_hex_sequence('0/16B3748')
+    _, lsn_b = cdc_mod.to_bq_hex_sequence('0/16B3750')
+    _, lsn_c = cdc_mod.to_bq_hex_sequence('1/0000001')
+    for lsn in (lsn_a, lsn_b, lsn_c):
+      self.assertRegex(lsn, bq_seq_re)
+    self.assertLess(lsn_a, lsn_b)
+    self.assertLess(lsn_b, lsn_c)
+
+    # ISO-8601 timestamps preserve lexicographical order.
+    _, ts_a = cdc_mod.to_bq_hex_sequence('2026-11-08T10:00:00Z')
+    _, ts_b = cdc_mod.to_bq_hex_sequence('2026-11-08T10:00:01Z')
+    self.assertRegex(ts_a, bq_seq_re)
+    self.assertLess(ts_a, ts_b)
+
+    # Mock BigQuery DDL client + BigQueryWriteClient (`append_rows`) + row_errors DLQ!
+    cdc_file = os.path.join(self.tmp, 'bq_cdc_in.jsonl')
+    with open(cdc_file, 'w', encoding='utf-8') as f:
+      f.write(json.dumps({
+          'op': 'c',
+          'source': {'lsn': '0/16B3748'},
+          'after': {'id': 1, 'email': 'ada@example.com'},
+      }) + '\n')
+      f.write(json.dumps({
+          'op': 'd',
+          'source': {'lsn': '0/16B3750'},
+          'before': {'id': 2, 'email': 'old@example.com'},
+          'after': None,
+      }) + '\n')
+      f.write(json.dumps({
+          'op': 'u',
+          'source': {'lsn': '0/16B3760'},
+          'after': {'id': 999, 'email': 'reject_me@example.com'},
+      }) + '\n')
+
+    from google.api_core import exceptions as gcp_exceptions
+    fake_bq_client = mock.MagicMock()
+    fake_bq_client.project = 'demo-proj'
+    fake_bq_client.get_table.side_effect = gcp_exceptions.NotFound('no table')
+
+    captured_requests: list[Any] = []
+
+    def _fake_append_rows(req_iter):
+      reqs = list(req_iter)
+      captured_requests.extend(reqs)
+      # Simulate BigQuery rejecting `id == 999` (`reject_me@example.com`) via `row_errors`!
+      r_errs = []
+      for idx, ser_row in enumerate(reqs[0].proto_rows.rows.serialized_rows):
+        if b'reject_me@example.com' in ser_row:
+          r_errs.append(
+              SimpleNamespace(
+                  index=idx, message='simulated row constraint error'))
+      return iter([
+          SimpleNamespace(
+              row_errors=r_errs, error=SimpleNamespace(code=0, message=''))
+      ])
+
+    fake_write_client = mock.MagicMock()
+    fake_write_client.append_rows.side_effect = _fake_append_rows
+    bq_dlq = os.path.join(self.tmp, 'bq_cdc_dlq.json')
+
+    with (
+        mock.patch('google.cloud.bigquery.Client', return_value=fake_bq_client),
+        mock.patch(
+            'google.cloud.bigquery_storage_v1.BigQueryWriteClient',
+            return_value=fake_write_client),
+    ):
+      rc, env, err = _run_json([
+          'pipe',
+          '--from',
+          cdc_file,
+          '--to',
+          'bigquery://demo-proj.analytics.users_cdc',
+          '--cdc',
+          '--primary-key',
+          'id',
+          '--dlq',
+          bq_dlq,
+          '--assert-counts',
+          '--runner=FnApiRunner',
+      ])
+    self.assertEqual(rc, cli.EXIT_OK, f'err={err} env={env}')
+    ddl_sql = fake_bq_client.query.call_args.args[0]
+    self.assertIn('PRIMARY KEY (`id`) NOT ENFORCED', ddl_sql)
+    self.assertGreaterEqual(len(captured_requests), 1)
+    self.assertEqual(
+        captured_requests[0].write_stream,
+        'projects/demo-proj/datasets/analytics/tables/users_cdc/streams/_default')
+    self.assertEqual(env['metrics']['rows_read'], 3)
+    self.assertEqual(env['metrics']['dlq_rows'], 1)
+    self.assertEqual(env['metrics']['rows_written'], 2)
+
+  def test_cdc_and_zero_copy_emit_yaml_package_and_worker_wheel(self):
+    # 1. Postgres `--cdc` -> BigQuery `--cdc` portable YAML export (`--emit-yaml`),
+    # including when a local JDK is present (`_find_java` succeeds).
+    with mock.patch('apache_beam.cli.sql._find_java', return_value='/usr/bin/java'):
+      rc_pg, env_pg, err_pg = _run_json([
+          'pipe',
+          '--from',
+          'postgres://db.internal:5432/shop?table=public.orders',
+          '--to',
+          'bigquery://demo-proj.analytics.orders',
+          '--cdc',
+          '--primary-key',
+          'id',
+          '--emit-yaml',
+      ])
+    self.assertEqual(rc_pg, cli.EXIT_OK, err_pg)
+    pg_yaml = env_pg['outputs']['yaml']
+    self.assertIn('ReadFromDebezium', pg_yaml)
+    self.assertIn('WriteToBigQueryCDC', pg_yaml)
+
+    # Package exported cross-engine CDC YAML as a zero-Docker Dataflow Flex Template!
+    cdc_tpl = os.path.join(self.tmp, 'cdc_pg_to_bq.template.json')
+    with mock.patch('sys.stdin', io.StringIO(pg_yaml)):
+      rc_pkg, env_pkg, err_pkg = _run_json([
+          'package',
+          '-',
+          '--to',
+          cdc_tpl,
+          '--image',
+          'gcr.io/dataflow-templates/yaml-template:test',
+      ])
+    self.assertEqual(rc_pkg, cli.EXIT_OK, err_pkg)
+    self.assertFalse(env_pkg['outputs']['docker_build_required'])
+
+    # 2. Spanner Change Stream -> Iceberg Merge-on-Read `--emit-yaml`.
+    rc_sp, env_sp, err_sp = _run_json([
+        'pipe',
+        '--from',
+        'spanner://demo-proj/prod-inst/shop-db?change_stream=orders_cs',
+        '--to',
+        'iceberg://lake.orders?warehouse=gs://demo-bkt/wh',
+        '--cdc',
+        '--primary-key',
+        'id',
+        '--emit-yaml',
+    ])
+    self.assertEqual(rc_sp, cli.EXIT_OK, err_sp)
+    sp_yaml = env_sp['outputs']['yaml']
+    self.assertIn('ReadFromSpannerCDC', sp_yaml)
+    self.assertIn('WriteToIceberg', sp_yaml)
+    self.assertIn('merge-on-read', sp_yaml)
+
+    # 3. Parquet -> Iceberg `--zero-copy --emit-yaml` emits `IcebergAddFiles`.
+    rc_zc, env_zc, err_zc = _run_json([
+        'pipe',
+        '--from',
+        'gs://demo-bkt/raw/*.parquet',
+        '--to',
+        'iceberg://lake.orders_zc?warehouse=gs://demo-bkt/wh',
+        '--zero-copy',
+        '--emit-yaml',
+    ])
+    self.assertEqual(rc_zc, cli.EXIT_OK, err_zc)
+    self.assertIn('IcebergAddFiles', env_zc['outputs']['yaml'])
+
+    # 4. Verify `beam io list --json` and preview worker wheel bundling (`lakehouse.py`, `cdc.py`).
+    rc_io, env_io, _ = _run_json(['io', 'list'])
+    self.assertEqual(rc_io, cli.EXIT_OK)
+    conn_names = {c['name'] for c in env_io['outputs']['connectors']}
+    self.assertTrue({'delta', 'iceberg', 'mysql', 'spanner', 'bigquery'}.issubset(conn_names))
+
+    import zipfile
+    preview_launcher = sys.modules.get('apache_beam_cli_preview.launcher')
+    if preview_launcher is not None:
+      whl_path = preview_launcher.ensure_preview_wheel()
+      with zipfile.ZipFile(whl_path, 'r') as zf:
+        names = set(zf.namelist())
+      self.assertTrue(any(n.endswith('_bundled_cli/lakehouse.py') for n in names))
+      self.assertTrue(any(n.endswith('_bundled_cli/cdc.py') for n in names))
+
 
 if __name__ == '__main__':
   unittest.main()
+
 

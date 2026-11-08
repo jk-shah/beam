@@ -136,5 +136,54 @@ beam tail -f --duration 30s pubsub://projects/<PROJECT>/subscriptions/<SUB>
 
 # Watch newly landing GCS / local DLQ or output shards in real time:
 beam tail -f "gs://<BUCKET>/dlq/*.json" --json
+
+# Follow live Delta Lake or Apache Iceberg snapshot commits in real time:
+beam tail -f -n 10 "iceberg://lake.orders?warehouse=gs://<BUCKET>/wh" --json
 ```
+
+---
+
+## 7. Cross-Engine CDC (`--cdc`) & Zero-Copy Lakehouse Bridges (`--zero-copy`)
+
+### Zero-Copy Lakehouse Registration (`delta://` / Parquet -> `iceberg://`)
+Register existing Parquet shards or active Delta Lake Parquet files into an Apache Iceberg v2 table (`format-version: 2`, `schema.name-mapping.default` for field-ID-free Parquet compatibility with BigQuery/BigLake/Spark/Trino) in `<150 ms` locally or on GCS with **`bytes_copied = 0`**:
+
+```bash
+# Inspect a Delta Lake table (with optional ?version=N time travel) with zero JVM startup:
+beam inspect "delta://gs://<BUCKET>/delta/orders" --json
+
+# Zero-copy register Delta Lake active files into Apache Iceberg v2 + reconcile via --verify:
+beam pipe \
+  --from "delta://gs://<BUCKET>/delta/orders" \
+  --to "iceberg://lake.orders?warehouse=gs://<BUCKET>/iceberg_wh" \
+  --zero-copy \
+  --verify --verify-key id \
+  --project=<PROJECT> \
+  --json
+```
+
+### Cross-Engine Change Data Capture (`--cdc --primary-key <COL>`)
+Normalize Debezium (`before`/`after`/`op`/`source.lsn`), Spanner Change Streams, Delta Change Data Feed (`_change_type`/`_commit_version`), Iceberg incremental snapshots, or flat CDC streams into idempotent ordered **`UPSERT` + `DELETE`** mutations on:
+- **`bigquery://`**: BigQuery Storage Write API `_default` stream (`_CHANGE_TYPE` + 16-digit `/`-segmented hex `_CHANGE_SEQUENCE_NUMBER`, auto-DDL `PRIMARY KEY (...) NOT ENFORCED`, and row-level `--dlq` routing).
+- **`iceberg://`**: Apache Iceberg v2 Merge-on-Read (`equality_ids` delete files + `identifier-field-ids` + `PARQUET:field_id`).
+
+```bash
+# Replicate Debezium / Pub/Sub / Delta CDC into BigQuery Storage Write API CDC with DLQ & conservation:
+beam pipe \
+  --from "gs://<BUCKET>/cdc/debezium_orders.jsonl" \
+  --to "bigquery://<PROJECT>.<DATASET>.orders_cdc" \
+  --cdc --primary-key id \
+  --dlq "gs://<BUCKET>/dlq/orders_cdc_dlq.json" \
+  --assert-counts \
+  --project=<PROJECT> \
+  --json
+
+# Export portable Beam YAML (ReadFromDebezium -> WriteToBigQueryCDC) & package as a Zero-Docker Flex Template:
+beam pipe \
+  --from "postgres://db.internal:5432/shop?table=public.orders" \
+  --to "bigquery://<PROJECT>.<DATASET>.orders_cdc" \
+  --cdc --primary-key id \
+  --emit-yaml | beam package - --to "gs://<BUCKET>/templates/pg_to_bq_cdc.json" --json
+```
+
 

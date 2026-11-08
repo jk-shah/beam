@@ -104,6 +104,7 @@ def run_tail(
     follow: bool = False,
     poll_interval: float = 0.5,
     max_scanned_bytes: str = '64MB',
+    from_opts: list[str] | None = None,
     default_project: str | None = None,
     on_record: RecordCallback | None = None,
 ) -> dict[str, Any]:
@@ -115,9 +116,11 @@ def run_tail(
   byte_budget = cost_guard.parse_byte_size(max_scanned_bytes)
 
   try:
+    parsed_opts = uris.parse_kv_options(from_opts, None, '--from-opt')
     ep = uris.parse_endpoint(
         location,
         is_read=True,
+        options=parsed_opts,
         default_project=default_project,
         allow_sniff=True)
   except uris.UriError as e:
@@ -141,6 +144,15 @@ def run_tail(
         follow=follow,
         byte_budget=byte_budget,
         on_record=on_record)
+  if ep.kind in ('delta', 'iceberg') and follow:
+    return _tail_lakehouse_follow(
+        ep,
+        limit=limit,
+        duration_sec=duration_sec,
+        poll_interval=poll_interval,
+        byte_budget=byte_budget,
+        default_project=default_project,
+        on_record=on_record)
   if ep.kind == 'file' and follow:
     return _tail_files_follow(
         location,
@@ -150,18 +162,19 @@ def run_tail(
         byte_budget=byte_budget,
         default_project=default_project,
         on_record=on_record)
-  if ep.kind in ('file', 'bigquery'):
+  if ep.kind in ('file', 'bigquery', 'delta', 'iceberg'):
     if follow and ep.kind == 'bigquery':
       raise TailError(
-          'beam tail -f (--follow) is for streaming/file endpoints '
-          '(pubsub://, kafka://, local paths, gs://); omit -f to peek at '
-          'bigquery:// tables.',
+          'beam tail -f (--follow) is for streaming/file/lakehouse endpoints '
+          '(pubsub://, kafka://, delta://, iceberg://, local paths, gs://); '
+          'omit -f to peek at bigquery:// tables.',
           2)
     eff_limit = 5 if limit is None else limit
     inspected = inspect_cmd.run_inspect(
         location,
         sample_count=eff_limit,
         max_scanned_bytes=max_scanned_bytes,
+        from_opts=from_opts,
         default_project=default_project)
     sampled_rows = list((inspected.get('untrusted_data') or {}).get('rows', ()))
     if on_record is not None:
@@ -179,7 +192,7 @@ def run_tail(
     }
   raise TailError(
       f'beam tail does not support {ep.kind!r} endpoints yet; supported: '
-      'pubsub://, kafka://, bigquery://, and file/gs:// paths',
+      'pubsub://, kafka://, delta://, iceberg://, bigquery://, and file/gs:// paths',
       2)
 
 
@@ -745,3 +758,151 @@ def _tail_files_follow(
       'untrusted_data': output.wrap_untrusted_rows(
           rows, truncated=truncated_budget or hit_limit),
   }
+
+
+def _tail_lakehouse_follow(
+    ep: uris.ParsedEndpoint,
+    *,
+    limit: int | None,
+    duration_sec: float | None,
+    poll_interval: float,
+    byte_budget: int,
+    default_project: str | None,
+    on_record: RecordCallback | None,
+) -> dict[str, Any]:
+  """Polls `delta://` commits or `iceberg://` snapshots in `-f` follow mode."""
+  import pyarrow.parquet as pq
+  from . import lakehouse
+
+  rows: list[dict[str, Any]] = []
+  scanned_bytes = 0
+  truncated_budget = False
+  interrupted = False
+  eff_poll = max(0.1, poll_interval)
+  deadline = (
+      time.monotonic() + duration_sec if duration_sec is not None else None)
+
+  last_delta_ver: int = -1
+  last_iceberg_snap: int | None = None
+  iceberg_dir: str | None = None
+
+  if ep.kind == 'delta':
+    try:
+      last_delta_ver = int(lakehouse.parse_delta_log(ep.config['table'])['version'])
+    except FileNotFoundError:
+      last_delta_ver = -1
+  else:
+    iceberg_dir = lakehouse.resolve_iceberg_table_dir(
+        ep.config, default_project=default_project)
+    try:
+      st = lakehouse.load_iceberg_state(iceberg_dir)
+      last_iceberg_snap = st['current_snapshot_id']
+    except FileNotFoundError:
+      last_iceberg_snap = None
+
+  try:
+    while True:
+      if limit is not None and len(rows) >= limit:
+        break
+      if deadline is not None and time.monotonic() >= deadline:
+        break
+
+      saw_data = False
+      if ep.kind == 'delta':
+        try:
+          cur_snap = lakehouse.parse_delta_log(ep.config['table'])
+          cur_ver = int(cur_snap['version'])
+        except FileNotFoundError:
+          cur_ver = -1
+        if cur_ver > last_delta_ver:
+          base_fields, actions = lakehouse.list_delta_cdc_actions(
+              ep.config['table'],
+              start_version=last_delta_ver + 1,
+              end_version=cur_ver)
+          last_delta_ver = cur_ver
+          type_map = {
+              f['name']: lakehouse._delta_type_to_py_type(f['type'])
+              for f in base_fields
+          }
+          for act in actions:
+            pvals = act.get('partition_values') or {}
+            ver = int(act['version'])
+            with lakehouse._fs_open_read(act['path']) as fobj:
+              pf = pq.ParquetFile(fobj)
+              for batch in pf.iter_batches():
+                for raw_r in batch.to_pylist():
+                  rec = {
+                      f['name']: lakehouse._coerce_scalar_for_py(
+                          raw_r.get(f['name'], pvals.get(f['name'])),
+                          type_map[f['name']])
+                      for f in base_fields
+                  }
+                  if act['kind'] == 'cdc_file':
+                    rec['_change_type'] = str(
+                        raw_r.get('_change_type', 'insert'))
+                  elif act['kind'] == 'removed_file':
+                    rec['_change_type'] = 'DELETE'
+                  else:
+                    rec['_change_type'] = 'INSERT'
+                  rec['_commit_version'] = int(raw_r.get('_commit_version', ver))
+                  est_sz = len(json.dumps(rec, default=str))
+                  if scanned_bytes + est_sz > byte_budget:
+                    truncated_budget = True
+                    break
+                  scanned_bytes += est_sz
+                  saw_data = True
+                  _emit_record(rows, rec, on_record)
+                  if limit is not None and len(rows) >= limit:
+                    break
+                if truncated_budget or (limit is not None and len(rows) >= limit):
+                  break
+            if truncated_budget or (limit is not None and len(rows) >= limit):
+              break
+      else:
+        assert iceberg_dir is not None
+        try:
+          st = lakehouse.load_iceberg_state(iceberg_dir)
+          cur_snap_id = st['current_snapshot_id']
+        except FileNotFoundError:
+          cur_snap_id = None
+        if cur_snap_id is not None and cur_snap_id != last_iceberg_snap:
+          _, changes = lakehouse.list_iceberg_cdc_changes(
+              iceberg_dir,
+              from_snapshot=last_iceberg_snap,
+              to_snapshot=cur_snap_id)
+          last_iceberg_snap = cur_snap_id
+          for rec in changes:
+            est_sz = len(json.dumps(rec, default=str))
+            if scanned_bytes + est_sz > byte_budget:
+              truncated_budget = True
+              break
+            scanned_bytes += est_sz
+            saw_data = True
+            _emit_record(rows, rec, on_record)
+            if limit is not None and len(rows) >= limit:
+              break
+
+      if truncated_budget or (limit is not None and len(rows) >= limit):
+        break
+      if not saw_data:
+        sleep_s = (
+            min(eff_poll, max(0.05, deadline - time.monotonic()))
+            if deadline is not None else eff_poll)
+        time.sleep(sleep_s)
+  except KeyboardInterrupt:
+    interrupted = True
+
+  hit_limit = bool(limit is not None and len(rows) >= limit)
+  return {
+      'uri': ep.raw,
+      'kind': ep.kind,
+      'mode': 'lakehouse_commit_follow',
+      'follow': True,
+      'interrupted': interrupted,
+      'non_destructive': True,
+      'sampled_count': len(rows),
+      'scanned_bytes': scanned_bytes,
+      'untrusted_data': output.wrap_untrusted_rows(
+          rows, truncated=truncated_budget or hit_limit),
+  }
+
