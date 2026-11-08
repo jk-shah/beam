@@ -48,11 +48,9 @@ class BuildPipeSpecTest(unittest.TestCase):
         ('gs://bucket/a.parquet', 'ReadFromParquet', 'WriteToParquet'),
         ('GS://bucket/a.parquet', 'ReadFromParquet', 'WriteToParquet'),
         ('a.AVRO', 'ReadFromAvro', 'WriteToAvro'),
-        # Output of an earlier command, read back.
         ('out/users.parquet*', 'ReadFromParquet', 'WriteToParquet'),
         ('out/users.avro-*', 'ReadFromAvro', 'WriteToAvro'),
         ('out/users.json-00000-of-00001', 'ReadFromJson', 'WriteToJson'),
-        # Windows backslash paths.
         (r'C:\Users\Ada\users.csv', 'ReadFromCsv', 'WriteToCsv'),
         (
             r'C:\Users\Ada\out\users.parquet*',
@@ -70,6 +68,24 @@ class BuildPipeSpecTest(unittest.TestCase):
     self.assertEqual([t['type'] for t in pipe.spec['pipeline']['transforms']],
                      ['ReadFromCsv', 'WriteToJson'])
 
+  def test_universal_uris_and_where_select_dlq(self):
+    pipe = build_pipe_spec(
+        'users.csv',
+        'bigquery://my-proj.analytics.users',
+        where="age >= 18 AND status != 'banned'",
+        select='id, lower(email) AS email, age',
+        dlq_sink='dlq/bad_rows.json',
+        if_exists='append',
+        include_counters=True,
+        prefer_python_bigquery_sink=True)
+    names = [t['name'] for t in pipe.spec['pipeline']['transforms']]
+    self.assertIn('ReadSource', names)
+    self.assertIn('FilterWhere', names)
+    self.assertIn('SelectFields', names)
+    self.assertIn('MergeDlq', names)
+    self.assertIn('WriteDlq', names)
+    self.assertIsNone(pipe.output_prefix)
+
   def test_errors_name_the_fix(self):
     cases = [
         (('users', 'out.csv'), {}, 'add --from-format'),
@@ -83,7 +99,9 @@ class BuildPipeSpecTest(unittest.TestCase):
             'to_format': 'xml'
         },
          "unsupported format 'xml' .* use one of: csv, json, parquet, avro"),
-        (('kafka://broker:9092/topic', 'b.csv'), {}, 'unsupported location'),
+        (('ftp://example.com/a.csv', 'b.csv'), {}, 'unsupported location'),
+        (('postgres://user:pass@host/db?table=t', 'b.csv'), {}, 'not allowed'),
+        (('a.csv', 'b.csv'), {'if_exists': 'append'}, '--if-exists=append'),
     ]
     for args, kwargs, message in cases:
       with self.subTest(args=args, kwargs=kwargs):
