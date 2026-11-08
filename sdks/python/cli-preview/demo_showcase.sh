@@ -89,4 +89,38 @@ echo "8) Distributed O(1)-Memory Reconciliation (beam diff)"
   --json
 
 echo ""
+echo "9) Zero-Docker Flex Template Packaging (beam package) & Live Follow (beam tail -f)"
+cat > "${WORK_DIR}/parameterized.yaml" <<'EOF'
+pipeline:
+  type: chain
+  transforms:
+    - type: ReadFromCsv
+      config:
+        path: "{{ input_csv }}"
+    - type: Filter
+      config:
+        language: python
+        keep:
+          callable: "lambda row: float(row.amount) >= {{ min_amount | default(100) }}"
+    - type: WriteToParquet
+      config:
+        path: "{{ output_parquet }}"
+EOF
+"${BEAM_BIN}" package "${WORK_DIR}/parameterized.yaml" \
+  --to "${WORK_DIR}/orders_flex_template.json" \
+  --project=demo-project \
+  --region=us-central1 \
+  --dry-run \
+  --json
+
+# Stream live appended JSONL events via `beam tail -f -n 2`
+touch "${WORK_DIR}/live_events.jsonl"
+(
+  sleep 0.3
+  printf '{"seq":1,"event":"open"}\n{"seq":2,"event":"purchase"}\n' >> "${WORK_DIR}/live_events.jsonl"
+) &
+"${BEAM_BIN}" tail -f -n 2 --duration 5s "${WORK_DIR}/live_events.jsonl" --json
+wait
+
+echo ""
 echo "Showcase completed successfully!"

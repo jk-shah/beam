@@ -57,7 +57,8 @@ Give your agent either:
 | `beam check <FILE\|->` | Fast static YAML & provider trust check (`--plan` for full Beam graph expansion) | `<80 ms` (static) |
 | `beam pipe --from <A> --to <B>` | Zero-code ETL with `--where`, `--select`, `--dlq`, `--max-bytes`, `--assert-counts`, `--verify` | Local or Cloud |
 | `beam diff <LEFT> <RIGHT>` | Distributed $O(1)$-memory key/hash dataset reconciliation (`EXIT_DIFF_MISMATCH = 6`) | Local or Cloud |
-| `beam tail <URI>` | Bounded, non-destructive stream/file peek (`ack_deadline` skip-ack on Pub/Sub) | Bounded |
+| `beam tail [-f] <URI>` | Bounded stream peek OR live `tail -f` follow (`pubsub://`, `kafka://`, `gs://`/local shards) | `<65 ms` |
+| `beam package <FILE\|->` | Zero-Docker YAML Flex Templates (`<2 s`) & zero-boilerplate Python AST Flex bundles | `<65 ms` |
 | `beam run <FILE\|->` | Runs Beam YAML pipelines (`--no-jinja` default on stdin to block SSTI) | Local or Cloud |
 | `beam wait <JOB_ID>` | Polls detached remote jobs and runs deferred `--assert-counts` / `--verify` checks | `<90 ms` |
 | `beam cancel <JOB_ID>` | Cancels or `--drain`s running remote pipelines | `<90 ms` |
@@ -70,9 +71,9 @@ Give your agent either:
 
 1. **Pure JSON Envelope (`--json` / `--output=json`)**:
    - Permanently redirects OS file descriptor `stdout` (`fd 1`) to `stderr` (`fd 2`) before importing `apache_beam`, keeping C++/gRPC/JVM logs out of machine-parsed JSON stdout.
-   - Every response includes `schema_version: "1.0"`, `ok`, `exit_code`, `duration_ms`, `metrics`, `outputs`, `warnings`, `error`, and `next_actions`.
+   - Every response includes `schema_version: "1.0"`, `ok`, `exit_code`, `duration_ms`, `metrics`, `outputs`, `warnings`, `error`, and `next_actions` (and `beam tail -f --json` emits flushed NDJSON `{"event":"record", ...}` lines followed by the final summary envelope).
 2. **Prompt-Injection Quarantine (`untrusted_data`)**:
-   - Sampled rows from `inspect`, `tail`, and `diff` live strictly inside `untrusted_data.rows` with ANSI/OSC escapes, C0/C1 control codes, Unicode BiDi overrides, and Unicode Tag characters (`U+E0000..U+E007F`) stripped.
+   - Sampled rows from `inspect`, `tail`, and `diff` live strictly inside `untrusted_data.rows` (or `record` with `untrusted_data: true` in `tail -f` NDJSON) with ANSI/OSC escapes, C0/C1 control codes, Unicode BiDi overrides, and Unicode Tag characters (`U+E0000..U+E007F`) stripped.
 3. **Cost & Mutation Guardrails**:
    - `--max-bytes 10GB` fails closed with exit code `8` (`EXIT_COST_LIMIT`) *before* launching any job (`$0` `tables.get` metadata fast path + `$0` `dryRun` fallback for BigQuery `VIEW`s).
    - Never overwrites existing files or non-empty BigQuery tables by default (`--if-exists={fail,replace,append}`).
@@ -106,4 +107,34 @@ beam wait <JOB_ID> --json
 ```
 
 *(Enterprise GCP org tip: if your VPC uses custom subnet mode or blocks external worker IPs, append `--subnetwork=regions/<REGION>/subnetworks/default --no_use_public_ips`.)*
+
+---
+
+## 6. Simplified Flex Templates (`beam package`) & Live Streaming (`beam tail -f`)
+
+### Zero-Docker YAML Flex Templates (`<2s`, No `Dockerfile` / `metadata.json` / Cloud Build)
+`beam package` inspects Jinja2 `{{ var }}` and `{{ var | default(...) }}` parameters via AST (zero template execution), resolves Google's regional `Yaml_Template` launcher image, writes the ready-to-launch `ContainerSpec` directly to GCS, and outputs ready-to-paste `gcloud dataflow flex-template run` + Cloud Composer (`DataflowStartFlexTemplateOperator`) snippets:
+
+```bash
+beam package orders_flex.yaml \
+  --to "gs://<BUCKET>/templates/orders_flex.json" \
+  --project=<PROJECT> --region=us-central1 \
+  --subnetwork=regions/us-central1/subnetworks/default --no-use-public-ips \
+  --temp-location="gs://<BUCKET>/tmp" \
+  --json
+```
+
+For custom Python pipelines (`.py`) or YAML pipelines with custom Python providers, `beam package pipeline.py --output-dir ./flex_bundle --image <AR_IMAGE> [--build-image] --json` extracts `PipelineOptions.add_argument` / `add_value_provider_argument` via Python `ast` and generates the single-image `Dockerfile` + `metadata.json` + `ContainerSpec` automatically.
+
+### Linux-Style Live Stream & Shard Follow (`beam tail -f`)
+```bash
+# Follow live Pub/Sub topic events (creates & auto-deletes an isolated ephemeral subscription):
+beam tail -f -n 20 pubsub://projects/<PROJECT>/topics/<TOPIC> --json
+
+# Follow a shared subscription non-destructively (never ACKs; deduplicates message_ids):
+beam tail -f --duration 30s pubsub://projects/<PROJECT>/subscriptions/<SUB>
+
+# Watch newly landing GCS / local DLQ or output shards in real time:
+beam tail -f "gs://<BUCKET>/dlq/*.json" --json
+```
 

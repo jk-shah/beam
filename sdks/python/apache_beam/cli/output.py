@@ -352,6 +352,14 @@ class JsonOutputSession:
       sys.stdout = sys.stderr
     return self
 
+  def emit_stream_line(self, payload: dict[str, Any]) -> None:
+    """Emits one incremental NDJSON event line without closing the session."""
+    if not self.enabled or self._emitted or self._json_stream is None:
+      return
+    serialized = json.dumps(payload, allow_nan=False)
+    self._json_stream.write(serialized + '\n')
+    self._json_stream.flush()
+
   def emit(self, payload: dict[str, Any]) -> None:
     if not self.enabled or self._emitted or self._json_stream is None:
       return

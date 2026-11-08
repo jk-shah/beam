@@ -128,6 +128,7 @@ _SUBCOMMANDS = frozenset([
     'tail',
     'wait',
     'cancel',
+    'package',
 ])
 _PASSTHROUGH_SUBCOMMANDS = frozenset(['run', 'pipe', 'diff', 'check'])
 _CLI_ZERO_FLAGS = {
@@ -155,6 +156,17 @@ _CLI_ZERO_FLAGS = {
     'check': frozenset([
         '--plan',
         '--trust-providers',
+        '--no-config',
+        '--help',
+    ]),
+    'tail': frozenset(['-f', '--follow', '--help']),
+    'package': frozenset([
+        '--no-use-public-ips',
+        '--no_use_public_ips',
+        '--enable-streaming-engine',
+        '--build-image',
+        '--dry-run',
+        '--dry_run',
         '--no-config',
         '--help',
     ]),
@@ -192,6 +204,35 @@ _CLI_ONE_FLAGS = {
         '--profile',
     ]),
     'check': frozenset(['--jinja-variables', '--profile']),
+    'tail': frozenset([
+        '-n',
+        '--limit',
+        '--duration',
+        '--poll-interval',
+        '--max-scanned-bytes',
+        '--project',
+    ]),
+    'package': frozenset([
+        '--to',
+        '--name',
+        '--description',
+        '--sdk',
+        '--image',
+        '--base-image',
+        '--region',
+        '--project',
+        '--subnetwork',
+        '--network',
+        '--staging-location',
+        '--temp-location',
+        '--service-account-email',
+        '--worker-machine-type',
+        '--max-workers',
+        '--num-workers',
+        '--requirements',
+        '--output-dir',
+        '--profile',
+    ]),
 }
 
 
@@ -375,6 +416,8 @@ def main(argv=None) -> int:
         return _sql(args, extra_args, json_session=json_session, t0=t0)
       if active_cmd == 'config':
         return _config(args, extra_args, json_session=json_session, t0=t0)
+      if active_cmd == 'package':
+        return _package(args, extra_args, json_session=json_session, t0=t0)
 
       # External plugin dispatch (`apache_beam.cli.plugins`).
       from . import llms_txt as llms_mod
@@ -717,20 +760,33 @@ def _build_parser():
   # 8. `beam tail`
   tail_p = commands.add_parser(
       'tail',
-      help='non-destructively peek at a Pub/Sub, Kafka, or dataset stream',
+      help='non-destructively peek or follow (-f) a stream or dataset',
       allow_abbrev=False)
   tail_p.add_argument('uri', metavar='URI', help='stream or dataset URI')
   tail_p.add_argument(
+      '-f',
+      '--follow',
+      action='store_true',
+      help='follow new messages/rows continuously until Ctrl-C, -n, or --duration')
+  tail_p.add_argument(
+      '-n',
       '--limit',
+      dest='limit',
       type=int,
-      default=5,
+      default=None,
       metavar='N',
-      help='max messages/rows to sample (default: 5)')
+      help='max messages/rows to sample (default: 5, or unlimited with -f)')
   tail_p.add_argument(
       '--duration',
-      default='5s',
+      default=None,
       metavar='DURATION',
-      help='bounded peek window (default: 5s)')
+      help='peek/follow window (default: 5s, or unlimited with -f)')
+  tail_p.add_argument(
+      '--poll-interval',
+      type=float,
+      default=0.5,
+      metavar='SEC',
+      help='poll interval in seconds in -f follow mode (default: 0.5)')
   tail_p.add_argument(
       '--max-scanned-bytes',
       default='64MB',
@@ -851,6 +907,98 @@ def _build_parser():
       'use', help='switch the active profile', allow_abbrev=False)
   use_p.add_argument(
       'profile_name', metavar='PROFILE', help='profile name to make active')
+
+  # 13. `beam package`
+  pkg_p = commands.add_parser(
+      'package',
+      help='package a .yaml or .py pipeline as a Dataflow Flex Template (<1s for YAML)',
+      allow_abbrev=False)
+  pkg_p.add_argument(
+      'source',
+      metavar='FILE_OR_STDIN',
+      help='pipeline .yaml/.py path, gs:// URI, or - for stdin YAML')
+  pkg_p.add_argument(
+      '--to',
+      dest='to_location',
+      metavar='SPEC_URI',
+      help='destination Flex Template spec JSON (gs://... or local path)')
+  pkg_p.add_argument('--name', metavar='NAME', help='template name')
+  pkg_p.add_argument(
+      '--description', metavar='TEXT', help='template description')
+  pkg_p.add_argument(
+      '--sdk',
+      default='auto',
+      choices=['auto', 'yaml', 'python'],
+      help='Flex Template SDK mode (default: auto)')
+  pkg_p.add_argument(
+      '--image',
+      metavar='IMAGE_URI',
+      help='container image URI (optional for YAML; Artifact Registry URI for Python)')
+  pkg_p.add_argument(
+      '--base-image',
+      default=None,
+      metavar='BASE_IMAGE',
+      help='launcher base image for Python templates')
+  pkg_p.add_argument(
+      '--region',
+      default='us-central1',
+      metavar='REGION',
+      help='default GCP region (default: us-central1)')
+  pkg_p.add_argument('--project', metavar='PROJECT', help='GCP project')
+  pkg_p.add_argument(
+      '--subnetwork', metavar='SUBNET', help='default worker GCE subnetwork')
+  pkg_p.add_argument(
+      '--network', metavar='NETWORK', help='default worker GCE network')
+  pkg_p.add_argument(
+      '--no-use-public-ips',
+      '--no_use_public_ips',
+      dest='no_use_public_ips',
+      action='store_true',
+      help='set WORKER_IP_PRIVATE in template defaultEnvironment')
+  pkg_p.add_argument(
+      '--staging-location',
+      metavar='GCS_URI',
+      help='default staging location in template defaultEnvironment')
+  pkg_p.add_argument(
+      '--temp-location',
+      metavar='GCS_URI',
+      help='default temp location in template defaultEnvironment')
+  pkg_p.add_argument(
+      '--service-account-email',
+      metavar='EMAIL',
+      help='default worker service account email')
+  pkg_p.add_argument(
+      '--worker-machine-type',
+      metavar='TYPE',
+      help='default worker machine type')
+  pkg_p.add_argument(
+      '--max-workers', type=int, metavar='N', help='default max workers')
+  pkg_p.add_argument(
+      '--num-workers', type=int, metavar='N', help='default initial workers')
+  pkg_p.add_argument(
+      '--enable-streaming-engine',
+      action='store_true',
+      help='enable Streaming Engine in template defaultEnvironment')
+  pkg_p.add_argument(
+      '--requirements',
+      dest='requirements_file',
+      metavar='FILE',
+      help='requirements.txt to bake into Python Flex Template image')
+  pkg_p.add_argument(
+      '--output-dir',
+      metavar='DIR',
+      help='local directory to write generated Dockerfile, metadata.json, and spec')
+  pkg_p.add_argument(
+      '--build-image',
+      action='store_true',
+      help='build and push Python Flex Template container via Cloud Build')
+  pkg_p.add_argument(
+      '--dry-run',
+      '--dry_run',
+      dest='dry_run',
+      action='store_true',
+      help='validate and preview ContainerSpec without writing files or building images')
+  _add_config_selection_args(pkg_p)
   return parser
 
 
@@ -1071,13 +1219,46 @@ def _inspect(args, extra_args, *, json_session, t0: float) -> int:
 def _tail(args, extra_args, *, json_session, t0: float) -> int:
   from . import tail
   _reject_extra_args(extra_args)
+  follow = bool(getattr(args, 'follow', False))
+  eff_limit = args.limit if args.limit is not None else (None if follow else 5)
+  eff_duration = (
+      args.duration if args.duration is not None else (None if follow else '5s')
+  )
+
+  on_record = None
+  if follow:
+    if json_session.enabled:
+      def _stream_ndjson(rec: dict[str, Any], idx: int) -> None:
+        json_session.emit_stream_line({
+            'event': 'record',
+            'index': idx,
+            'untrusted_data': True,
+            'record': rec,
+        })
+
+      on_record = _stream_ndjson
+    else:
+      print(
+          f'Following {args.uri} (non_destructive=True; Ctrl-C to stop)...',
+          file=sys.stderr,
+          flush=True)
+
+      def _stream_text(rec: dict[str, Any], idx: int) -> None:
+        del idx
+        print(json.dumps(rec, sort_keys=True), flush=True)
+
+      on_record = _stream_text
+
   try:
     info = tail.run_tail(
         args.uri,
-        limit=args.limit,
-        duration=args.duration,
+        limit=eff_limit,
+        duration=eff_duration,
+        follow=follow,
+        poll_interval=args.poll_interval,
         max_scanned_bytes=args.max_scanned_bytes,
-        default_project=args.project)
+        default_project=args.project,
+        on_record=on_record)
   except tail.TailError as e:
     raise _CliError(str(e), e.exit_code) from None
   except ValueError as e:
@@ -1086,21 +1267,138 @@ def _tail(args, extra_args, *, json_session, t0: float) -> int:
     raise _CliError(f'tail failed: {e}', EXIT_PIPELINE_FAILED) from None
 
   untrusted = info.pop('untrusted_data', None)
+  interrupted = bool(info.get('interrupted', False))
+  rc = EXIT_INTERRUPTED if interrupted else EXIT_OK
   if json_session.enabled:
     json_session.emit(
         output.build_envelope(
-            ok=True,
+            ok=not interrupted,
             command='tail',
-            exit_code=EXIT_OK,
+            exit_code=rc,
             duration_ms=int((time.monotonic() - t0) * 1000),
             outputs=info,
             untrusted_data=untrusted))
-  else:
+  elif not follow:
     print(
         f"Sampled {info['sampled_count']} record(s) from {info['uri']} "
         f"(mode={info['mode']}, non_destructive={info['non_destructive']}):")
     for r in (untrusted or {}).get('rows', ()):
       print('  ' + json.dumps(r, sort_keys=True))
+  else:
+    print(
+        f"Stopped following {info['uri']} after {info['sampled_count']} "
+        'record(s).',
+        file=sys.stderr)
+  return rc
+
+
+def _extract_opt_from_resolved(resolved: list[str], *keys: str) -> str | None:
+  key_set = set(keys)
+  i = 0
+  val: str | None = None
+  while i < len(resolved):
+    tok = resolved[i]
+    if '=' in tok:
+      k, v = tok.split('=', 1)
+      if k in key_set:
+        val = v
+    elif tok in key_set and i + 1 < len(resolved):
+      val = resolved[i + 1]
+      i += 1
+    i += 1
+  return val
+
+
+def _package(args, extra_args, *, json_session, t0: float) -> int:
+  from . import package as pkg_mod
+  _reject_extra_args(extra_args)
+  cfg_args = _resolve_config_args(args, [])
+  eff_project = args.project or _extract_opt_from_resolved(
+      cfg_args, '--project')
+  eff_region = args.region or _extract_opt_from_resolved(
+      cfg_args, '--region') or pkg_mod.DEFAULT_REGION
+  eff_subnet = args.subnetwork or _extract_opt_from_resolved(
+      cfg_args, '--subnetwork')
+  eff_staging = args.staging_location or _extract_opt_from_resolved(
+      cfg_args, '--staging_location', '--staging-location')
+  eff_temp = args.temp_location or _extract_opt_from_resolved(
+      cfg_args, '--temp_location', '--temp-location')
+  eff_no_pub = bool(
+      args.no_use_public_ips or '--no_use_public_ips' in cfg_args or
+      '--no-use-public-ips' in cfg_args)
+
+  kwargs: dict[str, Any] = {
+      'to_location': args.to_location,
+      'name': args.name,
+      'description': args.description,
+      'sdk': args.sdk,
+      'image': args.image,
+      'region': eff_region,
+      'project': eff_project,
+      'subnetwork': eff_subnet,
+      'network': args.network,
+      'no_use_public_ips': eff_no_pub,
+      'staging_location': eff_staging,
+      'temp_location': eff_temp,
+      'service_account_email': args.service_account_email,
+      'worker_machine_type': args.worker_machine_type,
+      'max_workers': args.max_workers,
+      'num_workers': args.num_workers,
+      'enable_streaming_engine': args.enable_streaming_engine,
+      'requirements_file': args.requirements_file,
+      'output_dir': args.output_dir,
+      'build_image': args.build_image,
+      'dry_run': args.dry_run,
+  }
+  if args.base_image:
+    kwargs['base_image'] = args.base_image
+
+  try:
+    report = pkg_mod.run_package(args.source, **kwargs)
+  except pkg_mod.PackageError as e:
+    raise _CliError(str(e), e.exit_code) from None
+  except Exception as e:  # pylint: disable=broad-except
+    raise _CliError(f'package failed: {e}', EXIT_PIPELINE_FAILED) from None
+
+  pkg_warnings = report.pop('warnings', None) or []
+  if json_session.enabled:
+    json_session.emit(
+        output.build_envelope(
+            ok=True,
+            command='package',
+            exit_code=EXIT_OK,
+            duration_ms=int((time.monotonic() - t0) * 1000),
+            warnings=pkg_warnings,
+            outputs=report))
+  else:
+    docker_msg = (
+        'yes (single-image Python container)'
+        if report['docker_build_required'] else
+        'no (zero-Docker managed YAML launcher)')
+    print(f"Template      : {report['name']} (sdk={report['sdk_language']})")
+    print(f'Docker Build  : {docker_msg}')
+    print(f"Launcher Image: {report['image']}")
+    if report.get('template_location'):
+      print(f"Template Spec : {report['template_location']}")
+    if report.get('written_files'):
+      print('Written Files :')
+      for wf in report['written_files']:
+        print(f'  - {wf}')
+    if report.get('parameters'):
+      print(f"Parameters ({len(report['parameters'])}):")
+      for p in report['parameters']:
+        req_s = 'optional' if p.get('isOptional') else 'required'
+        def_s = (
+            f", default={p['defaultValue']!r}"
+            if 'defaultValue' in p else '')
+        print(f"  - {p['name']} ({req_s}{def_s})")
+    for w in pkg_warnings:
+      print(f'Warning       : {w}', file=sys.stderr)
+    if args.dry_run:
+      print('\nContainerSpec Preview:')
+      print(json.dumps(report['container_spec'], indent=2, sort_keys=True))
+    print('\nLaunch with gcloud:')
+    print(f"  {report['launch']['gcloud']}")
   return EXIT_OK
 
 

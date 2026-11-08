@@ -15,26 +15,43 @@
 # limitations under the License.
 #
 
-"""Bounded, non-destructive stream & dataset peek (`beam tail`).
+"""Bounded & live follow (`-f`) non-destructive stream/dataset peek (`beam tail`).
 
 Guarantees:
-1. `pubsub://projects/<p>/subscriptions/<s>`: pulls up to `--limit` messages
-   within `--duration`, **never calls `acknowledge()`**, and resets
-   `ack_deadline_seconds=0` so pulled messages remain immediately visible to
-   downstream consumers with zero message loss!
-2. `pubsub://projects/<p>/topics/<t>`: creates an ephemeral subscription
-   `beam-cli-peek-<rand>`, garbage-collects stale `beam-cli-peek-*`
-   subscriptions older than 15 minutes on the topic, pulls up to `--limit`
-   messages published during `--duration`, and deletes the ephemeral
-   subscription in a `finally:` block.
-3. Enforces `--max-scanned-bytes` (default `64MB`) and wraps all sampled
-   records inside `output.wrap_untrusted_rows(...)` (`untrusted_data`).
+1. Bounded mode (`beam tail <URI>`): samples up to `--limit` (`-n`, default 5)
+   records within `--duration` (default `5s`) and exits cleanly (`0`), so AI
+   agents never hang synchronous tool calls.
+2. Live follow mode (`beam tail -f <URI>`): streams new records continuously
+   as they arrive (just like Unix `tail -f`) until `Ctrl-C`, `--limit` (`-n`),
+   or `--duration` is reached:
+   - `pubsub://projects/<p>/subscriptions/<s>`: **never calls `acknowledge()`**,
+     deduplicates redelivered `message_id`s in a bounded ring buffer, and
+     releases leases (`ack_deadline_seconds=0`) so downstream consumers see
+     every message with zero loss.
+   - `pubsub://projects/<p>/topics/<t>`: creates an ephemeral subscription
+     `beam-cli-peek-<epoch_hex>-<rand>`, acknowledges messages on that private
+     ephemeral subscription so `-f` never duplicates records across ack
+     deadlines, and **always deletes** the ephemeral subscription in `finally:`
+     (including on `Ctrl-C` / `KeyboardInterrupt`).
+   - `kafka://<brokers>/<topic>`: tails from `'latest'` in `-f` mode (or
+     `'earliest'` in bounded peek) without committing consumer offsets.
+   - Local or `gs://` files/directories: watches appended lines and newly
+     landed streaming/DLQ shards live.
+3. Enforces `--max-scanned-bytes` (default `64MB`) and sanitizes every record
+   via `output.sanitize_untrusted_value(...)` (`untrusted_data`).
 """
 
+import collections
+import csv
+import glob
+import io
 import json
+import os
+from pathlib import Path
 import time
-import uuid
 from typing import Any
+from typing import Callable
+import uuid
 
 from . import cost_guard
 from . import inspect_cmd
@@ -43,6 +60,8 @@ from . import output
 from . import uris
 
 EXIT_MISSING_PACKAGE = 4
+
+RecordCallback = Callable[[dict[str, Any], int], None]
 
 
 class TailError(Exception):
@@ -63,18 +82,36 @@ def _decode_payload_bytes(raw_bytes: bytes) -> Any:
   return output.sanitize_untrusted_text(text)
 
 
+def _emit_record(
+    rows: list[dict[str, Any]],
+    raw_record: Any,
+    on_record: RecordCallback | None,
+) -> dict[str, Any]:
+  sanitized = output.sanitize_untrusted_value(raw_record)
+  if not isinstance(sanitized, dict):
+    sanitized = {'value': sanitized}
+  rows.append(sanitized)
+  if on_record is not None:
+    on_record(sanitized, len(rows))
+  return sanitized
+
+
 def run_tail(
     location: str,
     *,
-    limit: int = 5,
-    duration: str = '5s',
+    limit: int | None = 5,
+    duration: str | None = '5s',
+    follow: bool = False,
+    poll_interval: float = 0.5,
     max_scanned_bytes: str = '64MB',
     default_project: str | None = None,
+    on_record: RecordCallback | None = None,
 ) -> dict[str, Any]:
-  """Samples up to `limit` records from a stream or dataset without consuming."""
-  if limit <= 0:
-    raise TailError('--limit must be >= 1', 2)
-  duration_sec = jobs.parse_duration_seconds(duration)
+  """Samples or live-follows (`follow=True`) records without consuming."""
+  if limit is not None and (limit < 0 or (limit == 0 and not follow)):
+    raise TailError('--limit (-n) must be >= 1 (or 0 with -f)', 2)
+  duration_sec = (
+      jobs.parse_duration_seconds(duration) if duration is not None else None)
   byte_budget = cost_guard.parse_byte_size(max_scanned_bytes)
 
   try:
@@ -91,30 +128,58 @@ def run_tail(
         ep,
         limit=limit,
         duration_sec=duration_sec,
+        follow=follow,
+        poll_interval=poll_interval,
         byte_budget=byte_budget,
-        default_project=default_project)
+        default_project=default_project,
+        on_record=on_record)
   if ep.kind == 'kafka':
     return _tail_kafka(
-        ep, limit=limit, duration_sec=duration_sec, byte_budget=byte_budget)
+        ep,
+        limit=limit,
+        duration_sec=duration_sec,
+        follow=follow,
+        byte_budget=byte_budget,
+        on_record=on_record)
+  if ep.kind == 'file' and follow:
+    return _tail_files_follow(
+        location,
+        limit=limit,
+        duration_sec=duration_sec,
+        poll_interval=poll_interval,
+        byte_budget=byte_budget,
+        default_project=default_project,
+        on_record=on_record)
   if ep.kind in ('file', 'bigquery'):
+    if follow and ep.kind == 'bigquery':
+      raise TailError(
+          'beam tail -f (--follow) is for streaming/file endpoints '
+          '(pubsub://, kafka://, local paths, gs://); omit -f to peek at '
+          'bigquery:// tables.',
+          2)
+    eff_limit = 5 if limit is None else limit
     inspected = inspect_cmd.run_inspect(
         location,
-        sample_count=limit,
+        sample_count=eff_limit,
         max_scanned_bytes=max_scanned_bytes,
         default_project=default_project)
+    sampled_rows = list((inspected.get('untrusted_data') or {}).get('rows', ()))
+    if on_record is not None:
+      for idx, r in enumerate(sampled_rows, 1):
+        on_record(r, idx)
     return {
         'uri': location,
         'kind': ep.kind,
         'mode': 'snapshot_peek',
+        'follow': False,
         'non_destructive': True,
-        'sampled_count': len(
-            (inspected.get('untrusted_data') or {}).get('rows', ())),
+        'sampled_count': len(sampled_rows),
         'scanned_bytes': inspected.get('estimated_bytes'),
         'untrusted_data': inspected.get('untrusted_data'),
     }
   raise TailError(
       f'beam tail does not support {ep.kind!r} endpoints yet; supported: '
-      'pubsub://, kafka://, bigquery://, and file paths',
+      'pubsub://, kafka://, bigquery://, and file/gs:// paths',
       2)
 
 
@@ -128,7 +193,6 @@ def _gc_stale_peek_subscriptions(
       sub_name = sub_path.rsplit('/', 1)[-1]
       if not sub_name.startswith('beam-cli-peek-'):
         continue
-      # Subscription name format: beam-cli-peek-<epoch_hex>-<rand>
       parts = sub_name.split('-')
       if len(parts) >= 5:
         try:
@@ -144,10 +208,13 @@ def _gc_stale_peek_subscriptions(
 def _tail_pubsub(
     ep: uris.ParsedEndpoint,
     *,
-    limit: int,
-    duration_sec: float,
+    limit: int | None,
+    duration_sec: float | None,
+    follow: bool,
+    poll_interval: float,
     byte_budget: int,
     default_project: str | None,
+    on_record: RecordCallback | None,
 ) -> dict[str, Any]:
   try:
     from google.api_core import exceptions as gcp_exceptions
@@ -166,11 +233,27 @@ def _tail_pubsub(
   rows: list[dict[str, Any]] = []
   scanned_bytes = 0
   truncated_budget = False
+  interrupted = False
+
+  # Bounded deduplication window so non-destructive subscription `tail -f`
+  # never prints redelivered unacked messages twice.
+  seen_ids_order: collections.deque[str] = collections.deque()
+  seen_ids_set: set[str] = set()
+
+  def _remember_msg_id(mid: str) -> bool:
+    if not mid:
+      return True
+    if mid in seen_ids_set:
+      return False
+    if len(seen_ids_order) >= 8192:
+      oldest = seen_ids_order.popleft()
+      seen_ids_set.discard(oldest)
+    seen_ids_order.append(mid)
+    seen_ids_set.add(mid)
+    return True
 
   try:
     if topic_path and not sub_path:
-      # Topic peek: create a short-lived ephemeral subscription and delete it
-      # in `finally:` so no persistent subscription is left behind.
       parts = topic_path.split('/')
       proj = parts[1] if len(parts) >= 4 else default_project
       if not proj:
@@ -191,62 +274,124 @@ def _tail_pubsub(
           })
       sub_path = ephemeral_sub
 
-    deadline = time.monotonic() + duration_sec
-    pending_ack_ids: list[str] = []
+    deadline = (
+        time.monotonic() + duration_sec if duration_sec is not None else None)
+    pending_nack_ids: list[str] = []
 
-    while len(rows) < limit and time.monotonic() < deadline:
-      remaining = max(0.2, deadline - time.monotonic())
-      need = limit - len(rows)
-      try:
-        response = subscriber.pull(
-            request={
-                'subscription': sub_path,
-                'max_messages': need,
-            },
-            timeout=min(remaining, 5.0))
-      except gcp_exceptions.DeadlineExceeded:
-        break
-
-      received = list(getattr(response, 'received_messages', ()) or ())
-      if not received:
-        if not ephemeral_sub:
-          # Existing subscription had 0 ready messages on pull -> return fast!
+    try:
+      while True:
+        if limit is not None and len(rows) >= limit:
           break
-        time.sleep(min(0.25, remaining))
-        continue
-
-      for rm in received:
-        if not ephemeral_sub and rm.ack_id:
-          pending_ack_ids.append(rm.ack_id)
-        msg = rm.message
-        raw_data = bytes(getattr(msg, 'data', b'') or b'')
-        if scanned_bytes + len(raw_data) > byte_budget:
-          truncated_budget = True
+        if deadline is not None and time.monotonic() >= deadline:
           break
-        scanned_bytes += len(raw_data)
-        pub_time = getattr(msg, 'publish_time', None)
-        rows.append({
-            'message_id': str(getattr(msg, 'message_id', '')),
-            'publish_time': (
-                pub_time.isoformat() if hasattr(pub_time, 'isoformat') else
-                str(pub_time) if pub_time else None),
-            'attributes': dict(getattr(msg, 'attributes', {}) or {}),
-            'payload': _decode_payload_bytes(raw_data),
-        })
-        if len(rows) >= limit:
-          break
-      if truncated_budget:
-        break
 
-    # Non-destructive guarantee on existing subscriptions: NEVER acknowledge,
-    # and release the lease immediately (`ack_deadline_seconds=0`) so real
-    # consumers see the messages without waiting for ack deadline expiry!
-    if not ephemeral_sub and pending_ack_ids and sub_path:
+        remaining = (
+            max(0.2, deadline - time.monotonic())
+            if deadline is not None else 5.0)
+        batch_max = (
+            min(20, limit - len(rows)) if limit is not None else 20)
+        if batch_max <= 0:
+          break
+
+        try:
+          response = subscriber.pull(
+              request={
+                  'subscription': sub_path,
+                  'max_messages': batch_max,
+              },
+              timeout=min(remaining, 5.0))
+        except gcp_exceptions.DeadlineExceeded:
+          if not follow:
+            break
+          continue
+
+        received = list(getattr(response, 'received_messages', ()) or ())
+        if not received:
+          if not follow and not ephemeral_sub:
+            break
+          sleep_s = (
+              min(poll_interval, remaining)
+              if deadline is not None else poll_interval)
+          time.sleep(max(0.05, sleep_s))
+          continue
+
+        ephemeral_ack_ids: list[str] = []
+        cycle_nack_ids: list[str] = []
+        for rm in received:
+          if ephemeral_sub:
+            if rm.ack_id:
+              ephemeral_ack_ids.append(rm.ack_id)
+          else:
+            if rm.ack_id:
+              cycle_nack_ids.append(rm.ack_id)
+              pending_nack_ids.append(rm.ack_id)
+
+          msg = rm.message
+          msg_id = str(getattr(msg, 'message_id', ''))
+          if not ephemeral_sub and not _remember_msg_id(msg_id):
+            continue
+
+          raw_data = bytes(getattr(msg, 'data', b'') or b'')
+          if scanned_bytes + len(raw_data) > byte_budget:
+            truncated_budget = True
+            break
+          scanned_bytes += len(raw_data)
+          pub_time = getattr(msg, 'publish_time', None)
+          _emit_record(
+              rows,
+              {
+                  'message_id': msg_id,
+                  'publish_time': (
+                      pub_time.isoformat() if hasattr(pub_time, 'isoformat')
+                      else str(pub_time) if pub_time else None),
+                  'attributes': dict(getattr(msg, 'attributes', {}) or {}),
+                  'payload': _decode_payload_bytes(raw_data),
+              },
+              on_record)
+          if limit is not None and len(rows) >= limit:
+            break
+
+        # Private ephemeral subscription: ACK immediately so `-f` never
+        # redelivers already-printed messages after 10s ack deadline!
+        if ephemeral_sub and ephemeral_ack_ids and sub_path:
+          try:
+            subscriber.acknowledge(
+                request={
+                    'subscription': sub_path,
+                    'ack_ids': ephemeral_ack_ids,
+                })
+          except Exception:  # pylint: disable=broad-except
+            pass
+
+        # Shared existing subscription in `-f` mode: release lease immediately
+        # so real downstream consumers are never delayed, then pause briefly.
+        if not ephemeral_sub and follow and cycle_nack_ids and sub_path:
+          try:
+            subscriber.modify_ack_deadline(
+                request={
+                    'subscription': sub_path,
+                    'ack_ids': cycle_nack_ids,
+                    'ack_deadline_seconds': 0,
+                })
+            pending_nack_ids.clear()
+          except Exception:  # pylint: disable=broad-except
+            pass
+
+        if truncated_budget:
+          break
+        if follow and not ephemeral_sub:
+          time.sleep(max(0.1, poll_interval))
+    except KeyboardInterrupt:
+      if not follow:
+        raise
+      interrupted = True
+
+    if not ephemeral_sub and pending_nack_ids and sub_path:
       try:
         subscriber.modify_ack_deadline(
             request={
                 'subscription': sub_path,
-                'ack_ids': pending_ack_ids,
+                'ack_ids': pending_nack_ids,
                 'ack_deadline_seconds': 0,
             })
       except Exception:  # pylint: disable=broad-except
@@ -262,25 +407,32 @@ def _tail_pubsub(
     except Exception:  # pylint: disable=broad-except
       pass
 
+  hit_limit = bool(limit is not None and len(rows) >= limit)
   return {
       'uri': ep.raw,
       'kind': 'pubsub',
-      'mode': 'ephemeral_topic_subscription'
-      if ephemeral_sub else 'subscription_nack_peek',
+      'mode': (
+          'ephemeral_topic_follow' if (ephemeral_sub and follow) else
+          'ephemeral_topic_subscription' if ephemeral_sub else
+          'subscription_nack_follow' if follow else 'subscription_nack_peek'),
+      'follow': bool(follow),
+      'interrupted': interrupted,
       'non_destructive': True,
       'sampled_count': len(rows),
       'scanned_bytes': scanned_bytes,
       'untrusted_data': output.wrap_untrusted_rows(
-          rows, truncated=truncated_budget or len(rows) >= limit),
+          rows, truncated=truncated_budget or hit_limit),
   }
 
 
 def _tail_kafka(
     ep: uris.ParsedEndpoint,
     *,
-    limit: int,
-    duration_sec: float,
+    limit: int | None,
+    duration_sec: float | None,
+    follow: bool,
     byte_budget: int,
+    on_record: RecordCallback | None,
 ) -> dict[str, Any]:
   bootstrap = ep.config['bootstrap_servers']
   topic = ep.config['topic']
@@ -296,42 +448,300 @@ def _tail_kafka(
       'bootstrap.servers': bootstrap,
       'group.id': f'beam-cli-peek-{uuid.uuid4().hex[:10]}',
       'enable.auto.commit': False,
-      'auto.offset.reset': 'earliest',
+      'auto.offset.reset': 'latest' if follow else 'earliest',
   })
   rows: list[dict[str, Any]] = []
   scanned_bytes = 0
   truncated_budget = False
+  interrupted = False
   try:
     consumer.subscribe([topic])
-    deadline = time.monotonic() + duration_sec
-    while len(rows) < limit and time.monotonic() < deadline:
-      msg = consumer.poll(timeout=min(0.5, max(0.05, deadline - time.monotonic())))
-      if msg is None:
-        continue
-      if msg.error():
-        continue
-      raw_val = bytes(msg.value() or b'')
-      if scanned_bytes + len(raw_val) > byte_budget:
-        truncated_budget = True
-        break
-      scanned_bytes += len(raw_val)
-      raw_key = msg.key()
-      rows.append({
-          'partition': msg.partition(),
-          'offset': msg.offset(),
-          'key': raw_key.decode('utf-8', errors='replace') if raw_key else None,
-          'payload': _decode_payload_bytes(raw_val),
-      })
+    deadline = (
+        time.monotonic() + duration_sec if duration_sec is not None else None)
+    try:
+      while True:
+        if limit is not None and len(rows) >= limit:
+          break
+        if deadline is not None and time.monotonic() >= deadline:
+          break
+        poll_wait = (
+            min(0.5, max(0.05, deadline - time.monotonic()))
+            if deadline is not None else 0.5)
+        msg = consumer.poll(timeout=poll_wait)
+        if msg is None or msg.error():
+          continue
+        raw_val = bytes(msg.value() or b'')
+        if scanned_bytes + len(raw_val) > byte_budget:
+          truncated_budget = True
+          break
+        scanned_bytes += len(raw_val)
+        raw_key = msg.key()
+        _emit_record(
+            rows,
+            {
+                'partition': msg.partition(),
+                'offset': msg.offset(),
+                'key': (
+                    raw_key.decode('utf-8', errors='replace')
+                    if raw_key else None),
+                'payload': _decode_payload_bytes(raw_val),
+            },
+            on_record)
+    except KeyboardInterrupt:
+      if not follow:
+        raise
+      interrupted = True
   finally:
     consumer.close()
 
+  hit_limit = bool(limit is not None and len(rows) >= limit)
   return {
       'uri': ep.raw,
       'kind': 'kafka',
-      'mode': 'uncommitted_ephemeral_consumer',
+      'mode': 'uncommitted_follow' if follow else 'uncommitted_ephemeral_consumer',
+      'follow': bool(follow),
+      'interrupted': interrupted,
       'non_destructive': True,
       'sampled_count': len(rows),
       'scanned_bytes': scanned_bytes,
       'untrusted_data': output.wrap_untrusted_rows(
-          rows, truncated=truncated_budget or len(rows) >= limit),
+          rows, truncated=truncated_budget or hit_limit),
+  }
+
+
+def _list_watch_targets(
+    location: str, default_project: str | None) -> list[tuple[str, int]]:
+  """Lists `(uri_or_path, size_bytes)` for local files/globs or `gs://`."""
+  if location.startswith('gs://'):
+    try:
+      from google.cloud import storage
+    except ImportError as e:
+      raise TailError(
+          f'google-cloud-storage is required to tail {location}: {e}',
+          EXIT_MISSING_PACKAGE) from None
+    without_scheme = location[len('gs://'):]
+    parts = without_scheme.split('/', 1)
+    bucket_name = parts[0]
+    raw_prefix = parts[1] if len(parts) > 1 else ''
+    # Strip trailing wildcard patterns like `*.jsonl` or `*` into GCS prefix.
+    prefix = raw_prefix.split('*', 1)[0]
+    has_glob = '*' in raw_prefix or '?' in raw_prefix
+    client = (
+        storage.Client(project=default_project)
+        if default_project else storage.Client())
+    items: list[tuple[str, int]] = []
+    import fnmatch
+    for blob in client.list_blobs(bucket_name, prefix=prefix):
+      if blob.name.endswith('/'):
+        continue
+      if has_glob and not fnmatch.fnmatch(blob.name, raw_prefix):
+        continue
+      if not has_glob and raw_prefix and not raw_prefix.endswith('/'):
+        # Exact file OR shard prefix (`out.jsonl-00000-of-00001`).
+        if blob.name != raw_prefix and not blob.name.startswith(
+            raw_prefix + '-'):
+          continue
+      items.append((f'gs://{bucket_name}/{blob.name}', int(blob.size or 0)))
+    items.sort(key=lambda kv: kv[0])
+    return items
+
+  p = Path(location)
+  if p.is_dir():
+    matches = [
+        str(child) for child in sorted(p.iterdir()) if child.is_file()
+    ]
+  elif any(ch in location for ch in ('*', '?', '[')):
+    matches = sorted(glob.glob(location))
+  elif p.is_file():
+    matches = [str(p)]
+  else:
+    matches = sorted(glob.glob(location + '-*-of-*'))
+
+  out: list[tuple[str, int]] = []
+  for m in matches:
+    try:
+      st = os.stat(m)
+      if os.path.isfile(m):
+        out.append((m, int(st.st_size)))
+    except OSError:
+      continue
+  return out
+
+
+def _read_appended_bytes(
+    item_uri: str, offset: int, default_project: str | None) -> bytes:
+  if item_uri.startswith('gs://'):
+    from google.cloud import storage
+    without_scheme = item_uri[len('gs://'):]
+    bucket_name, blob_name = without_scheme.split('/', 1)
+    client = (
+        storage.Client(project=default_project)
+        if default_project else storage.Client())
+    blob = client.bucket(bucket_name).blob(blob_name)
+    return blob.download_as_bytes(start=offset)
+
+  with open(item_uri, 'rb') as f:
+    f.seek(offset)
+    return f.read()
+
+
+def _parse_text_lines_from_chunk(
+    item_uri: str,
+    chunk_text: str,
+    csv_headers: dict[str, list[str]],
+) -> list[Any]:
+  lower = item_uri.lower()
+  is_csv = lower.endswith('.csv') or '.csv-' in lower
+  lines = [ln for ln in chunk_text.splitlines() if ln.strip()]
+  if not lines:
+    return []
+  if is_csv:
+    reader = list(csv.reader(io.StringIO('\n'.join(lines))))
+    if not reader:
+      return []
+    if item_uri not in csv_headers:
+      csv_headers[item_uri] = reader[0]
+      reader = reader[1:]
+    hdr = csv_headers[item_uri]
+    return [dict(zip(hdr, row)) for row in reader]
+
+  parsed: list[Any] = []
+  for ln in lines:
+    stripped = ln.strip()
+    if stripped.startswith('{') or stripped.startswith('['):
+      try:
+        parsed.append(json.loads(stripped))
+        continue
+      except ValueError:
+        pass
+    parsed.append({'line': stripped, 'source': item_uri})
+  return parsed
+
+
+def _tail_files_follow(
+    location: str,
+    *,
+    limit: int | None,
+    duration_sec: float | None,
+    poll_interval: float,
+    byte_budget: int,
+    default_project: str | None,
+    on_record: RecordCallback | None,
+) -> dict[str, Any]:
+  """Follows local or `gs://` files/directories as lines or shards land (`-f`)."""
+  rows: list[dict[str, Any]] = []
+  scanned_bytes = 0
+  truncated_budget = False
+  interrupted = False
+  csv_headers: dict[str, list[str]] = {}
+
+  # Snapshot existing files at their current end-of-file (just like `tail -f`
+  # watches newly appended lines and newly created shards). For CSV files that
+  # already exist, capture line 0 header so subsequent appended rows map cleanly.
+  offsets: dict[str, int] = {}
+  for uri_item, sz in _list_watch_targets(location, default_project):
+    offsets[uri_item] = sz
+    lower = uri_item.lower()
+    if sz > 0 and (lower.endswith('.csv') or '.csv-' in lower):
+      try:
+        head_bytes = _read_appended_bytes(uri_item, 0, default_project)[:4096]
+        first_line = head_bytes.decode('utf-8', errors='replace').splitlines()
+        if first_line:
+          hdr_rows = list(csv.reader([first_line[0]]))
+          if hdr_rows:
+            csv_headers[uri_item] = hdr_rows[0]
+      except Exception:  # pylint: disable=broad-except
+        pass
+
+  deadline = (
+      time.monotonic() + duration_sec if duration_sec is not None else None)
+  eff_poll = max(0.1, poll_interval)
+
+  try:
+    while True:
+      if limit is not None and len(rows) >= limit:
+        break
+      if deadline is not None and time.monotonic() >= deadline:
+        break
+
+      targets = _list_watch_targets(location, default_project)
+      saw_data = False
+      for uri_item, sz in targets:
+        prev_off = offsets.get(uri_item, 0)
+        if sz <= prev_off:
+          continue
+        lower = uri_item.lower()
+        is_binary_columnar = (
+            lower.endswith('.parquet') or '.parquet-' in lower or
+            lower.endswith('.avro') or '.avro-' in lower)
+        if is_binary_columnar and prev_off == 0:
+          # Newly landed Parquet/Avro shard: sample rows via `inspect_cmd`!
+          rem = None if limit is None else max(1, limit - len(rows))
+          insp = inspect_cmd.run_inspect(
+              uri_item,
+              sample_count=min(rem or 50, 50),
+              max_scanned_bytes=str(max(1, byte_budget - scanned_bytes)),
+              default_project=default_project)
+          offsets[uri_item] = sz
+          for r in (insp.get('untrusted_data') or {}).get('rows', ()):
+            saw_data = True
+            _emit_record(rows, r, on_record)
+            if limit is not None and len(rows) >= limit:
+              break
+        else:
+          delta = _read_appended_bytes(uri_item, prev_off, default_project)
+          if not delta:
+            continue
+          # Only advance up to the last complete newline so partial writes are
+          # re-read once completed.
+          last_nl = delta.rfind(b'\n')
+          if last_nl == -1:
+            # On GCS objects (immutable once closed), process full object.
+            if not uri_item.startswith('gs://'):
+              continue
+            complete = delta
+            offsets[uri_item] = prev_off + len(delta)
+          else:
+            complete = delta[:last_nl + 1]
+            offsets[uri_item] = prev_off + last_nl + 1
+
+          if scanned_bytes + len(complete) > byte_budget:
+            truncated_budget = True
+            break
+          scanned_bytes += len(complete)
+          recs = _parse_text_lines_from_chunk(
+              uri_item,
+              complete.decode('utf-8', errors='replace'),
+              csv_headers)
+          for r in recs:
+            saw_data = True
+            _emit_record(rows, r, on_record)
+            if limit is not None and len(rows) >= limit:
+              break
+
+        if truncated_budget or (limit is not None and len(rows) >= limit):
+          break
+
+      if truncated_budget or (limit is not None and len(rows) >= limit):
+        break
+      if not saw_data:
+        sleep_s = (
+            min(eff_poll, max(0.05, deadline - time.monotonic()))
+            if deadline is not None else eff_poll)
+        time.sleep(sleep_s)
+  except KeyboardInterrupt:
+    interrupted = True
+
+  hit_limit = bool(limit is not None and len(rows) >= limit)
+  return {
+      'uri': location,
+      'kind': 'file',
+      'mode': 'file_follow',
+      'follow': True,
+      'interrupted': interrupted,
+      'non_destructive': True,
+      'sampled_count': len(rows),
+      'scanned_bytes': scanned_bytes,
+      'untrusted_data': output.wrap_untrusted_rows(
+          rows, truncated=truncated_budget or hit_limit),
   }

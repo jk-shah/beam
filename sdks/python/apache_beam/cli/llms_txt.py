@@ -47,8 +47,10 @@ def render_llms_txt() -> str:
 ## 2. Subcommands
 - `beam inspect <URI> [--sample N] [--stats] [--search STR] [--json]`
     Zero-runner `<200ms` schema, row count, byte estimate, and sanitized preview.
-- `beam tail <URI> [--limit N] [--duration 5s] [--max-scanned-bytes 64MB] [--json]`
-    Non-destructive bounded stream peek (`pubsub://` without ACK, `kafka://`).
+- `beam tail [-f] [-n N] <URI> [--duration 5s] [--max-scanned-bytes 64MB] [--json]`
+    Non-destructive bounded stream peek (default `5s` / `-n 5` for agents) or live
+    follow (`-f` / `--follow` like Unix `tail -f`, streaming NDJSON across
+    `pubsub://`, `kafka://`, and local/`gs://` streaming or DLQ files).
 - `beam pipe --from <URI> --to <URI> [flags] [pipeline_options]`
     Move, convert, filter (`--where`), project (`--select`), quarantine dirty rows
     (`--dlq`), enforce scan budget (`--max-bytes`), verify conservation
@@ -58,6 +60,11 @@ def render_llms_txt() -> str:
     (`<prefix>-00000-of-NNNNN`) are auto-resolved when `<prefix>` is passed to
     `inspect`, `pipe --from`, or `diff`. In sandboxed/CI environments without
     loopback ports, pass `--runner=FnApiRunner` for fast in-process execution.
+- `beam package <FILE.yaml | FILE.py | -> --to <gs://.../spec.json> [flags] [--json]`
+    Zero-Docker `<1s` Flex Template packager for Beam YAML (auto-extracts Jinja
+    `{{ vars }}` into `metadata.parameters`) and AST-introspected single-image
+    Flex Template bundle generator for Python pipelines (no handwritten
+    `Dockerfile` or `metadata.json`).
 - `beam diff <LEFT_URI> <RIGHT_URI> [--key COL ...] [--rtol F] [--atol F] [--json]`
     Distributed O(1)-memory key/multiset reconciliation (`0` match, `6` drift).
 - `beam check <FILE.yaml | -> [--plan [--trust-providers]] [--json]`

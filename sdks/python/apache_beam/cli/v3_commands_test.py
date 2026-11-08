@@ -24,7 +24,9 @@ import io
 import json
 import math
 import os
+from pathlib import Path
 import shutil
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -546,6 +548,277 @@ class InspectCheckIoDoctorTailJobsTest(unittest.TestCase):
       self.assertEqual(rec['outputs']['file_count'], 1)
       self.assertEqual(len(rec['outputs']['dlq_files']), 1)
       self.assertTrue(rec['outputs']['verify']['match'])
+
+  def test_package_yaml_zero_docker_and_stdin(self):
+    yaml_path = os.path.join(self.tmp, 'orders_ingest.yaml')
+    yaml_content = (
+        'pipeline:\n'
+        '  type: chain\n'
+        '  transforms:\n'
+        '    - type: ReadFromCsv\n'
+        '      config:\n'
+        '        path: "{{ input_csv }}"\n'
+        '    - type: Filter\n'
+        '      config:\n'
+        '        language: generic\n'
+        '        keep: "amount >= {{ min_amount | default(100) }}"\n'
+        '    - type: WriteToParquet\n'
+        '      config:\n'
+        '        path: "{{ output_parquet }}"\n')
+    with open(yaml_path, 'w', encoding='utf-8') as f:
+      f.write(yaml_content)
+
+    spec_out = os.path.join(self.tmp, 'orders.template.json')
+    rc, env, _ = _run_json([
+        'package',
+        yaml_path,
+        '--to',
+        spec_out,
+        '--name',
+        'orders-ingest',
+        '--image',
+        'gcr.io/dataflow-templates/yaml-template:test',
+        '--project',
+        'demo-proj',
+        '--region',
+        'us-central1',
+        '--subnetwork',
+        'regions/us-central1/subnetworks/default',
+        '--no-use-public-ips',
+        '--temp-location',
+        'gs://demo-bucket/tmp',
+    ])
+    self.assertEqual(rc, cli.EXIT_OK)
+    out = env['outputs']
+    self.assertEqual(out['sdk_language'], 'YAML')
+    self.assertFalse(out['docker_build_required'])
+    params = {p['name']: p for p in out['parameters']}
+    self.assertEqual(list(params.keys()), ['input_csv', 'min_amount', 'output_parquet'])
+    self.assertFalse(params['input_csv']['isOptional'])
+    self.assertTrue(params['min_amount']['isOptional'])
+    self.assertEqual(params['min_amount']['defaultValue'], '100')
+    self.assertFalse(params['output_parquet']['isOptional'])
+
+    with open(spec_out, encoding='utf-8') as f:
+      spec = json.load(f)
+    self.assertEqual(spec['sdkInfo']['language'], 'YAML')
+    self.assertTrue(
+        spec['metadata']['yamlDefinition'].startswith(yaml_content.rstrip('\n')))
+    self.assertIn('requirements_file: null', spec['metadata']['yamlDefinition'])
+    self.assertEqual(
+        spec['defaultEnvironment']['ipConfiguration'], 'WORKER_IP_PRIVATE')
+    self.assertIn('gcloud dataflow flex-template run', out['launch']['gcloud'])
+
+    # Also verify `beam package -` reading YAML from stdin!
+    stdin_spec = os.path.join(self.tmp, 'stdin.template.json')
+    with mock.patch('sys.stdin', io.StringIO(yaml_content)):
+      rc2, env2, _ = _run_json([
+          'package',
+          '-',
+          '--to',
+          stdin_spec,
+          '--image',
+          'gcr.io/dataflow-templates/yaml-template:test',
+      ])
+    self.assertEqual(rc2, cli.EXIT_OK)
+    self.assertTrue(os.path.isfile(stdin_spec))
+    self.assertEqual(env2['outputs']['sdk_language'], 'YAML')
+
+  def test_package_python_ast_and_custom_provider_yaml_bundle(self):
+    # 1. Custom Python pipeline (.py) -> AST extracts PipelineOptions without executing!
+    py_file = os.path.join(self.tmp, 'custom_etl.py')
+    with open(py_file, 'w', encoding='utf-8') as f:
+      f.write(
+          'import apache_beam as beam\n'
+          'from apache_beam.options.pipeline_options import PipelineOptions\n'
+          'raise RuntimeError("MUST NOT BE EXECUTED DURING PACKAGE")\n'
+          'class CustomOptions(PipelineOptions):\n'
+          '  @classmethod\n'
+          '  def _add_argparse_args(cls, parser):\n'
+          '    parser.add_argument("--input-table", required=True, help="Source table")\n'
+          '    parser.add_value_provider_argument("--batch_size", default=500)\n')
+    req_file = os.path.join(self.tmp, 'requirements.txt')
+    with open(req_file, 'w', encoding='utf-8') as f:
+      f.write('pyarrow>=14.0.0\n')
+    bundle_dir = os.path.join(self.tmp, 'py_bundle')
+    rc, env, _ = _run_json([
+        'package',
+        py_file,
+        '--output-dir',
+        bundle_dir,
+        '--requirements',
+        req_file,
+        '--image',
+        'us-central1-docker.pkg.dev/demo/df/custom-etl:v1',
+    ])
+    self.assertEqual(rc, cli.EXIT_OK)
+    out = env['outputs']
+    self.assertEqual(out['sdk_language'], 'PYTHON')
+    self.assertTrue(out['docker_build_required'])
+    params = {p['name']: p for p in out['parameters']}
+    self.assertIn('input_table', params)
+    self.assertFalse(params['input_table']['isOptional'])
+    self.assertEqual(params['input_table']['helpText'], 'Source table')
+    self.assertIn('batch_size', params)
+    self.assertTrue(params['batch_size']['isOptional'])
+    self.assertEqual(params['batch_size']['defaultValue'], '500')
+    self.assertTrue(os.path.isfile(os.path.join(bundle_dir, 'Dockerfile')))
+    self.assertTrue(os.path.isfile(os.path.join(bundle_dir, 'metadata.json')))
+    self.assertTrue(os.path.isfile(os.path.join(bundle_dir, 'requirements.txt')))
+
+    # 2. YAML with custom Python provider (`apache_beam.cli.dlq`) gates `--sdk=yaml`
+    # and succeeds cleanly with `--sdk=python`!
+    dlq_yaml = os.path.join(self.tmp, 'dlq_pipe.yaml')
+    with open(dlq_yaml, 'w', encoding='utf-8') as f:
+      f.write(
+          'providers:\n'
+          '  - type: python\n'
+          '    config: {}\n'
+          '    transforms:\n'
+          '      ReadCsvWithDlq: "apache_beam.cli.dlq:ReadCsvWithDlq"\n'
+          'pipeline:\n'
+          '  type: chain\n'
+          '  transforms:\n'
+          '    - type: ReadCsvWithDlq\n'
+          '      config:\n'
+          '        path: "{{ src }}"\n')
+    rc_gate, env_gate, _ = _run_json([
+        'package', dlq_yaml, '--sdk', 'yaml', '--dry-run'
+    ])
+    self.assertEqual(rc_gate, cli.EXIT_USAGE)
+    self.assertIn('--sdk=python', env_gate['error']['message'])
+
+    dlq_bundle = os.path.join(self.tmp, 'dlq_bundle')
+    rc_py, env_py, _ = _run_json([
+        'package',
+        dlq_yaml,
+        '--sdk',
+        'python',
+        '--output-dir',
+        dlq_bundle,
+        '--image',
+        'us-central1-docker.pkg.dev/demo/df/dlq-pipe:v1',
+    ])
+    self.assertEqual(rc_py, cli.EXIT_OK)
+    self.assertEqual(env_py['outputs']['sdk_language'], 'PYTHON')
+    ep_code = Path(dlq_bundle, 'flex_yaml_entrypoint.py').read_text(encoding='utf-8')
+    self.assertIn("'src'", ep_code)
+    self.assertIn('--jinja_variables=', ep_code)
+
+  def test_tail_follow_live_file_and_pubsub_ephemeral_vs_nack(self):
+    import threading
+    import time as time_mod
+
+    # 1. Live file `-f` (`--follow`) with NDJSON streaming & ANSI sanitization.
+    live_jsonl = os.path.join(self.tmp, 'stream.jsonl')
+    with open(live_jsonl, 'w', encoding='utf-8') as f:
+      f.write('{"id": 0, "note": "existing_before_follow"}\n')
+
+    def _writer():
+      time_mod.sleep(0.15)
+      with open(live_jsonl, 'a', encoding='utf-8') as wf:
+        wf.write('{"id": 1, "msg": "hello \\u001b[31mRED\\u001b[0m"}\n')
+        wf.flush()
+      time_mod.sleep(0.1)
+      with open(live_jsonl, 'a', encoding='utf-8') as wf:
+        wf.write('{"id": 2, "msg": "second"}\n')
+        wf.flush()
+
+    t = threading.Thread(target=_writer, daemon=True)
+    t.start()
+    out_buf = io.StringIO()
+    err_buf = io.StringIO()
+    with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+      rc = cli.main([
+          'tail', '-f', '-n', '2', '--poll-interval', '0.05', '--duration', '5s',
+          live_jsonl, '--json'
+      ])
+    t.join(timeout=2.0)
+    self.assertEqual(rc, cli.EXIT_OK)
+    ndjson_lines = [
+        json.loads(ln) for ln in out_buf.getvalue().strip().splitlines() if ln.strip()
+    ]
+    # 2 live record lines + 1 final summary envelope!
+    self.assertEqual(len(ndjson_lines), 3)
+    self.assertEqual(ndjson_lines[0]['event'], 'record')
+    self.assertEqual(ndjson_lines[0]['record']['id'], 1)
+    self.assertNotIn('\x1b', ndjson_lines[0]['record']['msg'])
+    self.assertEqual(ndjson_lines[1]['record']['id'], 2)
+    self.assertTrue(ndjson_lines[2]['ok'])
+    self.assertEqual(ndjson_lines[2]['outputs']['sampled_count'], 2)
+
+    # 2. Pub/Sub `-f` on existing subscription: deduplicates redeliveries and NEVER acks!
+    from types import SimpleNamespace
+    fake_msg_1 = SimpleNamespace(
+        ack_id='ack-1',
+        message=SimpleNamespace(
+            message_id='m-1',
+            data=b'{"event":"click"}',
+            publish_time=None,
+            attributes={}))
+    fake_msg_dup = SimpleNamespace(
+        ack_id='ack-1b',
+        message=SimpleNamespace(
+            message_id='m-1',
+            data=b'{"event":"click"}',
+            publish_time=None,
+            attributes={}))
+    fake_msg_2 = SimpleNamespace(
+        ack_id='ack-2',
+        message=SimpleNamespace(
+            message_id='m-2',
+            data=b'{"event":"buy"}',
+            publish_time=None,
+            attributes={}))
+
+    fake_sub_client = mock.MagicMock()
+    fake_sub_client.pull.side_effect = [
+        SimpleNamespace(received_messages=[fake_msg_1]),
+        SimpleNamespace(received_messages=[fake_msg_dup, fake_msg_2]),
+    ]
+    with mock.patch(
+        'google.cloud.pubsub_v1.SubscriberClient',
+        return_value=fake_sub_client):
+      from apache_beam.cli import tail as tail_mod
+      streamed = []
+      res = tail_mod.run_tail(
+          'pubsub://projects/p/subscriptions/s',
+          limit=2,
+          duration='3s',
+          follow=True,
+          poll_interval=0.05,
+          on_record=lambda r, i: streamed.append(r))
+      self.assertEqual(res['sampled_count'], 2)
+      self.assertEqual(len(streamed), 2)
+      fake_sub_client.acknowledge.assert_not_called()
+      self.assertTrue(fake_sub_client.modify_ack_deadline.called)
+
+    # 3. Pub/Sub `-f` on topic: ACKs private ephemeral sub AND deletes it on Ctrl-C!
+    fake_topic_sub = mock.MagicMock()
+    fake_topic_sub.pull.side_effect = [
+        SimpleNamespace(received_messages=[fake_msg_1]),
+        KeyboardInterrupt(),
+    ]
+    fake_pub_client = mock.MagicMock()
+    fake_pub_client.list_topic_subscriptions.return_value = []
+    with (
+        mock.patch(
+            'google.cloud.pubsub_v1.SubscriberClient',
+            return_value=fake_topic_sub),
+        mock.patch(
+            'google.cloud.pubsub_v1.PublisherClient',
+            return_value=fake_pub_client),
+    ):
+      res_t = tail_mod.run_tail(
+          'pubsub://projects/p/topics/t',
+          limit=None,
+          duration=None,
+          follow=True,
+          poll_interval=0.05)
+      self.assertTrue(res_t['interrupted'])
+      self.assertEqual(res_t['sampled_count'], 1)
+      fake_topic_sub.acknowledge.assert_called_once()
+      fake_topic_sub.delete_subscription.assert_called_once()
 
 
 if __name__ == '__main__':
