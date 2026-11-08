@@ -28,19 +28,26 @@ from . import output
 from . import sql
 
 
+def _has_module(name: str) -> bool:
+  try:
+    return importlib.util.find_spec(name) is not None
+  except (ModuleNotFoundError, ValueError):
+    return False
+
+
 def run_doctor() -> dict[str, Any]:
   """Runs local environment checks without executing any remote pipeline."""
   beam_ver = output.installed_beam_version()
   py_ver = platform.python_version()
 
   extras = {
-      'yaml': importlib.util.find_spec('yaml') is not None and
-      importlib.util.find_spec('jsonschema') is not None,
-      'pyarrow': importlib.util.find_spec('pyarrow') is not None,
-      'gcp_bigquery': importlib.util.find_spec('google.cloud.bigquery') is not None,
-      'gcp_pubsub': importlib.util.find_spec('google.cloud.pubsub_v1') is not None,
-      'gcp_storage': importlib.util.find_spec('google.cloud.storage') is not None,
-      'fastavro': importlib.util.find_spec('fastavro') is not None,
+      'yaml': _has_module('yaml') and _has_module('jsonschema'),
+      'pyarrow': _has_module('pyarrow'),
+      'gcp_bigquery': _has_module('google.cloud.bigquery'),
+      'gcp_bigquery_storage': _has_module('google.cloud.bigquery_storage_v1'),
+      'gcp_pubsub': _has_module('google.cloud.pubsub_v1'),
+      'gcp_storage': _has_module('google.cloud.storage'),
+      'fastavro': _has_module('fastavro'),
   }
 
   # Java 11–25 check (reusing sql._find_java!).
@@ -53,7 +60,7 @@ def run_doctor() -> dict[str, Any]:
 
   # Google Application Default Credentials check (never exposes tokens!).
   adc_info: dict[str, Any]
-  if importlib.util.find_spec('google.auth') is not None:
+  if _has_module('google.auth'):
     try:
       import google.auth
       creds, default_proj = google.auth.default()

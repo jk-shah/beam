@@ -1389,6 +1389,22 @@ class InspectCheckIoDoctorTailJobsTest(unittest.TestCase):
       self.assertTrue(any(n.endswith('_bundled_cli/lakehouse.py') for n in names))
       self.assertTrue(any(n.endswith('_bundled_cli/cdc.py') for n in names))
 
+  def test_doctor_without_google_namespace_package(self):
+    import importlib.util
+    orig_find_spec = importlib.util.find_spec
+
+    def _no_google_find_spec(name, *args, **kwargs):
+      if name == 'google' or name.startswith('google.'):
+        raise ModuleNotFoundError("No module named 'google'")
+      return orig_find_spec(name, *args, **kwargs)
+
+    with mock.patch('importlib.util.find_spec', side_effect=_no_google_find_spec):
+      rc, env, err = _run_json(['doctor'])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertTrue(env['outputs']['healthy'])
+    self.assertFalse(env['outputs']['extras']['gcp_bigquery'])
+    self.assertFalse(env['outputs']['gcp_adc']['ok'])
+
 
 if __name__ == '__main__':
   unittest.main()
