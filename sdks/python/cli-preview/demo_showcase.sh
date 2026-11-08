@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end interactive showcase of the Apache Beam v3.1 CLI (`beam`).
+# End-to-end interactive showcase of the Apache Beam CLI (`beam`) preview.
 set -euo pipefail
 
 BEAM_BIN="${BEAM_BIN:-beam}"
@@ -7,7 +7,7 @@ WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/beam-cli-showcase.XXXXXX")"
 trap 'rm -rf "${WORK_DIR}"' EXIT
 
 echo "=================================================================="
-echo " Apache Beam CLI v3.1 Showcase  (workspace: ${WORK_DIR})"
+echo " Apache Beam CLI Preview Showcase  (workspace: ${WORK_DIR})"
 echo "=================================================================="
 
 echo ""
@@ -62,9 +62,9 @@ echo "5) Zero-Code ETL with --where, --select, --dlq & --assert-counts"
   --json
 
 echo ""
-echo "6) Inspect Clean Parquet Output & Dead-Letter Queue"
-"${BEAM_BIN}" inspect "${WORK_DIR}/clean/orders.parquet*" --stats --json
-"${BEAM_BIN}" tail "${WORK_DIR}/dlq/rejected.json*" --limit 5 --json
+echo "6) Inspect Clean Parquet Output & Dead-Letter Queue (auto-resolves -00000-of-NNNNN shards)"
+"${BEAM_BIN}" inspect "${WORK_DIR}/clean/orders.parquet" --stats --json
+"${BEAM_BIN}" tail "${WORK_DIR}/dlq/rejected.json" --limit 5 --json
 
 echo ""
 echo "7) Export Portable Beam YAML (--dry-run) & Static Check (beam check)"
@@ -78,13 +78,13 @@ echo "7) Export Portable Beam YAML (--dry-run) & Static Check (beam check)"
 echo ""
 echo "8) Distributed O(1)-Memory Reconciliation (beam diff)"
 "${BEAM_BIN}" pipe \
-  --from "${WORK_DIR}/clean/orders.parquet*" \
+  --from "${WORK_DIR}/clean/orders.parquet" \
   --to "${WORK_DIR}/mirror/orders.json" \
   --runner=FnApiRunner \
   --json
 "${BEAM_BIN}" diff \
-  "${WORK_DIR}/clean/orders.parquet*" \
-  "${WORK_DIR}/mirror/orders.json*" \
+  "${WORK_DIR}/clean/orders.parquet" \
+  "${WORK_DIR}/mirror/orders.json" \
   --key id \
   --json
 

@@ -15,7 +15,7 @@
 # limitations under the License.
 #
 
-"""End-to-end functional & pipeline tests for all v3.1 `beam` CLI commands."""
+"""End-to-end functional & pipeline tests for extended `beam` CLI commands."""
 
 import contextlib
 import decimal

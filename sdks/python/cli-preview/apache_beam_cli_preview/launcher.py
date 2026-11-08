@@ -53,9 +53,10 @@ class _PreviewCliFinder(importlib.abc.MetaPathFinder):
   def __init__(self, cli_dir: Path):
     self._cli_dir = cli_dir
     self._patching_arrow = False
+    self._patching_yaml_mapping = False
 
   def find_spec(self, fullname, path, target=None):
-    del path, target
+    del target
     if fullname == 'apache_beam.cli':
       return importlib.util.spec_from_file_location(
           fullname,
@@ -68,13 +69,16 @@ class _PreviewCliFinder(importlib.abc.MetaPathFinder):
         return importlib.util.spec_from_file_location(fullname, mod_py)
     if (fullname == 'apache_beam.typehints.arrow_type_compatibility' and
         not self._patching_arrow):
-      return self._wrap_arrow_spec(fullname)
+      return self._wrap_arrow_spec(fullname, path)
+    if (fullname == 'apache_beam.yaml.yaml_mapping' and
+        not self._patching_yaml_mapping):
+      return self._wrap_yaml_mapping_spec(fullname, path)
     return None
 
-  def _wrap_arrow_spec(self, fullname: str):
+  def _wrap_arrow_spec(self, fullname: str, path):
     self._patching_arrow = True
     try:
-      orig_spec = importlib.machinery.PathFinder.find_spec(fullname, sys.path)
+      orig_spec = importlib.machinery.PathFinder.find_spec(fullname, path)
     finally:
       self._patching_arrow = False
     if orig_spec is None or orig_spec.loader is None:
@@ -102,6 +106,53 @@ class _PreviewCliFinder(importlib.abc.MetaPathFinder):
           conv._cli_preview_patched = True
 
     orig_spec.loader = _PatchingLoader()
+    return orig_spec
+
+  def _wrap_yaml_mapping_spec(self, fullname: str, path):
+    import re
+    self._patching_yaml_mapping = True
+    try:
+      orig_spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+    finally:
+      self._patching_yaml_mapping = False
+    if orig_spec is None or orig_spec.loader is None:
+      return None
+    orig_loader = orig_spec.loader
+
+    class _YamlMappingPatchingLoader(importlib.abc.Loader):
+      def create_module(self, spec):
+        if hasattr(orig_loader, 'create_module'):
+          return orig_loader.create_module(spec)
+        return None
+
+      def exec_module(self, module):
+        orig_loader.exec_module(module)
+        orig_validate = getattr(module, 'validate_generic_expression', None)
+        is_literal = getattr(module, 'is_literal', None)
+        if (orig_validate is not None and is_literal is not None and
+            not getattr(orig_validate, '_cli_preview_patched', False)):
+
+          def _patched_validate(expr_dict, input_fields, allow_cmp, error_field):
+            try:
+              return orig_validate(
+                  expr_dict, input_fields, allow_cmp, error_field)
+            except ValueError:
+              if (allow_cmp and isinstance(expr_dict, dict) and
+                  len(expr_dict) == 1 and 'expression' in expr_dict):
+                expr = str(expr_dict['expression'])
+                m = re.fullmatch(r'(.*?)([<>=!]+)(.*)', expr)
+                if m:
+                  left, cmp_op, right = m.groups()
+                  is_atom = lambda s: is_literal(s) or s in input_fields
+                  if (is_atom(left.strip()) and is_atom(right.strip()) and
+                      cmp_op in {'==', '<=', '>=', '<', '>', '!='}):
+                    return None
+              raise
+
+          _patched_validate._cli_preview_patched = True
+          module.validate_generic_expression = _patched_validate
+
+    orig_spec.loader = _YamlMappingPatchingLoader()
     return orig_spec
 
 

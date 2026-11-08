@@ -15,6 +15,6 @@
 # limitations under the License.
 #
 
-"""Pure-Python `<3s` preview overlay for the Apache Beam v3.1 CLI."""
+"""Pure-Python `<3s` preview overlay for the Apache Beam CLI (`beam`)."""
 
-__version__ = '0.3.1'
+__version__ = '0.1.0'

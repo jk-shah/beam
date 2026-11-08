@@ -4,13 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "apache-beam-cli-preview"
-version = "0.3.1"
-description = "Fast (<90ms) pure-Python preview overlay for the Apache Beam v3.1 CLI (`beam` & `apache-beam`)."
+version = "0.1.0"
+description = "Fast (<90ms) pure-Python preview overlay for the Apache Beam CLI (`beam` & `apache-beam`)."
 readme = "PREVIEW_DEMO.md"
 requires-python = ">=3.10"
 license = {text = "Apache-2.0"}
 dependencies = [
   "apache-beam[yaml]>=2.75.0",
+  "pyarrow>=14.0.0",
+  "fastavro>=1.8.0",
 ]
 
 [project.optional-dependencies]

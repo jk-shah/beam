@@ -21,11 +21,33 @@ from pathlib import Path
 import shutil
 from setuptools import setup
 from setuptools.command.build_py import build_py as _build_py
-from setuptools.command.editable_wheel import editable_wheel as _editable_wheel
+from setuptools.command.sdist import sdist as _sdist
 
 _PTH_LINE = (
     'import apache_beam_cli_preview.launcher as _bcp; '
     '_bcp.install_runtime_hooks()\n')
+
+
+def _copy_cli_sources(src_cli: Path, dst_cli: Path) -> None:
+  dst_cli.mkdir(parents=True, exist_ok=True)
+  for py in src_cli.glob('*.py'):
+    if not py.name.endswith('_test.py'):
+      shutil.copy2(py, dst_cli / py.name)
+
+
+class _SdistWithCliBundle(_sdist):
+  """Ensures `uv pip install git+...#subdirectory=...` (sdist -> wheel) bundles `cli/`."""
+  def make_release_tree(self, base_dir, files):
+    super().make_release_tree(base_dir, files)
+    here = Path(__file__).resolve().parent
+    src_cli = here.parent / 'apache_beam' / 'cli'
+    if src_cli.is_dir():
+      _copy_cli_sources(
+          src_cli,
+          Path(base_dir) / 'apache_beam_cli_preview' / '_bundled_cli')
+    demo_sh = here / 'demo_showcase.sh'
+    if demo_sh.is_file():
+      shutil.copy2(demo_sh, Path(base_dir) / 'demo_showcase.sh')
 
 
 class _BuildPyWithCliBundle(_build_py):
@@ -33,19 +55,23 @@ class _BuildPyWithCliBundle(_build_py):
     super().run()
     here = Path(__file__).resolve().parent
     src_cli = here.parent / 'apache_beam' / 'cli'
+    if not src_cli.is_dir():
+      src_cli = here / 'apache_beam_cli_preview' / '_bundled_cli'
     if src_cli.is_dir():
-      dst_cli = Path(self.build_lib) / 'apache_beam_cli_preview' / '_bundled_cli'
-      dst_cli.mkdir(parents=True, exist_ok=True)
-      for py in src_cli.glob('*.py'):
-        if not py.name.endswith('_test.py'):
-          shutil.copy2(py, dst_cli / py.name)
+      _copy_cli_sources(
+          src_cli,
+          Path(self.build_lib) / 'apache_beam_cli_preview' / '_bundled_cli')
+    demo_sh = here / 'demo_showcase.sh'
+    if demo_sh.is_file():
+      dst_pkg = Path(self.build_lib) / 'apache_beam_cli_preview'
+      dst_pkg.mkdir(parents=True, exist_ok=True)
+      shutil.copy2(demo_sh, dst_pkg / '_bundled_demo.sh')
     pth_file = Path(self.build_lib) / 'apache_beam_cli_preview.pth'
     pth_file.write_text(_PTH_LINE, encoding='utf-8')
 
 
-class _EditableWheelWithPth(_editable_wheel):
-  def run(self):
-    super().run()
-
-
-setup(cmdclass={'build_py': _BuildPyWithCliBundle})
+setup(
+    cmdclass={
+        'build_py': _BuildPyWithCliBundle,
+        'sdist': _SdistWithCliBundle,
+    })
