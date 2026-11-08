@@ -52,8 +52,12 @@ def render_llms_txt() -> str:
 - `beam pipe --from <URI> --to <URI> [flags] [pipeline_options]`
     Move, convert, filter (`--where`), project (`--select`), quarantine dirty rows
     (`--dlq`), enforce scan budget (`--max-bytes`), verify conservation
-    (`--assert-counts`), or reconcile output (`--verify`). Pass `--dry-run` to
-    validate and emit portable Beam YAML without running.
+    (`--assert-counts`), or reconcile output (`--verify`). Pass `--emit-yaml`
+    (alias `--dry-run`) to validate and print portable Beam YAML without running
+    (with `--json`, YAML is returned in `outputs.yaml`). Sharded Beam outputs
+    (`<prefix>-00000-of-NNNNN`) are auto-resolved when `<prefix>` is passed to
+    `inspect`, `pipe --from`, or `diff`. In sandboxed/CI environments without
+    loopback ports, pass `--runner=FnApiRunner` for fast in-process execution.
 - `beam diff <LEFT_URI> <RIGHT_URI> [--key COL ...] [--rtol F] [--atol F] [--json]`
     Distributed O(1)-memory key/multiset reconciliation (`0` match, `6` drift).
 - `beam check <FILE.yaml | -> [--plan [--trust-providers]] [--json]`

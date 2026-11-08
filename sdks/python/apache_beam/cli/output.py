@@ -240,7 +240,7 @@ def classify_error(
       'message': scrubbed,
       'needs_human': needs_human,
   }
-  if line_match:
+  if line_match and command != 'pipe':
     error_obj['yaml_line'] = int(line_match.group(1))
   if step_match:
     error_obj['transform'] = step_match.group(1)

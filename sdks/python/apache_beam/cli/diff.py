@@ -220,6 +220,12 @@ def run_diff(
       default_project=proj,
       allow_sniff=True)
 
+  for ep_chk in (left_ep, right_ep):
+    if ep_chk.kind == 'file':
+      if not FileSystems.match([ep_chk.config['path']])[0].metadata_list:
+        raise uris.UriError(
+            f'no files matched {ep_chk.raw!r} (checked {ep_chk.config["path"]!r})')
+
   if max_bytes is not None:
     limit = cost_guard.parse_byte_size(max_bytes)
     left_est = cost_guard.estimate_endpoint_bytes(

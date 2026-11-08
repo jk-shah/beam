@@ -357,6 +357,64 @@ class InspectCheckIoDoctorTailJobsTest(unittest.TestCase):
           cancel_fn=lambda jid, p, r, st: st == 'JOB_STATE_DRAINING')
       self.assertEqual(cancelled['requested_state'], 'JOB_STATE_DRAINING')
 
+  def test_dogfood_polish_shard_prefix_emit_yaml_plan_hash_and_dirty_warnings(self):
+    dirty_csv = os.path.join(self.tmp, 'dirty.csv')
+    with open(dirty_csv, 'w', encoding='utf-8') as f:
+      f.write('id,amt\n1,10.5\n2,20.0\n3,30.0\n4,ERR\n5\n')
+
+    # 1. `inspect` warns on malformed/dirty CSV rows in sample!
+    rc_i, env_i, _ = _run_json(['inspect', dirty_csv, '--stats'])
+    self.assertEqual(rc_i, cli.EXIT_OK)
+    self.assertTrue(env_i['warnings'])
+    self.assertEqual(env_i['outputs']['stats']['malformed_rows_in_sample'], 1)
+
+    # 2. Write sharded Parquet, then read & diff WITHOUT trailing `*`!
+    out_pq = os.path.join(self.tmp, 'sharded', 'clean.parquet')
+    dlq_p = os.path.join(self.tmp, 'sharded', 'dlq.json')
+    rc_p, _, err_p = _run_json([
+        'pipe',
+        '--from', dirty_csv,
+        '--to', out_pq,
+        '--dlq', dlq_p,
+        '--runner=FnApiRunner',
+    ])
+    self.assertEqual(rc_p, cli.EXIT_OK, err_p)
+
+    out_jsonl = os.path.join(self.tmp, 'sharded', 'copy.jsonl')
+    rc_p2, _, err_p2 = _run_json([
+        'pipe',
+        '--from', out_pq,  # no `*`!
+        '--to', out_jsonl,
+        '--runner=FnApiRunner',
+    ])
+    self.assertEqual(rc_p2, cli.EXIT_OK, err_p2)
+
+    rc_d, env_d, err_d = _run_json([
+        'diff', out_pq, out_jsonl, '--key', 'id', '--runner=FnApiRunner'
+    ])
+    self.assertEqual(rc_d, cli.EXIT_OK, err_d)
+    self.assertEqual(env_d['runner'], 'FnApiRunner')
+
+    # 3. `--emit-yaml` succeeds even though `out_pq` already exists, and matches
+    # `beam check` `plan_hash` + expands `--plan` without `--trust-providers`!
+    rc_ey, env_ey, err_ey = _run_json([
+        'pipe',
+        '--from', dirty_csv,
+        '--to', out_pq,
+        '--dlq', dlq_p,
+        '--emit-yaml',
+    ])
+    self.assertEqual(rc_ey, cli.EXIT_OK, err_ey)
+    yaml_file = os.path.join(self.tmp, 'exported.yaml')
+    with open(yaml_file, 'w', encoding='utf-8') as f:
+      f.write(env_ey['outputs']['yaml'])
+
+    rc_chk, env_chk, err_chk = _run_json(['check', '--plan', yaml_file])
+    self.assertEqual(rc_chk, cli.EXIT_OK, err_chk)
+    self.assertEqual(
+        env_ey['outputs']['plan_hash'], env_chk['outputs']['plan_hash'])
+
 
 if __name__ == '__main__':
   unittest.main()
+

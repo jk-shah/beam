@@ -104,14 +104,33 @@ def run_check(
         'type': t['type'],
     })
 
-  has_custom_providers = bool(spec.get('providers'))
+  _builtin_cli_targets = frozenset([
+      'apache_beam.cli.dlq.read_csv_with_dlq',
+      'apache_beam.cli.dlq.read_json_with_dlq',
+      'apache_beam.cli.dlq.cli_count_rows',
+      'apache_beam.cli.dlq.cli_write_to_bigquery',
+  ])
+  providers_list = spec.get('providers') or []
+  has_custom_providers = bool(providers_list)
+  has_untrusted_providers = False
+  for prov in providers_list:
+    if not isinstance(prov, dict) or prov.get('type') != 'python' or prov.get(
+        'config') not in ({}, None):
+      has_untrusted_providers = True
+      break
+    t_map = prov.get('transforms')
+    if not isinstance(t_map, dict) or any(
+        val not in _builtin_cli_targets for val in t_map.values()):
+      has_untrusted_providers = True
+      break
+
   canonical_json = json.dumps(spec, sort_keys=True, separators=(',', ':'))
   plan_hash = 'sha256:' + hashlib.sha256(
       canonical_json.encode('utf-8')).hexdigest()
 
   expanded_transforms: list[str] | None = None
   if expand_plan:
-    if has_custom_providers and not trust_providers:
+    if has_untrusted_providers and not trust_providers:
       raise CheckError(
           f'{source_label} declares custom "providers:" which execute code '
           'during --plan expansion; re-run with --trust-providers to allow '

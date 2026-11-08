@@ -145,6 +145,9 @@ def _inspect_files(
   exact_row_count: int | None = None
   truncated_scan = False
 
+  inspect_warnings: list[str] = []
+  malformed_in_sample = 0
+
   if fmt == 'parquet':
     import pyarrow.parquet as pq
     total_rows = 0
@@ -202,18 +205,42 @@ def _inspect_files(
         wrapper = io.TextIOWrapper(
             bounded, encoding='utf-8-sig', errors='replace', newline='')
         reader = csv.reader(wrapper, delimiter=ep.config.get('delimiter', ','))
-        first = next(reader, None)
+        try:
+          first = next(reader, None)
+        except csv.Error:
+          malformed_in_sample += 1
+          continue
         if not first:
           continue
+        norm_first = [c.strip() or f'col_{i}' for i, c in enumerate(first)]
         if header is None:
-          header = [c.strip() or f'col_{i}' for i, c in enumerate(first)]
+          header = norm_first
           col_samples = {c: [] for c in header}
-        for idx, cells in enumerate(reader):
+        elif norm_first != header:
+          if len(first) != len(header):
+            malformed_in_sample += 1
+          else:
+            for c, cell in zip(header, first):
+              col_samples[c].append(cell)
+        idx = 0
+        while True:
+          try:
+            cells = next(reader, None)
+          except csv.Error:
+            malformed_in_sample += 1
+            break
+          if cells is None:
+            break
+          if not cells or (len(cells) == 1 and cells[0] == '' and
+                           len(header) > 1):
+            continue
           if len(cells) != len(header):
+            malformed_in_sample += 1
             continue
           if idx < 100:
             for c, cell in zip(header, cells):
               col_samples[c].append(cell)
+          idx += 1
           rec = dict(zip(header, cells))
           if (needle is None or _row_matches_search(rec, needle)) and len(
               rows) < sample_count:
@@ -221,11 +248,29 @@ def _inspect_files(
           if idx >= 100 and len(rows) >= sample_count:
             break
     if header:
-      schema_fields = [{
-          'name': c,
-          'type': dlq._infer_scalar_kind(col_samples[c]),
-          'nullable': True,
-      } for c in header]
+      dirty_cols: list[str] = []
+      for c in header:
+        strict_t = dlq._infer_scalar_kind(col_samples[c], allow_dirty=False)
+        dirty_t = dlq._infer_scalar_kind(col_samples[c], allow_dirty=True)
+        if dirty_t != strict_t:
+          dirty_cols.append(f'{c} ({dirty_t} with non-{dirty_t} outlier cells)')
+        schema_fields.append({
+            'name': c,
+            'type': dirty_t,
+            'nullable': True,
+        })
+      if malformed_in_sample > 0 or dirty_cols:
+        parts_msg = []
+        if malformed_in_sample > 0:
+          parts_msg.append(
+              f'{malformed_in_sample} malformed CSV row(s) (column/syntax mismatch)'
+          )
+        if dirty_cols:
+          parts_msg.append(
+              f'dirty type-outlier cell(s) in {", ".join(dirty_cols)}')
+        inspect_warnings.append(
+            f'Detected {" and ".join(parts_msg)} in sample; pass '
+            '--dlq <path> to `beam pipe` to quarantine corrupt records.')
 
   else:  # json / jsonl / text
     scanned = 0
@@ -248,6 +293,7 @@ def _inspect_files(
               parsed = json.loads(s)
               rec = parsed if isinstance(parsed, dict) else {'value': parsed}
             except ValueError:
+              malformed_in_sample += 1
               continue
           for k, v in rec.items():
             if k not in inferred_types and v is not None:
@@ -257,6 +303,10 @@ def _inspect_files(
             rows.append(rec)
           if len(inferred_types) > 0 and len(rows) >= sample_count:
             break
+    if malformed_in_sample > 0:
+      inspect_warnings.append(
+          f'Detected {malformed_in_sample} malformed JSON line(s) in sample; '
+          'pass --dlq <path> to `beam pipe` to quarantine corrupt records.')
     schema_fields = [{
         'name': k, 'type': t, 'nullable': True
     } for k, t in inferred_types.items()]
@@ -267,7 +317,11 @@ def _inspect_files(
         f['name']: sum(1 for r in rows if r.get(f['name']) in (None, ''))
         for f in schema_fields
     }
-    stats = {'sampled_rows': len(rows), 'null_counts_in_sample': null_counts}
+    stats = {
+        'sampled_rows': len(rows),
+        'malformed_rows_in_sample': malformed_in_sample,
+        'null_counts_in_sample': null_counts,
+    }
 
   return {
       'uri': ep.raw,
@@ -278,6 +332,7 @@ def _inspect_files(
       'row_count': exact_row_count,
       'schema': schema_fields,
       'stats': stats,
+      'warnings': inspect_warnings,
       'untrusted_data': output.wrap_untrusted_rows(rows, truncated=truncated_scan)
       if sample_count > 0 else None,
   }

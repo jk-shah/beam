@@ -334,7 +334,13 @@ def main(argv=None) -> int:
 
       active_cmd = getattr(args, 'command', None)
       verbose_flag = bool(getattr(args, 'verbose', False))
-      logging.getLogger().setLevel(logging.INFO)
+      if json_mode and not verbose_flag:
+        import warnings
+        logging.getLogger().setLevel(logging.ERROR)
+        warnings.filterwarnings(
+            'ignore', category=UserWarning, module=r'google\.auth.*')
+      else:
+        logging.getLogger().setLevel(logging.INFO)
 
       if active_cmd == 'run':
         return _run(args, extra_args, json_session=json_session, t0=t0)
@@ -379,7 +385,8 @@ def main(argv=None) -> int:
       raise _CliError(f'unknown command: {active_cmd!r}', EXIT_USAGE)
 
     except _CliError as e:
-      print(f'error: {e}', file=sys.stderr)
+      if not json_mode or verbose_flag:
+        print(f'error: {e}', file=sys.stderr)
       if json_mode:
         err_obj, auto_actions = output.classify_error(
             str(e), e.exit_code, command=active_cmd, verbose=verbose_flag)
@@ -395,7 +402,8 @@ def main(argv=None) -> int:
                 extra=e.extra))
       return e.exit_code
     except KeyboardInterrupt:
-      print('error: interrupted', file=sys.stderr)
+      if not json_mode or verbose_flag:
+        print('error: interrupted', file=sys.stderr)
       if json_mode:
         err_obj, _ = output.classify_error(
             'interrupted', EXIT_INTERRUPTED, command=active_cmd)
@@ -1029,6 +1037,7 @@ def _inspect(args, extra_args, *, json_session, t0: float) -> int:
     raise _CliError(f'inspect failed: {e}', EXIT_PIPELINE_FAILED) from None
 
   untrusted = info.pop('untrusted_data', None)
+  insp_warnings = info.pop('warnings', None) or []
   if json_session.enabled:
     json_session.emit(
         output.build_envelope(
@@ -1036,6 +1045,7 @@ def _inspect(args, extra_args, *, json_session, t0: float) -> int:
             command='inspect',
             exit_code=EXIT_OK,
             duration_ms=int((time.monotonic() - t0) * 1000),
+            warnings=insp_warnings,
             outputs=info,
             untrusted_data=untrusted))
   else:
@@ -1049,6 +1059,8 @@ def _inspect(args, extra_args, *, json_session, t0: float) -> int:
       for col in info['schema']:
         null_s = 'NULLABLE' if col.get('nullable', True) else 'REQUIRED'
         print(f"  - {col['name']}: {col['type']} ({null_s})")
+    for w in insp_warnings:
+      print(f'Warning  : {w}', file=sys.stderr)
     if untrusted and untrusted.get('rows'):
       print(f"Sample ({len(untrusted['rows'])} rows, sanitized):")
       for r in untrusted['rows']:
@@ -1105,7 +1117,14 @@ def _check(args, extra_args, *, json_session, t0: float) -> int:
         jinja_variables_json=args.jinja_variables,
         pipeline_args=resolved)
   except check_cmd.CheckError as e:
-    raise _CliError(str(e), EXIT_USAGE) from None
+    acts = None
+    if '--trust-providers' in str(e):
+      acts = [{
+          'command': f'beam check {args.file} --plan --trust-providers --json',
+          'description': 'Expand pipeline plan with explicit provider execution trust.',
+          'requires_human': True,
+      }]
+    raise _CliError(str(e), EXIT_USAGE, next_actions=acts) from None
   except ImportError as e:
     raise _CliError(
         f'a required package is missing: {e}', EXIT_MISSING_PACKAGE) from None
@@ -1133,6 +1152,7 @@ def _diff(args, extra_args, *, json_session, t0: float) -> int:
   from . import uris
   resolved_args = _resolve_config_args(args, extra_args)
   proj = _extract_project_from_args(resolved_args)
+  diff_runner = _extract_runner_from_args(resolved_args) or 'FnApiRunner'
   try:
     rc, report = diff.run_diff(
         args.left,
@@ -1150,7 +1170,12 @@ def _diff(args, extra_args, *, json_session, t0: float) -> int:
         str(e),
         EXIT_COST_LIMIT,
         extra={
-            'estimated_bytes': e.estimated_bytes, 'limit_bytes': e.limit_bytes
+            'estimated_bytes': e.estimated_bytes,
+            'limit_bytes': e.limit_bytes,
+            'outputs': {
+                'estimated_bytes': e.estimated_bytes,
+                'limit_bytes': e.limit_bytes,
+            },
         }) from None
   except (uris.UriError, ValueError) as e:
     raise _CliError(str(e), EXIT_USAGE) from None
@@ -1169,6 +1194,7 @@ def _diff(args, extra_args, *, json_session, t0: float) -> int:
             ok=(rc == EXIT_OK),
             command='diff',
             exit_code=rc,
+            runner=diff_runner,
             duration_ms=int((time.monotonic() - t0) * 1000),
             metrics={
                 'left_rows': summary['left_rows'],
@@ -1419,19 +1445,25 @@ def _pipe(
           extra={
               'estimated_bytes': e.estimated_bytes,
               'limit_bytes': e.limit_bytes,
+              'outputs': {
+                  'estimated_bytes': e.estimated_bytes,
+                  'limit_bytes': e.limit_bytes,
+              },
           }) from None
     except ValueError as e:
       raise _CliError(str(e), EXIT_USAGE) from None
 
-  # Local existing-output check runs before importing `apache_beam` (`<50 ms`).
+  # Local existing-output check runs before importing `apache_beam` (`<50 ms`),
+  # skipped on `--dry-run` / `--emit-yaml` which never writes output!
   if (pipe.output_prefix is not None and '://' not in pipe.output_prefix and
-      args.if_exists == 'fail'):
+      args.if_exists == 'fail' and not args.dry_run):
     _refuse_existing_local_output(pipe.output_prefix)
 
   import yaml
   dumper = getattr(yaml, 'CSafeDumper', yaml.SafeDumper)
   yaml_str = yaml.dump(pipe.spec, Dumper=dumper, sort_keys=False)
-  plan_hash = 'sha256:' + hashlib.sha256(yaml_str.encode('utf-8')).hexdigest()
+  canonical_spec = json.dumps(pipe.spec, sort_keys=True, separators=(',', ':'))
+  plan_hash = 'sha256:' + hashlib.sha256(canonical_spec.encode('utf-8')).hexdigest()
 
   local_check_paths = [args.source, args.sink]
   if args.dlq:
@@ -1537,7 +1569,7 @@ def _run_yaml(
         stack.enter_context(
             subprocess_server.SubprocessServer.cache_subprocesses())
         pipeline = beam.Pipeline(options=options, display_data=display_data)
-        if output_prefix is not None and if_exists == 'fail':
+        if output_prefix is not None and if_exists == 'fail' and dry_run_yaml is None:
           _refuse_existing_output(output_prefix, verbose)
         elif (output_prefix is not None and if_exists == 'replace' and
               dry_run_yaml is None):
@@ -1809,6 +1841,28 @@ def _execute_with_optional_timeout(
       raise
 
   import threading
+  if not is_local:
+    # Remote runners (e.g. DataflowRunner) stage artifacts and create the remote
+    # job inside `pipeline.run()`; complete submission first so `job_id` is
+    # always captured and persisted before bounding `wait_until_finish()`.
+    res = pipeline.run()
+    box_remote: dict[str, Any] = {'state': None, 'exc': None}
+
+    def _wait_remote():
+      try:
+        box_remote['state'] = res.wait_until_finish()
+      except BaseException as exc:  # pylint: disable=broad-except
+        box_remote['exc'] = exc
+
+    t_rem = threading.Thread(target=_wait_remote, daemon=True)
+    t_rem.start()
+    t_rem.join(timeout=wait_timeout_sec)
+    if t_rem.is_alive():
+      return res, getattr(res, 'state', 'RUNNING'), True
+    if box_remote['exc'] is not None:
+      raise box_remote['exc']
+    return res, box_remote['state'], False
+
   box: dict[str, Any] = {'res': None, 'state': None, 'exc': None}
 
   def _waiter():
@@ -1823,7 +1877,7 @@ def _execute_with_optional_timeout(
   t.start()
   t.join(timeout=wait_timeout_sec)
   if t.is_alive():
-    if is_local and box['res'] is not None:
+    if box['res'] is not None:
       _cancel(box['res'])
     return box['res'], None, True
   if box['exc'] is not None:

@@ -284,7 +284,23 @@ def parse_endpoint(
       raise UriError(
           f'unsupported format {fmt!r} for {location!r}; use one of: {valid}')
     norm_fmt = 'json' if fmt == 'jsonl' else fmt
-    cfg = {'path': location, **opts}
+    read_path = location
+    if is_read and not any(c in location for c in '*?['):
+      if not scheme and not os.path.exists(location):
+        import glob as _glob
+        shard_pat = _glob.escape(location) + '-*-of-*'
+        if _glob.glob(shard_pat):
+          read_path = shard_pat
+      elif scheme in FILE_SCHEMES and allow_sniff:
+        try:
+          from apache_beam.io.filesystems import FileSystems
+          if not FileSystems.match([location])[0].metadata_list:
+            remote_shard_pat = location + '-*-of-*'
+            if FileSystems.match([remote_shard_pat])[0].metadata_list:
+              read_path = remote_shard_pat
+        except Exception:  # pylint: disable=broad-except
+          pass
+    cfg = {'path': read_path, **opts}
     return ParsedEndpoint(
         kind='file',
         scheme=scheme or 'local',

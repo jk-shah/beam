@@ -128,8 +128,9 @@ def check_max_bytes(
       endpoint, default_project=default_project, stop_after_bytes=limit)
   estimated = est.get('estimated_bytes')
   if estimated is not None and estimated > limit:
+    at_least = 'at least ' if est.get('short_circuited') else ''
     raise CostLimitError(
-        f'estimated input scan is {format_bytes(estimated)} '
+        f'estimated input scan is {at_least}{format_bytes(estimated)} '
         f'({estimated:,} bytes via {est.get("method")}), exceeding '
         f'--max-bytes={max_bytes_raw} ({limit:,} bytes)',
         estimated_bytes=estimated,
@@ -153,7 +154,7 @@ def _estimate_file_bytes(
       if os.path.isfile(p):
         total += os.path.getsize(p)
         count += 1
-        if stop_after_bytes is not None and total > stop_after_bytes:
+        if stop_after_bytes is not None and count >= 1000 and total > stop_after_bytes:
           return {
               'estimated_bytes': total,
               'file_count': count,

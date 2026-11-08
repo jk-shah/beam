@@ -324,7 +324,10 @@ def _query_dataflow_job(
   ])
   client = apiclient.DataflowApplicationClient(opts)
   job_proto = client.get_job(job_id)
-  state_str = str(getattr(job_proto, 'currentState', 'JOB_STATE_UNKNOWN'))
+  raw_state = getattr(job_proto, 'current_state', None)
+  if raw_state is None:
+    raw_state = getattr(job_proto, 'currentState', 'JOB_STATE_UNKNOWN')
+  state_str = str(getattr(raw_state, 'name', None) or raw_state)
 
   raw_counters: dict[str, int] = {}
   try:
@@ -335,20 +338,29 @@ def _query_dataflow_job(
         continue
       origin = str(getattr(m_name, 'origin', '') or '')
       name_str = str(getattr(m_name, 'name', '') or '')
-      context_entries = {
-          str(kv.key): str(kv.value)
-          for kv in (getattr(m_name, 'context', None).additionalProperties
-                     if getattr(m_name, 'context', None) else ())
-      }
+      ctx_obj = getattr(m_name, 'context', None)
+      if hasattr(ctx_obj, 'items'):
+        context_entries = {str(k): str(v) for k, v in ctx_obj.items()}
+      elif ctx_obj and hasattr(ctx_obj, 'additionalProperties'):
+        context_entries = {
+            str(kv.key): str(kv.value) for kv in ctx_obj.additionalProperties
+        }
+      else:
+        context_entries = {}
       if 'user' in origin.lower() and context_entries.get(
           'namespace') == 'beam_cli' and not name_str.endswith(
               ('_MIN', '_MAX', '_MEAN', '_COUNT')):
         scalar = getattr(m, 'scalar', None)
-        val = getattr(scalar, 'integer_value', None)
-        if val is None and scalar is not None:
-          val = getattr(scalar, 'double_value', 0)
-        if val is not None and 'tentative' not in context_entries:
-          raw_counters[name_str] = int(val)
+        if isinstance(scalar, (int, float)):
+          val: int | float | None = scalar
+        elif scalar is not None:
+          val = getattr(scalar, 'integer_value', None)
+          if val is None:
+            val = getattr(scalar, 'double_value', None)
+        else:
+          val = None
+        if val is not None and context_entries.get('tentative') != 'true':
+          raw_counters[name_str] = raw_counters.get(name_str, 0) + int(val)
   except Exception:  # pylint: disable=broad-except
     pass
 
