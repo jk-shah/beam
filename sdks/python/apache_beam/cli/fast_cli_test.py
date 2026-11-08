@@ -155,6 +155,61 @@ class FastCliIsolationTest(unittest.TestCase):
     self.assertEqual(proc.returncode, 0, proc.stderr)
     self.assertIn('usage: beam', proc.stdout)
 
+  def test_v3_fast_commands_skip_beam_and_meet_latency_budget(self):
+    import statistics
+    import time
+
+    in_csv = os.path.join(self.tmp, 'sample.csv')
+    with open(in_csv, 'w', encoding='utf-8') as f:
+      f.write('id,amount\n1,42.5\n2,99.0\n')
+
+    valid_yaml = os.path.join(self.tmp, 'valid.yaml')
+    with open(valid_yaml, 'w', encoding='utf-8') as f:
+      f.write(
+          'pipeline:\n'
+          '  transforms:\n'
+          '    - type: ReadFromCsv\n'
+          '      config: {path: "a.csv"}\n')
+
+    fast_cases = [
+        (['--version', '--json'], 0),
+        (['--llms-txt'], 0),
+        (['io', 'list', '--json'], 0),
+        (['io', 'describe', 'bigquery', '--json'], 0),
+        (['check', valid_yaml, '--json'], 0),
+        (['inspect', in_csv, '--json'], 0),
+        (
+            [
+                'pipe',
+                '--from',
+                in_csv,
+                '--to',
+                os.path.join(self.tmp, 'out.parquet'),
+                '--max-bytes',
+                '1B',
+                '--json',
+            ],
+            8,
+        ),
+    ]
+    for argv, expected_rc in fast_cases:
+      with self.subTest(argv=argv):
+        proc, status = self._probe(argv)
+        self.assertEqual(proc.returncode, expected_rc, proc.stderr)
+        self.assertFalse(status['beam_imported'])
+
+    # Measure median wall-clock subprocess latency on `beam --version --json`.
+    durations_ms = []
+    for _ in range(5):
+      t0 = time.monotonic()
+      proc, _ = self._probe(['--version', '--json'])
+      durations_ms.append((time.monotonic() - t0) * 1000.0)
+      self.assertEqual(proc.returncode, 0)
+    self.assertLess(
+        statistics.median(durations_ms),
+        120.0,
+        f'Expected median fast CLI startup <120ms, got {durations_ms}')
+
 
 if __name__ == '__main__':
   unittest.main()
