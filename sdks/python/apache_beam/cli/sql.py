@@ -140,7 +140,9 @@ def _resolve_version(version):
       raise SqlError(f'invalid Beam version {version!r}', _EXIT_USAGE)
     return version
   installed = _installed_beam_version()
-  if '.dev' not in installed and 'rc' not in installed:
+  if '.dev' not in installed and not re.search(r'rc\d+$',
+                                               installed,
+                                               re.IGNORECASE):
     return installed
   # A development checkout (`2.XX.0.dev`) has no published Maven JARs; fall
   # back to the latest release on Maven Central, just as `beam-sql.sh` uses a

@@ -104,11 +104,15 @@ class ParserTest(unittest.TestCase):
     self.assertIn("no such file: 'no/such/pipeline.yaml'", err)
     self.assertNotIn('pipeline options go after FILE', err)
 
-  def test_missing_file_hints_at_option_order(self):
-    # argparse takes "dataflow" for FILE when an option uses a space.
+  def test_space_separated_pipeline_option_before_file_binds_file(self):
     code, _, err = _run_cli(['run', '--runner', 'dataflow', 'p.yaml'])
     self.assertEqual(code, cli.EXIT_USAGE)
-    self.assertIn("no such file: 'dataflow'", err)
+    self.assertIn("no such file: 'p.yaml'", err)
+
+  def test_missing_file_hints_at_custom_option_order(self):
+    code, _, err = _run_cli(['run', '--custom_opt', 'val', 'p.yaml'])
+    self.assertEqual(code, cli.EXIT_USAGE)
+    self.assertIn("no such file: 'val'", err)
     self.assertIn('pipeline options go after FILE', err)
 
 
@@ -193,8 +197,7 @@ class RunTest(unittest.TestCase):
             '--yaml_pipeline_file=' + path,
             '--runner=DirectRunner',
             '--jinja_variables={"a": 1}',
-            '--project',
-            'p'
+            '--project=p',
         ])
 
   def test_missing_package_exits_with_4(self):
@@ -251,6 +254,38 @@ class PipeTest(unittest.TestCase):
     self.assertIn('beam pipe never overwrites data', err)
     with open(existing) as f:
       self.assertEqual(f.read(), 'keep me\n')
+
+  def test_pipes_csv_to_parquet_and_back_to_json(self):
+    parquet_prefix = os.path.join(self.tmp, 'out', 'users.parquet')
+    json_prefix = os.path.join(self.tmp, 'out', 'roundtrip.json')
+    code, out, _ = _run_cli([
+        'pipe',
+        '--runner',
+        'DirectRunner',
+        '--from',
+        self.input,
+        '--to',
+        parquet_prefix,
+    ])
+    self.assertEqual(code, cli.EXIT_OK)
+    self.assertIn('Wrote 1 file:', out)
+
+    code, out, _ = _run_cli([
+        'pipe',
+        '--from',
+        parquet_prefix + '*',
+        '--to',
+        json_prefix,
+        '--runner',
+        'DirectRunner',
+    ])
+    self.assertEqual(code, cli.EXIT_OK)
+    self.assertEqual([json.loads(line) for line in _read_lines(json_prefix)],
+                     [{
+                         'name': 'Ada', 'age': 36
+                     }, {
+                         'name': 'Linus', 'age': 17
+                     }])
 
   def test_dry_run_prints_a_pipeline_that_beam_run_runs(self):
     for flag in ('--dry-run', '--dry_run'):

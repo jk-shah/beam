@@ -44,17 +44,11 @@ class PipeSpec(NamedTuple):
   # The sink path. Beam file sinks treat it as a prefix and write sharded
   # files that start with it, so the command checks for and lists files
   # matching it.
-  output_prefix: str
+  output_prefix: str | None
 
 
 # Format name -> suffix of the Beam YAML transforms (ReadFrom<X>, WriteTo<X>).
-_READ_FORMATS = {
-    'csv': 'Csv', 'json': 'Json', 'parquet': 'Parquet', 'avro': 'Avro'
-}
-# Parquet is read but not written: Beam's WriteToParquet fails when it
-# directly follows ReadFromCsv or ReadFromJson (ArrowInvalid: "Column 1 ...
-# expected length N but got length 0").
-_WRITE_FORMATS = {'csv': 'Csv', 'json': 'Json', 'avro': 'Avro'}
+_FORMATS = {'csv': 'Csv', 'json': 'Json', 'parquet': 'Parquet', 'avro': 'Avro'}
 _EXTENSIONS = {
     '.csv': 'csv',
     '.json': 'json',
@@ -80,9 +74,8 @@ def build_pipe_spec(source, sink, from_format=None, to_format=None):
     PipeSpecError: if a location or format is invalid. The message names the
       flag that fixes it.
   """
-  read = _transform(
-      'ReadFrom', _READ_FORMATS, source, from_format, '--from-format')
-  write = _transform('WriteTo', _WRITE_FORMATS, sink, to_format, '--to-format')
+  read = _transform('ReadFrom', source, from_format, '--from-format')
+  write = _transform('WriteTo', sink, to_format, '--to-format')
   spec = {'pipeline': {'type': 'chain', 'transforms': [read, write]}}
   return PipeSpec(spec, sink)
 
@@ -99,12 +92,13 @@ def _extension(path):
   reading one command's output in another uses a glob such as
   `out/users.json*`. The extension is the one before that suffix.
   """
-  name = _SHARD_OR_GLOB_SUFFIX.sub('', os.path.basename(path))
+  name = _SHARD_OR_GLOB_SUFFIX.sub(
+      '', os.path.basename(path.replace('\\', '/')))
   return os.path.splitext(name)[1].lower()
 
 
-def _transform(verb, formats, path, fmt, flag):
-  if '://' in path and path.split('://', 1)[0] not in _FILE_SCHEMES:
+def _transform(verb, path, fmt, flag):
+  if '://' in path and path.split('://', 1)[0].lower() not in _FILE_SCHEMES:
     schemes = ', '.join(s + '://' for s in _FILE_SCHEMES)
     raise PipeSpecError(
         f'unsupported location {path!r}: use a local path or one of '
@@ -116,11 +110,11 @@ def _transform(verb, formats, path, fmt, flag):
     raise PipeSpecError(
         f'cannot tell the format of {path!r} (no known file extension)\n'
         f'  add {flag}, for example: {flag} json')
-  if fmt not in formats:
+  if fmt not in _FORMATS:
     raise PipeSpecError(
         f'unsupported format {fmt!r} for {path!r}; use one of: '
-        f'{", ".join(formats)}')
-  return {'type': verb + formats[fmt], 'config': {'path': path}}
+        f'{", ".join(_FORMATS)}')
+  return {'type': verb + _FORMATS[fmt], 'config': {'path': path}}
 
 
 def to_yaml(spec, argv):

@@ -48,6 +48,8 @@ import os
 import sys
 import traceback
 
+from . import _option_arity
+
 # Exit codes, also listed in `--help`. Usage errors use 2, the code argparse
 # itself exits with.
 EXIT_OK = 0
@@ -58,7 +60,7 @@ EXIT_INTERRUPTED = 130  # 128 + SIGINT, the shell convention for Ctrl-C.
 
 _EXIT_CODES = """
 exit codes:
-  0    the pipeline finished (or --dry-run checked it)
+  0    the pipeline finished (or --dry-run checked it, or --no_wait_until_finish submitted it)
   1    the pipeline failed
   2    usage error, or the pipeline could not be built
   4    a required package is missing
@@ -72,16 +74,15 @@ examples:
       --region=us-central1 --temp_location=gs://my-bucket/tmp
 
 Every other --flag is passed to the pipeline as a Beam pipeline option.
-Write them after FILE, as --flag=value.
 """ + _EXIT_CODES
 
 _PIPE_EPILOG = """\
 examples:
-  beam pipe --from users.csv --to out/users.json
-  beam pipe --from 'data/*.parquet' --to out/data --to-format avro
-  beam pipe --from users.csv --to out/users.json --dry-run > pipeline.yaml
+  beam pipe --from users.csv --to out/users.parquet
+  beam pipe --from 'data/*.parquet' --to out/data --to-format json
+  beam pipe --from users.csv --to out/users.parquet --dry-run > pipeline.yaml
 
-Formats: csv, json and avro can be read and written; parquet can be read.
+Formats: csv, json, parquet, avro (from the file extension unless overridden).
 Paths can be local or on any Beam filesystem (gs://, s3://, ...). The
 output path is a prefix: Beam writes sharded files that start with it, and
 existing output is never overwritten.
@@ -120,18 +121,52 @@ exit codes:
   2    usage or validation error
 """
 
+_SUBCOMMANDS = frozenset(['run', 'pipe', 'sql', 'config'])
+_PASSTHROUGH_SUBCOMMANDS = frozenset(['run', 'pipe'])
+_CLI_ZERO_FLAGS = {
+    None: frozenset(['--help']),
+    'run': frozenset(['--verbose', '--no-config', '--help']),
+    'pipe': frozenset(
+        ['--dry-run', '--dry_run', '--verbose', '--no-config', '--help']),
+}
+_CLI_ONE_FLAGS = {
+    None: frozenset(),
+    'run': frozenset(['--profile']),
+    'pipe': frozenset([
+        '--from',
+        '--to',
+        '--format',
+        '--from-format',
+        '--to-format',
+        '--profile',
+    ]),
+}
+
+
+def _normalize_cli_argv(argv):
+  return _option_arity.normalize_argv(
+      argv,
+      subcommands=_SUBCOMMANDS,
+      passthrough_subcommands=_PASSTHROUGH_SUBCOMMANDS,
+      cli_zero_flags_by_cmd=_CLI_ZERO_FLAGS,
+      cli_one_flags_by_cmd=_CLI_ONE_FLAGS)
+
 
 def main(argv=None):
   """Runs the `beam` command and returns its exit code."""
-  argv = sys.argv[1:] if argv is None else argv
-  args, extra_args = _build_parser().parse_known_args(argv)
+  raw_argv = list(sys.argv[1:] if argv is None else argv)
+  norm_argv = _normalize_cli_argv(raw_argv)
+  args, extra_args = _build_parser().parse_known_args(norm_argv)
   # The same logging setup as `python -m apache_beam.yaml.main`.
   logging.getLogger().setLevel(logging.INFO)
   try:
     if args.command == 'run':
       return _run(args, extra_args)
     if args.command == 'pipe':
-      return _pipe(args, extra_args, argv[argv.index('pipe') + 1:])
+      pipe_tail = (
+          raw_argv[raw_argv.index('pipe') + 1:]
+          if 'pipe' in raw_argv else norm_argv[1:])
+      return _pipe(args, extra_args, pipe_tail)
     if args.command == 'sql':
       return _sql(args, extra_args)
     return _config(args, extra_args)
@@ -381,17 +416,12 @@ def _run(args, pipeline_args):
   if '://' not in file and not os.path.isfile(file):
     hint = ''
     if pipeline_args:
-      # `beam run --runner dataflow p.yaml` makes argparse take "dataflow"
-      # for FILE.
-      hint = '\n  pipeline options go after FILE, written as --flag=value'
+      hint = '\n  custom pipeline options go after FILE, written as --flag=value'
     raise _CliError(f'no such file: {file!r}{hint}', EXIT_USAGE)
 
   resolved_args = _resolve_config_args(args, pipeline_args)
-  options, pipeline = _build(
-      ['--yaml_pipeline_file=' + file] + resolved_args, args.verbose)
-  result = _execute(pipeline, args.verbose)
-  print(f'Done. Ran {_describe_runner(options, result)}.')
-  return EXIT_OK
+  return _run_yaml(['--yaml_pipeline_file=' + file] + resolved_args,
+                   args.verbose)
 
 
 def _pipe(args, pipeline_args, pipe_argv):
@@ -406,62 +436,180 @@ def _pipe(args, pipeline_args, pipe_argv):
   except pipe_spec.PipeSpecError as e:
     raise _CliError(str(e), EXIT_USAGE) from None
 
-  # A dry run makes every check a real run makes, including building the
-  # pipeline, so that it predicts whether `beam run` on its output will work.
-  _refuse_existing_output(pipe.output_prefix)
+  # Local existing-output check runs before importing `apache_beam` so fast
+  # local error paths stay `<50 ms`; remote filesystems (`gs://`, `s3://`, ...)
+  # are checked inside `_run_yaml` after `Pipeline(options=...)` initializes
+  # `FileSystems._pipeline_options`.
+  if pipe.output_prefix is not None and '://' not in pipe.output_prefix:
+    _refuse_existing_local_output(pipe.output_prefix)
+
   resolved_args = _resolve_config_args(args, pipeline_args)
   import yaml
   dumper = getattr(yaml, 'CSafeDumper', yaml.SafeDumper)
-  options, pipeline = _build([
-      '--yaml_pipeline=' + yaml.dump(pipe.spec, Dumper=dumper, sort_keys=False)
-  ] + resolved_args,
-                             args.verbose)
-  _warn_if_local_paths([args.source, args.sink], options)
-  if args.dry_run:
-    # The YAML goes to stdout and every message to stderr, so that
-    # `> pipeline.yaml` captures exactly the pipeline.
-    print(pipe_spec.to_yaml(pipe.spec, pipe_argv), end='')
-    print(
-        'Dry run: the pipeline was built and checked but not run. To run '
-        'it, save the YAML (for example with > pipeline.yaml) and use: '
-        'beam run pipeline.yaml',
-        file=sys.stderr)
-    return EXIT_OK
+  return _run_yaml(
+      ['--yaml_pipeline=' + yaml.dump(pipe.spec, Dumper=dumper, sort_keys=False)
+       ] + resolved_args,
+      args.verbose,
+      local_paths=[args.source, args.sink],
+      dry_run_yaml=pipe_spec.to_yaml(pipe.spec, pipe_argv)
+      if args.dry_run else None,
+      output_prefix=pipe.output_prefix)
 
-  result = _execute(pipeline, args.verbose)
+
+def _run_yaml(
+    yaml_main_argv,
+    verbose,
+    local_paths=(),
+    dry_run_yaml=None,
+    output_prefix=None):
+  # Beam and Beam YAML are imported here, not at the top of the module, so
+  # fast CLI paths remain instant and a missing [yaml] extra is reported with
+  # exit code 4 and a hint instead of a traceback.
+  import contextlib
+  try:
+    import apache_beam as beam
+    from apache_beam.options.pipeline_options import CrossLanguageOptions
+    from apache_beam.options.pipeline_options import StandardOptions
+    from apache_beam.runners.runner import PipelineState
+    from apache_beam.utils import subprocess_server
+    from apache_beam.yaml import main as yaml_main
+  except ImportError as e:
+    _maybe_print_traceback(verbose)
+    raise _CliError(
+        f'a required package is missing: {e}\n'
+        "  Beam YAML needs the [yaml] extra: pip install 'apache-beam[yaml]'",
+        EXIT_MISSING_PACKAGE) from None
+
+  # Build and run in two steps (yaml_main.run does both in a `with` block) so
+  # that build errors and pipeline failures get different exit codes, and so
+  # that `pipe --dry-run` can stop after building. Cache subprocess servers
+  # across `constructor(pipeline)` and `pipeline.run()` via `ExitStack` rather
+  # than `Pipeline.__exit__`, which auto-runs the pipeline when no exception is
+  # passed.
+  with contextlib.ExitStack() as stack:
+    try:
+      options, constructor, display_data = (
+          yaml_main.build_pipeline_components_from_argv(yaml_main_argv))
+      stack.enter_context(
+          subprocess_server.JavaJarServer.beam_services(
+              options.view_as(CrossLanguageOptions).beam_services))
+      stack.enter_context(
+          subprocess_server.SubprocessServer.cache_subprocesses())
+      pipeline = beam.Pipeline(options=options, display_data=display_data)
+      if output_prefix is not None:
+        _refuse_existing_output(output_prefix, verbose)
+      constructor(pipeline)
+    except _CliError:
+      raise
+    except ImportError as e:
+      _maybe_print_traceback(verbose)
+      raise _CliError(
+          f'a required package is missing: {e}\n'
+          '  install the extra the pipeline needs, for example: '
+          "pip install 'apache-beam[yaml,gcp]'",
+          EXIT_MISSING_PACKAGE) from None
+    except Exception as e:  # pylint: disable=broad-except
+      _maybe_print_traceback(verbose)
+      raise _CliError(
+          f'could not build the pipeline: {e}', EXIT_USAGE) from None
+
+    if local_paths:
+      _warn_if_local_paths(local_paths, options)
+    if dry_run_yaml is not None:
+      print(dry_run_yaml, end='')
+      print(
+          'Dry run: the pipeline was built and checked but not run. To run '
+          'it, save the YAML (for example with > pipeline.yaml) and use: '
+          'beam run pipeline.yaml',
+          file=sys.stderr)
+      return EXIT_OK
+
+    no_wait = options.view_as(StandardOptions).no_wait_until_finish
+    state = None
+    try:
+      result = pipeline.run()
+      if not no_wait:
+        try:
+          state = result.wait_until_finish()
+        except KeyboardInterrupt:
+          _cancel(result)
+          raise
+    except KeyboardInterrupt:
+      raise
+    except Exception as e:  # pylint: disable=broad-except
+      _maybe_print_traceback(verbose)
+      more = '' if verbose else '\n  rerun with --verbose for the traceback'
+      raise _CliError(
+          f'pipeline failed: {_summarize(e)}{more}',
+          EXIT_PIPELINE_FAILED) from None
+
+  if no_wait:
+    print(
+        f'Submitted {_describe_runner(options, result)} '
+        f'(state: {result.state}; not waiting for completion).')
+    return EXIT_OK
+  if state != PipelineState.DONE:
+    raise _CliError(f'pipeline finished in state {state}', EXIT_PIPELINE_FAILED)
+
   print(f'Done. Ran {_describe_runner(options, result)}.')
-  written = _matching_files(pipe.output_prefix)
-  print(f'Wrote {len(written)} file{"" if len(written) == 1 else "s"}:')
-  for path in written:
-    print('  ' + path)
+  if output_prefix is not None:
+    written = _matching_files(
+        output_prefix, verbose, error_exit_code=EXIT_PIPELINE_FAILED)
+    print(f'Wrote {len(written)} file{"" if len(written) == 1 else "s"}:')
+    for path in written:
+      print('  ' + path)
   return EXIT_OK
 
 
-def _refuse_existing_output(prefix):
-  """Fails if any file starts with the output prefix: pipe never overwrites."""
-  existing = _matching_files(prefix)
+def _format_existing_output_error(prefix, existing):
+  shown = '\n'.join('  ' + path for path in existing[:5])
+  more = f'\n  ... and {len(existing) - 5} more' if len(existing) > 5 else ''
+  return _CliError(
+      f'output already exists for {prefix!r}; beam pipe never overwrites '
+      f'data:\n{shown}{more}\n'
+      '  remove these files or choose another --to path',
+      EXIT_USAGE)
+
+
+def _refuse_existing_local_output(prefix):
+  existing = sorted(
+      p for p in glob.glob(glob.escape(prefix) + '*') if os.path.isfile(p))
   if existing:
-    shown = '\n'.join('  ' + path for path in existing[:5])
-    more = f'\n  ... and {len(existing) - 5} more' if len(existing) > 5 else ''
-    raise _CliError(
-        f'output already exists for {prefix!r}; beam pipe never overwrites '
-        f'data:\n{shown}{more}\n'
-        '  remove these files or choose another --to path',
-        EXIT_USAGE)
+    raise _format_existing_output_error(prefix, existing)
 
 
-def _matching_files(prefix):
-  if '://' not in prefix:
-    return sorted(
-        p for p in glob.glob(glob.escape(prefix) + '*') if os.path.isfile(p))
+def _refuse_existing_output(prefix, verbose):
+  """Fails if any file starts with the output prefix: pipe never overwrites."""
+  existing = _matching_files(prefix, verbose, error_exit_code=EXIT_USAGE)
+  if existing:
+    raise _format_existing_output_error(prefix, existing)
+
+
+def _matching_files(prefix, verbose, error_exit_code):
+  from apache_beam.io.filesystem import BeamIOError
   from apache_beam.io.filesystems import FileSystems
+
+  dot = (
+      '.' +
+      os.sep if '://' not in prefix and not os.path.dirname(prefix) else '')
   try:
-    match = FileSystems.match([prefix + '*'])[0]
-  except ValueError as e:
-    # No filesystem handles the scheme, for example gs:// without the [gcp]
-    # extra. Beam's message names the extra to install.
-    raise _CliError(str(e), EXIT_MISSING_PACKAGE) from None
-  return sorted(m.path for m in match.metadata_list)
+    match = FileSystems.match([dot + prefix + '*'])[0]
+  except (BeamIOError, ValueError) as e:
+    _maybe_print_traceback(verbose)
+    cause = (
+        next(iter(e.exception_details.values()))
+        if isinstance(e, BeamIOError) and e.exception_details else e)
+    if (isinstance(cause, ImportError) or
+        'dependencies are not installed' in str(cause) or
+        'Unable to get filesystem from specified path' in str(cause)):
+      raise _CliError(
+          f'a required package is missing: {cause}',
+          EXIT_MISSING_PACKAGE) from None
+    raise _CliError(
+        f'could not access {prefix!r}: {cause}', error_exit_code) from None
+  return sorted(
+      m.path[len(dot):] if dot and m.path.startswith(dot) else m.path
+      for m in match.metadata_list)
 
 
 def _runner_name(runner):
@@ -479,15 +627,13 @@ _LOCAL_RUNNERS = frozenset(
 
 
 def _warn_if_local_paths(paths, options):
-  """Warns when a runner that isn't local would open local files.
-
-  On a cluster the runner's workers open the files, so a local or relative
-  path refers to each worker's own disk or container. The job can then
-  succeed while reading nothing, or write where the user never looks.
-  """
+  """Warns when a runner that isn't local would open local files."""
   from apache_beam.options.pipeline_options import StandardOptions
   runner = options.view_as(StandardOptions).runner
-  local = [path for path in paths if '://' not in path]
+  local = [
+      path for path in paths
+      if '://' not in path or path.lower().startswith('file://')
+  ]
   if local and _runner_name(runner) not in _LOCAL_RUNNERS:
     print(
         f'warning: {", ".join(local)}: local paths are opened by the '
@@ -495,69 +641,6 @@ def _warn_if_local_paths(paths, options):
         'worker can reach (for example gs://, s3:// or hdfs://, or a shared '
         'mount at the same absolute path)',
         file=sys.stderr)
-
-
-def _build(yaml_main_argv, verbose):
-  """Builds a Beam YAML pipeline; returns (options, pipeline).
-
-  `yaml_main_argv` is what `python -m apache_beam.yaml.main` would receive.
-  Building also validates the YAML and expands cross-language transforms.
-  """
-  # Beam and Beam YAML are imported here, not at the top of the module, so
-  # fast CLI paths remain instant and a missing [yaml] extra is reported with
-  # exit code 4 and a hint instead of a traceback.
-  try:
-    import apache_beam as beam
-    from apache_beam.yaml import main as yaml_main
-  except ImportError as e:
-    _maybe_print_traceback(verbose)
-    raise _CliError(
-        f'a required package is missing: {e}\n'
-        "  Beam YAML needs the [yaml] extra: pip install 'apache-beam[yaml]'",
-        EXIT_MISSING_PACKAGE) from None
-
-  # Build and run in two steps (yaml_main.run does both in a `with` block) so
-  # that build errors and pipeline failures get different exit codes, and so
-  # that `pipe --dry-run` can stop after building.
-  try:
-    options, constructor, display_data = (
-        yaml_main.build_pipeline_components_from_argv(yaml_main_argv))
-    pipeline = beam.Pipeline(options=options, display_data=display_data)
-    constructor(pipeline)
-  except ImportError as e:
-    # A transform's extra is missing, for example [gcp] for BigQuery.
-    _maybe_print_traceback(verbose)
-    raise _CliError(
-        f'a required package is missing: {e}\n'
-        '  install the extra the pipeline needs, for example: '
-        "pip install 'apache-beam[yaml,gcp]'",
-        EXIT_MISSING_PACKAGE) from None
-  except Exception as e:  # pylint: disable=broad-except
-    _maybe_print_traceback(verbose)
-    raise _CliError(f'could not build the pipeline: {e}', EXIT_USAGE) from None
-  return options, pipeline
-
-
-def _execute(pipeline, verbose):
-  """Runs a built pipeline until it finishes; returns its result."""
-  from apache_beam.runners.runner import PipelineState
-  try:
-    result = pipeline.run()
-    try:
-      state = result.wait_until_finish()
-    except KeyboardInterrupt:
-      # main() reports the interruption after the pipeline is cancelled.
-      _cancel(result)
-      raise
-  except Exception as e:  # pylint: disable=broad-except
-    _maybe_print_traceback(verbose)
-    more = '' if verbose else '\n  rerun with --verbose for the traceback'
-    raise _CliError(
-        f'pipeline failed: {_summarize(e)}{more}',
-        EXIT_PIPELINE_FAILED) from None
-  if state != PipelineState.DONE:
-    raise _CliError(f'pipeline finished in state {state}', EXIT_PIPELINE_FAILED)
-  return result
 
 
 def _maybe_print_traceback(verbose):
@@ -569,21 +652,10 @@ _PYTHON_TRACEBACK = 'Traceback (most recent call last):'
 
 
 def _summarize(error, max_lines=10):
-  """Returns the part of a pipeline error that says what went wrong.
-
-  Runner errors often embed whole stack traces. Prism and the default runner
-  put a line of context ("Pipeline job-001 failed in state FAILED: bundle ...
-  failed:") before the worker's Python traceback, whose last line names the
-  exception and the failing step; Java runners add `\\tat ...` frames. Stack
-  frames are indented, so only unindented lines are kept, and for a Python
-  traceback only the context and the last exception line. `--verbose` still
-  prints everything.
-  """
+  """Returns the part of a pipeline error that says what went wrong."""
   message = str(error)
   if type(error) is not RuntimeError and not message.startswith(
       type(error).__name__):
-    # Errors raised directly (for example a ZeroDivisionError from the
-    # in-process runner) don't name their type in the message.
     message = f'{type(error).__name__}: {message}'
   lines = [
       line.rstrip() for line in message.splitlines()
@@ -603,11 +675,7 @@ def _summarize(error, max_lines=10):
 
 
 def _cancel(result):
-  """Cancels the pipeline after Ctrl-C, saying whether that worked.
-
-  A local runner usually receives the same Ctrl-C and stops by itself, in
-  which case cancelling fails harmlessly.
-  """
+  """Cancels the pipeline after Ctrl-C, saying whether that worked."""
   try:
     result.cancel()
     print('Cancelled the pipeline.', file=sys.stderr)
@@ -619,12 +687,7 @@ def _cancel(result):
 
 
 def _describe_runner(options, result):
-  """Says which runner ran the pipeline, for the last line of output.
-
-  Without --runner (or with --runner=DirectRunner), the Python SDK runs the
-  pipeline on Prism and falls back to the Python direct runner when Prism
-  can't run it. The type of the result tells the two apart.
-  """
+  """Says which runner ran the pipeline, for the last line of output."""
   from apache_beam.options.pipeline_options import StandardOptions
   runner = options.view_as(StandardOptions).runner
   if _runner_name(runner) != 'direct':

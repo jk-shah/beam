@@ -319,6 +319,8 @@ class PyarrowBatchConverter(BatchConverter):
     return PyarrowBatchConverter(element_type)
 
   def produce_batch(self, elements):
+    if not isinstance(elements, (list, tuple)):
+      elements = list(elements)
     arrays = [
         pa.array([getattr(el, name) for el in elements],
                  type=self._arrow_schema.field(name).type)
