@@ -136,7 +136,8 @@ def render_llms_txt() -> str:
   Beam YAML (`keep: "state is not None and state != 'CA'"`).
 - CSV: empty cells are NULL (like core `ReadFromCsv`); add genuine NULL markers with `--null-values NA,NULL` (never
   list bad values such as `abc` there: they would silently become NULL instead of going to `--dlq`). Columns are typed
-  from a 100-row sample; any value with a leading zero (zip `00501`) keeps the column as text. Set types explicitly
+  from a 100-row sample; any value with a leading zero (zip `00501`) keeps the column as text (small local runs
+  check every row; elsewhere a late leading-zero value fails or goes to `--dlq`, never silently cast). Set types explicitly
   with `--from-opt fields=amount:float,id:int` (CSV and JSONL); values that don't parse go to `--dlq`.
 - Globs: CSV files in one glob may list columns in different orders (matched by name). A local glob over several
   formats (`data/*` with `.jsonl` and `.csv`) is read file by file and unified by column name on small local runs;

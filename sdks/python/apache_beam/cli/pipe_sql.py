@@ -356,7 +356,8 @@ def load_endpoint_rows(
         ep.config['path'],
         delimiter=delim,
         allow_dirty=bool(dlq_records is not None),
-        null_values=nulls)
+        null_values=nulls,
+        scan_all_for_leading_zeros=('://' not in str(ep.config['path'])))
     cols = [
         (
             c,

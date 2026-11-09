@@ -66,7 +66,12 @@ _CONTROL_AND_INJECTION_RE = re.compile(
 
 # Long quoted string literals in runtime exceptions (may embed untrusted row
 # cells when a worker fails parsing a record).
-_LONG_QUOTED_RE = re.compile(r"""(['"])(?:\\.|(?!\1).){28,}?\1""", re.DOTALL)
+# A long quoted literal (a possible secret or raw payload). The opening quote
+# must not follow a word character or another quote, so the closing quote of
+# a short literal (column 'zip': ...) is never mistaken for the start of one
+# and ordinary error text between two literals is left readable.
+_LONG_QUOTED_RE = re.compile(
+    r"""(?<![\w'"])(['"])(?:\\.|(?!\1).){28,}?\1""", re.DOTALL)
 
 
 # Set by `beam pipe` when --dlq was passed, so a failure doesn't suggest it.

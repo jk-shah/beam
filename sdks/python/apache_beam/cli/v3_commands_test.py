@@ -2862,6 +2862,91 @@ class Round7FixesTest(unittest.TestCase):
         env['warnings'])
 
 
+class Round8FixesTest(unittest.TestCase):
+  """Late leading-zero CSV values and readable scrubbed errors."""
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp(prefix='beam-r8-test-')
+    self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+    self.src = os.path.join(self.tmp, 'late.csv')
+    with open(self.src, 'w', encoding='utf-8') as f:
+      f.write('id,zip\n')
+      for i in range(1, 152):
+        f.write(f'{i},{"00123" if i == 120 else 10000 + i}\n')
+
+  def _path(self, name):
+    return os.path.join(self.tmp, name)
+
+  def test_late_leading_zero_kept_on_fast_and_sql_paths(self):
+    out = self._path('fast.jsonl')
+    rc, env, err = _run_json(
+        ['pipe', '--from', self.src, '--to', out, '--where', 'id = 120'])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertEqual(env['runner'], 'local_fast')
+    with open(out, encoding='utf-8') as f:
+      self.assertEqual(json.loads(f.readline())['zip'], '00123')
+    rc, env, err = _run_json([
+        'pipe', '--from', 't=' + self.src, '--sql',
+        'SELECT zip FROM t WHERE id = 120'
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertEqual(env['untrusted_data']['rows'], [{'zip': '00123'}])
+
+  def test_late_leading_zero_never_cast_on_runner_path(self):
+    no_fast = {'BEAM_CLI_NO_FAST_PATH': '1'}
+    rc, env, _ = _run_json(
+        ['pipe', '--from', self.src, '--to', self._path('r.jsonl')],
+        extra_env=no_fast)
+    self.assertEqual(rc, cli.EXIT_PIPELINE_FAILED)
+    self.assertIn('leading zero', env['error']['message'])
+    self.assertIn('fields=COLUMN:str', env['error']['message'])
+    out = self._path('r2.jsonl')
+    rc, env, err = _run_json([
+        'pipe', '--from', self.src, '--to', out, '--from-opt', 'fields=zip:str',
+        '--where', 'id = 120'
+    ],
+                             extra_env=no_fast)
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    with open(out, encoding='utf-8') as f:
+      self.assertEqual(json.loads(f.readline())['zip'], '00123')
+
+  def test_offline_dry_run_falls_back_to_static_check(self):
+    path = self._path('gcs.yaml')
+    with open(path, 'w', encoding='utf-8') as f:
+      f.write('pipeline:\n  type: chain\n  transforms:\n'
+              '  - type: ReadFromCsv\n    config:\n'
+              '      path: gs://bucket/orders/*.csv\n'
+              '  - type: WriteToJson\n    config:\n      path: out.json\n')
+
+    class RefreshError(Exception):
+      pass
+
+    with mock.patch(
+        'apache_beam.yaml.main.build_pipeline_components_from_argv',
+        side_effect=RefreshError('Reauthentication is needed')):
+      rc, env, err = _run_json(['run', path, '--dry-run'])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertEqual(env['state'], 'DRY_RUN_VALIDATED')
+    self.assertTrue(env['warnings'][0].startswith('dry run passed'))
+    # A real YAML error is still an error.
+    with open(path, 'a', encoding='utf-8') as f:
+      f.write('  - type: Filter\n    keep: x > 1\n')
+    with mock.patch(
+        'apache_beam.yaml.main.build_pipeline_components_from_argv',
+        side_effect=RefreshError('Reauthentication is needed')):
+      rc, env, _ = _run_json(['run', path, '--dry-run'])
+    self.assertEqual(rc, cli.EXIT_USAGE)
+
+  def test_scrubber_keeps_text_between_short_literals(self):
+    from apache_beam.cli import output as output_mod
+    msg = ("column 'zip': value 00123 has a leading zero and should be kept "
+           "as text; see 'docs'")
+    self.assertEqual(output_mod.scrub_error_message(msg), msg)
+    self.assertIn(
+        '<redacted-value>',
+        output_mod.scrub_error_message(
+            "token 'abcdefghijklmnopqrstuvwxyz0123456789' leaked"))
+
+
 if __name__ == '__main__':
   unittest.main()
 

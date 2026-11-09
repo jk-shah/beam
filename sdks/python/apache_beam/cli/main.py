@@ -2636,6 +2636,26 @@ def _run_fast_local_pipe(
   return EXIT_OK
 
 
+def _dry_run_offline_ok(exc: BaseException, yaml_text: str) -> bool:
+  """True if a dry run failed only for lack of cloud access and the YAML
+  passes the offline static check (`beam check` without --plan)."""
+  from . import check_cmd
+  if not check_cmd._is_remote_access_error(exc):
+    return False
+  import tempfile
+  with tempfile.NamedTemporaryFile(
+      'w', suffix='.yaml', delete=False, encoding='utf-8') as f:
+    f.write(yaml_text)
+    path = f.name
+  try:
+    check_cmd.run_check(path)
+    return True
+  except check_cmd.CheckError:
+    return False
+  finally:
+    os.unlink(path)
+
+
 def _run_yaml(
     yaml_or_pipeline_argv: list[str],
     verbose: bool,
@@ -2776,6 +2796,15 @@ def _run_yaml(
             warnings_list.append(
                 'Source files do not exist yet; emitted portable YAML without '
                 'live schema inspection.')
+          elif dry_run_yaml is not None and _dry_run_offline_ok(
+              e, dry_run_yaml):
+            # Like `beam check --plan`: building needs cloud storage or
+            # credentials that aren't available, but the YAML is valid.
+            options = PipelineOptions(yaml_or_pipeline_argv)
+            warnings_list.append(
+                'dry run passed (offline static validation); building the full '
+                'pipeline was skipped because it needs access to remote storage '
+                'or credentials that are not available here')
           else:
             _maybe_print_traceback(verbose)
             raise _CliError(

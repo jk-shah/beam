@@ -341,6 +341,13 @@ def _parse_cell(
   if kind == 'str':
     return raw
   stripped = raw.strip()
+  if kind in ('int', 'float') and _has_leading_zero(stripped):
+    # The column was typed from a sample without leading zeros; casting would
+    # silently turn "00123" into 123. Fail this value instead (DLQ or error).
+    raise ValueError(
+        f'value {stripped} has a leading zero but the column was typed {kind} '
+        'from the first rows; keep it as text with --from-opt '
+        'fields=COLUMN:str (or route such rows with --dlq)')
   if kind == 'int':
     return int(stripped)
   if kind == 'float':
@@ -361,8 +368,14 @@ def _preflight_csv_schema(
     sample_rows: int = 100,
     allow_dirty: bool = True,
     null_values=DEFAULT_CSV_NULL_VALUES,
+    scan_all_for_leading_zeros: bool = False,
 ) -> tuple[list[str], dict[str, str]]:
-  """Reads header + up to `sample_rows` well-formed rows to lock CSV schema."""
+  """Reads header + up to `sample_rows` well-formed rows to lock CSV schema.
+
+  With `scan_all_for_leading_zeros` (small local inputs), every row is also
+  checked, and a numeric column with a leading-zero value anywhere ("00123")
+  is typed as text so no value loses its zeros.
+  """
   matches = _match_paths(path)
   if not matches:
     raise ValueError(f'no CSV files matched {path!r}')
@@ -415,7 +428,43 @@ def _preflight_csv_schema(
           col_samples[c], allow_dirty=allow_dirty, null_values=null_values)
       for c in header
   }
+  if scan_all_for_leading_zeros:
+    numeric = [c for c in header if kinds[c] in ('int', 'float')]
+    if numeric:
+      for c in _columns_with_leading_zeros(
+          matches, header, numeric, delimiter):
+        kinds[c] = 'str'
   return header, kinds
+
+
+def _columns_with_leading_zeros(files, header, columns, delimiter):
+  """Columns (of `columns`) with a leading-zero value in any row of `files`."""
+  found: set[str] = set()
+  for fp in files:
+    with _open_auto(fp) as raw_stream:
+      reader = csv.reader(
+          io.TextIOWrapper(
+              raw_stream, encoding='utf-8-sig', errors='replace', newline=''),
+          delimiter=delimiter)
+      try:
+        first = next(reader, None)
+      except csv.Error:
+        continue
+      if not first:
+        continue
+      norm = [col.strip() or f'col_{i}' for i, col in enumerate(first)]
+      positions = {c: norm.index(c) for c in columns if c in norm}
+      try:
+        for row in reader:
+          for c, i in positions.items():
+            if c not in found and i < len(row) and _has_leading_zero(
+                row[i].strip()):
+              found.add(c)
+          if len(found) == len(positions):
+            break
+      except csv.Error:
+        pass
+  return found
 
 
 def header_order(file_header: list[str], header: list[str]):

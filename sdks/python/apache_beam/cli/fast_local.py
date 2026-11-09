@@ -341,7 +341,10 @@ def _read_source(
     nulls = dlq.DEFAULT_CSV_NULL_VALUES | frozenset(
         src.config.get('null_values') or ())
     header, kinds = dlq._preflight_csv_schema(
-        src.config['path'], delimiter=delim, null_values=nulls)
+        src.config['path'],
+        delimiter=delim,
+        null_values=nulls,
+        scan_all_for_leading_zeros=True)
     kinds = dlq.apply_type_overrides(
         kinds, src.config.get('types'), str(src.raw))
     rows = []
