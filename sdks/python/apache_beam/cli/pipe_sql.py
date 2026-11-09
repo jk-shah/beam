@@ -293,7 +293,12 @@ def load_endpoint_rows(
   from . import lakehouse
 
   if ep.kind == 'delta':
-    snap, rows = lakehouse.read_delta_rows_local(ep.config['path'], limit=None)
+    table_root = ep.config.get('table') or ep.config.get('path')
+    ver = ep.config.get('version')
+    snap, rows = lakehouse.read_delta_rows_local(
+        table_root,
+        version=int(ver) if ver is not None else None,
+        limit=None)
     cols = []
     for f in snap.get('schema', []):
       ft = str(f.get('type', 'string')).lower()
@@ -731,11 +736,116 @@ _SQL_DIALECT_HINTS = (
     (re.compile(r'no such function: (date_trunc|format_timestamp|extract)',
                 re.I),
      "use strftime(), e.g. strftime('%Y-%m', ts)"),
+    (re.compile(
+        r'no such function: (regr_\w+|corr|covar_\w+|arg_max|arg_min|'
+        r'max_by|min_by|mode|bool_and|bool_or|string_agg|array_agg)',
+        re.I),
+     'statistical and ANSI warehouse aggregates require --sql-engine duckdb '
+     '(or Python numpy/scipy for linear regression)'),
     (re.compile(r'no such table|table .* does not exist|replacement scan', re.I),
      'name each input with --from ALIAS=PATH / --join ALIAS=PATH (inputs are '
      'pre-loaded as tables, never file paths; without an alias use the file '
      'name or FROM source)'),
 )
+
+_SQLITE_CAST_TYPE_MAP = {
+    'string': 'TEXT',
+    'bytes': 'BLOB',
+    'int64': 'INTEGER',
+    'float64': 'REAL',
+    'bignumeric': 'REAL',
+}
+
+
+def _scan_sql_outside_literals(sql_text: str):
+  """Yields `(is_code, segment)` preserving SQL quotes and comments."""
+  n = len(sql_text)
+  i = 0
+  code_start = 0
+  while i < n:
+    ch = sql_text[i]
+    if ch in ("'", '"', '`'):
+      if i > code_start:
+        yield True, sql_text[code_start:i]
+      q = ch
+      j = i + 1
+      while j < n:
+        if sql_text[j] == q:
+          if j + 1 < n and sql_text[j + 1] == q:
+            j += 2
+            continue
+          j += 1
+          break
+        j += 1
+      yield False, sql_text[i:j]
+      i = code_start = j
+      continue
+    if sql_text[i:i + 2] == '--':
+      if i > code_start:
+        yield True, sql_text[code_start:i]
+      nl = sql_text.find('\n', i + 2)
+      end = n if nl == -1 else nl + 1
+      yield False, sql_text[i:end]
+      i = code_start = end
+      continue
+    if sql_text[i:i + 2] == '/*':
+      if i > code_start:
+        yield True, sql_text[code_start:i]
+      end_c = sql_text.find('*/', i + 2)
+      end = n if end_c == -1 else end_c + 2
+      yield False, sql_text[i:end]
+      i = code_start = end
+      continue
+    i += 1
+  if code_start < n:
+    yield True, sql_text[code_start:]
+
+
+def _normalize_sqlite_cast_types(sql_query: str) -> str:
+  """Maps BigQuery/ANSI `CAST(... AS STRING|INT64|FLOAT64|BYTES)` to SQLite types.
+
+  SQLite treats unknown type names without `CHAR`/`CLOB`/`TEXT` (including
+  `STRING`) as `NUMERIC` affinity, which would silently coerce `'u1'` -> `0`!
+  """
+  def _sub_cast_type(m: re.Match) -> str:
+    mapped = _SQLITE_CAST_TYPE_MAP.get(m.group(2).lower())
+    return f'{m.group(1)}{mapped}{m.group(3)}' if mapped else m.group(0)
+
+  cast_as_re = re.compile(
+      r'(\bAS\s+)(STRING|BYTES|INT64|FLOAT64|BIGNUMERIC)(\s*\))', re.I)
+  parts: list[str] = []
+  for is_code, seg in _scan_sql_outside_literals(sql_query):
+    parts.append(cast_as_re.sub(_sub_cast_type, seg) if is_code else seg)
+  return ''.join(parts)
+
+
+def _rewrite_source_uri_table_refs(
+    sql_query: str, named_sources: list[NamedSource]) -> str:
+  """Rewrites `FROM "delta://..."` / `FROM "iceberg://..."` matching a lakehouse input to its alias."""
+  uri_to_alias: dict[str, str] = {}
+  for ns in named_sources:
+    if ns.endpoint.kind not in ('delta', 'iceberg'):
+      continue
+    quoted = _quote_ident(ns.alias)
+    for cand in (ns.uri, ns.endpoint.raw):
+      if isinstance(cand, str) and cand.strip():
+        uri_to_alias[cand.strip()] = quoted
+  if not uri_to_alias:
+    return sql_query
+
+  segs = list(_scan_sql_outside_literals(sql_query))
+  out: list[str] = []
+  for idx, (is_code, seg) in enumerate(segs):
+    if (not is_code and len(seg) >= 2 and seg[0] in ('"', '`') and
+        seg[-1] == seg[0] and idx > 0 and segs[idx - 1][0]):
+      prev_code = segs[idx - 1][1]
+      if re.search(r'\b(?:FROM|JOIN)\s*$', prev_code, re.I):
+        unq = seg[1:-1].replace(seg[0] * 2, seg[0]).strip()
+        if unq in uri_to_alias:
+          out.append(uri_to_alias[unq])
+          continue
+    out.append(seg)
+  return ''.join(out)
 
 
 def _sql_error_hint(message: str, query: str) -> str:
@@ -839,6 +949,7 @@ def _run_duckdb(
     raise SqlEngineMissingError(
         f'--sql-engine duckdb needs the duckdb package: {DUCKDB_INSTALL_HINT} '
         '(check with: beam doctor)') from None
+  clean_q = _rewrite_source_uri_table_refs(clean_q, named_sources)
   total_read = 0
   con = duckdb.connect(
       ':memory:',
@@ -954,6 +1065,8 @@ def run_in_memory_sql(
         dlq_records=dlq_records,
         warnings=warnings)
     return out_cols, out_rows, (dlq_records or []), total_read
+  clean_q = _normalize_sqlite_cast_types(
+      _rewrite_source_uri_table_refs(clean_q, named_sources))
   total_read = 0
 
   conn = sqlite3.connect(':memory:')
@@ -1124,10 +1237,24 @@ def keyed_json_document(columns, rows, key: str, value: str | None = None):
   return doc
 
 
-def write_json_document(path: str, doc: Any) -> str:
-  parent = os.path.dirname(os.path.abspath(path))
+def _new_sql_stage_path(target: str, tag: str) -> str:
+  import tempfile
+  abs_target = os.path.abspath(target)
+  parent = os.path.dirname(abs_target) or '.'
   os.makedirs(parent, exist_ok=True)
-  tmp_path = f'{path}.tmp.{os.getpid()}'
+  base = os.path.basename(abs_target) or 'out'
+  fd, tmp_path = tempfile.mkstemp(
+      prefix=f'.{base}.{tag}.', suffix='.tmp', dir=parent)
+  os.close(fd)
+  try:
+    os.chmod(tmp_path, 0o644)
+  except OSError:
+    pass
+  return tmp_path
+
+
+def write_json_document(path: str, doc: Any) -> str:
+  tmp_path = _new_sql_stage_path(path, 'doc')
   try:
     with open(tmp_path, 'w', encoding='utf-8') as f:
       json.dump(doc, f, indent=2, default=str)
@@ -1135,7 +1262,10 @@ def write_json_document(path: str, doc: Any) -> str:
     os.replace(tmp_path, path)
   finally:
     if os.path.exists(tmp_path):
-      os.unlink(tmp_path)
+      try:
+        os.unlink(tmp_path)
+      except OSError:
+        pass
   return path
 
 
@@ -1170,23 +1300,28 @@ def stage_rows_to_local_file(
     warnings: list[str] | None = None,
     tag: str = 'sql',
 ) -> tuple[str, str]:
-  """Writes `out_rows` to a sibling `.tmp` file, returning `(tmp_path, final_path)`."""
+  """Writes `out_rows` to an exclusive sibling `.tmp` file, returning `(tmp_path, final_path)`."""
   target = sink_ep.output_prefix or sink_ep.config.get('path')
   if not target:
     raise SqlPipeError(f'missing target path for sink {sink_ep.raw!r}')
-  parent = os.path.dirname(os.path.abspath(target))
-  if parent:
-    os.makedirs(parent, exist_ok=True)
 
   keyed = keyed_json_options(sink_ep)
   if keyed is not None:
     if if_exists == 'append':
       raise SqlPipeError('--to-opt key= cannot be combined with --if-exists append')
     doc = keyed_json_document(out_cols, out_rows, keyed['key'], keyed.get('value'))
-    tmp_path = f'{target}.tmp.{tag}.{os.getpid()}'
-    with open(tmp_path, 'w', encoding='utf-8') as f:
-      json.dump(doc, f, indent=2, default=str)
-      f.write('\n')
+    tmp_path = _new_sql_stage_path(target, tag)
+    try:
+      with open(tmp_path, 'w', encoding='utf-8') as f:
+        json.dump(doc, f, indent=2, default=str)
+        f.write('\n')
+    except BaseException:
+      if os.path.exists(tmp_path):
+        try:
+          os.unlink(tmp_path)
+        except OSError:
+          pass
+      raise
     return tmp_path, target
 
   ext = os.path.splitext(target)[1].lower()
@@ -1207,7 +1342,7 @@ def stage_rows_to_local_file(
         final_path, is_read=True, explicit_format=sink_ep.format)
     _, prev_rows, _ = load_endpoint_rows(prev_ep)
     rows_to_write = prev_rows + rows_to_write
-  tmp_path = f'{final_path}.tmp.{tag}.{os.getpid()}'
+  tmp_path = _new_sql_stage_path(final_path, tag)
 
   fmt = sink_ep.format
   try:

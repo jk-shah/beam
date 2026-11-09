@@ -77,14 +77,14 @@ def render_llms_txt() -> str:
     `{{{{ vars }}}}` into `metadata.parameters`) and AST-introspected single-image
     Flex Template bundle generator for Python pipelines (no handwritten
     `Dockerfile` or `metadata.json`).
-- `beam diff <LEFT_URI> <RIGHT_URI> [--key COL ...] [--columns shared|all|col1,col2] [--to FILE] [--exit-zero] [--rtol F] [--atol F] [--json]`
+- `beam diff <LEFT_URI> <RIGHT_URI> [--key COL ...] [--columns shared|all|col1,col2] [--limit 100|all] [--to FILE] [--exit-zero] [--rtol F] [--atol F] [--json]`
     Distributed O(1)-memory key/multiset reconciliation across files, `delta://`,
     `iceberg://`, and `bigquery://` (`0` match, `6` drift). Compares shared columns
     (or `--columns all`, or an explicit subset `--columns qty,price`) and reports
     added/removed/retyped columns in `outputs.schema_diff`. With
-    `--key`, `outputs.differing_keys` lists up to 100 keys each for
-    `only_in_left`, `only_in_right`, `value_mismatches`, `duplicate_keys`
-    (`truncated` flag; values are untrusted data).
+    `--key`, `outputs.differing_keys` lists up to `--limit` keys (default 100, or
+    `--limit all` up to 100,000) each for `only_in_left`, `only_in_right`,
+    `value_mismatches`, `duplicate_keys` (`truncated` flag; values are untrusted data).
 - `beam check <FILE.yaml | -> [--plan [--trust-providers]] [--json]`
     Offline SafeLoader YAML validator + deterministic `plan_hash` (`sha256`).
     `--plan` falls back to the static check, with a warning, if expansion needs cloud access;

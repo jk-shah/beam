@@ -3436,5 +3436,141 @@ class Round10FixesTest(unittest.TestCase):
     self.assertIn('no_such_col', env_bad['error']['message'])
 
 
+class Round11FixesTest(unittest.TestCase):
+  """Regression tests for Round 11 simulation findings (L1-L3)."""
+
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp(prefix='beam-r11-test-')
+    self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+  def test_sqlite_cast_as_string_preserves_text_values(self):
+    """L1: `CAST(col AS STRING)` maps to SQLite `TEXT` instead of `NUMERIC` 0."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    src = os.path.join(self.tmp, 'users.parquet')
+    out = os.path.join(self.tmp, 'users_out.parquet')
+    pq.write_table(
+        pa.Table.from_pylist([
+            {'id': 1, 'user': 'u1', 'note': 'keep CAST(x AS STRING) literal'},
+            {'id': 2, 'user': 'u2', 'note': 'ok'},
+        ]),
+        src)
+    rc, env, err = _run_json([
+        'pipe',
+        '--from',
+        f't={src}',
+        '--sql',
+        (
+            "SELECT CAST(id AS INT64) AS id, CAST(user AS STRING) AS user, "
+            "CAST(NULL AS STRING) AS tier, 'AS STRING)' AS lit "
+            'FROM t ORDER BY id'
+        ),
+        '--to',
+        out,
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    rows = pq.read_table(out).to_pylist()
+    self.assertEqual(rows, [
+        {'id': 1, 'user': 'u1', 'tier': None, 'lit': 'AS STRING)'},
+        {'id': 2, 'user': 'u2', 'tier': None, 'lit': 'AS STRING)'},
+    ])
+
+  def test_sql_on_delta_and_iceberg_and_quoted_uri_table_refs(self):
+    """L2: `beam pipe --sql` reads `delta://` & `iceberg://` and quoted URI refs."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    ddir = os.path.join(self.tmp, 'wh_delta')
+    log_dir = os.path.join(ddir, '_delta_log')
+    os.makedirs(log_dir, exist_ok=True)
+    p0 = os.path.join(ddir, 'part-0.parquet')
+    pq.write_table(
+        pa.Table.from_pylist([
+            {'sku': 'S1', 'qty': 4, 'cost': 10.0},
+            {'sku': 'S2', 'qty': 2, 'cost': 25.0},
+        ]),
+        p0)
+    delta_schema = {
+        'type': 'struct',
+        'fields': [
+            {'name': 'sku', 'type': 'string', 'nullable': False, 'metadata': {}},
+            {'name': 'qty', 'type': 'long', 'nullable': True, 'metadata': {}},
+            {'name': 'cost', 'type': 'double', 'nullable': True, 'metadata': {}},
+        ],
+    }
+    with open(os.path.join(log_dir, '00000000000000000000.json'), 'w', encoding='utf-8') as f:
+      f.write(json.dumps({'protocol': {'minReaderVersion': 1, 'minWriterVersion': 2}}) + '\n')
+      f.write(json.dumps({
+          'metaData': {
+              'id': 'd1',
+              'format': {'provider': 'parquet', 'options': {}},
+              'schemaString': json.dumps(delta_schema),
+              'partitionColumns': [],
+          }
+      }) + '\n')
+      f.write(json.dumps({
+          'add': {'path': 'part-0.parquet', 'size': os.path.getsize(p0), 'modificationTime': 1, 'dataChange': True}
+      }) + '\n')
+
+    delta_uri = f'delta://{ddir}'
+    rc, env, err = _run_json([
+        'pipe',
+        '--from',
+        delta_uri,
+        '--sql',
+        f'SELECT COUNT(*) AS n, SUM(qty * cost) AS val FROM "{delta_uri}"',
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertEqual(env['untrusted_data']['rows'], [{'n': 2, 'val': 90.0}])
+
+    # Register into Iceberg v2 and query Iceberg directly with --sql too!
+    wh = os.path.join(self.tmp, 'ice_wh')
+    ice_uri = f'iceberg://ops.inv?warehouse={wh}'
+    rc_zc, _, err_zc = _run_json(
+        ['pipe', '--from', delta_uri, '--to', ice_uri, '--zero-copy'])
+    self.assertEqual(rc_zc, cli.EXIT_OK, err_zc)
+
+    rc_ice, env_ice, err_ice = _run_json([
+        'pipe',
+        '--from',
+        ice_uri,
+        '--sql',
+        f'SELECT COUNT(*) AS n, SUM(qty * cost) AS val FROM "{ice_uri}"',
+    ])
+    self.assertEqual(rc_ice, cli.EXIT_OK, err_ice)
+    self.assertEqual(env_ice['untrusted_data']['rows'], [{'n': 2, 'val': 90.0}])
+
+  def test_diff_key_limit_all_and_regr_slope_duckdb_hint(self):
+    """L3: `beam diff --limit all` returns >100 differing keys; `regr_slope` hints DuckDB."""
+    left_csv = os.path.join(self.tmp, 'l.csv')
+    right_csv = os.path.join(self.tmp, 'r.csv')
+    with open(left_csv, 'w', encoding='utf-8') as f:
+      f.write('id,v\n')
+      for i in range(135):
+        f.write(f'K{i:03d},1\n')
+    with open(right_csv, 'w', encoding='utf-8') as f:
+      f.write('id,v\n')
+
+    rc_def, env_def, _ = _run_json(
+        ['diff', left_csv, right_csv, '--key', 'id', '--exit-zero'])
+    self.assertEqual(rc_def, cli.EXIT_OK)
+    self.assertEqual(len(env_def['outputs']['differing_keys']['only_in_left']), 100)
+    self.assertTrue(env_def['outputs']['differing_keys']['truncated'])
+
+    rc_all, env_all, err_all = _run_json([
+        'diff', left_csv, right_csv, '--key', 'id', '--limit', 'all', '--exit-zero'
+    ])
+    self.assertEqual(rc_all, cli.EXIT_OK, err_all)
+    self.assertEqual(len(env_all['outputs']['differing_keys']['only_in_left']), 135)
+    self.assertFalse(env_all['outputs']['differing_keys']['truncated'])
+
+    rc_regr, env_regr, _ = _run_json([
+        'pipe', '--from', left_csv, '--sql', 'SELECT regr_slope(v, v) FROM source'
+    ])
+    self.assertEqual(rc_regr, cli.EXIT_USAGE)
+    self.assertIn('--sql-engine duckdb', env_regr['error']['message'])
+
+
 if __name__ == '__main__':
   unittest.main()

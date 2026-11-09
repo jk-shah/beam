@@ -1096,5 +1096,82 @@ class ConnectorAndRuntimeBestPracticesTest(unittest.TestCase):
       pass
 
 
+class InputValidationAndResourceBoundsPass4Test(unittest.TestCase):
+  """Pass 4 checks: BigQuery project IDs, schema sanitization, Avro/metadata bounds, and timeouts."""
+
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp(prefix='beam-pass4-')
+    self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+  def test_bigquery_project_id_validation_across_uris_and_fallbacks(self):
+    from apache_beam.cli import uris
+
+    self.assertEqual(uris.validate_bq_project_id('acme.com:prod-1'), 'acme.com:prod-1')
+    for bad_proj in (
+        'proj` ; DROP TABLE x --',
+        'proj\nother',
+        'proj..bad',
+        'proj with spaces',
+    ):
+      with self.assertRaises(uris.UriError):
+        uris.validate_bq_project_id(bad_proj)
+      with self.assertRaises(uris.UriError):
+        uris.normalize_bq_table_spec('sales.orders', default_project=bad_proj)
+
+  def test_inspect_sanitizes_parquet_avro_and_lakehouse_column_names_and_bounds_avro_scan(self):
+    import fastavro
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from apache_beam.cli import inspect_cmd
+
+    dirty_col = 'col\x1b[31m\u202ename'
+    pq_path = os.path.join(self.tmp, 'dirty_cols.parquet')
+    pq.write_table(pa.Table.from_pydict({dirty_col: [1, 2]}), pq_path)
+    pq_rep = inspect_cmd.run_inspect(pq_path, sample_count=1)
+    sanitized_name = pq_rep['schema'][0]['name']
+    self.assertNotIn('\x1b', sanitized_name)
+    self.assertNotIn('\u202e', sanitized_name)
+
+    avro_path = os.path.join(self.tmp, 'large.avro')
+    schema = fastavro.parse_schema({
+        'type': 'record',
+        'name': 'Rec',
+        'fields': [{'name': 'payload', 'type': 'string'}],
+    })
+    with open(avro_path, 'wb') as f:
+      fastavro.writer(
+          f, schema, [{'payload': f'row-{i}-' + ('x' * 200)} for i in range(200)])
+    avro_rep = inspect_cmd.run_inspect(
+        avro_path, sample_count=5, search_term='never-matches', max_scanned_bytes='2KB')
+    self.assertTrue(avro_rep['untrusted_data']['truncated'])
+    self.assertEqual(avro_rep['untrusted_data']['rows'], [])
+
+  def test_lakehouse_metadata_size_cap_and_postgres_probe_timeout(self):
+    from apache_beam.cli import cost_guard
+    from apache_beam.cli import lakehouse
+    from apache_beam.cli import uris
+
+    meta_file = os.path.join(self.tmp, 'oversized.json')
+    with open(meta_file, 'wb') as f:
+      f.write(b'x' * 1024)
+    with self.assertRaises(lakehouse.LakehouseError):
+      lakehouse._fs_read_bytes(meta_file, max_bytes=512)
+
+    captured_kwargs: dict[str, Any] = {}
+
+    class _FakeDriver:
+      @staticmethod
+      def connect(_dsn, **kwargs):
+        captured_kwargs.update(kwargs)
+        raise RuntimeError('unreachable test host')
+
+    ep = uris.parse_endpoint('postgres://db.example.com:5432/app?table=orders', is_read=True)
+    with mock.patch('builtins.__import__', side_effect=lambda name, *a, **k: _FakeDriver if name == 'psycopg' else __import__(name, *a, **k)):
+      res = cost_guard._estimate_postgres_bytes(ep)
+    self.assertIsNone(res['estimated_bytes'])
+    self.assertEqual(captured_kwargs.get('connect_timeout'), 5)
+    self.assertIn('statement_timeout=5000', str(captured_kwargs.get('options')))
+
+
 if __name__ == '__main__':
   unittest.main()

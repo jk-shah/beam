@@ -45,6 +45,27 @@ EXIT_DIFF_MISMATCH = 6
 
 # Most keys listed per category in `differing_keys`; counts stay exact.
 KEY_LIST_LIMIT = 100
+MAX_KEY_LIST_LIMIT = 100_000
+
+
+def parse_key_limit(raw: int | str | None) -> int:
+  if raw is None or raw == '':
+    return KEY_LIST_LIMIT
+  if isinstance(raw, str) and raw.strip().lower() == 'all':
+    return MAX_KEY_LIST_LIMIT
+  try:
+    n = int(raw)
+  except (TypeError, ValueError):
+    raise uris.UriError(
+        f'invalid --limit {raw!r}; expected a non-negative integer or "all"'
+    ) from None
+  if n < 0:
+    raise uris.UriError('--limit must be non-negative (or "all")')
+  if n == 0:
+    return MAX_KEY_LIST_LIMIT
+  return min(n, MAX_KEY_LIST_LIMIT)
+
+
 _KEY_CATEGORIES = {
     'only_in_left': 'only_in_left',
     'only_in_right': 'only_in_right',
@@ -181,7 +202,7 @@ def _read_endpoint_pcoll(pipeline, label: str, ep: uris.ParsedEndpoint):
       _, proj, ds, tbl_name = uris.normalize_bq_table_spec(
           str(bq_cfg['table']), default_project=def_proj)
       client = gcp_bq.Client(project=proj)
-      eff_proj = proj or client.project
+      eff_proj = uris.validate_bq_project_id(proj or client.project)
       tbl = client.get_table(f'{eff_proj}.{ds}.{tbl_name}')
       t_type = str(getattr(tbl, 'table_type', 'TABLE') or 'TABLE').upper()
       constraints = getattr(tbl, 'table_constraints', None)
@@ -300,6 +321,7 @@ def run_diff(
     pipeline_args: list[str] | None = None,
     default_project: str | None = None,
     columns: str = 'shared',
+    key_limit: int | str | None = None,
 ) -> tuple[int, dict[str, Any]]:
   """Runs distributed reconciliation and returns `(exit_code, report_dict)`.
 
@@ -312,6 +334,8 @@ def run_diff(
   from apache_beam.options.pipeline_options import GoogleCloudOptions
   from apache_beam.options.pipeline_options import PipelineOptions
   from apache_beam.options.pipeline_options import StandardOptions
+
+  eff_key_limit = parse_key_limit(key_limit)
 
   p_args = list(pipeline_args or [])
   opts = PipelineOptions(p_args)
@@ -450,7 +474,7 @@ def run_diff(
     @staticmethod
     def _add_key(acc, category, key):
       bucket = acc['key_lists'][category]
-      if len(bucket) < KEY_LIST_LIMIT:
+      if len(bucket) < eff_key_limit:
         bucket.append(key)
       else:
         acc['key_lists_truncated'] = True
@@ -802,7 +826,7 @@ def run_diff(
             key=lambda k: json.dumps(k, sort_keys=True, default=str))
         for category, keys in key_lists.items()
     }
-    differing_keys['limit'] = KEY_LIST_LIMIT
+    differing_keys['limit'] = eff_key_limit
     differing_keys['truncated'] = keys_truncated
     differing_keys['values_are_untrusted'] = True
   if explicit_cols is not None:

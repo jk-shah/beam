@@ -235,6 +235,7 @@ def _estimate_bigquery_bytes(
 
   _, proj, dataset, table = uris.normalize_bq_table_spec(
       cfg['table'], default_project=default_project or client.project)
+  proj = uris.validate_bq_project_id(proj)
   fq_dot = f'{proj}.{dataset}.{table}' if proj else f'{dataset}.{table}'
   tbl = client.get_table(fq_dot)
   table_type = str(getattr(tbl, 'table_type', 'TABLE') or 'TABLE').upper()
@@ -291,7 +292,10 @@ def _estimate_postgres_bytes(endpoint: uris.ParsedEndpoint) -> dict[str, Any]:
 
   jdbc_url = endpoint.config['url']
   pg_dsn = jdbc_url[len('jdbc:'):] if jdbc_url.startswith('jdbc:') else jdbc_url
-  conn_kwargs: dict[str, Any] = {}
+  conn_kwargs: dict[str, Any] = {
+      'connect_timeout': 5,
+      'options': '-c statement_timeout=5000',
+  }
   if endpoint.config.get('username'):
     conn_kwargs['user'] = endpoint.config['username']
   if endpoint.config.get('password'):

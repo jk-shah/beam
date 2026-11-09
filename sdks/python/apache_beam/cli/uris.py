@@ -418,6 +418,19 @@ def _infer_jinja_file_format(location: str) -> str:
   return ''
 
 
+_SAFE_BQ_PROJECT_RE = re.compile(r'^[A-Za-z0-9_.:-]{1,128}$')
+
+
+def validate_bq_project_id(proj: str | None) -> str | None:
+  """Validates a GCP / BigQuery project identifier before SQL/API interpolation."""
+  if proj is None or proj == '':
+    return None
+  p = str(proj)
+  if '..' in p or not _SAFE_BQ_PROJECT_RE.match(p):
+    raise UriError(f'invalid BigQuery project identifier {proj!r}')
+  return p
+
+
 def normalize_bq_table_spec(
     raw_uri_or_spec: str,
     default_project: str | None = None,
@@ -425,6 +438,8 @@ def normalize_bq_table_spec(
     allow_jinja: bool = False,
 ) -> tuple[str, str | None, str, str]:
   """Normalizes `bigquery://P.D.T` or `P:D.T` -> `('P:D.T', P, D, T)`."""
+  if default_project and not (allow_jinja and _has_jinja_syntax(default_project)):
+    validate_bq_project_id(default_project)
   body = raw_uri_or_spec
   if body.lower().startswith('bigquery://'):
     body = body[len('bigquery://'):]
@@ -453,11 +468,11 @@ def normalize_bq_table_spec(
       spec = body
     return spec, default_project, '', ''
   m = _BQ_TABLE_ID_RE.match(body)
-  if not m:
+  if not m or '..' in (m.group('project') or ''):
     raise UriError(
         f'invalid BigQuery table URI {raw_uri_or_spec!r}; expected '
         'bigquery://PROJECT.DATASET.TABLE or bigquery://PROJECT:DATASET.TABLE')
-  proj = m.group('project') or default_project
+  proj = validate_bq_project_id(m.group('project') or default_project)
   dataset = m.group('dataset')
   table = m.group('table')
   spec = f'{proj}:{dataset}.{table}' if proj else f'{dataset}.{table}'

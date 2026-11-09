@@ -86,13 +86,22 @@ def _fs_list_files(pattern: str) -> list[tuple[str, int]]:
           for m in sorted(metas, key=lambda x: x.path)]
 
 
-def _fs_read_bytes(path: str) -> bytes:
+MAX_METADATA_BYTES = 64 * 1024 * 1024
+
+
+def _fs_read_bytes(path: str, *, max_bytes: int = MAX_METADATA_BYTES) -> bytes:
   if '://' not in path:
     with open(path, 'rb') as f:
-      return f.read()
-  from apache_beam.io.filesystems import FileSystems
-  with FileSystems.open(path) as f:
-    return f.read()
+      data = f.read(max_bytes + 1)
+  else:
+    from apache_beam.io.filesystems import FileSystems
+    with FileSystems.open(path) as f:
+      data = f.read(max_bytes + 1)
+  if len(data) > max_bytes:
+    raise LakehouseError(
+        f'lakehouse metadata file {path!r} exceeds maximum size '
+        f'({max_bytes:,} bytes)')
+  return data
 
 
 def _fs_open_read(path: str):
@@ -104,11 +113,27 @@ def _fs_open_read(path: str):
 
 def _fs_write_bytes(path: str, data: bytes, mime_type: str = 'application/octet-stream') -> None:
   if '://' not in path:
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    tmp_path = f'{path}.tmp-{uuid.uuid4().hex[:8]}'
-    with open(tmp_path, 'wb') as f:
-      f.write(data)
-    os.replace(tmp_path, path)
+    import tempfile
+    abs_p = os.path.abspath(path)
+    parent = os.path.dirname(abs_p) or '.'
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f'.{os.path.basename(abs_p)}.', suffix='.tmp', dir=parent)
+    try:
+      with os.fdopen(fd, 'wb') as f:
+        f.write(data)
+      try:
+        os.chmod(tmp_path, 0o644)
+      except OSError:
+        pass
+      os.replace(tmp_path, path)
+    except BaseException:
+      if os.path.exists(tmp_path):
+        try:
+          os.unlink(tmp_path)
+        except OSError:
+          pass
+      raise
     return
   from apache_beam.io.filesystems import FileSystems
   with FileSystems.create(path, mime_type=mime_type) as f:
@@ -585,7 +610,11 @@ def inspect_delta_table(
       'row_count': snap['row_count'],
       'partition_columns': snap['partition_columns'],
       'cdc_enabled': snap['cdc_enabled'],
-      'schema': snap['schema'],
+      'schema': [{
+          **col,
+          'name': output.sanitize_untrusted_text(
+              str(col.get('name', '')), max_chars=256),
+      } for col in snap['schema']],
       'untrusted_data': output.wrap_untrusted_rows(rows)
       if sample_count > 0 else None,
   }
@@ -1070,9 +1099,11 @@ def inspect_iceberg_table(
       'identifier_columns': state['identifier_columns'],
       'estimated_bytes': state['estimated_bytes'],
       'row_count': live_rows,
-      'schema': [
-          {k: v for k, v in col.items() if k != 'id'} for col in state['schema']
-      ],
+      'schema': [{
+          **{k: v for k, v in col.items() if k != 'id'},
+          'name': output.sanitize_untrusted_text(
+              str(col.get('name', '')), max_chars=256),
+      } for col in state['schema']],
       'untrusted_data': output.wrap_untrusted_rows(sample_rows)
       if sample_count > 0 else None,
   }

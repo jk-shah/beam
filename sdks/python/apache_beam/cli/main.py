@@ -818,6 +818,13 @@ def _build_parser():
       metavar='FILE',
       help='write the structured JSON reconciliation report to FILE')
   diff_p.add_argument(
+      '--limit',
+      default=None,
+      metavar='N_OR_ALL',
+      help=(
+          'maximum differing keys listed per category in outputs.differing_keys '
+          '(default: 100; pass "all" or 0 for up to 100,000 keys)'))
+  diff_p.add_argument(
       '--exit-zero',
       action='store_true',
       help='exit 0 even when datasets differ (drift is still in outputs.match)')
@@ -1625,6 +1632,7 @@ def _diff(args, extra_args, *, json_session, t0: float) -> int:
         rtol=args.rtol,
         atol=args.atol,
         columns=args.columns,
+        key_limit=args.limit,
         max_bytes=args.max_bytes,
         pipeline_args=resolved_args,
         default_project=proj)
@@ -2263,7 +2271,15 @@ def _pipe(
             shutil.rmtree(d, ignore_errors=True)
 
     # Local `<100ms` zero-JVM authorizer-sandboxed `:memory:` SQLite execution!
-    if any('://' in p for p in local_sql_paths):
+    def _uses_remote_fs(p: str) -> bool:
+      if '://' not in p:
+        return False
+      low_p = p.lower()
+      if low_p.startswith(('delta://', 'iceberg://')):
+        return any(s in low_p for s in ('gs://', 's3://', 'azfs://', 'hdfs://'))
+      return not low_p.startswith('file://')
+
+    if any(_uses_remote_fs(p) for p in local_sql_paths):
       from apache_beam.io.filesystems import FileSystems
       from apache_beam.options.pipeline_options import PipelineOptions
       FileSystems.set_options(PipelineOptions(resolved_args))

@@ -847,7 +847,7 @@ def _ensure_bq_cdc_table(
   _, proj, ds, tbl_name = uris.normalize_bq_table_spec(
       table_spec, default_project=default_project)
   client = gcp_bq.Client(project=proj)
-  eff_proj = proj or client.project
+  eff_proj = uris.validate_bq_project_id(proj or client.project)
   fq = f'{eff_proj}.{ds}.{tbl_name}'
 
   for ident in [ds, tbl_name] + list(primary_keys) + [c for c, _ in col_specs]:

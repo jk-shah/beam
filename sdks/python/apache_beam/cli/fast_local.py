@@ -611,6 +611,22 @@ def _arrow_table(columns: list[str], rows: list[dict[str, Any]],
   return pa.Table.from_arrays(arrays, schema=pa.schema(fields))
 
 
+def _new_stage_path(target: str, tag: str) -> str:
+  import tempfile
+  abs_target = os.path.abspath(target)
+  parent = os.path.dirname(abs_target) or '.'
+  os.makedirs(parent, exist_ok=True)
+  base = os.path.basename(abs_target) or 'out'
+  fd, tmp_path = tempfile.mkstemp(
+      prefix=f'.{base}.{tag}.', suffix='.tmp', dir=parent)
+  os.close(fd)
+  try:
+    os.chmod(tmp_path, 0o644)
+  except OSError:
+    pass
+  return tmp_path
+
+
 def _stage_write(
     ep: uris.ParsedEndpoint,
     columns: list[str],
@@ -619,35 +635,47 @@ def _stage_write(
     *,
     tag: str = 'out',
 ) -> tuple[str, str]:
-  """Writes `rows` to a sibling `.tmp` file without touching `target` yet."""
+  """Writes `rows` to an exclusive sibling `.tmp` file without touching `target`."""
   target = ep.output_prefix
-  parent = os.path.dirname(os.path.abspath(target))
-  os.makedirs(parent, exist_ok=True)
-  tmp_path = f'{target}.tmp.{tag}.{os.getpid()}'
-  rows = list(rows)
-  if ep.format == 'parquet':
-    import pyarrow.parquet as pq
-    pq.write_table(_arrow_table(columns, rows, known_types), tmp_path)
-  elif ep.format == 'csv':
-    with open(tmp_path, 'w', encoding='utf-8', newline='') as f:
-      writer = csv.writer(f, lineterminator='\n')
-      writer.writerow(columns)
-      for r in rows:
-        writer.writerow([_cell(r.get(c)) for c in columns])
-  else:
-    with open(tmp_path, 'w', encoding='utf-8') as f:
-      for r in rows:
-        f.write(json.dumps(r, default=str) + '\n')
+  tmp_path = _new_stage_path(target, tag)
+  try:
+    rows = list(rows)
+    if ep.format == 'parquet':
+      import pyarrow.parquet as pq
+      pq.write_table(_arrow_table(columns, rows, known_types), tmp_path)
+    elif ep.format == 'csv':
+      with open(tmp_path, 'w', encoding='utf-8', newline='') as f:
+        writer = csv.writer(f, lineterminator='\n')
+        writer.writerow(columns)
+        for r in rows:
+          writer.writerow([_cell(r.get(c)) for c in columns])
+    else:
+      with open(tmp_path, 'w', encoding='utf-8') as f:
+        for r in rows:
+          f.write(json.dumps(r, default=str) + '\n')
+  except BaseException:
+    if os.path.exists(tmp_path):
+      try:
+        os.unlink(tmp_path)
+      except OSError:
+        pass
+    raise
   return tmp_path, target
 
 
 def _stage_json_document(target: str, doc: Any) -> tuple[str, str]:
-  parent = os.path.dirname(os.path.abspath(target))
-  os.makedirs(parent, exist_ok=True)
-  tmp_path = f'{target}.tmp.doc.{os.getpid()}'
-  with open(tmp_path, 'w', encoding='utf-8') as f:
-    json.dump(doc, f, indent=2, default=str)
-    f.write('\n')
+  tmp_path = _new_stage_path(target, 'doc')
+  try:
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+      json.dump(doc, f, indent=2, default=str)
+      f.write('\n')
+  except BaseException:
+    if os.path.exists(tmp_path):
+      try:
+        os.unlink(tmp_path)
+      except OSError:
+        pass
+    raise
   return tmp_path, target
 
 

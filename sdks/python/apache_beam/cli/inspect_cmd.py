@@ -168,7 +168,8 @@ def _inspect_files(
         if not schema_fields:
           arrow_schema = pf.schema_arrow
           schema_fields = [{
-              'name': field.name,
+              'name': output.sanitize_untrusted_text(
+                  str(field.name), max_chars=256),
               'type': str(field.type),
               'nullable': bool(field.nullable),
           } for field in arrow_schema]
@@ -186,20 +187,40 @@ def _inspect_files(
 
   elif fmt == 'avro':
     import fastavro
-    with _open_file_bytes(first_path) as fobj:
-      reader = fastavro.reader(fobj)
-      w_schema = reader.writer_schema
-      if isinstance(w_schema, dict) and 'fields' in w_schema:
-        schema_fields = [{
-            'name': str(f.get('name')),
-            'type': str(f.get('type')),
-            'nullable': 'null' in str(f.get('type')),
-        } for f in w_schema['fields']]
-      for rec in reader:
-        if needle is None or _row_matches_search(rec, needle):
-          rows.append(dict(rec))
-          if len(rows) >= sample_count:
+    scanned = 0
+    for fpath, _ in matched:
+      if scanned >= scan_budget or (len(rows) >= sample_count and schema_fields):
+        if scanned >= scan_budget:
+          truncated_scan = True
+        break
+      with _open_file_bytes(fpath) as fobj:
+        reader = fastavro.reader(fobj)
+        w_schema = reader.writer_schema
+        if not schema_fields and isinstance(w_schema, dict) and 'fields' in w_schema:
+          schema_fields = [{
+              'name': output.sanitize_untrusted_text(
+                  str(f.get('name')), max_chars=256),
+              'type': str(f.get('type')),
+              'nullable': 'null' in str(f.get('type')),
+          } for f in w_schema['fields']]
+        start_pos = 0
+        for rec in reader:
+          if needle is None or _row_matches_search(rec, needle):
+            rows.append(dict(rec))
+            if len(rows) >= sample_count:
+              break
+          try:
+            pos = int(fobj.tell())
+          except Exception:  # pylint: disable=broad-except
+            pos = start_pos + 256
+          if scanned + (pos - start_pos) >= scan_budget:
+            scanned = scan_budget
+            truncated_scan = True
             break
+        try:
+          scanned += int(fobj.tell())
+        except Exception:  # pylint: disable=broad-except
+          pass
 
   elif fmt == 'csv':
     from . import dlq
@@ -367,12 +388,13 @@ def _inspect_bigquery(
   client = bigquery.Client(project=default_project)
   _, proj, dataset, table = uris.normalize_bq_table_spec(
       ep.config['table'], default_project=default_project or client.project)
+  proj = uris.validate_bq_project_id(proj)
   fq_dot = f'{proj}.{dataset}.{table}' if proj else f'{dataset}.{table}'
   tbl = client.get_table(fq_dot)
   table_type = str(getattr(tbl, 'table_type', 'TABLE') or 'TABLE').upper()
 
   schema_fields = [{
-      'name': f.name,
+      'name': output.sanitize_untrusted_text(str(f.name), max_chars=256),
       'type': f.field_type,
       'mode': f.mode,
       'nullable': f.mode != 'REQUIRED',
