@@ -67,7 +67,7 @@ _SINK_EXTENSIONS = {
 # the user tuned the Beam reader, so the runner path handles it.
 _SOURCE_KEYS = {
     'csv': frozenset(['path', 'delimiter', 'null_values', 'types']),
-    'json': frozenset(['path', 'types']),
+    'json': frozenset(['path', 'types', 'sample_rows', 'on_unknown_fields']),
     'parquet': frozenset(['path']),
     'avro': frozenset(['path']),
 }
@@ -332,8 +332,12 @@ def _kind_arrow_type(kind: Any):
 
 
 def _read_source(
-    src: uris.ParsedEndpoint, files: list[str], route_errors: bool,
-    dlq_records: list[dict[str, Any]]):
+    src: uris.ParsedEndpoint,
+    files: list[str],
+    route_errors: bool,
+    dlq_records: list[dict[str, Any]],
+    drift_state: dict[str, Any] | None = None,
+):
   """Returns `(columns, rows, rows_read, arrow_types)` for the source."""
   fmt = src.format
   if fmt == 'csv':
@@ -368,9 +372,15 @@ def _read_source(
     }
 
   if fmt == 'json':
+    eff_sample = dlq.parse_sample_rows_opt(src.config.get('sample_rows'))
+    allow_unknown = (
+        dlq.parse_unknown_fields_opt(src.config.get('on_unknown_fields')) ==
+        'ignore')
     kinds = dlq.apply_type_overrides(
-        dlq.infer_json_kinds(src.config['path']), src.config.get('types'),
-        str(src.raw))
+        dlq.infer_json_kinds(src.config['path'], sample_rows=eff_sample),
+        src.config.get('types'),
+        str(src.raw),
+        allow_new_columns=True)
     rows = []
     rows_read = 0
     for fp in files:
@@ -381,13 +391,21 @@ def _read_source(
             continue
           rows_read += 1
           try:
-            rows.append(dlq.parse_json_record(stripped, kinds, Row))
+            rows.append(
+                dlq.parse_json_record(
+                    stripped,
+                    kinds,
+                    Row,
+                    allow_unknown_fields=allow_unknown))
           except Exception as exc:  # pylint: disable=broad-except
             if not route_errors:
               raise FastPipeError(
                   dlq.json_fail_fast_message(
                       stripped, exc,
                       " [while running 'ReadJsonWithDlq']")) from None
+            if isinstance(exc, dlq.SchemaDriftError) and drift_state is not None:
+              drift_state['count'] = int(drift_state.get('count', 0)) + 1
+              drift_state.setdefault('fields', set()).update(exc.extra_fields)
             dlq_records.append(dlq.json_dlq_record(stripped, exc))
     return list(kinds), rows, rows_read, {
         k: _kind_arrow_type(v)
@@ -460,7 +478,7 @@ def _typed_columns_outside_csv(groups) -> dict[str, str]:
   return {c: k for c, k in kinds.items() if c in csv_header}
 
 
-def _read_mixed(src, groups, route_errors, dlq_records):
+def _read_mixed(src, groups, route_errors, dlq_records, drift_state=None):
   """Reads a glob that matched several formats, each file with its own reader.
 
   Rows are unified by column name: columns appear in first-seen order and a
@@ -487,7 +505,7 @@ def _read_mixed(src, groups, route_errors, dlq_records):
       cfg['types'] = {**csv_types, **(cfg.get('types') or {})}
     sub = src._replace(format=fmt, config=cfg)
     cols, fmt_rows, n, fmt_types = _read_source(
-        sub, fmt_files, route_errors, dlq_records)
+        sub, fmt_files, route_errors, dlq_records, drift_state=drift_state)
     for c in cols:
       if c not in columns:
         columns.append(c)
@@ -551,54 +569,78 @@ def _arrow_table(columns: list[str], rows: list[dict[str, Any]],
   return pa.Table.from_arrays(arrays, schema=pa.schema(fields))
 
 
-def _write(
-    ep: uris.ParsedEndpoint, columns: list[str], rows: Iterable[dict[str, Any]],
-    known_types: dict[str, Any]) -> str:
+def _stage_write(
+    ep: uris.ParsedEndpoint,
+    columns: list[str],
+    rows: Iterable[dict[str, Any]],
+    known_types: dict[str, Any],
+    *,
+    tag: str = 'out',
+) -> tuple[str, str]:
+  """Writes `rows` to a sibling `.tmp` file without touching `target` yet."""
   target = ep.output_prefix
   parent = os.path.dirname(os.path.abspath(target))
   os.makedirs(parent, exist_ok=True)
-  tmp_path = f'{target}.tmp.{os.getpid()}'
+  tmp_path = f'{target}.tmp.{tag}.{os.getpid()}'
   rows = list(rows)
-  try:
-    if ep.format == 'parquet':
-      import pyarrow.parquet as pq
-      pq.write_table(_arrow_table(columns, rows, known_types), tmp_path)
-    elif ep.format == 'csv':
-      with open(tmp_path, 'w', encoding='utf-8', newline='') as f:
-        writer = csv.writer(f, lineterminator='\n')
-        writer.writerow(columns)
-        for r in rows:
-          writer.writerow([_cell(r.get(c)) for c in columns])
-    else:
-      with open(tmp_path, 'w', encoding='utf-8') as f:
-        for r in rows:
-          f.write(json.dumps(r, default=str) + '\n')
-    os.replace(tmp_path, target)
-  finally:
-    if os.path.exists(tmp_path):
-      try:
-        os.unlink(tmp_path)
-      except OSError:
-        pass
-  return target
+  if ep.format == 'parquet':
+    import pyarrow.parquet as pq
+    pq.write_table(_arrow_table(columns, rows, known_types), tmp_path)
+  elif ep.format == 'csv':
+    with open(tmp_path, 'w', encoding='utf-8', newline='') as f:
+      writer = csv.writer(f, lineterminator='\n')
+      writer.writerow(columns)
+      for r in rows:
+        writer.writerow([_cell(r.get(c)) for c in columns])
+  else:
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+      for r in rows:
+        f.write(json.dumps(r, default=str) + '\n')
+  return tmp_path, target
 
 
-def run(pipe, files: list[str], mixed_groups=None) -> FastPipeResult:
+def _stage_json_document(target: str, doc: Any) -> tuple[str, str]:
+  parent = os.path.dirname(os.path.abspath(target))
+  os.makedirs(parent, exist_ok=True)
+  tmp_path = f'{target}.tmp.doc.{os.getpid()}'
+  with open(tmp_path, 'w', encoding='utf-8') as f:
+    json.dump(doc, f, indent=2, default=str)
+    f.write('\n')
+  return tmp_path, target
+
+
+def run(
+    pipe,
+    files: list[str],
+    mixed_groups=None,
+    *,
+    assert_counts: bool = False,
+) -> FastPipeResult:
   """Runs `pipe` in-process. Raises FastPipeError like a failed pipeline.
 
   `mixed_groups` (`{format: files}`) reads a glob that matched several file
-  formats, each file with its own reader.
+  formats, each file with its own reader. Existing outputs are kept untouched
+  until every transform, count assertion, and staged write succeeds.
   """
   where_cfg, select_cfg = _transform_configs(pipe.spec)
   route_errors = pipe.dlq_endpoint is not None
   dlq_records: list[dict[str, Any]] = []
+  drift_state: dict[str, Any] = {'count': 0, 'fields': set()}
 
   if mixed_groups:
     columns, rows, rows_read, types = _read_mixed(
-        pipe.source_endpoint, mixed_groups, route_errors, dlq_records)
+        pipe.source_endpoint,
+        mixed_groups,
+        route_errors,
+        dlq_records,
+        drift_state=drift_state)
   else:
     columns, rows, rows_read, types = _read_source(
-        pipe.source_endpoint, files, route_errors, dlq_records)
+        pipe.source_endpoint,
+        files,
+        route_errors,
+        dlq_records,
+        drift_state=drift_state)
 
   filtered_out = 0
   text_number_cols: set[str] = set()
@@ -647,32 +689,63 @@ def run(pipe, files: list[str], mixed_groups=None) -> FastPipeResult:
     types = out_types
 
   out_rows = [_plain(r) for r in rows]
-  from . import pipe_sql
-  keyed = pipe_sql.keyed_json_options(pipe.sink_endpoint)
-  if keyed is not None:
-    try:
-      doc = pipe_sql.keyed_json_document(
-          columns, out_rows, keyed['key'], keyed.get('value'))
-    except pipe_sql.SqlPipeError as e:
-      raise FastPipeError(str(e)) from None
-    written = [
-        pipe_sql.write_json_document(pipe.sink_endpoint.output_prefix, doc)
-    ]
-  else:
-    written = [_write(pipe.sink_endpoint, columns, out_rows, types)]
-  dlq_files: list[str] = []
-  if route_errors:
-    dlq_files.append(
-        _write(
-            pipe.dlq_endpoint, ['step', 'error_type', 'error', 'raw_payload'],
-            dlq_records, {}))
-
-  metrics = {'rows_read': rows_read, 'rows_written': len(out_rows)}
+  metrics: dict[str, int] = {'rows_read': rows_read, 'rows_written': len(out_rows)}
   if where_cfg is not None:
     metrics['rows_filtered_out'] = filtered_out
   if route_errors:
     metrics['dlq_rows'] = len(dlq_records)
+  drift_count = int(drift_state.get('count', 0))
+  if drift_count > 0:
+    metrics['schema_drift_rows'] = drift_count
+
+  if assert_counts:
+    from . import jobs
+    err_msg = jobs.check_assert_counts(metrics)
+    if err_msg:
+      raise FastPipeError(err_msg)
+
+  from . import pipe_sql
+  keyed = pipe_sql.keyed_json_options(pipe.sink_endpoint)
+  staged_pairs: list[tuple[str, str]] = []
+  try:
+    if keyed is not None:
+      try:
+        doc = pipe_sql.keyed_json_document(
+            columns, out_rows, keyed['key'], keyed.get('value'))
+      except pipe_sql.SqlPipeError as e:
+        raise FastPipeError(str(e)) from None
+      sink_pair = _stage_json_document(pipe.sink_endpoint.output_prefix, doc)
+    else:
+      sink_pair = _stage_write(
+          pipe.sink_endpoint, columns, out_rows, types, tag='sink')
+    staged_pairs.append(sink_pair)
+
+    dlq_pair: tuple[str, str] | None = None
+    if route_errors:
+      dlq_pair = _stage_write(
+          pipe.dlq_endpoint,
+          ['step', 'error_type', 'error', 'raw_payload'],
+          dlq_records,
+          {},
+          tag='dlq')
+      staged_pairs.append(dlq_pair)
+
+    for tmp_p, final_p in staged_pairs:
+      os.replace(tmp_p, final_p)
+  finally:
+    for tmp_p, _ in staged_pairs:
+      if os.path.exists(tmp_p):
+        try:
+          os.unlink(tmp_p)
+        except OSError:
+          pass
+
+  written = [sink_pair[1]]
+  dlq_files = [dlq_pair[1]] if dlq_pair is not None else []
   warnings = []
+  if drift_count > 0:
+    warnings.append(
+        dlq.schema_drift_warning(drift_count, drift_state.get('fields', ())))
   if text_number_cols:
     cols = ', '.join(sorted(text_number_cols))
     spec = ','.join(f'{c}:float' for c in sorted(text_number_cols))

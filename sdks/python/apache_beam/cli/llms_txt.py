@@ -147,13 +147,16 @@ def render_llms_txt() -> str:
   `{{"West": {{"events": 6, ...}}, ...}}` (one row per key; NULL or repeated keys fail). Add `--to-opt value=col` for
   `{{"<key>": <col>}}`; JSON text from `json_group_array()` / `json_object()` is embedded as JSON. Local runs only.
 - Nested JSON objects and Parquet/Avro structs use dots: `--where "props.amount >= 10" --select "user.id AS user_id"`.
-  With `--dlq`, malformed JSON lines and values that don't fit the inferred type are quarantined; without it they fail the run.
+  With `--dlq`, malformed JSON lines, type mismatches, and records with new fields absent from the 100-row sample
+  (`SchemaDriftError`) are quarantined to `--dlq` (with an explicit warning in `warnings`); without `--dlq` they fail fast.
+  Use `--from-opt sample_rows=all` (or `fields=COL:TYPE`) to include sparse late fields, or `--from-opt on_unknown_fields=ignore`
+  to drop unknown fields intentionally.
 - Local `--sql` is SQLite (inputs named `alias=URI`; unaliased inputs are named after the file) plus `to_utc(ts)`
   (normalizes ISO `Z`/offsets/naive and epoch sec/ms to `YYYY-MM-DDTHH:MM:SSZ`), exact `median(x)`,
   `percentile(x, 95)`, `quantile(x, 0.95)` (linear interpolation, like numpy) and `stddev(x)`; window functions
   such as `ROW_NUMBER() OVER (PARTITION BY k ORDER BY to_utc(ts) DESC)` work. Schema-evolution append / column
   rename is one query: `SELECT id, name, CAST(NULL AS TEXT) AS tier FROM old UNION ALL SELECT id, full_name AS name, tier FROM batch2`
-  (in-place `--to target.parquet --if-exists replace` reads inputs before replacing).
+  (local `--if-exists replace` stages new outputs and keeps previous files intact on any failure).
   Not supported by SQLite: `PERCENTILE_CONT ... WITHIN GROUP`, `APPROX_QUANTILES`. Local-only functions are not
   portable to `--emit-yaml` / remote Beam SQL (Calcite); the CLI warns when you export them.
 - Optional DuckDB engine: `--sql-engine duckdb` (install with `pip install duckdb` or the `[duckdb]` extra; `beam doctor`

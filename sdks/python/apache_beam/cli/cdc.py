@@ -35,6 +35,7 @@ Delivers idempotent ordered `UPSERT` and `DELETE` mutations to:
 
 import datetime
 import decimal
+import io
 import json
 import re
 from typing import Any
@@ -306,8 +307,9 @@ def infer_cdc_jsonl_fields(
     op_col: Optional[str] = None,
     seq_col: Optional[str] = None,
     primary_keys: Iterable[str] = (),
+    sample_rows: Optional[int] = 100,
 ) -> list[tuple[str, str]]:
-  """Samples up to 64 JSONL records to lock static typed columns for CDC."""
+  """Samples up to `sample_rows` JSONL records (`None` = all) for CDC schema."""
   from . import lakehouse
 
   matched = lakehouse._fs_list_files(
@@ -320,9 +322,9 @@ def infer_cdc_jsonl_fields(
   col_types: dict[str, str] = {}
   seen = 0
   for fpath, _ in matched:
-    with lakehouse._fs_open_read(fpath) as fobj:
-      chunk = fobj.read(262144).decode('utf-8', errors='replace')
-      for line in chunk.splitlines():
+    with lakehouse._fs_open_read(fpath) as fobj, io.TextIOWrapper(
+        fobj, encoding='utf-8', errors='replace') as text_s:
+      for line in text_s:
         s = line.strip()
         if not s:
           continue
@@ -353,9 +355,9 @@ def infer_cdc_jsonl_fields(
             else:
               col_types[k] = 'str'
         seen += 1
-        if seen >= 64:
+        if sample_rows is not None and seen >= sample_rows:
           break
-    if seen >= 64:
+    if sample_rows is not None and seen >= sample_rows:
       break
   return [(c, col_types[c]) for c in col_order]
 
@@ -457,6 +459,8 @@ def cli_normalize_cdc(
     op_col: Optional[str] = None,
     seq_col: Optional[str] = None,
     fields_spec: Optional[list[list[str]]] = None,
+    on_unknown_fields: str = 'error',
+    strict_inferred_fields: bool = False,
     error_handling: Optional[dict[str, Any]] = None,
 ):
   """Beam PTransform normalizing CDC inputs into typed rows + `_beam_cdc_*`."""
@@ -468,6 +472,9 @@ def cli_normalize_cdc(
   from apache_beam.typehints.row_type import RowTypeConstraint
 
   pks = [str(k) for k in primary_key]
+  check_unknown = bool(
+      strict_inferred_fields and
+      dlq.parse_unknown_fields_opt(on_unknown_fields) != 'ignore')
   err_tag = (error_handling or {}).get('output')
   dlq_row_type = RowTypeConstraint.from_fields([
       ('step', str),
@@ -479,7 +486,9 @@ def cli_normalize_cdc(
   class _NormalizeCdcDoFn(beam.DoFn):
     def __init__(self, col_specs: list[tuple[str, str]]):
       self._cols = col_specs
+      self._known = {c for c, _ in col_specs}
       self._err_ctr = Metrics.counter('beam_cli', 'cdc_dlq_rows')
+      self._drift_ctr = Metrics.counter('beam_cli', 'schema_drift_rows')
       self._skip_ctr = Metrics.counter('beam_cli', 'cdc_preimage_skipped')
 
     def process(self, element, ts=beam.DoFn.TimestampParam):
@@ -495,6 +504,15 @@ def cli_normalize_cdc(
           self._skip_ctr.inc()
           return
         canon_op, int_seq, hex_seq, payload = parsed
+        if check_unknown:
+          extra = [k for k in payload if k not in self._known]
+          if extra:
+            shown = ', '.join(repr(k) for k in extra[:8])
+            known = ', '.join(c for c, _ in self._cols)
+            raise dlq.SchemaDriftError(
+                f'new CDC field(s) {shown} appeared after schema sampling '
+                f'(inferred fields: {known})',
+                extra_fields=extra)
         if int_seq == 0 and fallback_us > 0:
           int_seq, hex_seq = to_bq_hex_sequence(fallback_us)
         out_dict: dict[str, Any] = {}
@@ -506,8 +524,16 @@ def cli_normalize_cdc(
         yield beam.Row(**out_dict)
       except Exception as exc:  # pylint: disable=broad-except
         if not err_tag:
+          if isinstance(exc, dlq.SchemaDriftError):
+            raise ValueError(
+                f'{type(exc).__name__}: {exc} (pass --dlq PATH to quarantine '
+                'these records for review, --from-opt sample_rows=all to scan '
+                'all records for schema, or --from-opt on_unknown_fields=ignore '
+                'to drop extra fields)') from exc
           raise
         self._err_ctr.inc()
+        if isinstance(exc, dlq.SchemaDriftError):
+          self._drift_ctr.inc()
         err_row = beam.Row(
             step='NormalizeCdc',
             error_type=type(exc).__name__,

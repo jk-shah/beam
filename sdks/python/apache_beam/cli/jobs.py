@@ -283,6 +283,9 @@ def finalize_cli_row_metrics(raw_counters: dict[str, int]) -> dict[str, int]:
   filter_dlq_rows = int(raw_counters.get('filter_dlq_rows', 0))
   if 'dlq_rows' in raw_counters or dlq_rows > 0:
     out['dlq_rows'] = dlq_rows
+  schema_drift_rows = int(raw_counters.get('schema_drift_rows', 0))
+  if schema_drift_rows > 0:
+    out['schema_drift_rows'] = schema_drift_rows
   cdc_skipped = int(raw_counters.get('cdc_preimage_skipped', 0))
   # Older versions and deletes collapsed by CliMaterializeCdc (--cdc into
   # plain files) are not written, so they count as filtered out.

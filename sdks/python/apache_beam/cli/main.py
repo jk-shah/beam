@@ -31,13 +31,16 @@ envelopes for autonomous AI agents across:
 """
 
 import argparse
+import copy
 import glob
 import hashlib
 import io
 import json
 import logging
 import os
+import shutil
 import sys
+import tempfile
 import time
 import traceback
 from typing import Any
@@ -2193,23 +2196,46 @@ def _pipe(
             "locally but are not in Beam SQL's remote dialect (Calcite); the "
             'exported or remote pipeline may fail to build',
             file=sys.stderr)
-      return _run_yaml(
-          resolved_args,
-          args.verbose,
-          direct_yaml_text=sql_yaml_str,
-          command_name='pipe',
-          local_paths=local_sql_paths,
-          dry_run_yaml=pipe_spec.to_yaml(sql_spec, pipe_argv)
-          if args.dry_run else None,
-          output_prefix=sink_ep.output_prefix if sink_ep else None,
-          if_exists=args.if_exists,
-          dlq_prefix=dlq_ep.output_prefix if dlq_ep else None,
-          requires_java_xlang=True,
-          wait_timeout_sec=wait_timeout_sec,
-          raw_argv_for_idem=raw_argv,
-          plan_hash=sql_plan_hash,
-          json_session=json_session,
-          t0=t0)
+      orig_sql_out = sink_ep.output_prefix if sink_ep else None
+      orig_sql_dlq = dlq_ep.output_prefix if dlq_ep else None
+      staged_sql_spec, sql_stage_dir, sql_stage_prefix, sql_dlq_dir, sql_dlq_stage = (
+          _stage_spec_sinks(
+              sql_spec,
+              sink_prefix=orig_sql_out,
+              dlq_prefix=orig_sql_dlq,
+              stage_sink=bool(
+                  is_local_runner and not args.dry_run and
+                  args.if_exists == 'replace'),
+              stage_dlq=bool(
+                  is_local_runner and not args.dry_run and
+                  args.if_exists != 'append')))
+      run_sql_yaml = (
+          yaml.dump(staged_sql_spec, Dumper=dumper, sort_keys=False, width=100000)
+          if (sql_stage_prefix or sql_dlq_stage) else sql_yaml_str)
+      try:
+        return _run_yaml(
+            resolved_args,
+            args.verbose,
+            direct_yaml_text=run_sql_yaml,
+            command_name='pipe',
+            local_paths=local_sql_paths,
+            dry_run_yaml=pipe_spec.to_yaml(sql_spec, pipe_argv)
+            if args.dry_run else None,
+            output_prefix=sql_stage_prefix or orig_sql_out,
+            replace_commit_target=orig_sql_out if sql_stage_prefix else None,
+            if_exists=args.if_exists,
+            dlq_prefix=sql_dlq_stage or orig_sql_dlq,
+            dlq_commit_target=orig_sql_dlq if sql_dlq_stage else None,
+            requires_java_xlang=True,
+            wait_timeout_sec=wait_timeout_sec,
+            raw_argv_for_idem=raw_argv,
+            plan_hash=sql_plan_hash,
+            json_session=json_session,
+            t0=t0)
+      finally:
+        for d in (sql_stage_dir, sql_dlq_dir):
+          if d:
+            shutil.rmtree(d, ignore_errors=True)
 
     # Local `<100ms` zero-JVM authorizer-sandboxed `:memory:` SQLite execution!
     if any('://' in p for p in local_sql_paths):
@@ -2227,35 +2253,57 @@ def _pipe(
       # in-place append) are read first; stale files go after the write.
 
     try:
+      sql_warnings: list[str] = []
       out_cols, out_rows, dlq_recs, total_read = pipe_sql.run_in_memory_sql(
           named_sources,
           args.sql,
           default_project=default_proj,
           enable_dlq=bool(dlq_ep is not None),
-          engine=args.sql_engine)
+          engine=args.sql_engine,
+          warnings=sql_warnings)
       written_sql: list[str] = []
-      sql_warnings: list[str] = []
-      if sink_ep is not None:
-        if '://' in (sink_prefix or ''):
-          raise _CliError(
-              f'remote sink {args.sink!r} with --sql requires '
-              '--runner=DataflowRunner or a local destination path',
-              EXIT_USAGE)
-        written_sql = pipe_sql.write_rows_to_local_file(
-            out_cols,
-            out_rows,
-            sink_ep,
-            if_exists=args.if_exists,
-            warnings=sql_warnings)
+      dlq_written: list[str] = []
+      staged_sql_pairs: list[tuple[str, str]] = []
+      try:
+        sink_sql_pair: tuple[str, str] | None = None
+        if sink_ep is not None:
+          if '://' in (sink_prefix or ''):
+            raise _CliError(
+                f'remote sink {args.sink!r} with --sql requires '
+                '--runner=DataflowRunner or a local destination path',
+                EXIT_USAGE)
+          sink_sql_pair = pipe_sql.stage_rows_to_local_file(
+              out_cols,
+              out_rows,
+              sink_ep,
+              if_exists=args.if_exists,
+              warnings=sql_warnings,
+              tag='sink')
+          staged_sql_pairs.append(sink_sql_pair)
+        dlq_sql_pair: tuple[str, str] | None = None
+        if dlq_ep is not None:
+          dlq_sql_pair = pipe_sql.stage_rows_to_local_file(
+              ['step', 'error_type', 'error', 'raw_payload'],
+              dlq_recs,
+              dlq_ep,
+              if_exists='append' if args.if_exists == 'append' else 'replace',
+              tag='dlq')
+          staged_sql_pairs.append(dlq_sql_pair)
+        for tmp_p, final_p in staged_sql_pairs:
+          os.replace(tmp_p, final_p)
+      finally:
+        for tmp_p, _ in staged_sql_pairs:
+          if os.path.exists(tmp_p):
+            try:
+              os.unlink(tmp_p)
+            except OSError:
+              pass
+      if sink_sql_pair is not None:
+        written_sql = [sink_sql_pair[1]]
         if args.if_exists == 'replace' and sink_prefix:
           _remove_existing_output_for_replace(sink_prefix, keep=written_sql)
-      dlq_written: list[str] = []
-      if dlq_ep is not None:
-        dlq_written = pipe_sql.write_rows_to_local_file(
-            ['step', 'error_type', 'error', 'raw_payload'],
-            dlq_recs,
-            dlq_ep,
-            if_exists='append' if args.if_exists == 'append' else 'replace')
+      if dlq_sql_pair is not None:
+        dlq_written = [dlq_sql_pair[1]]
     except pipe_sql.SqlEngineMissingError as e:
       raise _CliError(str(e), EXIT_MISSING_PACKAGE) from None
     except (pipe_sql.SqlPipeError, FileNotFoundError) as e:
@@ -2515,18 +2563,35 @@ def _pipe(
     if fast_rc is not None:
       return fast_rc
 
-  if args.if_exists == 'replace' and not args.dry_run:
+  import yaml
+  dumper = getattr(yaml, 'CSafeDumper', yaml.SafeDumper)
+  canonical_spec = json.dumps(pipe.spec, sort_keys=True, separators=(',', ':'))
+  plan_hash = 'sha256:' + hashlib.sha256(canonical_spec.encode('utf-8')).hexdigest()
+
+  orig_out_prefix = pipe.output_prefix
+  orig_dlq_prefix = (
+      pipe.dlq_endpoint.output_prefix if pipe.dlq_endpoint else None)
+  staged_spec, sink_stage_dir, sink_stage_prefix, dlq_stage_dir, dlq_stage_prefix = (
+      _stage_spec_sinks(
+          pipe.spec,
+          sink_prefix=orig_out_prefix,
+          dlq_prefix=orig_dlq_prefix,
+          stage_sink=bool(
+              is_local_runner and not args.dry_run and
+              args.if_exists == 'replace'),
+          stage_dlq=bool(
+              is_local_runner and not args.dry_run and
+              args.if_exists != 'append')))
+
+  if args.if_exists == 'replace' and not args.dry_run and not sink_stage_prefix:
     src_path = (pipe.source_endpoint.config.get('path')
                 if pipe.source_endpoint is not None else None)
     if isinstance(src_path, str) and '://' not in src_path:
       from . import dlq as dlq_mod
-      _refuse_replace_of_input(pipe.output_prefix, dlq_mod._match_paths(src_path))
+      _refuse_replace_of_input(orig_out_prefix, dlq_mod._match_paths(src_path))
 
-  import yaml
-  dumper = getattr(yaml, 'CSafeDumper', yaml.SafeDumper)
-  yaml_str = yaml.dump(pipe.spec, Dumper=dumper, sort_keys=False, width=100000)
-  canonical_spec = json.dumps(pipe.spec, sort_keys=True, separators=(',', ':'))
-  plan_hash = 'sha256:' + hashlib.sha256(canonical_spec.encode('utf-8')).hexdigest()
+  yaml_str = yaml.dump(
+      staged_spec, Dumper=dumper, sort_keys=False, width=100000)
 
   local_check_paths = [source_uri, args.sink]
   if args.dlq:
@@ -2557,27 +2622,117 @@ def _pipe(
     if not json_session.enabled:
       print(f'note: {note}', file=sys.stderr)
 
-  return _run_yaml(
-      resolved_args,
-      args.verbose,
-      direct_yaml_text=yaml_str,
-      command_name='pipe',
-      local_paths=local_check_paths,
-      dry_run_yaml=pipe_spec.to_yaml(pipe.spec, pipe_argv)
-      if args.dry_run else None,
-      output_prefix=pipe.output_prefix,
-      if_exists=args.if_exists,
-      dlq_prefix=(
-          pipe.dlq_endpoint.output_prefix if pipe.dlq_endpoint else None),
-      requires_java_xlang=pipe.requires_java_xlang,
-      wait_timeout_sec=wait_timeout_sec,
-      raw_argv_for_idem=raw_argv,
-      plan_hash=plan_hash,
-      post_checks=post_checks,
-      explicit_sharding=explicit_sharding,
-      extra_warnings=extra_warnings,
-      json_session=json_session,
-      t0=t0)
+  try:
+    return _run_yaml(
+        resolved_args,
+        args.verbose,
+        direct_yaml_text=yaml_str,
+        command_name='pipe',
+        local_paths=local_check_paths,
+        dry_run_yaml=pipe_spec.to_yaml(pipe.spec, pipe_argv)
+        if args.dry_run else None,
+        output_prefix=sink_stage_prefix or orig_out_prefix,
+        replace_commit_target=orig_out_prefix if sink_stage_prefix else None,
+        if_exists=args.if_exists,
+        dlq_prefix=dlq_stage_prefix or orig_dlq_prefix,
+        dlq_commit_target=orig_dlq_prefix if dlq_stage_prefix else None,
+        requires_java_xlang=pipe.requires_java_xlang,
+        wait_timeout_sec=wait_timeout_sec,
+        raw_argv_for_idem=raw_argv,
+        plan_hash=plan_hash,
+        post_checks=post_checks,
+        explicit_sharding=explicit_sharding,
+        extra_warnings=extra_warnings,
+        json_session=json_session,
+        t0=t0)
+  finally:
+    for d in (sink_stage_dir, dlq_stage_dir):
+      if d:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _prepare_local_stage_prefix(prefix: str) -> tuple[str, str]:
+  """Creates a hidden sibling staging directory for atomic post-run swap."""
+  abs_target = os.path.abspath(prefix)
+  if prefix.endswith(('/', os.sep)):
+    os.makedirs(abs_target, exist_ok=True)
+    stage_dir = tempfile.mkdtemp(prefix='.beam_replace_', dir=abs_target)
+    return stage_dir, stage_dir + os.sep
+  parent = os.path.dirname(abs_target) or '.'
+  os.makedirs(parent, exist_ok=True)
+  stage_dir = tempfile.mkdtemp(prefix='.beam_replace_', dir=parent)
+  return stage_dir, os.path.join(stage_dir, os.path.basename(abs_target))
+
+
+def _stage_spec_sinks(
+    spec: dict[str, Any],
+    *,
+    sink_prefix: str | None,
+    dlq_prefix: str | None,
+    stage_sink: bool,
+    stage_dlq: bool,
+) -> tuple[dict[str, Any], str | None, str | None, str | None, str | None]:
+  """Rewrites local sink/DLQ paths in a copy of `spec` to staging directories."""
+  want_sink = bool(stage_sink and sink_prefix and '://' not in sink_prefix)
+  want_dlq = bool(stage_dlq and dlq_prefix and '://' not in dlq_prefix)
+  if not want_sink and not want_dlq:
+    return spec, None, None, None, None
+
+  copied = copy.deepcopy(spec)
+  transforms = copied.get('pipeline', {}).get('transforms', [])
+  is_chain = copied.get('pipeline', {}).get('type') == 'chain'
+
+  sink_dir = sink_stage = None
+  dlq_dir = dlq_stage = None
+  if want_sink and sink_prefix is not None:
+    sink_target_cfg = None
+    if is_chain and transforms:
+      cfg = transforms[-1].get('config')
+      if isinstance(cfg, dict) and cfg.get('path') == sink_prefix:
+        sink_target_cfg = cfg
+    else:
+      for t in transforms:
+        cfg = t.get('config')
+        if (t.get('name') == 'WriteSink' and isinstance(cfg, dict) and
+            cfg.get('path') == sink_prefix):
+          sink_target_cfg = cfg
+          break
+    if sink_target_cfg is not None:
+      sink_dir, sink_stage = _prepare_local_stage_prefix(sink_prefix)
+      sink_target_cfg['path'] = sink_stage
+
+  if want_dlq and dlq_prefix is not None and not is_chain:
+    for t in transforms:
+      cfg = t.get('config')
+      if (t.get('name') == 'WriteDlq' and isinstance(cfg, dict) and
+          cfg.get('path') == dlq_prefix):
+        dlq_dir, dlq_stage = _prepare_local_stage_prefix(dlq_prefix)
+        cfg['path'] = dlq_stage
+        break
+
+  return copied, sink_dir, sink_stage, dlq_dir, dlq_stage
+
+
+def _commit_staged_local_files(
+    staged_files: list[str],
+    stage_prefix: str,
+    target_prefix: str,
+    *,
+    remove_stale_replace: bool,
+) -> list[str]:
+  """Atomically swaps staged local output files onto `target_prefix`."""
+  final_files: list[str] = []
+  for f in staged_files:
+    abs_f = os.path.abspath(f)
+    suffix = abs_f[len(stage_prefix):] if abs_f.startswith(stage_prefix) else ''
+    dest = target_prefix + suffix
+    parent = os.path.dirname(os.path.abspath(dest)) or '.'
+    os.makedirs(parent, exist_ok=True)
+    os.replace(abs_f, dest)
+    final_files.append(dest)
+  if remove_stale_replace:
+    _remove_existing_output_for_replace(target_prefix, keep=final_files)
+  return final_files
 
 
 def _bigquery_write_disposition(spec: dict[str, Any]) -> str | None:
@@ -2599,11 +2754,14 @@ def _run_fast_local_pipe(
     pipe, files, args, *, json_session, t0, mixed_groups=None) -> int | None:
   """Runs a qualifying `beam pipe` in-process; None falls back to Beam."""
   from . import fast_local
-  from . import jobs
   canonical_spec = json.dumps(pipe.spec, sort_keys=True, separators=(',', ':'))
   plan_hash = 'sha256:' + hashlib.sha256(canonical_spec.encode('utf-8')).hexdigest()
   try:
-    res = fast_local.run(pipe, files, mixed_groups=mixed_groups)
+    res = fast_local.run(
+        pipe,
+        files,
+        mixed_groups=mixed_groups,
+        assert_counts=bool(args.assert_counts))
   except ImportError as e:
     if mixed_groups:
       raise _CliError(
@@ -2620,10 +2778,6 @@ def _run_fast_local_pipe(
     raise _CliError(
         f'pipeline failed: {_summarize(e)}', EXIT_PIPELINE_FAILED) from None
 
-  if args.assert_counts:
-    err_msg = jobs.check_assert_counts(res.metrics)
-    if err_msg:
-      raise _CliError(err_msg, EXIT_PIPELINE_FAILED)
   if args.if_exists == 'replace':
     # The inputs were read before the new output replaced the old one.
     _remove_existing_output_for_replace(pipe.output_prefix, keep=res.files)
@@ -2696,8 +2850,10 @@ def _run_yaml(
     local_paths=(),
     dry_run_yaml: str | None = None,
     output_prefix: str | None = None,
+    replace_commit_target: str | None = None,
     if_exists: str = 'fail',
     dlq_prefix: str | None = None,
+    dlq_commit_target: str | None = None,
     requires_java_xlang: bool = False,
     wait_timeout_sec: float | None = None,
     raw_argv_for_idem: list[str] | None = None,
@@ -2792,9 +2948,6 @@ def _run_yaml(
           pipeline = beam.Pipeline(options=options, display_data=display_data)
           if output_prefix is not None and if_exists == 'fail' and dry_run_yaml is None:
             _refuse_existing_output(output_prefix, verbose)
-          elif (output_prefix is not None and if_exists == 'replace' and
-                dry_run_yaml is None):
-            _remove_existing_output_for_replace(output_prefix)
           constructor(pipeline)
         except _CliError:
           raise
@@ -2902,6 +3055,11 @@ def _run_yaml(
                 f"Re-attached to existing job {existing_rec['job_id']} "
                 f"(state: {existing_rec.get('state')}).")
           return EXIT_OK
+
+      if (replace_commit_target is None and output_prefix is not None and
+          if_exists == 'replace'):
+        # Fallback for unstaged remote sinks after graph build & idempotency pass.
+        _remove_existing_output_for_replace(output_prefix)
 
       state = None
       timed_out = False
@@ -3018,6 +3176,12 @@ def _run_yaml(
 
     row_metrics = jobs.extract_beam_cli_counters(
         result.metrics() if hasattr(result, 'metrics') else None)
+    if row_metrics.get('schema_drift_rows', 0) > 0:
+      drift_warn = _dlq_mod.schema_drift_warning(
+          row_metrics['schema_drift_rows'])
+      warnings_list.append(drift_warn)
+      if not (json_session is not None and json_session.enabled):
+        print(f'warning: {drift_warn}', file=sys.stderr)
 
     if post_checks and post_checks.get('assert_counts'):
       err_msg = jobs.check_assert_counts(row_metrics)
@@ -3026,6 +3190,7 @@ def _run_yaml(
 
     outputs_dict: dict[str, Any] = {}
     written: list[str] = []
+    dlq_files: list[str] = []
     allow_materialize = bool(
         is_local and command_name == 'pipe' and if_exists != 'append' and
         not explicit_sharding)
@@ -3046,9 +3211,6 @@ def _run_yaml(
       if is_local:
         _cleanup_empty_beam_temp_dirs(dlq_prefix)
       outputs_dict['dlq_files'] = dlq_files
-    if is_local and local_paths:
-      for lp in local_paths:
-        _cleanup_empty_beam_temp_dirs(lp)
 
     if post_checks and post_checks.get('verify_diff'):
       from . import diff
@@ -3066,10 +3228,34 @@ def _run_yaml(
       diff_rep.pop('untrusted_data', None)
       outputs_dict['verify'] = diff_rep
       if diff_rc != EXIT_OK:
+        if replace_commit_target is not None:
+          outputs_dict['files'] = []
+          outputs_dict['file_count'] = 0
+        if dlq_commit_target is not None:
+          outputs_dict.pop('dlq_files', None)
         raise _CliError(
             f'--verify detected mismatch between {v_cfg["left"]} and {v_cfg["right"]}',
             EXIT_DIFF_MISMATCH,
             extra={'outputs': outputs_dict, 'metrics': row_metrics})
+
+    if dlq_commit_target is not None and dlq_prefix is not None:
+      dlq_files = _commit_staged_local_files(
+          dlq_files,
+          dlq_prefix,
+          dlq_commit_target,
+          remove_stale_replace=bool(if_exists == 'replace' or dlq_files))
+      outputs_dict['dlq_files'] = dlq_files
+    if replace_commit_target is not None and output_prefix is not None:
+      written = _commit_staged_local_files(
+          written,
+          output_prefix,
+          replace_commit_target,
+          remove_stale_replace=True)
+      outputs_dict['files'] = written
+      outputs_dict['file_count'] = len(written)
+    if is_local and local_paths:
+      for lp in local_paths:
+        _cleanup_empty_beam_temp_dirs(lp)
 
     if json_session is not None and json_session.enabled:
       json_session.emit(

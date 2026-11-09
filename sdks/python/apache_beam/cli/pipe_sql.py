@@ -286,6 +286,7 @@ def load_endpoint_rows(
     *,
     default_project: str | None = None,
     dlq_records: list[dict[str, Any]] | None = None,
+    warnings: list[str] | None = None,
 ) -> tuple[list[tuple[str, str]], list[dict[str, Any]], int]:
   """Reads `(columns_with_sqlite_types, rows, raw_rows_read)` from `ep`."""
   from . import lakehouse
@@ -412,10 +413,29 @@ def load_endpoint_rows(
     rows = []
     raw_count = 0
     col_types: dict[str, str] = {}
+    try:
+      eff_sample = dlq.parse_sample_rows_opt(ep.config.get('sample_rows'))
+      allow_unknown = (
+          dlq.parse_unknown_fields_opt(ep.config.get('on_unknown_fields')) ==
+          'ignore')
+    except ValueError as e:
+      raise SqlPipeError(str(e)) from None
     # JSONL is typed from a sample like `beam pipe` does, so a value that
-    # doesn't fit its column (amount "abc") goes to --dlq or fails with a
-    # hint, instead of reaching SQLite as text and breaking the output.
-    kinds = _jsonl_kinds(files)
+    # doesn't fit its column (amount "abc") or a late field absent from the
+    # sample goes to --dlq or fails with a hint, instead of silently dropping
+    # fields or reaching SQLite as text.
+    kinds = _jsonl_kinds(files, sample_rows=eff_sample)
+    if kinds is not None and ep.config.get('fields'):
+      from . import cdc as cdc_mod
+      try:
+        parsed_types = dict(
+            cdc_mod.parse_fields_shorthand(str(ep.config['fields'])))
+        kinds = dlq.apply_type_overrides(
+            kinds, parsed_types, str(ep.raw), allow_new_columns=True)
+      except ValueError as e:
+        raise SqlPipeError(str(e)) from None
+    drift_count = 0
+    drift_fields: set[str] = set()
     for fp in files:
       with _open_binary(fp) as bf:
         text = bf.read().decode('utf-8', errors='replace')
@@ -442,10 +462,15 @@ def load_endpoint_rows(
         raw_count += 1
         if kinds is not None:
           try:
-            rows.append(dlq.parse_json_record(s, kinds, _dict_row))
+            rows.append(
+                dlq.parse_json_record(
+                    s, kinds, _dict_row, allow_unknown_fields=allow_unknown))
           except Exception as e:  # pylint: disable=broad-except
             if dlq_records is None:
               raise SqlPipeError(dlq.json_fail_fast_message(s, e)) from None
+            if isinstance(e, dlq.SchemaDriftError):
+              drift_count += 1
+              drift_fields.update(e.extra_fields)
             dlq_records.append(dlq.json_dlq_record(s, e))
           continue
         try:
@@ -473,6 +498,8 @@ def load_endpoint_rows(
             })
             continue
           raise SqlPipeError(f'invalid JSON record in {fp}: {e}') from None
+    if drift_count > 0 and warnings is not None:
+      warnings.append(dlq.schema_drift_warning(drift_count, drift_fields))
     if kinds is not None:
       col_types = {
           k: ('INTEGER' if v in ('int', 'bool') else
@@ -507,7 +534,7 @@ def _dict_row(**fields):
   return dict(fields)
 
 
-def _jsonl_kinds(files):
+def _jsonl_kinds(files, *, sample_rows: int | None = 100):
   """Sampled JSONL field kinds, or None for JSON array files or no sample."""
   for fp in files:
     try:
@@ -518,7 +545,7 @@ def _jsonl_kinds(files):
     if head.startswith('['):
       return None
   try:
-    kinds = dlq.infer_json_kinds(list(files))
+    kinds = dlq.infer_json_kinds(list(files), sample_rows=sample_rows)
   except Exception:  # pylint: disable=broad-except
     return None
   return kinds or None
@@ -792,7 +819,8 @@ def _arrow_table(cols, rows):
   return pa.Table.from_arrays(arrays, names=names)
 
 
-def _run_duckdb(named_sources, clean_q, *, default_project, dlq_records):
+def _run_duckdb(
+    named_sources, clean_q, *, default_project, dlq_records, warnings=None):
   """Runs one read-only SELECT in a sandboxed in-memory DuckDB.
 
   Inputs are loaded by the same readers as the SQLite engine (typing, NULLs,
@@ -822,7 +850,10 @@ def _run_duckdb(named_sources, clean_q, *, default_project, dlq_records):
     used_lower = set()
     for ns in named_sources:
       cols, rows, raw_cnt = load_endpoint_rows(
-          ns.endpoint, default_project=default_project, dlq_records=dlq_records)
+          ns.endpoint,
+          default_project=default_project,
+          dlq_records=dlq_records,
+          warnings=warnings)
       total_read += raw_cnt
       con.register(ns.alias, _arrow_table(cols, rows))
       used_lower.add(ns.alias.lower())
@@ -878,6 +909,7 @@ def run_in_memory_sql(
     default_project: str | None = None,
     enable_dlq: bool = False,
     engine: str = 'sqlite',
+    warnings: list[str] | None = None,
 ) -> tuple[list[str], list[dict[str, Any]], list[dict[str, Any]], int]:
   """Executes `sql_query` in a sandboxed in-memory SQLite or DuckDB database.
 
@@ -893,7 +925,8 @@ def run_in_memory_sql(
         named_sources,
         clean_q,
         default_project=default_project,
-        dlq_records=dlq_records)
+        dlq_records=dlq_records,
+        warnings=warnings)
     return out_cols, out_rows, (dlq_records or []), total_read
   total_read = 0
 
@@ -905,7 +938,10 @@ def run_in_memory_sql(
 
     for ns in named_sources:
       cols, rows, raw_cnt = load_endpoint_rows(
-          ns.endpoint, default_project=default_project, dlq_records=dlq_records)
+          ns.endpoint,
+          default_project=default_project,
+          dlq_records=dlq_records,
+          warnings=warnings)
       total_read += raw_cnt
       if not cols and rows:
         cols = [(k, 'TEXT') for k in rows[0].keys()]
@@ -1066,31 +1102,33 @@ def _mixed_columns_as_text(columns, rows, warnings=None):
   return pa.table(arrays)
 
 
-def write_rows_to_local_file(
+def stage_rows_to_local_file(
     out_cols: list[str],
     out_rows: list[dict[str, Any]],
     sink_ep: uris.ParsedEndpoint,
     *,
     if_exists: str = 'fail',
     warnings: list[str] | None = None,
-) -> list[str]:
-  """Writes `out_rows` directly to a local file (`parquet`, `json`, `csv`)."""
+    tag: str = 'sql',
+) -> tuple[str, str]:
+  """Writes `out_rows` to a sibling `.tmp` file, returning `(tmp_path, final_path)`."""
   target = sink_ep.output_prefix or sink_ep.config.get('path')
   if not target:
     raise SqlPipeError(f'missing target path for sink {sink_ep.raw!r}')
+  parent = os.path.dirname(os.path.abspath(target))
+  if parent:
+    os.makedirs(parent, exist_ok=True)
+
   keyed = keyed_json_options(sink_ep)
   if keyed is not None:
     if if_exists == 'append':
       raise SqlPipeError('--to-opt key= cannot be combined with --if-exists append')
-    return [
-        write_json_document(
-            target,
-            keyed_json_document(
-                out_cols, out_rows, keyed['key'], keyed.get('value')))
-    ]
-  parent = os.path.dirname(os.path.abspath(target))
-  if parent:
-    os.makedirs(parent, exist_ok=True)
+    doc = keyed_json_document(out_cols, out_rows, keyed['key'], keyed.get('value'))
+    tmp_path = f'{target}.tmp.{tag}.{os.getpid()}'
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+      json.dump(doc, f, indent=2, default=str)
+      f.write('\n')
+    return tmp_path, target
 
   ext = os.path.splitext(target)[1].lower()
   has_explicit_ext = ext in (
@@ -1110,7 +1148,7 @@ def write_rows_to_local_file(
         final_path, is_read=True, explicit_format=sink_ep.format)
     _, prev_rows, _ = load_endpoint_rows(prev_ep)
     rows_to_write = prev_rows + rows_to_write
-  tmp_path = f'{final_path}.tmp.{os.getpid()}'
+  tmp_path = f'{final_path}.tmp.{tag}.{os.getpid()}'
 
   fmt = sink_ep.format
   try:
@@ -1144,6 +1182,28 @@ def write_rows_to_local_file(
       with open(tmp_path, 'w', encoding='utf-8') as f:
         for r in rows_to_write:
           f.write(json.dumps(r, default=str) + '\n')
+  except BaseException:
+    if os.path.exists(tmp_path):
+      try:
+        os.unlink(tmp_path)
+      except OSError:
+        pass
+    raise
+  return tmp_path, final_path
+
+
+def write_rows_to_local_file(
+    out_cols: list[str],
+    out_rows: list[dict[str, Any]],
+    sink_ep: uris.ParsedEndpoint,
+    *,
+    if_exists: str = 'fail',
+    warnings: list[str] | None = None,
+) -> list[str]:
+  """Writes `out_rows` directly to a local file (`parquet`, `json`, `csv`)."""
+  tmp_path, final_path = stage_rows_to_local_file(
+      out_cols, out_rows, sink_ep, if_exists=if_exists, warnings=warnings)
+  try:
     os.replace(tmp_path, final_path)
   finally:
     if os.path.exists(tmp_path):

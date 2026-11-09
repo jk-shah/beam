@@ -36,7 +36,9 @@ import decimal
 import io
 import json
 import math
+import re
 from typing import Any
+from typing import Iterable
 from typing import Optional
 
 # Transforms in Beam YAML's standard library that accept `error_handling` in
@@ -484,17 +486,25 @@ def header_order(file_header: list[str], header: list[str]):
 _TYPE_KINDS = ('int', 'float', 'bool', 'str')
 
 
-def apply_type_overrides(kinds: dict[str, Any], types, source: str):
+def apply_type_overrides(
+    kinds: dict[str, Any],
+    types,
+    source: str,
+    *,
+    allow_new_columns: bool = False,
+):
   """Applies explicit column types (`--from-opt fields=amount:float`).
 
   Values that don't parse as the given type go to the DLQ (or fail the run
-  without `--dlq`) instead of the whole column falling back to text.
+  without `--dlq`) instead of the whole column falling back to text. When
+  `allow_new_columns=True` (JSONL), explicit fields may also declare sparse
+  fields absent from the initial schema sample.
   """
   if not types:
     return kinds
   out = dict(kinds)
   for col, kind in dict(types).items():
-    if col not in out:
+    if col not in out and not allow_new_columns:
       raise ValueError(
           f'--from-opt fields: column {col!r} is not in {source} (columns: '
           f'{", ".join(out)})')
@@ -966,8 +976,70 @@ def _json_kind_type(kind: Any) -> Any:
   }.get(kind, Optional[str])
 
 
+class SchemaDriftError(ValueError):
+  """A JSON record contains field(s) absent from the sampled schema."""
+
+  def __init__(self, message: str, extra_fields: Iterable[str] = ()):
+    super().__init__(message)
+    self.extra_fields = [str(f) for f in extra_fields]
+
+
+def parse_sample_rows_opt(raw: Any) -> Optional[int]:
+  """Parses `--from-opt sample_rows=all|<INT>` (default `100`, `None` = all)."""
+  if raw is None or raw == '':
+    return 100
+  if isinstance(raw, bool):
+    raise ValueError(
+        "--from-opt sample_rows must be a positive integer or 'all'")
+  s = str(raw).strip().lower()
+  if s == 'all':
+    return None
+  try:
+    n = int(s)
+  except ValueError:
+    raise ValueError(
+        f"--from-opt sample_rows={raw!r}: expected a positive integer or 'all'"
+    ) from None
+  if n < 1:
+    raise ValueError(
+        f"--from-opt sample_rows={raw!r}: expected a positive integer or 'all'")
+  return n
+
+
+def parse_unknown_fields_opt(raw: Any) -> str:
+  """Parses `--from-opt on_unknown_fields=error|ignore` (default `'error'`)."""
+  if raw is None or raw == '':
+    return 'error'
+  s = str(raw).strip().lower()
+  if s in ('error', 'ignore'):
+    return s
+  raise ValueError(
+      f"--from-opt on_unknown_fields={raw!r}: expected 'error' or 'ignore'")
+
+
+def schema_drift_warning(count: int, extra_fields: Iterable[str] = ()) -> str:
+  """Warning emitted when `--dlq` quarantines records with new JSON fields."""
+  safe_fields = [
+      f for f in sorted({str(x) for x in extra_fields if x})
+      if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.]*', f)
+  ]
+  detail = f" ({', '.join(safe_fields[:8])})" if safe_fields else ''
+  return (
+      f'{count} JSON record(s) contained new field(s){detail} absent from '
+      'the sampled schema and were quarantined to --dlq for review instead of '
+      'dropping fields silently; pass --from-opt sample_rows=all (or '
+      '--from-opt fields=COL:TYPE) to include them in the output schema, or '
+      '--from-opt on_unknown_fields=ignore to drop extra fields')
+
+
 def _coerce_json_value(
-    value: Any, kind: Any, path: str, row_factory=None) -> Any:
+    value: Any,
+    kind: Any,
+    path: str,
+    row_factory=None,
+    *,
+    allow_unknown_fields: bool = False,
+) -> Any:
   """Converts one parsed JSON value to `kind`, raising ValueError on mismatch.
 
   Runs inside the parsing DoFn *before* the row is yielded: a value that does
@@ -981,13 +1053,27 @@ def _coerce_json_value(
     if not isinstance(value, dict):
       raise ValueError(
           f'field {path!r}: expected a JSON object, got {type(value).__name__}')
+    if not allow_unknown_fields:
+      extra = [k for k in value if k not in kind]
+      if extra:
+        qualified = [f'{path}.{k}' for k in extra]
+        shown = ', '.join(repr(q) for q in qualified[:8])
+        known = ', '.join(kind)
+        raise SchemaDriftError(
+            f'new field(s) {shown} appeared after schema sampling '
+            f'(inferred fields for {path!r}: {known})',
+            extra_fields=qualified)
     if row_factory is None:
       import apache_beam as beam
       row_factory = beam.Row
     return row_factory(
         **{
             name: _coerce_json_value(
-                value.get(name), sub, f'{path}.{name}', row_factory)
+                value.get(name),
+                sub,
+                f'{path}.{name}',
+                row_factory,
+                allow_unknown_fields=allow_unknown_fields)
             for name, sub in kind.items()
         })
   if kind == 'bool':
@@ -1009,22 +1095,31 @@ def read_json_with_dlq(
     path: str,
     *,
     types: Optional[dict[str, str]] = None,
+    sample_rows: Any = 100,
+    on_unknown_fields: str = 'error',
     error_handling: Optional[dict[str, Any]] = None,
 ):
   """JSONL Beam YAML source with a sampled schema and an optional DLQ.
 
-  The schema is inferred from up to 100 valid objects; nested objects become
-  nested rows so `--where`/`--select` can use `user.id`. With
-  `error_handling: {output: ...}` (the CLI's `--dlq`), malformed lines and
-  values that don't match the schema go to that output. Without it they fail
-  the pipeline with the file content's line, rather than being dropped.
+  The schema is inferred from up to `sample_rows` valid objects (default 100,
+  or `'all'` for every record); nested objects become nested rows so
+  `--where`/`--select` can use `user.id`. Any record with fields absent from
+  the inferred schema raises `SchemaDriftError` (routed to `error_handling`
+  when `--dlq` is set, or failing fast otherwise) unless
+  `on_unknown_fields='ignore'`.
   """
   import apache_beam as beam
   from apache_beam.io import ReadFromText
   from apache_beam.metrics import Metrics
   from apache_beam.typehints.row_type import RowTypeConstraint
 
-  kinds = apply_type_overrides(infer_json_kinds(path), types, path)
+  eff_sample = parse_sample_rows_opt(sample_rows)
+  allow_unknown = (parse_unknown_fields_opt(on_unknown_fields) == 'ignore')
+  kinds = apply_type_overrides(
+      infer_json_kinds(path, sample_rows=eff_sample),
+      types,
+      path,
+      allow_new_columns=True)
   install_keyword_safe_row_hooks()
   good_row_type = RowTypeConstraint.from_fields([
       (name, _json_kind_type(kind)) for name, kind in kinds.items()
@@ -1042,6 +1137,7 @@ def read_json_with_dlq(
     def __init__(self):
       self._rows_read = Metrics.counter('beam_cli', 'rows_read')
       self._dlq_rows = Metrics.counter('beam_cli', 'source_dlq_rows')
+      self._drift_rows = Metrics.counter('beam_cli', 'schema_drift_rows')
 
     def process(self, line: str):
       stripped = line.strip()
@@ -1049,11 +1145,14 @@ def read_json_with_dlq(
         return
       self._rows_read.inc()
       try:
-        row = parse_json_record(stripped, kinds, beam.Row)
+        row = parse_json_record(
+            stripped, kinds, beam.Row, allow_unknown_fields=allow_unknown)
       except Exception as exc:  # pylint: disable=broad-except
         if not route_errors:
           raise ValueError(json_fail_fast_message(stripped, exc)) from exc
         self._dlq_rows.inc()
+        if isinstance(exc, SchemaDriftError):
+          self._drift_rows.inc()
         yield beam.pvalue.TaggedOutput(
             'errors', beam.Row(**json_dlq_record(stripped, exc)))
         return
@@ -1077,8 +1176,10 @@ def read_json_with_dlq(
   return _ReadJsonWithDlqTransform()
 
 
-def infer_json_kinds(path: str) -> dict[str, Any]:
-  """Infers field kinds from up to 100 valid JSON objects in `path`."""
+def infer_json_kinds(
+    path: str | list[str], *, sample_rows: Optional[int] = 100
+) -> dict[str, Any]:
+  """Infers field kinds from up to `sample_rows` valid JSON objects (`None` = all)."""
   matches = _match_paths(path)
   if not matches:
     raise ValueError(f'no JSON files matched {path!r}')
@@ -1097,9 +1198,9 @@ def infer_json_kinds(path: str) -> dict[str, Any]:
           continue
         if isinstance(obj, dict):
           samples.append(obj)
-        if len(samples) >= 100:
+        if sample_rows is not None and len(samples) >= sample_rows:
           break
-    if len(samples) >= 100:
+    if sample_rows is not None and len(samples) >= sample_rows:
       break
 
   if not samples:
@@ -1113,14 +1214,34 @@ def infer_json_kinds(path: str) -> dict[str, Any]:
   return kinds
 
 
-def parse_json_record(stripped: str, kinds: dict[str, Any], row_factory):
+def parse_json_record(
+    stripped: str,
+    kinds: dict[str, Any],
+    row_factory,
+    *,
+    allow_unknown_fields: bool = False,
+):
   """Parses one stripped JSONL line into a row, raising on any mismatch."""
   obj = json.loads(stripped)
   if not isinstance(obj, dict):
     raise ValueError('expected JSON object per line')
+  if not allow_unknown_fields:
+    extra = [k for k in obj if k not in kinds]
+    if extra:
+      shown = ', '.join(repr(k) for k in extra[:8])
+      known = ', '.join(kinds)
+      raise SchemaDriftError(
+          f'new field(s) {shown} appeared after schema sampling '
+          f'(inferred fields: {known})',
+          extra_fields=extra)
   return row_factory(
       **{
-          name: _coerce_json_value(obj.get(name), kind, name, row_factory)
+          name: _coerce_json_value(
+              obj.get(name),
+              kind,
+              name,
+              row_factory,
+              allow_unknown_fields=allow_unknown_fields)
           for name, kind in kinds.items()
       })
 
@@ -1138,6 +1259,13 @@ def json_dlq_record(stripped: str, exc: Exception) -> dict[str, Any]:
 def json_fail_fast_message(
     stripped: str, exc: Exception, step: str = '') -> str:
   """The error for a bad JSONL line when no `--dlq` is configured."""
+  if isinstance(exc, SchemaDriftError):
+    return (
+        f'{type(exc).__name__}: {exc} in JSON line {stripped[:200]!r}{step} '
+        '(pass --dlq PATH to quarantine these records for review, '
+        '--from-opt sample_rows=all to scan all records for schema, '
+        '--from-opt fields=COL:TYPE to declare sparse fields, or '
+        '--from-opt on_unknown_fields=ignore to drop extra fields)')
   return (
       f'{type(exc).__name__}: {exc} in JSON line {stripped[:200]!r}{step} '
       '(pass --dlq PATH to route bad records instead of failing)')

@@ -305,8 +305,20 @@ def build_pipe_spec(
           f'--from-opt fields: bytes is not supported for {src_ep.format} '
           f'columns ({", ".join(bad)})')
     src_ep.config['types'] = parsed_types
+  if src_ep.kind == 'file' and src_ep.format == 'json':
+    try:
+      if 'sample_rows' in src_ep.config:
+        dlq.parse_sample_rows_opt(src_ep.config['sample_rows'])
+      if 'on_unknown_fields' in src_ep.config:
+        src_ep.config['on_unknown_fields'] = dlq.parse_unknown_fields_opt(
+            src_ep.config['on_unknown_fields'])
+    except ValueError as e:
+      raise PipeSpecError(str(e)) from None
   src_type = src_ep.yaml_type
   src_cfg = dict(src_ep.config)
+  if src_type == 'ReadFromJson':
+    src_cfg.pop('sample_rows', None)
+    src_cfg.pop('on_unknown_fields', None)
   if src_type == 'ReadFromCsv' and 'null_values' in src_cfg:
     # Exported YAML reads CSV with pandas: same markers, no pandas defaults.
     src_cfg['na_values'] = [''] + src_cfg.pop('null_values')
@@ -330,6 +342,7 @@ def build_pipe_spec(
   if cdc:
     from . import cdc as cdc_mod
     resolved_cdc_fields: list[tuple[str, str]] = []
+    cdc_fields_inferred_from_jsonl = False
     if raw_cdc_fields is not None:
       try:
         resolved_cdc_fields = cdc_mod.parse_fields_shorthand(
@@ -337,13 +350,18 @@ def build_pipe_spec(
       except ValueError as e:
         raise PipeSpecError(str(e)) from None
     elif src_ep.kind == 'file' and src_ep.format == 'json':
+      cdc_sample_rows = dlq.parse_sample_rows_opt(
+          src_ep.config.get('sample_rows'))
       resolved_cdc_fields = cdc_mod.infer_cdc_jsonl_fields(
           src_ep.config['path'],
           cdc_format=cdc_format,
           op_col=cdc_op_col,
           seq_col=cdc_seq_col,
-          primary_keys=pks)
-      if not resolved_cdc_fields and prefer_python_lakehouse_and_cdc:
+          primary_keys=pks,
+          sample_rows=cdc_sample_rows)
+      if resolved_cdc_fields:
+        cdc_fields_inferred_from_jsonl = True
+      elif prefer_python_lakehouse_and_cdc:
         resolved_cdc_fields = cdc_mod.infer_target_table_fields(
             dst_ep, default_project=default_project)
     elif src_ep.kind in ('pubsub', 'kafka') and 'schema' not in src_ep.config:
@@ -379,6 +397,10 @@ def build_pipe_spec(
         cdc_norm_cfg['fields_spec'] = [
             [cname, ckind] for cname, ckind in resolved_cdc_fields
         ]
+      if cdc_fields_inferred_from_jsonl:
+        cdc_norm_cfg['strict_inferred_fields'] = True
+        if 'on_unknown_fields' in src_ep.config:
+          cdc_norm_cfg['on_unknown_fields'] = src_ep.config['on_unknown_fields']
 
   if prefer_python_lakehouse_and_cdc:
     if src_ep.kind == 'delta':
@@ -399,7 +421,9 @@ def build_pipe_spec(
       # as nested rows and fails on bad lines unless --dlq routes them.
       src_type = 'ReadJsonWithDlq'
       src_cfg = {
-          k: v for k, v in src_ep.config.items() if k in ('path', 'types')
+          k: v
+          for k, v in src_ep.config.items()
+          if k in ('path', 'types', 'sample_rows', 'on_unknown_fields')
       }
       src_java = False
       needs_cli_provider = True
@@ -586,7 +610,11 @@ def build_pipe_spec(
   elif src_ep.kind == 'file' and src_ep.format == 'json' and not cdc:
     src_type = 'ReadJsonWithDlq'
     src_cfg = {
-        **{k: v for k, v in src_cfg.items() if k in ('path', 'types')},
+        **{
+            k: v
+            for k, v in src_ep.config.items()
+            if k in ('path', 'types', 'sample_rows', 'on_unknown_fields')
+        },
         'error_handling': {'output': 'errors'},
     }
     source_counts_internally = True

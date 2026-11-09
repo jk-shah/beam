@@ -31,6 +31,8 @@ Use `beam` whenever moving, converting, filtering, joining/aggregating (`--join`
 - **SQLite window functions, CTEs, percentiles, and `to_utc()` are built in**: `ROW_NUMBER() OVER (...)`, `RANK()`, `LAG()`, `median(x)`, `percentile(x, 90)`, `quantile(x, 0.9)`, `stddev(x)`, and `to_utc(ts)` work out of the box. Check `beam doctor --json` (`outputs.sql_engines.duckdb.available`) if you want `--sql-engine duckdb`.
 - **SQL three-valued NULL semantics everywhere**: empty CSV cells are `NULL`; `!=`, `<>`, `NOT IN`, `AND`/`OR` follow SQL NULL rules on both in-process and Beam runner paths.
 - **Exact duplicate CDC rows collapse cleanly**: `--cdc` deduplicates byte-identical events sharing the latest sequence value and retains data sequence columns (`updated_at`).
+- **Safe atomic `--if-exists replace`**: previous local outputs stay untouched until the new run, `--assert-counts`, and `--verify` all succeed completely.
+- **Zero silent JSON field loss**: JSONL fields appearing after the 100-row sample raise `SchemaDriftError` (or quarantine to `--dlq` with an explicit warning in `warnings`); pass `--from-opt sample_rows=all` (or `fields=COL:TYPE`) to include sparse late fields, or `--from-opt on_unknown_fields=ignore` to drop unknown fields intentionally.
 
 ## Mandatory Agent Protocol
 

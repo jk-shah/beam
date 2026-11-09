@@ -3095,16 +3095,195 @@ class Round9FixesTest(unittest.TestCase):
     self.assertEqual(
         pq.read_table(target_pq).to_pylist(),
         [{'id': 2, 'name': 'Bob', 'tier': 'gold'}])
-    # Runner path refuses in-place replace instead of deleting the input first.
-    rc, env, _ = _run_json(
-        ['pipe', '--from', target_pq, '--to', target_pq, '--if-exists', 'replace'],
+    # Runner path also stages local replace before swapping, so in-place works!
+    rc, env, err = _run_json(
+        [
+            'pipe', '--from', target_pq, '--to', target_pq, '--if-exists',
+            'replace'
+        ],
         extra_env={'BEAM_CLI_NO_FAST_PATH': '1'})
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertEqual(
+        pq.read_table(target_pq).to_pylist(),
+        [{'id': 2, 'name': 'Bob', 'tier': 'gold'}])
+
+
+class UserFeedbackFixesTest(unittest.TestCase):
+  """Regression tests for safe --if-exists replace and >100-row JSON drift."""
+
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp(prefix='beam-cli-feedback-')
+
+  def tearDown(self):
+    shutil.rmtree(self.tmp, ignore_errors=True)
+
+  def test_failed_replace_preserves_previous_output_across_all_paths(self):
+    out_pq = os.path.join(self.tmp, 'report.parquet')
+    expected_rows = [{'id': 1, 'amount': 42.5}, {'id': 2, 'amount': 99.0}]
+    pq.write_table(pa.Table.from_pylist(expected_rows), out_pq)
+    with open(out_pq, 'rb') as f:
+      original_bytes = f.read()
+
+    bad_csv = os.path.join(self.tmp, 'bad.csv')
+    with open(bad_csv, 'w', encoding='utf-8') as f:
+      f.write('id,amount\n10,12.5\n11,15.0\n12,NOT_A_FLOAT\n13,20.0\n')
+
+    # 1. Fast local path fails on bad CSV row -> previous output stays intact.
+    rc, env, _ = _run_json([
+        'pipe', '--from', bad_csv, '--to', out_pq, '--from-opt',
+        'fields=id:int,amount:float', '--if-exists', 'replace'
+    ])
+    self.assertEqual(rc, cli.EXIT_PIPELINE_FAILED)
+    with open(out_pq, 'rb') as f:
+      self.assertEqual(f.read(), original_bytes)
+
+    # 2. Beam runner path fails mid-run -> staged dir discarded, old output intact.
+    rc, env, _ = _run_json(
+        [
+            'pipe', '--from', bad_csv, '--to', out_pq, '--from-opt',
+            'fields=id:int,amount:float', '--if-exists', 'replace'
+        ],
+        extra_env={'BEAM_CLI_NO_FAST_PATH': '1'})
+    self.assertEqual(rc, cli.EXIT_PIPELINE_FAILED)
+    with open(out_pq, 'rb') as f:
+      self.assertEqual(f.read(), original_bytes)
+
+    # 3. Beam runner path failing post-run --verify (--where drops a row so
+    #    output != source) ALSO preserves the previous output!
+    good_csv = os.path.join(self.tmp, 'good.csv')
+    with open(good_csv, 'w', encoding='utf-8') as f:
+      f.write('id,amount\n10,12.5\n11,50.0\n')
+    rc, env, _ = _run_json([
+        'pipe', '--from', good_csv, '--to', out_pq, '--where', 'amount > 20',
+        '--verify', '--verify-key', 'id', '--if-exists', 'replace'
+    ])
+    self.assertEqual(rc, cli.EXIT_DIFF_MISMATCH)
+    with open(out_pq, 'rb') as f:
+      self.assertEqual(f.read(), original_bytes)
+
+    # 4. Local --sql failing mid-query preserves previous output.
+    rc, env, _ = _run_json([
+        'pipe', '--from', good_csv, '--sql', 'SELECT nonexistent_col FROM source',
+        '--to', out_pq, '--if-exists', 'replace'
+    ])
     self.assertEqual(rc, cli.EXIT_USAGE)
-    self.assertIn('is also an input', env['error']['message'])
-    self.assertTrue(os.path.isfile(target_pq))
+    with open(out_pq, 'rb') as f:
+      self.assertEqual(f.read(), original_bytes)
+    self.assertEqual(pq.read_table(out_pq).to_pylist(), expected_rows)
+
+    # 5. Clean --if-exists replace succeeds and swaps in the new output cleanly.
+    rc, env, err = _run_json(
+        ['pipe', '--from', good_csv, '--to', out_pq, '--if-exists', 'replace'],
+        extra_env={'BEAM_CLI_NO_FAST_PATH': '1'})
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertEqual(
+        sorted(pq.read_table(out_pq).to_pylist(), key=lambda r: r['id']),
+        [{'id': 10, 'amount': 12.5}, {'id': 11, 'amount': 50.0}])
+    # No leftover .beam_replace_* staging directories.
+    leftovers = [
+        n for n in os.listdir(self.tmp) if n.startswith('.beam_replace_')
+    ]
+    self.assertEqual(leftovers, [])
+
+  def test_late_json_fields_after_100_records_never_dropped_silently(self):
+    src_jsonl = os.path.join(self.tmp, 'events.jsonl')
+    with open(src_jsonl, 'w', encoding='utf-8') as f:
+      for i in range(1, 121):
+        rec = {'id': i, 'user': {'uid': f'u{i}'}}
+        if i == 105:
+          rec['coupon'] = 'SAVE10'
+        elif i == 106:
+          rec['user']['badge'] = 'vip'
+        f.write(json.dumps(rec) + '\n')
+
+    # 1. Without --dlq: fails fast naming the late field across fast_local,
+    #    Beam runner, and --sql!
+    for idx, env_vars in enumerate(({}, {'BEAM_CLI_NO_FAST_PATH': '1'})):
+      out_f = os.path.join(self.tmp, f'fail_{idx}.jsonl')
+      rc, env, _ = _run_json(['pipe', '--from', src_jsonl, '--to', out_f],
+                             extra_env=env_vars)
+      self.assertEqual(rc, cli.EXIT_PIPELINE_FAILED)
+      self.assertIn('SchemaDriftError', env['error']['message'])
+      self.assertIn('coupon', env['error']['message'])
+      self.assertFalse(os.path.exists(out_f))
+
+    rc_sql, env_sql, _ = _run_json([
+        'pipe', '--from', src_jsonl, '--sql', 'SELECT id FROM source', '--to',
+        os.path.join(self.tmp, 'fail_sql.jsonl')
+    ])
+    self.assertEqual(rc_sql, cli.EXIT_USAGE)
+    self.assertIn('SchemaDriftError', env_sql['error']['message'])
+    self.assertIn('coupon', env_sql['error']['message'])
+
+    # 2. With --dlq: quarantines rows 105 & 106 with full raw_payload AND flags
+    #    warnings so an agent never misses the schema change on ok=True!
+    for idx, env_vars in enumerate(({}, {'BEAM_CLI_NO_FAST_PATH': '1'})):
+      out_ok = os.path.join(self.tmp, f'ok_{idx}.jsonl')
+      dlq_ok = os.path.join(self.tmp, f'dlq_{idx}.jsonl')
+      rc, env, err = _run_json(
+          [
+              'pipe', '--from', src_jsonl, '--to', out_ok, '--dlq', dlq_ok,
+              '--assert-counts'
+          ],
+          extra_env=env_vars)
+      self.assertEqual(rc, cli.EXIT_OK, err)
+      self.assertEqual(env['metrics']['rows_read'], 120)
+      self.assertEqual(env['metrics']['rows_written'], 118)
+      self.assertEqual(env['metrics']['dlq_rows'], 2)
+      self.assertTrue(
+          any('quarantined to --dlq' in w for w in env['warnings']),
+          env['warnings'])
+      with open(dlq_ok, 'r', encoding='utf-8') as f:
+        dlq_rows = [json.loads(line) for line in f if line.strip()]
+      self.assertEqual(len(dlq_rows), 2)
+      self.assertTrue(
+          all(r['error_type'] == 'SchemaDriftError' for r in dlq_rows))
+      payloads = ' '.join(r['raw_payload'] for r in dlq_rows)
+      self.assertIn('SAVE10', payloads)
+      self.assertIn('vip', payloads)
+
+    # Also verify --sql with --dlq quarantines & warns on late JSON fields.
+    out_sql_ok = os.path.join(self.tmp, 'sql_ok.jsonl')
+    dlq_sql_ok = os.path.join(self.tmp, 'sql_dlq.jsonl')
+    rc, env, err = _run_json([
+        'pipe', '--from', src_jsonl, '--sql', 'SELECT id FROM source', '--to',
+        out_sql_ok, '--dlq', dlq_sql_ok
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertEqual(env['metrics']['rows_written'], 118)
+    self.assertEqual(env['metrics']['dlq_rows'], 2)
+    self.assertTrue(
+        any('quarantined to --dlq' in w for w in env['warnings']),
+        env['warnings'])
+
+    # 3. --from-opt sample_rows=all widens schema discovery and preserves all
+    #    120 rows including late top-level and nested fields!
+    for idx, env_vars in enumerate(({}, {'BEAM_CLI_NO_FAST_PATH': '1'})):
+      out_all = os.path.join(self.tmp, f'all_{idx}.jsonl')
+      rc, env, err = _run_json(
+          [
+              'pipe', '--from', src_jsonl, '--to', out_all, '--from-opt',
+              'sample_rows=all', '--assert-counts'
+          ],
+          extra_env=env_vars)
+      self.assertEqual(rc, cli.EXIT_OK, err)
+      self.assertEqual(env['metrics']['rows_written'], 120)
+      with open(out_all, 'r', encoding='utf-8') as f:
+        by_id = {r['id']: r for r in (json.loads(line) for line in f if line)}
+      self.assertEqual(by_id[105]['coupon'], 'SAVE10')
+      self.assertEqual(by_id[106]['user']['badge'], 'vip')
+      self.assertIsNone(by_id[1]['coupon'])
+
+    # 4. --from-opt on_unknown_fields=ignore intentionally drops unknown fields.
+    out_ign = os.path.join(self.tmp, 'ign.jsonl')
+    rc, env, err = _run_json([
+        'pipe', '--from', src_jsonl, '--to', out_ign, '--from-opt',
+        'on_unknown_fields=ignore', '--assert-counts'
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertEqual(env['metrics']['rows_written'], 120)
+    self.assertEqual(env['warnings'], [])
 
 
 if __name__ == '__main__':
   unittest.main()
-
-
