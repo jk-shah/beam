@@ -252,21 +252,23 @@ def extract_beam_cli_counters(metrics_result: Any) -> dict[str, int]:
   """Extracts `Metrics.counter('beam_cli', ...)` from a Beam `MetricResults`."""
   if metrics_result is None:
     return {}
+  counters: dict[str, int] = {}
   try:
     from apache_beam.metrics.metric import MetricsFilter
     queried = metrics_result.query(MetricsFilter().with_namespace('beam_cli'))
+    if not isinstance(queried, dict):
+      return {}
+    for c in queried.get('counters', ()):
+      name = getattr(getattr(c, 'key', None), 'metric', None)
+      metric_name = getattr(name, 'name', None)
+      committed = getattr(c, 'committed', None)
+      attempted = getattr(c, 'attempted', 0)
+      val = committed if committed is not None else attempted
+      if metric_name:
+        counters[str(metric_name)] = (
+            counters.get(str(metric_name), 0) + int(val or 0))
   except Exception:  # pylint: disable=broad-except
     return {}
-
-  counters: dict[str, int] = {}
-  for c in queried.get('counters', ()):
-    name = getattr(getattr(c, 'key', None), 'metric', None)
-    metric_name = getattr(name, 'name', None)
-    committed = getattr(c, 'committed', None)
-    attempted = getattr(c, 'attempted', 0)
-    val = committed if committed is not None else attempted
-    if metric_name:
-      counters[str(metric_name)] = counters.get(str(metric_name), 0) + int(val or 0)
 
   return finalize_cli_row_metrics(counters)
 

@@ -237,6 +237,20 @@ class SqlShellTest(unittest.TestCase):
     ):
       self.assertEqual(sql.run(list_ios=True), 1)
     self.assertIn('parquet', out_offline.getvalue())
+    self.assertIn('delta', out_offline.getvalue())
+
+  def test_delta_and_iceberg_pom_matches_upstream_beam_sql_sh(self):
+    pom_xml = sql._render_pom('2.79.0', 'direct', ['delta', 'iceberg'])
+    ET.fromstring(pom_xml)
+    self.assertIn('beam-sdks-java-extensions-sql-delta', pom_xml)
+    self.assertIn('beam-sdks-java-extensions-sql-iceberg', pom_xml)
+    self.assertIn('<artifactId>gcs-connector</artifactId><version>4.0.4</version>', pom_xml)
+    self.assertIn('<artifactId>iceberg-gcp</artifactId><version>1.12.0</version>', pom_xml)
+    self.assertIn('<Multi-Release>true</Multi-Release>', pom_xml)
+    self.assertIn('<id>apache.snapshots</id>', pom_xml)
+    self.assertLess(
+        pom_xml.index('beam-sdks-java-extensions-sql-delta'),
+        pom_xml.index('beam-sdks-java-extensions-sql-jdbc'))
 
 
 if __name__ == '__main__':

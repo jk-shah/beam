@@ -265,10 +265,15 @@ def _find_java():
   return java_bin, java_home
 
 
-# Same Maven Wrapper versions and URLs as `scripts/beam-sql.sh`.
+# Same Maven Wrapper, Iceberg, GCS connector, and repository constants as
+# `scripts/beam-sql.sh` on upstream master (#40958, #41090).
 _MAVEN_WRAPPER_VERSION = '3.2.0'
 _MAVEN_VERSION = '3.9.6'
 _MAVEN_SHADE_PLUGIN_VERSION = '3.5.1'
+_DEFAULT_ICEBERG_VERSION = '1.12.0'
+_DEFAULT_BIGDATAOSS_GCS_CONNECTOR_VERSION = '4.0.4'
+_APACHE_SNAPSHOT_REPOSITORY_URL = (
+    'https://repository.apache.org/content/repositories/snapshots/')
 _MAVEN_WRAPPER_SCRIPT_URL = (
     'https://raw.githubusercontent.com/apache/maven-wrapper/refs/tags/'
     f'maven-wrapper-{_MAVEN_WRAPPER_VERSION}/maven-wrapper-distribution/'
@@ -322,25 +327,63 @@ def _download_https(url, dest_path):
     raise SqlError(f'failed to download {url}: {e}', _EXIT_FAILED) from None
 
 
+def _validated_dep_version(env_var: str, default: str) -> str:
+  val = (os.environ.get(env_var) or default).strip()
+  if not _VALID_ARTIFACT_PART.match(val.lower()):
+    raise SqlError(f'invalid {env_var}={val!r}', _EXIT_USAGE)
+  return val
+
+
+def _dep_xml(group_id: str, artifact_id: str, version_expr: str) -> str:
+  return (
+      '        <dependency>'
+      f'<groupId>{xml_escape(group_id)}</groupId>'
+      f'<artifactId>{xml_escape(artifact_id)}</artifactId>'
+      f'<version>{version_expr}</version>'
+      '</dependency>')
+
+
 def _render_pom(version, runner_key, ios):
   """Generates the `pom.xml` used to shade `BeamSqlLine` and selected IOs."""
+  iceberg_ver = xml_escape(
+      _validated_dep_version('ICEBERG_VERSION', _DEFAULT_ICEBERG_VERSION))
+  gcs_ver = xml_escape(
+      _validated_dep_version(
+          'BIGDATAOSS_GCS_CONNECTOR_VERSION',
+          _DEFAULT_BIGDATAOSS_GCS_CONNECTOR_VERSION))
+
   deps = []
+  # IO dependencies precede `beam-sdks-java-extensions-sql-jdbc` so connector
+  # classes take precedence during shading (matching `scripts/beam-sql.sh`).
   for io_name in ios:
     deps.append(
-        '        <dependency>'
-        '<groupId>org.apache.beam</groupId>'
-        f'<artifactId>beam-sdks-java-io-{xml_escape(io_name)}</artifactId>'
-        '<version>${beam.version}</version>'
-        '</dependency>')
+        _dep_xml(
+            'org.apache.beam', f'beam-sdks-java-io-{io_name}',
+            '${beam.version}'))
+    if io_name == 'delta':
+      deps.append(
+          _dep_xml(
+              'org.apache.beam', 'beam-sdks-java-extensions-sql-delta',
+              '${beam.version}'))
+      for gcs_art in ('gcs-connector', 'util-hadoop', 'gcsio', 'util'):
+        deps.append(_dep_xml('com.google.cloud.bigdataoss', gcs_art, gcs_ver))
+    elif io_name == 'iceberg':
+      deps.append(
+          _dep_xml(
+              'org.apache.beam', 'beam-sdks-java-extensions-sql-iceberg',
+              '${beam.version}'))
+      for ice_art in ('iceberg-aws', 'iceberg-aws-bundle', 'iceberg-gcp'):
+        deps.append(_dep_xml('org.apache.iceberg', ice_art, iceberg_ver))
+
+  deps.append(
+      _dep_xml(
+          'org.apache.beam', 'beam-sdks-java-extensions-sql-jdbc',
+          '${beam.version}'))
   runner_artifact = _RUNNER_ARTIFACTS[runner_key]
   if runner_artifact:
     deps.append(
-        '        <dependency>'
-        '<groupId>org.apache.beam</groupId>'
-        f'<artifactId>{xml_escape(runner_artifact)}</artifactId>'
-        '<version>${beam.version}</version>'
-        '</dependency>')
-  extra_deps = ('\n' + '\n'.join(deps)) if deps else ''
+        _dep_xml('org.apache.beam', runner_artifact, '${beam.version}'))
+  deps_block = '\n'.join(deps)
   return f"""\
 <project xmlns="http://maven.apache.org/POM/4.0.0"
          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
@@ -350,12 +393,21 @@ def _render_pom(version, runner_key, ios):
     <artifactId>beam-sql-shell-runner</artifactId>
     <version>1.0</version>
     <dependencies>
-        <dependency>
-            <groupId>org.apache.beam</groupId>
-            <artifactId>beam-sdks-java-extensions-sql-jdbc</artifactId>
-            <version>${{beam.version}}</version>
-        </dependency>{extra_deps}
+{deps_block}
     </dependencies>
+    <repositories>
+        <repository>
+            <id>apache.snapshots</id>
+            <url>{_APACHE_SNAPSHOT_REPOSITORY_URL}</url>
+            <releases>
+                <enabled>false</enabled>
+            </releases>
+            <snapshots>
+                <enabled>true</enabled>
+                <updatePolicy>always</updatePolicy>
+            </snapshots>
+        </repository>
+    </repositories>
     <properties>
         <beam.version>{xml_escape(version)}</beam.version>
     </properties>
@@ -373,6 +425,11 @@ def _render_pom(version, runner_key, ios):
                         </goals>
                         <configuration>
                             <transformers>
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                    <manifestEntries>
+                                        <Multi-Release>true</Multi-Release>
+                                    </manifestEntries>
+                                </transformer>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
                             </transformers>
                             <filters>
@@ -457,7 +514,7 @@ _METADATA_URL = (
 
 _KNOWN_IOS = (
     'amazon-web-services2 amqp azure azure-cosmos cassandra cdap clickhouse '
-    'csv debezium elasticsearch google-ads google-cloud-platform '
+    'csv debezium delta elasticsearch google-ads google-cloud-platform '
     'hadoop-format hbase hcatalog iceberg influxdb jdbc jms json kafka '
     'kinesis kudu mongodb mqtt neo4j parquet pulsar rabbitmq redis '
     'singlestore snowflake solace solr sparkreceiver splunk synthetic thrift '
