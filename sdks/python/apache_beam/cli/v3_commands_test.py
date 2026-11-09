@@ -2508,6 +2508,110 @@ class NullMatrixPipeTest(unittest.TestCase):
     self.assertIn('keep_default_na: false', env['outputs']['yaml'])
 
 
+def _has_duckdb() -> bool:
+  import importlib.util
+  return importlib.util.find_spec('duckdb') is not None
+
+
+class DuckDbSqlEngineTest(unittest.TestCase):
+  """`beam pipe --sql --sql-engine duckdb` (optional local SQL engine)."""
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp(prefix='beam-duckdb-test-')
+    self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+    self.csv = os.path.join(self.tmp, 'o.csv')
+    with open(self.csv, 'w', encoding='utf-8') as f:
+      f.write('id,region,amount\n1,US,10\n2,EU,\n3,US,30\n4,,40\n')
+    self.pq = os.path.join(self.tmp, 'u.parquet')
+    pq.write_table(
+        pa.Table.from_pylist([
+            {'id': 1, 'user': {'tier': 'gold'}},
+            {'id': 3, 'user': None},
+        ]),
+        self.pq)
+
+  def _sql(self, query, *extra, engine='duckdb', inputs=None):
+    argv = ['pipe']
+    for alias, path in (inputs or [('o', self.csv)]):
+      argv += ['--from' if argv == ['pipe'] else '--join', f'{alias}={path}']
+    argv += ['--sql', query, '--sql-engine', engine, *extra]
+    return _run_json(argv)
+
+  @unittest.skipUnless(_has_duckdb(), 'duckdb not installed')
+  def test_ansi_analytics_and_nulls(self):
+    rc, env, err = self._sql(
+        'SELECT region, percentile_cont(0.5) WITHIN GROUP (ORDER BY amount) '
+        'AS p50, count(*) AS n FROM o GROUP BY region '
+        'ORDER BY region NULLS LAST')
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertEqual(env['outputs']['sql_engine'], 'duckdb')
+    self.assertEqual(
+        env['untrusted_data']['rows'], [
+            {'region': 'EU', 'p50': None, 'n': 1},
+            {'region': 'US', 'p50': 20.0, 'n': 2},
+            {'region': None, 'p50': 40.0, 'n': 1},
+        ])
+
+  @unittest.skipUnless(_has_duckdb(), 'duckdb not installed')
+  def test_join_with_nested_struct_and_file_output(self):
+    out = os.path.join(self.tmp, 'out.parquet')
+    rc, env, err = self._sql(
+        'SELECT o.id, u."user".tier AS tier FROM o '
+        'LEFT JOIN u ON o.id = u.id ORDER BY o.id', '--to', out,
+        inputs=[('o', self.csv), ('u', self.pq)])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertEqual(
+        pq.read_table(out).to_pylist(), [
+            {'id': 1, 'tier': 'gold'},
+            {'id': 2, 'tier': None},
+            {'id': 3, 'tier': None},
+            {'id': 4, 'tier': None},
+        ])
+
+  @unittest.skipUnless(_has_duckdb(), 'duckdb not installed')
+  def test_same_answer_as_sqlite(self):
+    query = ('SELECT region, COUNT(*) AS n, SUM(amount) AS total FROM o '
+             "WHERE region IS NOT NULL AND region != 'XX' GROUP BY region "
+             'ORDER BY region')
+    results = {}
+    for engine in ('sqlite', 'duckdb'):
+      rc, env, err = self._sql(query, engine=engine)
+      self.assertEqual(rc, cli.EXIT_OK, err)
+      results[engine] = env['untrusted_data']['rows']
+    self.assertEqual(results['sqlite'], results['duckdb'])
+
+  @unittest.skipUnless(_has_duckdb(), 'duckdb not installed')
+  def test_sandbox_blocks_files_and_multiple_statements(self):
+    for query in ("SELECT * FROM read_csv('/etc/passwd')",
+                  f"SELECT * FROM '{self.csv}'",
+                  "SELECT 1; SELECT 2"):
+      rc, env, _ = self._sql(query)
+      self.assertEqual(rc, cli.EXIT_USAGE, query)
+      self.assertNotIn('root:', json.dumps(env))
+
+  def test_missing_duckdb_points_to_install_and_doctor(self):
+    with mock.patch.dict(sys.modules, {'duckdb': None}):
+      rc, env, _ = self._sql('SELECT * FROM o')
+    self.assertEqual(rc, cli.EXIT_MISSING_PACKAGE)
+    self.assertIn('pip install', env['error']['message'])
+    self.assertIn('beam doctor', env['error']['message'])
+
+  def test_sqlite_within_group_error_suggests_duckdb(self):
+    rc, env, _ = self._sql(
+        'SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY amount) FROM o',
+        engine='sqlite')
+    self.assertEqual(rc, cli.EXIT_USAGE)
+    self.assertIn('--sql-engine duckdb', env['error']['message'])
+
+  def test_doctor_reports_sql_engines(self):
+    rc, env, _ = _run_json(['doctor'])
+    engines = env['outputs']['sql_engines']
+    self.assertEqual(engines['default'], 'sqlite')
+    self.assertTrue(engines['sqlite']['available'])
+    self.assertEqual(engines['duckdb']['available'], _has_duckdb())
+    if not _has_duckdb():
+      self.assertIn('pip install', engines['duckdb']['install'])
+
+
 if __name__ == '__main__':
   unittest.main()
 

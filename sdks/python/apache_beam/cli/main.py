@@ -193,6 +193,7 @@ _CLI_ONE_FLAGS = {
         '--dlq',
         '--dlq-format',
         '--null-values',
+        '--sql-engine',
         '--if-exists',
         '--from-opt',
         '--to-opt',
@@ -508,7 +509,8 @@ what you can do (beam --llms-txt prints the full agent manual):
                           no state; empty CSV cells are NULL (--null-values
                           NA,NULL adds markers); test with IS [NOT] NULL
   SQL                     beam pipe --from t=in.csv --sql "SELECT ... FROM t"
-                          (local; median/percentile/stddev included)
+                          (local SQLite with median/percentile/stddev; or
+                          --sql-engine duckdb if installed, see beam doctor)
   CDC                     --cdc --primary-key id applies change events
                           (files keep the latest row per key)
   compare datasets        beam diff left.parquet right.parquet --key id
@@ -653,6 +655,13 @@ def _build_parser():
       '--dlq-format',
       metavar='FMT',
       help='dead-letter file format (default: json or inferred from extension)')
+  pipe.add_argument(
+      '--sql-engine',
+      choices=['sqlite', 'duckdb'],
+      default='sqlite',
+      help='local engine for --sql: sqlite (default, built in) or duckdb '
+      '(optional, pip install duckdb; adds PERCENTILE_CONT ... WITHIN GROUP, '
+      'QUALIFY, struct fields). beam doctor shows which are installed')
   pipe.add_argument(
       '--null-values',
       metavar='LIST',
@@ -2137,7 +2146,14 @@ def _pipe(
       if sink_ep is None and not args.dry_run:
         raise _CliError(
             'remote --sql execution requires --to <SINK>', EXIT_USAGE)
-      non_portable = pipe_sql.local_only_sql_functions(args.sql)
+      non_portable = (
+          pipe_sql.local_only_sql_functions(args.sql)
+          if args.sql_engine == 'sqlite' else [])
+      if args.sql_engine != 'sqlite':
+        print(
+            f'note: --sql-engine {args.sql_engine} applies to local runs; the '
+            "exported or remote pipeline uses Beam SQL's dialect (Calcite)",
+            file=sys.stderr)
       if non_portable:
         print(
             'warning: --sql uses ' + ', '.join(non_portable) + ', which run '
@@ -2182,7 +2198,8 @@ def _pipe(
           named_sources,
           args.sql,
           default_project=default_proj,
-          enable_dlq=bool(dlq_ep is not None))
+          enable_dlq=bool(dlq_ep is not None),
+          engine=args.sql_engine)
       written_sql: list[str] = []
       if sink_ep is not None:
         if '://' in (sink_prefix or ''):
@@ -2199,6 +2216,8 @@ def _pipe(
             dlq_recs,
             dlq_ep,
             if_exists='append' if args.if_exists == 'append' else 'replace')
+    except pipe_sql.SqlEngineMissingError as e:
+      raise _CliError(str(e), EXIT_MISSING_PACKAGE) from None
     except (pipe_sql.SqlPipeError, FileNotFoundError) as e:
       raise _CliError(str(e), EXIT_USAGE) from None
     except ImportError as e:
@@ -2222,6 +2241,7 @@ def _pipe(
         'row_count': len(out_rows),
         'columns': out_cols,
         'plan_hash': sql_plan_hash,
+        'sql_engine': args.sql_engine,
     }
     if dlq_written:
       sql_outputs['dlq_files'] = dlq_written
@@ -2243,7 +2263,8 @@ def _pipe(
                   truncated=len(out_rows) > preview_limit)))
     else:
       if written_sql:
-        print('Done. Ran locally on SQLite SQL engine.')
+        engine_name = 'DuckDB' if args.sql_engine == 'duckdb' else 'SQLite'
+        print(f'Done. Ran locally on the {engine_name} SQL engine.')
         print(
             f'Wrote {len(written_sql)} '
             f'file{"" if len(written_sql) == 1 else "s"}:')

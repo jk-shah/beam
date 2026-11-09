@@ -20,6 +20,7 @@
 import importlib.util
 import os
 import platform
+import sqlite3
 import sys
 from typing import Any
 
@@ -48,6 +49,25 @@ def run_doctor() -> dict[str, Any]:
       'gcp_pubsub': _has_module('google.cloud.pubsub_v1'),
       'gcp_storage': _has_module('google.cloud.storage'),
       'fastavro': _has_module('fastavro'),
+      'duckdb': _has_module('duckdb'),
+  }
+
+  # Local `beam pipe --sql` engines (`--sql-engine`). Versions come from
+  # package metadata so doctor stays fast and never imports DuckDB.
+  from . import pipe_sql
+  duck_ver = pipe_sql.duckdb_version() if extras['duckdb'] else None
+  sql_engines = {
+      'default': 'sqlite',
+      'sqlite': {
+          'available': True, 'version': sqlite3.sqlite_version
+      },
+      'duckdb': {
+          'available': duck_ver is not None,
+          'version': duck_ver,
+          **({} if duck_ver else {
+              'install': pipe_sql.DUCKDB_INSTALL_HINT
+          }),
+      },
   }
 
   # Java 11–25 check (reusing sql._find_java!).
@@ -92,6 +112,7 @@ def run_doctor() -> dict[str, Any]:
       'python_version': py_ver,
       'python_executable': sys.executable,
       'extras': extras,
+      'sql_engines': sql_engines,
       'java': java_info,
       'gcp_adc': adc_info,
       'paths': {

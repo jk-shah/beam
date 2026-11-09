@@ -141,8 +141,12 @@ def render_llms_txt() -> str:
 - Local `--sql` is SQLite (inputs named `alias=URI`; unaliased inputs are named after the file) plus exact
   `median(x)`, `percentile(x, 95)`, `quantile(x, 0.95)` (linear interpolation, like numpy) and `stddev(x)`;
   window functions such as `ROW_NUMBER() OVER (PARTITION BY k ORDER BY ts DESC)` work.
-  Not supported locally: `PERCENTILE_CONT ... WITHIN GROUP`, `APPROX_QUANTILES`. Local-only functions are not
+  Not supported by SQLite: `PERCENTILE_CONT ... WITHIN GROUP`, `APPROX_QUANTILES`. Local-only functions are not
   portable to `--emit-yaml` / remote Beam SQL (Calcite); the CLI warns when you export them.
+- Optional DuckDB engine: `--sql-engine duckdb` (install with `pip install duckdb` or the `[duckdb]` extra; `beam doctor`
+  shows `sql_engines`) runs the same inputs (same typing, NULLs and `--dlq`) in a sandboxed in-memory DuckDB with
+  file access disabled: ANSI `PERCENTILE_CONT ... WITHIN GROUP`, `QUALIFY`, `median`, `quantile_cont`, struct fields
+  (`u."user".tier`). Without DuckDB the command exits `4` with the install command.
 - `--cdc --primary-key K` into plain files (Parquet/CSV/JSON/Avro) writes the latest live row per key, ordered by
   `lsn` / `ts_ms` / `updated_at` or `--cdc-seq-col COL`; deleted keys are dropped.
 

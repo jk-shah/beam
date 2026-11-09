@@ -19,6 +19,10 @@ dependencies = [
 gcp = [
   "apache-beam[yaml,gcp]>=2.71.0",
 ]
+# Optional local SQL engine for `beam pipe --sql --sql-engine duckdb`.
+duckdb = [
+  "duckdb>=1.1",
+]
 
 [project.scripts]
 beam = "apache_beam_cli_preview.launcher:main"

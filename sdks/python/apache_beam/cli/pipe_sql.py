@@ -618,8 +618,9 @@ def _register_aggregate_functions(conn: sqlite3.Connection) -> None:
 # Functions and syntax from other dialects mapped to what local SQL supports.
 _SQL_DIALECT_HINTS = (
     (re.compile(r'within\s+group', re.I),
-     'WITHIN GROUP is not supported locally; use percentile(col, 95) or '
-     'quantile(col, 0.95) (exact, linear interpolation) or median(col)'),
+     'WITHIN GROUP is not supported by the default SQLite engine; use '
+     'percentile(col, 95), quantile(col, 0.95) or median(col), or pass '
+     '--sql-engine duckdb'),
     (re.compile(r'no such function: (percentile_cont|percentile_disc|'
                 r'approx_quantiles|approx_percentile)', re.I),
      'use percentile(col, 95), quantile(col, 0.95) or median(col) (exact, '
@@ -644,7 +645,8 @@ def _sql_error_hint(message: str, query: str) -> str:
   if 'no such function' in message.lower():
     return (
         '; hint: local SQL is SQLite plus median, percentile, quantile, '
-        'stddev, concat, split_part, floor, ceil, power and sqrt')
+        'stddev, concat, split_part, floor, ceil, power and sqrt; for ANSI '
+        'analytics pass --sql-engine duckdb')
   return ''
 
 
@@ -668,19 +670,138 @@ def local_only_sql_functions(query: str) -> list[str]:
   ]
 
 
+# Local `--sql` engines. SQLite ships with Python; DuckDB is optional
+# (`pip install duckdb`) and adds ANSI analytics such as
+# `PERCENTILE_CONT ... WITHIN GROUP`, `QUALIFY`, struct field access and
+# `list` functions.
+SQL_ENGINES = ('sqlite', 'duckdb')
+DUCKDB_INSTALL_HINT = "pip install 'duckdb>=1.1'"
+
+
+class SqlEngineMissingError(SqlPipeError):
+  """The requested `--sql-engine` is not installed."""
+
+
+def duckdb_version() -> str | None:
+  """Installed DuckDB version, without importing it, or None."""
+  try:
+    from importlib import metadata
+    return metadata.version('duckdb')
+  except Exception:  # pylint: disable=broad-except
+    return None
+
+
+_ARROW_TYPES_FOR_SQLITE = {'INTEGER': 'int64', 'REAL': 'float64'}
+
+
+def _arrow_table(cols, rows):
+  """Builds a pyarrow Table from loaded rows, keeping nested values."""
+  import pyarrow as pa
+  names = [c for c, _ in cols] or (list(rows[0]) if rows else ['_empty'])
+  types = dict(cols)
+  arrays = []
+  for name in names:
+    values = [r.get(name) for r in rows]
+    declared = _ARROW_TYPES_FOR_SQLITE.get(types.get(name, ''), None)
+    try:
+      if declared and not any(isinstance(v, (dict, list)) for v in values):
+        arrays.append(pa.array(values, type=declared))
+      else:
+        arrays.append(pa.array(values) if values else pa.array(
+            [], type=pa.string()))
+    except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError, ValueError):
+      # Mixed types in one column: keep the values as text.
+      arrays.append(
+          pa.array([
+              None if v is None else
+              (json.dumps(v, default=str) if isinstance(v, (dict, list)) else
+               str(v)) for v in values
+          ],
+                   type=pa.string()))
+  return pa.Table.from_arrays(arrays, names=names)
+
+
+def _run_duckdb(named_sources, clean_q, *, default_project, dlq_records):
+  """Runs one read-only SELECT in a sandboxed in-memory DuckDB.
+
+  Inputs are loaded by the same readers as the SQLite engine (typing, NULLs,
+  DLQ) and registered as in-memory Arrow tables. The connection then has
+  file system access, extension install/load and configuration changes
+  disabled, so SQL can't read or write files (`read_csv`, `COPY`, `ATTACH`).
+  """
+  try:
+    import duckdb
+  except ImportError:
+    raise SqlEngineMissingError(
+        f'--sql-engine duckdb needs the duckdb package: {DUCKDB_INSTALL_HINT} '
+        '(check with: beam doctor)') from None
+  total_read = 0
+  con = duckdb.connect(
+      ':memory:',
+      config={
+          'enable_external_access': False,
+          'autoinstall_known_extensions': False,
+          'autoload_known_extensions': False,
+      })
+  try:
+    statements = con.extract_statements(clean_q)
+    if len(statements) != 1 or statements[0].type != duckdb.StatementType.SELECT:
+      raise SqlPipeError('--sql only accepts a single read-only SELECT query')
+    first_alias = None
+    used_lower = set()
+    for ns in named_sources:
+      cols, rows, raw_cnt = load_endpoint_rows(
+          ns.endpoint, default_project=default_project, dlq_records=dlq_records)
+      total_read += raw_cnt
+      con.register(ns.alias, _arrow_table(cols, rows))
+      used_lower.add(ns.alias.lower())
+      first_alias = first_alias or ns.alias
+    if first_alias is not None:
+      for view_name in ('PCOLLECTION', 'source'):
+        if view_name.lower() not in used_lower:
+          con.execute(
+              f'CREATE VIEW {_quote_ident(view_name)} AS '
+              f'SELECT * FROM {_quote_ident(first_alias)}')
+    con.execute('SET lock_configuration = true')
+    try:
+      cur = con.execute(clean_q)
+      out_cols = [d[0] for d in (cur.description or [])]
+      fetched = cur.fetchall()
+    except duckdb.Error as e:
+      avail = ', '.join(ns.alias for ns in named_sources)
+      first_line = str(e).splitlines()[0]
+      raise SqlPipeError(
+          f'SQL execution error (DuckDB): {first_line} '
+          f'(available tables: {avail})') from None
+    return out_cols, [dict(zip(out_cols, t)) for t in fetched], total_read
+  finally:
+    con.close()
+
+
 def run_in_memory_sql(
     named_sources: list[NamedSource],
     sql_query: str,
     *,
     default_project: str | None = None,
     enable_dlq: bool = False,
+    engine: str = 'sqlite',
 ) -> tuple[list[str], list[dict[str, Any]], list[dict[str, Any]], int]:
-  """Executes `sql_query` in a sandboxed `:memory:` SQLite DB.
+  """Executes `sql_query` in a sandboxed in-memory SQLite or DuckDB database.
 
   Returns `(out_columns, out_rows, dlq_records, total_rows_read)`.
   """
+  if engine not in SQL_ENGINES:
+    raise SqlPipeError(
+        f'unknown --sql-engine {engine!r}; use one of {", ".join(SQL_ENGINES)}')
   clean_q = validate_readonly_select_sql(sql_query)
   dlq_records: list[dict[str, Any]] | None = [] if enable_dlq else None
+  if engine == 'duckdb':
+    out_cols, out_rows, total_read = _run_duckdb(
+        named_sources,
+        clean_q,
+        default_project=default_project,
+        dlq_records=dlq_records)
+    return out_cols, out_rows, (dlq_records or []), total_read
   total_read = 0
 
   conn = sqlite3.connect(':memory:')
@@ -809,7 +930,11 @@ def write_rows_to_local_file(
             f, fieldnames=out_cols, delimiter=delim, extrasaction='ignore')
         writer.writeheader()
         for r in rows_to_write:
-          writer.writerow({k: ('' if v is None else v) for k, v in r.items()})
+          writer.writerow({
+              k: ('' if v is None else json.dumps(v, default=str)
+                  if isinstance(v, (dict, list)) else v)
+              for k, v in r.items()
+          })
     else:
       # Default JSONL (`json` / `text`).
       with open(tmp_path, 'w', encoding='utf-8') as f:
