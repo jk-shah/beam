@@ -25,6 +25,7 @@ Security guarantee:
   behind `--trust-providers` when custom `providers:` are declared in the YAML!
 """
 
+import contextlib
 import hashlib
 import json
 import os
@@ -46,6 +47,7 @@ def run_check(
     trust_providers: bool = False,
     jinja_variables_json: str | None = None,
     pipeline_args: list[str] | None = None,
+    verbose: bool = False,
 ) -> dict[str, Any]:
   """Validates a Beam YAML pipeline and returns a structured validation report."""
   import yaml
@@ -74,10 +76,23 @@ def run_check(
           raw_text, json.loads(jinja_variables_json))
 
   loader = getattr(yaml, 'CSafeLoader', yaml.SafeLoader)
+  if not jinja_variables_json and ('{{' in raw_text or '{%' in raw_text):
+    from . import package as pkg_mod
+    try:
+      pkg_mod.extract_jinja_parameters(raw_text)
+    except pkg_mod.PackageError as e:
+      raise CheckError(f'Jinja2 syntax error in {source_label}: {e}') from None
   try:
     spec = yaml.load(raw_text, Loader=loader)
   except yaml.YAMLError as e:
-    raise CheckError(f'YAML syntax error in {source_label}: {e}') from None
+    if not jinja_variables_json and '{{' in raw_text:
+      from . import package as pkg_mod
+      try:
+        spec = pkg_mod._validate_yaml_with_jinja_placeholders(raw_text)
+      except pkg_mod.PackageError:
+        raise CheckError(f'YAML syntax error in {source_label}: {e}') from None
+    else:
+      raise CheckError(f'YAML syntax error in {source_label}: {e}') from None
 
   if not isinstance(spec, dict) or 'pipeline' not in spec:
     raise CheckError(
@@ -126,6 +141,7 @@ def run_check(
       canonical_json.encode('utf-8')).hexdigest()
 
   expanded_transforms: list[str] | None = None
+  plan_skipped_reason: str | None = None
   if expand_plan:
     if has_untrusted_providers and not trust_providers:
       raise CheckError(
@@ -140,19 +156,84 @@ def run_check(
         yaml_main.build_pipeline_components_from_yaml(
             clean_yaml, list(pipeline_args or []), validate_schema='generic'))
     p = beam.Pipeline(options=options, display_data={'yaml': clean_yaml})
-    constructor(p)
-    proto = p.to_runner_api()
-    expanded_transforms = sorted(
-        t.unique_name for t in proto.components.transforms.values()
-        if t.unique_name and '/' not in t.unique_name)
+    try:
+      with _quiet_expansion(enabled=not verbose):
+        constructor(p)
+        proto = p.to_runner_api()
+      expanded_transforms = sorted(
+          t.unique_name for t in proto.components.transforms.values()
+          if t.unique_name and '/' not in t.unique_name)
+    except Exception as e:  # pylint: disable=broad-except
+      # Some transforms list cloud paths or read schemas while the pipeline is
+      # built (e.g. ReadFromCsv globs gs://...). Without network access or
+      # credentials that is not a defect in the YAML, so report the static
+      # result and why the full plan was skipped rather than failing.
+      if not _is_remote_access_error(e):
+        raise
+      plan_skipped_reason = (
+          'check passed (offline static validation); full plan expansion was '
+          'skipped because it needs access to remote storage or credentials '
+          'that are not available here')
+      plan_skipped_detail = str(e).splitlines()[0][:300]
 
-  return {
+  result = {
       'valid': True,
       'source': source_label,
-      'mode': 'expanded_plan' if expand_plan else 'offline_static',
+      'mode': 'expanded_plan' if expanded_transforms is not None else
+      'offline_static',
       'plan_hash': plan_hash,
       'transform_count': len(stages),
       'transforms': stages,
       'has_custom_providers': has_custom_providers,
       'expanded_top_level_transforms': expanded_transforms,
   }
+  if plan_skipped_reason:
+    result['plan_skipped_reason'] = plan_skipped_reason
+    result['plan_skipped_detail'] = plan_skipped_detail
+  return result
+
+
+_REMOTE_ACCESS_MARKERS = (
+    'gs://', 's3://', 'azfs://', 'hdfs://', 'list operation failed',
+    'operation not permitted', 'defaultcredentialserror',
+    'could not automatically determine credentials', 'name resolution',
+    'nodename nor servname', 'failed to establish a new connection',
+    'connection refused', 'maven', 'http error 403', 'refresherror',
+    'mutualtlschannelerror', 'reauthentication', 'invalid_grant',
+    'transporterror')
+
+
+def _is_remote_access_error(exc: BaseException) -> bool:
+  """True if `exc` (from --plan expansion) comes from missing network/creds."""
+  text = f'{type(exc).__name__}: {exc}'.lower()
+  return any(marker in text for marker in _REMOTE_ACCESS_MARKERS)
+
+
+@contextlib.contextmanager
+def _quiet_expansion(enabled: bool = True):
+  """Hides log records, warnings and stray stderr while --plan expands.
+
+  Building a pipeline can log credential refresh failures and gRPC/auth
+  tracebacks (RefreshError, MutualTLSChannelError) even when `beam check`
+  then reports a clean result or an offline fallback. `--verbose` keeps them.
+  """
+  if not enabled:
+    yield
+    return
+  import io
+  import logging
+  import warnings
+  prev_disable = logging.root.manager.disable
+  prev_grpc = os.environ.get('GRPC_VERBOSITY')
+  os.environ['GRPC_VERBOSITY'] = 'NONE'
+  logging.disable(logging.CRITICAL)
+  try:
+    with warnings.catch_warnings(), contextlib.redirect_stderr(io.StringIO()):
+      warnings.simplefilter('ignore')
+      yield
+  finally:
+    logging.disable(prev_disable)
+    if prev_grpc is None:
+      os.environ.pop('GRPC_VERBOSITY', None)
+    else:
+      os.environ['GRPC_VERBOSITY'] = prev_grpc

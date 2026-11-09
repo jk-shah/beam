@@ -18,6 +18,7 @@
 """End-to-end functional & pipeline tests for extended `beam` CLI commands."""
 
 import contextlib
+import csv
 import decimal
 import glob
 import io
@@ -175,6 +176,411 @@ class PipeV3IntegrationTest(unittest.TestCase):
     ])
     self.assertEqual(rc2, cli.EXIT_OK, err2)
     self.assertTrue(env2['ok'])
+
+
+class NestedJsonPipeTest(unittest.TestCase):
+  """Nested JSONL objects (Round 3 agent task T1)."""
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp(prefix='beam-nested-json-test-')
+    self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+    ev = lambda i, t, u, amt: json.dumps({
+        'event_id': i, 'type': t, 'user': {'id': u, 'country': 'US'},
+        'props': {} if amt is None else {'amount': amt}})
+    self.src = os.path.join(self.tmp, 'events.jsonl')
+    with open(self.src, 'w', encoding='utf-8') as f:
+      f.write('\n'.join([
+          ev(1, 'purchase', 'u1', 12.5),
+          ev(2, 'click', 'u2', None),
+          ev(3, 'purchase', 'u3', 8.0),
+          '{"event_id": 4, "type": "purchase", "user": {',
+          ev(5, 'purchase', 'u4', 99.99),
+          ev(6, 'purchase', 'u5', 'abc'),
+          ev(7, 'purchase', 'u6', 10),
+      ]) + '\n')
+
+  def test_nested_fields_where_select_and_dlq(self):
+    out_pq = os.path.join(self.tmp, 'purchases.parquet')
+    dlq = os.path.join(self.tmp, 'dlq.jsonl')
+    rc, env, err = _run_json([
+        'pipe', '--from', self.src, '--to', out_pq,
+        '--where', "type == 'purchase' and props.amount >= 10",
+        '--select', 'event_id, user.id AS user_id, props.amount AS amount',
+        '--dlq', dlq, '--assert-counts', '--runner=FnApiRunner'])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    # 7 lines: malformed line 4 and non-numeric amount 6 -> DLQ; 2 and 3 are
+    # filtered out; 1, 5 and 7 (int 10 widened to float) are written.
+    self.assertEqual(env['metrics']['rows_read'], 7)
+    self.assertEqual(env['metrics']['dlq_rows'], 2)
+    self.assertEqual(env['metrics']['rows_filtered_out'], 2)
+    self.assertEqual(env['metrics']['rows_written'], 3)
+    rows = sorted(pq.read_table(out_pq).to_pylist(), key=lambda r: r['event_id'])
+    self.assertEqual(rows, [
+        {'event_id': 1, 'user_id': 'u1', 'amount': 12.5},
+        {'event_id': 5, 'user_id': 'u4', 'amount': 99.99},
+        {'event_id': 7, 'user_id': 'u6', 'amount': 10.0},
+    ])
+    with open(dlq, encoding='utf-8') as f:
+      self.assertEqual(len([l for l in f if l.strip()]), 2)
+
+  def test_bad_line_without_dlq_fails_with_hint(self):
+    rc, env, _ = _run_json([
+        'pipe', '--from', self.src, '--to',
+        os.path.join(self.tmp, 'all.parquet'), '--runner=FnApiRunner'])
+    self.assertNotEqual(rc, cli.EXIT_OK)
+    self.assertIn('--dlq', env['error']['message'])
+
+  def test_nested_objects_written_as_json_objects(self):
+    with open(self.src, 'w', encoding='utf-8') as f:
+      f.write('{"id": 1, "user": {"id": "u1"}}\n{"id": 2, "user": {"id": "u2"}}\n')
+    out_json = os.path.join(self.tmp, 'users.json')
+    rc, _, err = _run_json([
+        'pipe', '--from', self.src, '--to', out_json, '--runner=FnApiRunner'])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    with open(out_json, encoding='utf-8') as f:
+      first = json.loads(f.readline())
+    self.assertEqual(first['user'], {'id': 'u1'})
+
+  def test_kind_inference_and_coercion_survive_pickling(self):
+    from apache_beam.cli import dlq
+    from apache_beam.internal import pickler
+    kinds = dlq._infer_json_kind([
+        {'n': 1, 'x': 1.5, 'tags': ['a'], 'u': {'id': 'a'}},
+        {'n': 2, 'x': 2, 'tags': [], 'u': {'id': 'b'}},
+        {'n': 3, 'x': 'oops', 'u': {}},
+        {'n': 4, 'x': 3.0},
+    ])
+    self.assertEqual(
+        kinds, {'n': 'int', 'x': 'float', 'tags': 'json', 'u': {'id': 'str'}})
+    kinds = pickler.loads(pickler.dumps(kinds))
+    self.assertEqual(dlq._coerce_json_value(2, kinds['x'], 'x'), 2.0)
+    self.assertEqual(dlq._coerce_json_value(['a'], kinds['tags'], 'tags'), '["a"]')
+    self.assertEqual(dlq._coerce_json_value({'id': 'z'}, kinds['u'], 'u').id, 'z')
+    with self.assertRaisesRegex(ValueError, "field 'x'"):
+      dlq._coerce_json_value('oops', kinds['x'], 'x')
+    with self.assertRaisesRegex(ValueError, 'expected a JSON object'):
+      dlq._coerce_json_value('flat', kinds['u'], 'u')
+
+
+class CdcIntoFilesTest(unittest.TestCase):
+  """--cdc into plain files writes the latest live row per key."""
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp(prefix='beam-cdc-files-test-')
+    self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+  def _pipe(self, src, *extra):
+    out = os.path.join(self.tmp, 'latest.parquet')
+    rc, env, err = _run_json([
+        'pipe', '--from', src, '--to', out, '--cdc', '--primary-key', 'id',
+        '--assert-counts', '--runner=FnApiRunner', *extra])
+    return rc, env, err, out
+
+  def test_flat_csv_keeps_latest_version_and_updated_at(self):
+    src = os.path.join(self.tmp, 'updates.csv')
+    with open(src, 'w', encoding='utf-8') as f:
+      f.write('id,status,updated_at\n'
+              '1,active,2026-11-01T10:00:00\n'
+              '1,suspended,2026-11-03T08:00:00\n'
+              '2,active,2026-11-01T09:00:00\n'
+              '1,active,2026-11-02T15:00:00\n')
+    rc, env, err, out = self._pipe(src)
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertEqual(env['metrics']['rows_written'], 2)
+    self.assertEqual(env['metrics']['cdc_superseded_rows'], 2)
+    rows = sorted(pq.read_table(out).to_pylist(), key=lambda r: r['id'])
+    self.assertEqual(rows, [
+        {'id': 1, 'status': 'suspended', 'updated_at': '2026-11-03T08:00:00'},
+        {'id': 2, 'status': 'active', 'updated_at': '2026-11-01T09:00:00'},
+    ])
+
+  def test_debezium_delete_removes_key(self):
+    src = os.path.join(self.tmp, 'cdc.jsonl')
+    events = [
+        {'op': 'c', 'source': {'lsn': 1}, 'after': {'id': 1, 'v': 'a'}},
+        {'op': 'c', 'source': {'lsn': 2}, 'after': {'id': 2, 'v': 'b'}},
+        {'op': 'u', 'source': {'lsn': 4}, 'after': {'id': 1, 'v': 'c'}},
+        {'op': 'u', 'source': {'lsn': 3}, 'after': {'id': 1, 'v': 'stale'}},
+        {'op': 'd', 'source': {'lsn': 5}, 'before': {'id': 2, 'v': 'b'}},
+    ]
+    with open(src, 'w', encoding='utf-8') as f:
+      f.write('\n'.join(json.dumps(e) for e in events) + '\n')
+    rc, env, err, out = self._pipe(src)
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertEqual(pq.read_table(out).to_pylist(), [{'id': 1, 'v': 'c'}])
+    self.assertEqual(env['metrics']['rows_written'], 1)
+
+  def test_unorderable_changes_fail_with_hint(self):
+    src = os.path.join(self.tmp, 'noseq.csv')
+    with open(src, 'w', encoding='utf-8') as f:
+      f.write('id,status\n1,a\n1,b\n')
+    rc, env, _, _ = self._pipe(src)
+    self.assertNotEqual(rc, cli.EXIT_OK)
+    self.assertIn('--cdc-seq-col', env['error']['message'])
+
+
+class OfflineRobustnessTest(unittest.TestCase):
+  """check --plan without network, and the Prism exec probe."""
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp(prefix='beam-offline-test-')
+    self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+  def test_plan_falls_back_to_static_on_remote_access_error(self):
+    from apache_beam.cli import check_cmd
+    self.assertTrue(check_cmd._is_remote_access_error(
+        RuntimeError("List operation failed for 'gs://bucket/x/'")))
+    self.assertFalse(check_cmd._is_remote_access_error(
+        ValueError('Unknown type or missing provider for type Foo')))
+    path = os.path.join(self.tmp, 'p.yaml')
+    with open(path, 'w', encoding='utf-8') as f:
+      f.write('pipeline:\n  type: chain\n  transforms:\n'
+              '  - type: Create\n    config:\n      elements: [1]\n'
+              '  - type: LogForTesting\n')
+    with mock.patch(
+        'apache_beam.yaml.main.build_pipeline_components_from_yaml',
+        side_effect=None) as build:
+      build.return_value = (None, mock.Mock(
+          side_effect=OSError('Operation not permitted: gs://acme/raw')))
+      rc, env, _ = _run_json(['check', path, '--plan'])
+    self.assertEqual(rc, cli.EXIT_OK)
+    self.assertEqual(env['outputs']['mode'], 'offline_static')
+    self.assertIn('remote storage', env['warnings'][0])
+
+  def test_plan_hides_auth_log_noise(self):
+    import logging
+    path = os.path.join(self.tmp, 'p.yaml')
+    with open(path, 'w', encoding='utf-8') as f:
+      f.write('pipeline:\n  type: chain\n  transforms:\n'
+              '  - type: Create\n    config:\n      elements: [1]\n'
+              '  - type: LogForTesting\n')
+
+    def noisy_constructor(_):
+      logging.getLogger('google.auth').error(
+          'Traceback: MutualTLSChannelError noise')
+      sys.stderr.write('RefreshError traceback noise\n')
+      raise RuntimeError('RefreshError: Reauthentication is needed.')
+
+    with mock.patch(
+        'apache_beam.yaml.main.build_pipeline_components_from_yaml',
+        return_value=(None, noisy_constructor)):
+      rc, env, err = _run_json(['check', path, '--plan'])
+    self.assertEqual(rc, cli.EXIT_OK)
+    self.assertEqual(env['outputs']['mode'], 'offline_static')
+    self.assertIn('RefreshError', env['outputs']['plan_skipped_detail'])
+    self.assertTrue(env['outputs']['plan_skipped_reason'].startswith('check passed'))
+    self.assertNotIn('noise', err)
+    # Logging is restored afterwards.
+    self.assertEqual(logging.root.manager.disable, logging.NOTSET)
+
+  def test_emit_yaml_explains_bigquery_write_empty(self):
+    src = os.path.join(self.tmp, 'in.csv')
+    with open(src, 'w', encoding='utf-8') as f:
+      f.write('id,name\n1,a\n')
+    argv = ['pipe', '--from', src, '--to', 'bigquery://p.ds.t', '--emit-yaml']
+    rc, env, _ = _run_json(argv)
+    self.assertEqual(rc, cli.EXIT_OK)
+    self.assertIn('write_disposition: WRITE_EMPTY', env['outputs']['yaml'])
+    self.assertTrue(any('--if-exists append' in w for w in env['warnings']))
+    rc, env, _ = _run_json(argv + ['--if-exists', 'append'])
+    self.assertEqual(rc, cli.EXIT_OK)
+    self.assertFalse(any('WRITE_EMPTY' in w for w in env['warnings']))
+
+  def test_prism_probe_requires_a_runnable_binary(self):
+    ok = os.path.join(self.tmp, 'prism')
+    with open(ok, 'w', encoding='utf-8') as f:
+      f.write('#!/bin/sh\nexit 0\n')
+    os.chmod(ok, 0o755)
+    self.assertTrue(cli._prism_binary_runs(ok))
+    self.assertFalse(cli._prism_binary_runs(os.path.join(self.tmp, 'missing')))
+
+  def test_io_describe_covers_yaml_transforms(self):
+    rc, env, _ = _run_json(['io', 'describe', 'Filter'])
+    self.assertEqual(rc, cli.EXIT_OK)
+    info = env['outputs']['connector']
+    self.assertEqual(info['kind'], 'yaml_transform')
+    self.assertIn('keep', info['config_fields'])
+    rc, env, _ = _run_json(['io', 'describe', 'no_such_thing'])
+    self.assertEqual(rc, cli.EXIT_USAGE)
+    self.assertIn('transforms:', env['error']['message'])
+
+
+class LocalSqlDialectTest(unittest.TestCase):
+  """Local --sql statistics and dialect hints (Round 3 task T2)."""
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp(prefix='beam-sql-dialect-test-')
+    self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+    self.src = os.path.join(self.tmp, 'latency.parquet')
+    pq.write_table(
+        pa.table({
+            'kind': ['a'] * 5,
+            'ms': [10.0, 20.0, 30.0, 40.0, 100.0],
+        }),
+        self.src)
+
+  def _sql(self, query):
+    return _run_json(['pipe', '--from', f'l={self.src}', '--sql', query])
+
+  def test_exact_percentiles_match_numpy_linear(self):
+    rc, env, err = self._sql(
+        'SELECT median(ms) AS med, percentile(ms, 95) AS p95, '
+        'quantile(ms, 0.25) AS q25, stddev(ms) AS sd FROM l')
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    row = env['untrusted_data']['rows'][0]
+    self.assertAlmostEqual(row['med'], 30.0)
+    self.assertAlmostEqual(row['p95'], 88.0)  # numpy.percentile(..., 95)
+    self.assertAlmostEqual(row['q25'], 20.0)
+    self.assertAlmostEqual(row['sd'], 35.355339, places=5)
+
+  def test_other_dialect_percentiles_get_a_hint(self):
+    for query in (
+        'SELECT PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ms) FROM l',
+        'SELECT APPROX_QUANTILES(ms, 100) FROM l'):
+      rc, env, _ = self._sql(query)
+      self.assertEqual(rc, cli.EXIT_USAGE)
+      self.assertIn('percentile(col, 95)', env['error']['message'])
+
+  def test_unknown_table_hint_mentions_alias(self):
+    rc, env, _ = _run_json(['pipe', '--from', self.src, '--sql', 'SELECT * FROM t'])
+    self.assertNotEqual(rc, cli.EXIT_OK)
+    self.assertIn('--from ALIAS=PATH', env['error']['message'])
+    self.assertIn('available tables: latency', env['error']['message'])
+
+  def test_local_only_function_detection(self):
+    from apache_beam.cli import pipe_sql
+    self.assertEqual(
+        pipe_sql.local_only_sql_functions(
+            'SELECT median(x), percentile (y, 9), COUNT(*) FROM t'),
+        ['median', 'percentile'])
+    self.assertEqual(pipe_sql.local_only_sql_functions('SELECT SUM(x) FROM t'), [])
+
+
+class NestedParquetPipeTest(unittest.TestCase):
+  """Struct columns in --where/--select (works around apache/beam#41100)."""
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp(prefix='beam-nested-parquet-test-')
+    self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+    self.src = os.path.join(self.tmp, 'people.parquet')
+    pq.write_table(
+        pa.table({
+            'name': ['a', 'b', 'c'],
+            'address': [
+                {'city': 'SF', 'zip': 1},
+                {'city': 'NY', 'zip': 2},
+                None,
+            ],
+        }),
+        self.src)
+
+  def _check(self, *extra):
+    out = os.path.join(self.tmp, 'out.parquet')
+    rc, env, err = _run_json([
+        'pipe', '--from', self.src, '--to', out,
+        '--where', 'address is not None and address.zip >= 2',
+        '--select', 'name, address.city AS city',
+        '--assert-counts', '--runner=FnApiRunner', *extra])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertEqual(pq.read_table(out).to_pylist(), [{'name': 'b', 'city': 'NY'}])
+    self.assertEqual(env['metrics']['rows_written'], 1)
+
+  def test_nested_struct_fields(self):
+    self._check()
+
+  def test_nested_struct_fields_with_dlq(self):
+    self._check('--dlq', os.path.join(self.tmp, 'dlq.json'))
+
+
+class SchemaDriftDiffTest(unittest.TestCase):
+  """beam diff separates schema drift from row differences (Round 3 T5)."""
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp(prefix='beam-diff-drift-test-')
+    self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+    self.v1 = os.path.join(self.tmp, 'v1.parquet')
+    self.v2 = os.path.join(self.tmp, 'v2.parquet')
+    pq.write_table(
+        pa.table({
+            'sku': ['A1', 'A2', 'A3'],
+            'price': pa.array([10, 20, 30], pa.int64()),
+        }),
+        self.v1)
+    pq.write_table(
+        pa.table({
+            'sku': ['A1', 'A2', 'A4'],
+            'price': pa.array([10, 25, 40], pa.int64()),
+            'category': ['tools', 'tools', 'toys'],
+        }),
+        self.v2)
+
+  def _diff(self, *extra):
+    return _run_json(
+        ['diff', self.v1, self.v2, '--key', 'sku', '--runner=FnApiRunner',
+         *extra])
+
+  def test_shared_columns_by_default(self):
+    rc, env, _ = self._diff()
+    self.assertEqual(rc, cli.EXIT_DIFF_MISMATCH)
+    self.assertEqual(env['metrics']['matched_rows'], 1)
+    self.assertEqual(env['metrics']['value_mismatches'], 1)
+    self.assertEqual(env['outputs']['schema_diff'], {
+        'columns_added': ['category'],
+        'columns_removed': [],
+        'type_changes': {},
+        'compared_columns': 'shared',
+    })
+
+  def test_all_columns_treats_missing_as_null(self):
+    rc, env, _ = self._diff('--columns', 'all')
+    self.assertEqual(rc, cli.EXIT_DIFF_MISMATCH)
+    self.assertEqual(env['metrics']['matched_rows'], 0)
+    self.assertEqual(env['metrics']['value_mismatches'], 2)
+
+  def test_type_change_and_identical_data_still_differs(self):
+    pq.write_table(
+        pa.table({
+            'sku': ['A1', 'A2', 'A3'],
+            'price': pa.array([10.0, 20.0, 30.0], pa.float64()),
+        }),
+        self.v2)
+    rc, env, _ = self._diff()
+    self.assertEqual(rc, cli.EXIT_DIFF_MISMATCH)
+    self.assertFalse(env['outputs']['match'])
+    self.assertEqual(env['metrics']['value_mismatches'], 0)
+    self.assertEqual(
+        env['outputs']['schema_diff']['type_changes'],
+        {'price': {'left': 'int', 'right': 'float'}})
+
+  def test_differing_keys_are_listed(self):
+    rc, env, _ = self._diff()
+    self.assertEqual(rc, cli.EXIT_DIFF_MISMATCH)
+    self.assertEqual(
+        env['outputs']['differing_keys'], {
+            'only_in_left': ['A3'],
+            'only_in_right': ['A4'],
+            'value_mismatches': ['A2'],
+            'duplicate_keys': [],
+            'limit': 100,
+            'truncated': False,
+            'values_are_untrusted': True,
+        })
+
+  def test_differing_keys_are_capped(self):
+    from apache_beam.cli import diff as diff_mod
+    with mock.patch.object(diff_mod, 'KEY_LIST_LIMIT', 1):
+      pq.write_table(
+          pa.table({
+              'sku': ['B1', 'B2', 'B3'],
+              'price': pa.array([1, 2, 3], pa.int64()),
+          }),
+          self.v2)
+      rc, env, _ = self._diff()
+    self.assertEqual(rc, cli.EXIT_DIFF_MISMATCH)
+    keys = env['outputs']['differing_keys']
+    self.assertEqual(env['metrics']['only_in_left'], 3)
+    self.assertEqual(len(keys['only_in_left']), 1)
+    self.assertTrue(keys['truncated'])
+
+  def test_no_key_lists_without_keys(self):
+    rc, env, _ = _run_json(
+        ['diff', self.v1, self.v2, '--runner=FnApiRunner'])
+    self.assertEqual(rc, cli.EXIT_DIFF_MISMATCH)
+    self.assertIsNone(env['outputs']['differing_keys'])
 
 
 class DiffV3ReconciliationTest(unittest.TestCase):
@@ -1388,6 +1794,7 @@ class InspectCheckIoDoctorTailJobsTest(unittest.TestCase):
         names = set(zf.namelist())
       self.assertTrue(any(n.endswith('_bundled_cli/lakehouse.py') for n in names))
       self.assertTrue(any(n.endswith('_bundled_cli/cdc.py') for n in names))
+      self.assertTrue(any(n.endswith('_bundled_cli/pipe_sql.py') for n in names))
 
   def test_doctor_without_google_namespace_package(self):
     import importlib.util
@@ -1404,6 +1811,701 @@ class InspectCheckIoDoctorTailJobsTest(unittest.TestCase):
     self.assertTrue(env['outputs']['healthy'])
     self.assertFalse(env['outputs']['extras']['gcp_bigquery'])
     self.assertFalse(env['outputs']['gcp_adc']['ok'])
+
+  def test_keyword_column_csv_sql_syntax_and_exact_local_parquet(self):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    raw_csv = os.path.join(self.tmp, 'orders_raw.csv')
+    with open(raw_csv, 'w', encoding='utf-8') as f:
+      f.write('order_id,customer_id,country,status,class,amount,email\n')
+      f.write('101,C1,US,PAID,enterprise,250.5,Alice@Example.com\n')
+      f.write('102,C2,CA,PAID,starter,80.0,Bob@Example.com\n')
+      f.write('103,C99,US,PAID,pro,120.25,Unmapped@Example.com\n')
+      f.write('104,C1,US,REFUNDED,enterprise,50.0,Alice@Example.com\n')
+      f.write('105,C3,US,PAID,starter,-10.0,Neg@Example.com\n')
+      f.write('106,C3,US,PAID,starter,not_a_float,BadNum@Example.com\n')
+      f.write('107,BROKEN_FEW_COLS\n')
+
+    clean_pq = os.path.join(self.tmp, 'out', 'clean_orders.parquet')
+    dlq_jsonl = os.path.join(self.tmp, 'out', 'orders_dlq.jsonl')
+
+    rc, env, err = _run_json([
+        'pipe',
+        '--from',
+        raw_csv,
+        '--to',
+        clean_pq,
+        '--dlq',
+        dlq_jsonl,
+        '--where',
+        "status = 'PAID' AND amount > 0 AND country <> 'CA'",
+        '--select',
+        (
+            'CAST(order_id AS INT) AS order_id, customer_id, country, class, '
+            'round(amount, 2) AS amount, lower(email) AS email'
+        ),
+        '--assert-counts',
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertEqual(env['outputs']['files'], [clean_pq])
+    self.assertEqual(env['outputs']['dlq_files'], [dlq_jsonl])
+    self.assertTrue(os.path.isfile(clean_pq))
+    self.assertTrue(os.path.isfile(dlq_jsonl))
+
+    tbl = pq.read_table(clean_pq)
+    self.assertTrue(pa.types.is_integer(tbl.schema.field('order_id').type))
+    rows = sorted(tbl.to_pylist(), key=lambda r: r['order_id'])
+    self.assertEqual(
+        rows,
+        [
+            {
+                'order_id': 101,
+                'customer_id': 'C1',
+                'country': 'US',
+                'class': 'enterprise',
+                'amount': 250.5,
+                'email': 'alice@example.com',
+            },
+            {
+                'order_id': 103,
+                'customer_id': 'C99',
+                'country': 'US',
+                'class': 'pro',
+                'amount': 120.25,
+                'email': 'unmapped@example.com',
+            },
+        ])
+    m = env['metrics']
+    self.assertEqual(m['rows_read'], 7)
+    self.assertEqual(m['rows_written'], 2)
+    self.assertEqual(m['dlq_rows'], 2)
+    self.assertEqual(m['rows_filtered_out'], 3)
+
+  def test_iceberg_path_style_absolute_uri_matches_warehouse_query(self):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    delta_dir = os.path.join(self.tmp, 'delta_events')
+    os.makedirs(os.path.join(delta_dir, '_delta_log'), exist_ok=True)
+    pq_file = os.path.join(delta_dir, 'part-00000.parquet')
+    pq.write_table(
+        pa.Table.from_pylist([
+            {'event_id': 1, 'kind': 'click'},
+            {'event_id': 2, 'kind': 'purchase'},
+        ]),
+        pq_file)
+    commit_0 = [
+        {
+            'metaData': {
+                'id': 'evt-1',
+                'schemaString': json.dumps({
+                    'type': 'struct',
+                    'fields': [
+                        {'name': 'event_id', 'type': 'long', 'nullable': True},
+                        {'name': 'kind', 'type': 'string', 'nullable': True},
+                    ],
+                }),
+            }
+        },
+        {
+            'add': {
+                'path': 'part-00000.parquet',
+                'size': os.path.getsize(pq_file),
+                'modificationTime': 1700000000000,
+                'dataChange': True,
+            }
+        },
+    ]
+    with open(
+        os.path.join(delta_dir, '_delta_log', '00000000000000000000.json'),
+        'w',
+        encoding='utf-8') as f:
+      for entry in commit_0:
+        f.write(json.dumps(entry) + '\n')
+
+    wh_dir = os.path.join(self.tmp, 'iceberg_wh')
+    path_style_uri = f'iceberg://{wh_dir}/analytics.events'
+    query_style_uri = f'iceberg://analytics.events?warehouse={wh_dir}'
+
+    rc, env, err = _run_json([
+        'pipe',
+        '--from',
+        f'delta://{delta_dir}',
+        '--to',
+        path_style_uri,
+        '--zero-copy',
+        '--verify',
+        '--verify-key',
+        'event_id',
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    expected_meta = os.path.join(
+        wh_dir, 'analytics', 'events', 'metadata', 'v1.metadata.json')
+    self.assertTrue(os.path.isfile(expected_meta))
+    self.assertEqual(env['outputs']['metadata_path'], expected_meta)
+
+    # Both path-style and `?warehouse=` URIs resolve the exact same Iceberg table!
+    rc_i1, env_i1, err_i1 = _run_json(['inspect', query_style_uri])
+    self.assertEqual(rc_i1, cli.EXIT_OK, err_i1)
+    self.assertEqual(env_i1['outputs']['row_count'], 2)
+
+    rc_d, env_d, err_d = _run_json(
+        ['diff', path_style_uri, query_style_uri, '--key', 'event_id'])
+    self.assertEqual(rc_d, cli.EXIT_OK, err_d)
+    self.assertTrue(env_d['outputs']['match'])
+
+  def test_pipe_multi_input_sql_left_join_group_by_and_authorizer_sandbox(self):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    orders_pq = os.path.join(self.tmp, 'clean_orders.parquet')
+    pq.write_table(
+        pa.Table.from_pylist([
+            {'order_id': 1, 'customer_id': 'C1', 'amount': 100.0},
+            {'order_id': 2, 'customer_id': 'C1', 'amount': 50.25},
+            {'order_id': 3, 'customer_id': 'C2', 'amount': 40.0},
+            {'order_id': 4, 'customer_id': 'C_MISSING', 'amount': 25.5},
+        ]),
+        orders_pq)
+    customers_csv = os.path.join(self.tmp, 'customers.csv')
+    with open(customers_csv, 'w', encoding='utf-8') as f:
+      f.write('customer_id,tier\nC1,GOLD\nC2,SILVER\n')
+
+    out_json = os.path.join(self.tmp, 'out', 'revenue_by_tier.json')
+    sql_q = (
+        "SELECT COALESCE(c.tier, 'UNMAPPED') AS tier, "
+        'COUNT(*) AS order_count, '
+        'ROUND(SUM(o.amount), 2) AS total_revenue '
+        'FROM o LEFT JOIN c ON o.customer_id = c.customer_id '
+        'GROUP BY 1 ORDER BY total_revenue DESC'
+    )
+
+    rc, env, err = _run_json([
+        'pipe',
+        '--from',
+        f'o={orders_pq}',
+        '--join',
+        f'c={customers_csv}',
+        '--to',
+        out_json,
+        '--sql',
+        sql_q,
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertEqual(env['runner'], 'local_sql')
+    self.assertEqual(env['outputs']['files'], [out_json])
+    self.assertTrue(os.path.isfile(out_json))
+    expected_agg = [
+        {'tier': 'GOLD', 'order_count': 2, 'total_revenue': 150.25},
+        {'tier': 'SILVER', 'order_count': 1, 'total_revenue': 40.0},
+        {'tier': 'UNMAPPED', 'order_count': 1, 'total_revenue': 25.5},
+    ]
+    self.assertEqual(env['untrusted_data']['rows'], expected_agg)
+    with open(out_json, encoding='utf-8') as f:
+      written_rows = [json.loads(line) for line in f if line.strip()]
+    self.assertEqual(written_rows, expected_agg)
+
+    # Query-only mode (`--sql` without `--to`) returns rows directly in JSON!
+    rc_q, env_q, err_q = _run_json([
+        'pipe',
+        '--from',
+        f'o={orders_pq}',
+        '--sql',
+        'SELECT COUNT(*) AS n FROM o',
+    ])
+    self.assertEqual(rc_q, cli.EXIT_OK, err_q)
+    self.assertEqual(env_q['untrusted_data']['rows'], [{'n': 4}])
+
+    # Portable `--emit-yaml` compiles `type: Sql` with named inputs.
+    rc_y, env_y, err_y = _run_json([
+        'pipe',
+        '--from',
+        f'o={orders_pq}',
+        '--join',
+        f'c={customers_csv}',
+        '--to',
+        out_json,
+        '--sql',
+        sql_q,
+        '--emit-yaml',
+    ])
+    self.assertEqual(rc_y, cli.EXIT_OK, err_y)
+    self.assertIn('type: Sql', env_y['outputs']['yaml'])
+    self.assertIn('Read_o', env_y['outputs']['yaml'])
+    self.assertIn('Read_c', env_y['outputs']['yaml'])
+
+    # SQLite authorizer & read-only guardrails reject ATTACH, PRAGMA, and DML!
+    for bad_sql in (
+        "ATTACH DATABASE ':memory:' AS evil",
+        'PRAGMA database_list',
+        'DELETE FROM o',
+        'SELECT 1; DROP TABLE o',
+    ):
+      rc_bad, _, _ = _run_json([
+          'pipe', '--from', f'o={orders_pq}', '--sql', bad_sql
+      ])
+      self.assertEqual(rc_bad, cli.EXIT_USAGE, f'expected EXIT_USAGE for {bad_sql}')
+
+  def test_offline_emit_yaml_succeeds_before_local_source_exists(self):
+    missing_csv = os.path.join(self.tmp, 'not_created_yet', 'raw.csv')
+    future_pq = os.path.join(self.tmp, 'out', 'clean.parquet')
+    rc, env, err = _run_json([
+        'pipe',
+        '--from',
+        missing_csv,
+        '--to',
+        future_pq,
+        '--where',
+        'amount > 0',
+        '--emit-yaml',
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertIn('ReadFromCsv', env['outputs']['yaml'])
+    self.assertIn('WriteToParquet', env['outputs']['yaml'])
+    self.assertTrue(
+        any('do not exist yet' in w for w in env.get('warnings', [])))
+
+  def test_emit_yaml_with_jinja_placeholders_and_package_roundtrip(self):
+    # Exact Round 2 simulation command: Jinja URIs + Jinja default() in --where.
+    rc, env, err = _run_json([
+        'pipe',
+        '--from',
+        '{{ input_csv }}',
+        '--to',
+        '{{ output_parquet }}',
+        '--where',
+        'amount >= {{ min_amount | default(50) }}',
+        '--select',
+        'order_id, amount * {{ rate | default(1.0) }} AS final_amount',
+        '--emit-yaml',
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    emitted_yaml = env['outputs']['yaml']
+    self.assertIn('ReadFromCsv', emitted_yaml)
+    self.assertIn('WriteToParquet', emitted_yaml)
+    self.assertIn('{{ input_csv }}', emitted_yaml)
+    self.assertIn('{{ output_parquet }}', emitted_yaml)
+    self.assertIn('{{ min_amount | default(50) }}', emitted_yaml)
+    self.assertIn('{{ rate | default(1.0) }}', emitted_yaml)
+
+    # 1. Passes `beam check -` offline without executing Jinja!
+    with mock.patch('sys.stdin', io.StringIO(emitted_yaml)):
+      rc_chk, env_chk, err_chk = _run_json(['check', '-'])
+    self.assertEqual(rc_chk, cli.EXIT_OK, err_chk)
+    self.assertTrue(env_chk['outputs']['valid'])
+
+    # 2. Pipes directly into `beam package - --to spec.json` extracting all params!
+    spec_json = os.path.join(self.tmp, 'orders_etl.template.json')
+    with mock.patch('sys.stdin', io.StringIO(emitted_yaml)):
+      rc_pkg, env_pkg, err_pkg = _run_json([
+          'package',
+          '-',
+          '--to',
+          spec_json,
+          '--image',
+          'gcr.io/dataflow-templates/yaml-template:test',
+      ])
+    self.assertEqual(rc_pkg, cli.EXIT_OK, err_pkg)
+    params = {p['name']: p for p in env_pkg['outputs']['parameters']}
+    self.assertEqual(
+        set(params.keys()),
+        {'input_csv', 'output_parquet', 'min_amount', 'rate'})
+    self.assertFalse(params['input_csv']['isOptional'])
+    self.assertFalse(params['output_parquet']['isOptional'])
+    self.assertTrue(params['min_amount']['isOptional'])
+    self.assertEqual(params['min_amount']['defaultValue'], '50')
+    self.assertTrue(params['rate']['isOptional'])
+    self.assertEqual(params['rate']['defaultValue'], '1.0')
+
+    # 3. Security regression: live `beam pipe` (without --emit-yaml) rejects Jinja!
+    csv_in = os.path.join(self.tmp, 'live.csv')
+    with open(csv_in, 'w', encoding='utf-8') as f:
+      f.write('order_id,amount\n1,100\n')
+    rc_live_uri, env_live_uri, _ = _run_json([
+        'pipe', '--from', '{{ input_csv }}', '--to', os.path.join(self.tmp, 'x.parquet')
+    ])
+    self.assertEqual(rc_live_uri, cli.EXIT_USAGE)
+    self.assertIn('--emit-yaml', env_live_uri['error']['message'])
+
+    rc_live_where, _, _ = _run_json([
+        'pipe',
+        '--from',
+        csv_in,
+        '--to',
+        os.path.join(self.tmp, 'x.parquet'),
+        '--where',
+        'amount >= {{ min_amount | default(50) }}',
+    ])
+    self.assertEqual(rc_live_where, cli.EXIT_USAGE)
+
+    # 4. Malformed Jinja in `--emit-yaml` fails fast with EXIT_USAGE.
+    rc_bad_j, _, _ = _run_json([
+        'pipe',
+        '--from',
+        '{{ input_csv }}',
+        '--to',
+        '{{ output_parquet }}',
+        '--where',
+        'amount >= {{ unclosed',
+        '--emit-yaml',
+    ])
+    self.assertEqual(rc_bad_j, cli.EXIT_USAGE)
+
+  def test_local_pipe_leaves_zero_empty_beam_temp_directories(self):
+    raw_csv = os.path.join(self.tmp, 'orders.csv')
+    with open(raw_csv, 'w', encoding='utf-8') as f:
+      f.write('order_id,amount\n1,75.0\nbad_row\n2,-5.0\n')
+
+    out_dir = os.path.join(self.tmp, 'clean_out')
+    os.makedirs(os.path.join(out_dir, '.temp-stale-empty', 'sub'), exist_ok=True)
+    concurrent_dir = os.path.join(out_dir, '.temp-concurrent-active')
+    os.makedirs(concurrent_dir, exist_ok=True)
+    active_part = os.path.join(concurrent_dir, 'in_flight.part')
+    with open(active_part, 'w', encoding='utf-8') as f:
+      f.write('in-progress')
+
+    out_pq = os.path.join(out_dir, 'clean_orders.parquet')
+    dlq_json = os.path.join(out_dir, 'orders_dlq.json')
+    rc, env, err = _run_json([
+        'pipe',
+        '--from',
+        raw_csv,
+        '--to',
+        out_pq,
+        '--dlq',
+        dlq_json,
+        '--where',
+        'amount > 0',
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertEqual(env['outputs']['files'], [out_pq])
+    entries = sorted(os.listdir(out_dir))
+    # Empty `.temp*` directories (both Beam's FileBasedSink temp dir and
+    # `.temp-stale-empty`) are pruned, while non-empty `.temp-concurrent-active`
+    # is preserved untouched!
+    self.assertEqual(
+        entries,
+        ['.temp-concurrent-active', 'clean_orders.parquet', 'orders_dlq.json'])
+    self.assertTrue(os.path.isfile(active_part))
+
+
+class FastLocalPipeTest(unittest.TestCase):
+  """Small local file-to-file pipes run in-process (Round 4 finding R1)."""
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp(prefix='beam-fast-local-test-')
+    self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+    self.csv = os.path.join(self.tmp, 'orders.csv')
+    with open(self.csv, 'w', encoding='utf-8') as f:
+      f.write('id,customer,amount,zip\n')
+      f.write('1,alice,120.5,00501\n')
+      f.write('2,bob,abc,94107\n')
+      f.write('3,carol,,10115\n')
+      f.write('4,dave,300,02139,extra\n')
+      f.write('5,erin,99.99,60601\n')
+      f.write('6,frank,7,30301\n')
+    self.jsonl = os.path.join(self.tmp, 'events.jsonl')
+    with open(self.jsonl, 'w', encoding='utf-8') as f:
+      for r in [
+          {'id': 1, 'user': {'name': 'a', 'tier': 'gold'}, 'amount': 10.5},
+          {'id': 2, 'user': {'name': 'b', 'tier': None}, 'amount': 200},
+          {'id': 3, 'user': None, 'amount': None},
+          {'id': 4, 'user': {'name': 'd', 'tier': 'gold'}, 'amount': 0},
+      ]:
+        f.write(json.dumps(r) + '\n')
+
+  def _pipe(self, argv, fast=True):
+    env = {} if fast else {'BEAM_CLI_NO_FAST_PATH': '1'}
+    return _run_json(['pipe', '--from'] + list(argv), extra_env=env)
+
+  def test_csv_with_dlq_runs_in_process(self):
+    out = os.path.join(self.tmp, 'out.parquet')
+    dlq = os.path.join(self.tmp, 'dlq.jsonl')
+    rc, env, err = self._pipe([
+        self.csv, '--to', out, '--where', 'amount > 50', '--select',
+        'id, customer, zip', '--dlq', dlq, '--assert-counts'
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertEqual(env['runner'], 'local_fast')
+    self.assertEqual(env['outputs']['files'], [out])
+    self.assertEqual(env['outputs']['dlq_files'], [dlq])
+    # 6 records: bad float (2) and extra column (4) -> DLQ; NULL amount (3)
+    # and 7 (6) filtered out; 1 and 5 written.
+    self.assertEqual(
+        env['metrics'], {
+            'rows_read': 6, 'rows_written': 2, 'rows_filtered_out': 2,
+            'dlq_rows': 2
+        })
+    table = pq.read_table(out)
+    self.assertEqual(
+        table.to_pylist(), [
+            {'id': 1, 'customer': 'alice', 'zip': '00501'},
+            {'id': 5, 'customer': 'erin', 'zip': '60601'},
+        ])
+    self.assertEqual(str(table.schema.field('id').type), 'int64')
+    with open(dlq, encoding='utf-8') as f:
+      errs = [json.loads(l) for l in f if l.strip()]
+    self.assertEqual(
+        sorted(e['error_type'] for e in errs),
+        ['ColumnCountMismatch', 'ValueError'])
+
+  def test_matches_runner_path(self):
+    cases = [
+        [
+            self.csv, '--to', 'OUT.jsonl', '--where', 'amount > 50',
+            '--select', 'id, upper(customer) AS c, amount * 2 AS twice',
+            '--dlq', 'DLQ.jsonl'
+        ],
+        [
+            self.jsonl, '--to', 'OUT.csv', '--where',
+            "user.tier == 'gold' or amount > 100", '--select',
+            'id, coalesce(amount, 0) AS amount'
+        ],
+    ]
+    for i, case in enumerate(cases):
+      results = []
+      for fast in (True, False):
+        tag = f'{i}-{"fast" if fast else "beam"}'
+        argv = [
+            a.replace('OUT', os.path.join(self.tmp, f'out-{tag}')).replace(
+                'DLQ', os.path.join(self.tmp, f'dlq-{tag}')) for a in case
+        ]
+        rc, env, err = self._pipe(argv, fast=fast)
+        self.assertEqual(rc, cli.EXIT_OK, err)
+        files = env['outputs']['files'] + env['outputs'].get('dlq_files', [])
+        contents = []
+        for path in files:
+          with open(path, encoding='utf-8') as f:
+            body = f.read().splitlines()
+          if path.endswith('.csv'):
+            contents.append([body[0]] + sorted(body[1:]))
+          else:
+            parsed = [json.loads(l) for l in body if l.strip()]
+            for rec in parsed:
+              rec.pop('raw_payload', None)
+            contents.append(sorted(json.dumps(r, sort_keys=True) for r in parsed))
+        results.append((env['runner'], env['metrics'], contents))
+      (fast_runner, fast_metrics, fast_rows), (beam_runner, beam_metrics,
+                                               beam_rows) = results
+      self.assertEqual(fast_runner, 'local_fast')
+      self.assertNotEqual(beam_runner, 'local_fast')
+      self.assertEqual(fast_metrics, beam_metrics, case)
+      self.assertEqual(fast_rows, beam_rows, case)
+
+  def test_runner_is_used_when_not_eligible(self):
+    out = os.path.join(self.tmp, 'o.jsonl')
+    for extra, env_vars in (
+        (['--runner=FnApiRunner'], {}),
+        ([], {'BEAM_CLI_NO_FAST_PATH': '1'}),
+    ):
+      if os.path.exists(out):
+        os.remove(out)
+      rc, env, err = _run_json(
+          ['pipe', '--from', self.jsonl, '--to', out] + extra,
+          extra_env=env_vars)
+      self.assertEqual(rc, cli.EXIT_OK, err)
+      self.assertNotEqual(env['runner'], 'local_fast')
+    # Sharded output (no file extension) keeps Beam's shard naming.
+    rc, env, err = self._pipe(
+        [self.jsonl, '--to', os.path.join(self.tmp, 'shards'), '--to-format', 'json'])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertNotEqual(env['runner'], 'local_fast')
+
+  def test_size_cap_falls_back_to_runner(self):
+    from apache_beam.cli import fast_local
+    with mock.patch.object(fast_local, 'MAX_INPUT_BYTES', 10):
+      rc, env, err = self._pipe(
+          [self.jsonl, '--to', os.path.join(self.tmp, 'o.jsonl')])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertNotEqual(env['runner'], 'local_fast')
+
+  def test_bad_record_without_dlq_fails_with_hint(self):
+    rc, env, _ = self._pipe([self.csv, '--to', os.path.join(self.tmp, 'o.csv')])
+    self.assertEqual(rc, cli.EXIT_PIPELINE_FAILED)
+    self.assertIn('--dlq', env['error']['message'])
+    self.assertIn('ReadCsvWithDlq', env['error']['message'])
+
+  def test_expression_error_without_dlq_fails(self):
+    rc, env, _ = self._pipe([
+        self.jsonl, '--to', os.path.join(self.tmp, 'o.jsonl'), '--select',
+        'id, 10 / amount AS inv'
+    ])
+    self.assertEqual(rc, cli.EXIT_PIPELINE_FAILED)
+    self.assertIn('ZeroDivisionError', env['error']['message'])
+    self.assertIn("'MapToFields'", env['error']['message'])
+
+  def test_existing_output_is_refused_and_replace_overwrites(self):
+    out = os.path.join(self.tmp, 'o.jsonl')
+    with open(out, 'w', encoding='utf-8') as f:
+      f.write('{"old": 1}\n')
+    rc, env, _ = self._pipe([self.jsonl, '--to', out])
+    self.assertEqual(rc, cli.EXIT_USAGE)
+    rc, env, err = self._pipe([self.jsonl, '--to', out, '--if-exists', 'replace'])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertEqual(env['runner'], 'local_fast')
+    with open(out, encoding='utf-8') as f:
+      self.assertEqual(len(f.read().splitlines()), 4)
+
+  def test_nested_struct_to_csv_is_json_text(self):
+    out = os.path.join(self.tmp, 'o.csv')
+    rc, env, err = self._pipe([self.jsonl, '--to', out])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    with open(out, encoding='utf-8', newline='') as f:
+      rows = list(csv.reader(f))
+    self.assertEqual(rows[0], ['id', 'user', 'amount'])
+    self.assertEqual(json.loads(rows[1][1]), {'name': 'a', 'tier': 'gold'})
+    self.assertEqual(rows[3][1], '')
+
+
+class NullSafeExpressionTest(unittest.TestCase):
+  """NULL operands follow SQL semantics instead of raising."""
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp(prefix='beam-null-safe-test-')
+    self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+    self.src = os.path.join(self.tmp, 'in.jsonl')
+    with open(self.src, 'w', encoding='utf-8') as f:
+      for r in [
+          {'id': 1, 'amount': 120.0, 'user': {'tier': 'gold'}, 'name': 'Ann'},
+          {'id': 2, 'amount': None, 'user': None, 'name': None},
+          {'id': 3, 'amount': 5.0, 'user': {'tier': None}, 'name': 'Bo'},
+      ]:
+        f.write(json.dumps(r) + '\n')
+
+  def _ids(self, where, fast):
+    out = os.path.join(self.tmp, f'o-{fast}-{abs(hash(where))}.jsonl')
+    env_vars = {} if fast else {'BEAM_CLI_NO_FAST_PATH': '1'}
+    rc, env, err = _run_json(
+        ['pipe', '--from', self.src, '--to', out, '--where', where],
+        extra_env=env_vars)
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    with open(out, encoding='utf-8') as f:
+      return sorted(json.loads(l)['id'] for l in f if l.strip())
+
+  def test_where_drops_null_comparisons(self):
+    for fast in (True, False):
+      self.assertEqual(self._ids('amount > 10', fast), [1])
+      self.assertEqual(self._ids('not (amount > 10)', fast), [3])
+      self.assertEqual(self._ids("user.tier == 'gold'", fast), [1])
+      self.assertEqual(self._ids("upper(name) == 'BO'", fast), [3])
+      self.assertEqual(self._ids('amount * 2 >= 10', fast), [1, 3])
+      self.assertEqual(self._ids('amount IS NULL', fast), [2])
+
+  def test_compiled_code_keeps_type_inference_for_nested_paths(self):
+    from apache_beam.cli import expressions
+    cfg, _ = expressions.compile_select('id, user.tier AS tier, amount * 2 AS a')
+    self.assertEqual(cfg['fields']['id'], 'id')
+    self.assertIn(
+        "getattr(__row__, 'user').tier", cfg['fields']['tier']['callable'])
+    self.assertIn('is None', cfg['fields']['a']['callable'])
+
+
+class NullMatrixPipeTest(unittest.TestCase):
+  """NULL x operator x format, end to end on both paths (Round 5 F1-F3).
+
+  SQLite is the oracle for which rows a SQL WHERE keeps. CSV has no NULL
+  literal, so its empty cells are NULL (as in core ReadFromCsv) and the
+  oracle loads them that way.
+  """
+  ROWS = [
+      {'id': 1, 'state': 'CA', 'amount': 120.0, 'qty': 2},
+      {'id': 2, 'state': None, 'amount': 50.0, 'qty': 0},
+      {'id': 3, 'state': 'NY', 'amount': None, 'qty': 3},
+      {'id': 4, 'state': 'C', 'amount': 0.0, 'qty': None},
+      {'id': 5, 'state': '', 'amount': 300.0, 'qty': 1},
+  ]
+  FAST_EXPRESSIONS = [
+      "state != 'CA'",
+      "state IN ('CA')",
+      "state NOT IN ('CA', 'NY')",
+      'NOT (amount > 100)',
+      'amount > 100 OR qty = 0',
+      'NOT (amount > 100 OR qty = 0)',
+      'state IS NULL',
+  ]
+  RUNNER_CASES = [
+      ('csv', "state != 'CA'"),
+      ('jsonl', "state IN ('CA')"),
+      ('parquet', 'NOT (amount > 100 OR qty = 0)'),
+  ]
+
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp(prefix='beam-null-matrix-test-')
+    self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+    self.paths = {
+        'csv': os.path.join(self.tmp, 'in.csv'),
+        'jsonl': os.path.join(self.tmp, 'in.jsonl'),
+        'parquet': os.path.join(self.tmp, 'in.parquet'),
+    }
+    with open(self.paths['csv'], 'w', encoding='utf-8') as f:
+      f.write('id,state,amount,qty\n')
+      for r in self.ROWS:
+        f.write(','.join('' if r[c] is None else str(r[c])
+                         for c in ('id', 'state', 'amount', 'qty')) + '\n')
+    with open(self.paths['jsonl'], 'w', encoding='utf-8') as f:
+      for r in self.ROWS:
+        f.write(json.dumps(r) + '\n')
+    pq.write_table(pa.Table.from_pylist(self.ROWS), self.paths['parquet'])
+
+  def _expected(self, fmt, expr):
+    import sqlite3
+    conn = sqlite3.connect(':memory:')
+    conn.execute('CREATE TABLE t (id INT, state TEXT, amount REAL, qty INT)')
+    rows = [
+        dict(r, state=None if (fmt == 'csv' and r['state'] == '') else
+             r['state']) for r in self.ROWS
+    ]
+    conn.executemany('INSERT INTO t VALUES (:id, :state, :amount, :qty)', rows)
+    return sorted(i for (i, ) in conn.execute(f'SELECT id FROM t WHERE {expr}'))
+
+  def _ids(self, fmt, expr, fast):
+    out = os.path.join(
+        self.tmp, f'out-{fmt}-{int(fast)}-{abs(hash(expr))}.jsonl')
+    rc, env, err = _run_json(
+        ['pipe', '--from', self.paths[fmt], '--to', out, '--where', expr],
+        extra_env={} if fast else {'BEAM_CLI_NO_FAST_PATH': '1'})
+    self.assertEqual(rc, cli.EXIT_OK, f'{fmt} {expr}: {err}')
+    self.assertEqual(env['runner'] == 'local_fast', fast)
+    if not os.path.exists(out):
+      return []  # the Beam runner writes no file when no rows are kept
+    with open(out, encoding='utf-8') as f:
+      return sorted(json.loads(l)['id'] for l in f if l.strip())
+
+  def test_fast_path_matches_sqlite(self):
+    for fmt in self.paths:
+      for expr in self.FAST_EXPRESSIONS:
+        self.assertEqual(
+            self._ids(fmt, expr, fast=True), self._expected(fmt, expr),
+            f'{fmt}: {expr}')
+
+  def test_runner_path_matches_sqlite(self):
+    for fmt, expr in self.RUNNER_CASES:
+      self.assertEqual(
+          self._ids(fmt, expr, fast=False), self._expected(fmt, expr),
+          f'{fmt}: {expr}')
+
+  def test_null_values_option(self):
+    src = os.path.join(self.tmp, 'na.csv')
+    with open(src, 'w', encoding='utf-8') as f:
+      f.write('id,region,amount\n1,NA,10\n2,EU,NULL\n3,,5\n4,US,7\n')
+    out = os.path.join(self.tmp, 'na.jsonl')
+    rc, env, err = _run_json([
+        'pipe', '--from', src, '--to', out, '--null-values', 'NA,NULL',
+        '--where', 'region IS NULL OR amount IS NULL'
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    with open(out, encoding='utf-8') as f:
+      rows = [json.loads(l) for l in f if l.strip()]
+    self.assertEqual([r['id'] for r in rows], [1, 2, 3])
+    # amount stays numeric: NULL is not a dirty value.
+    self.assertIsNone(rows[1]['amount'])
+    self.assertEqual(rows[0]['amount'], 10)
+    # Exported YAML keeps the same markers for pandas.
+    rc, env, _ = _run_json([
+        'pipe', '--from', src, '--to', out + '.x.jsonl', '--null-values',
+        'NA,NULL', '--emit-yaml'
+    ])
+    self.assertEqual(rc, cli.EXIT_OK)
+    self.assertIn('keep_default_na: false', env['outputs']['yaml'])
 
 
 if __name__ == '__main__':

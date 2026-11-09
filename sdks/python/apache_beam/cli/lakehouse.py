@@ -617,7 +617,8 @@ def resolve_iceberg_table_dir(
   """Resolves an `iceberg://` config (`table` + `catalog_properties`) to its root dir."""
   cat_props = dict(config.get('catalog_properties') or {})
   cat_type = str(cat_props.get('type', 'hadoop')).lower()
-  table_ident = str(config.get('table') or '').strip('/')
+  raw_table = str(config.get('table') or '').rstrip('/')
+  table_ident = raw_table.lstrip('/')
 
   # Explicit direct table location if passed.
   if config.get('location'):
@@ -671,10 +672,22 @@ def resolve_iceberg_table_dir(
 
   warehouse = str(cat_props.get('warehouse') or '').strip()
   if not warehouse:
-    # Allow direct filesystem path in `table` if it looks like a path.
-    if ('/' in table_ident or os.sep in table_ident or
-        table_ident.startswith('.')):
-      return _normalize_fs_root(table_ident)
+    # Allow direct filesystem path in `table` (including `iceberg:///abs/wh/ns.tbl`
+    # and `iceberg://rel/wh/ns.tbl`) without stripping leading `/`!
+    if ('/' in raw_table or os.sep in raw_table or
+        raw_table.startswith('.')):
+      norm_path = _normalize_fs_root(raw_table)
+      # If literal `<norm_path>/metadata` already exists locally, keep it as-is.
+      if '://' not in norm_path and os.path.isdir(
+          os.path.join(norm_path, 'metadata')):
+        return norm_path
+      if '/' in norm_path:
+        parent_dir, last_seg = norm_path.rsplit('/', 1)
+        if '.' in last_seg and not last_seg.startswith('.'):
+          seg_parts = [p for p in last_seg.split('.') if p]
+          if len(seg_parts) >= 2:
+            return _join_fs(parent_dir, *seg_parts)
+      return norm_path
     raise LakehouseError(
         f'Iceberg table {table_ident!r} requires a warehouse path '
         '(e.g. iceberg://namespace.table?warehouse=gs://my-bucket/warehouse '

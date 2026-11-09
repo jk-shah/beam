@@ -219,14 +219,120 @@ def _coerce_opt_value(raw: str) -> Any:
   return raw
 
 
+_JINJA_BLOCK_RE = re.compile(r'\{\{(.*?)\}\}', re.DOTALL)
+_JINJA_LEAD_VAR_RE = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]*)')
+_JINJA_STR_LIT_RE = re.compile(r"""['"]([^'"]+)['"]""")
+_JINJA_FORMAT_TOKENS: dict[str, str] = {
+    'csv': 'csv',
+    'tsv': 'csv',
+    'json': 'json',
+    'jsonl': 'json',
+    'ndjson': 'json',
+    'parquet': 'parquet',
+    'pq': 'parquet',
+    'avro': 'avro',
+}
+
+
+def _has_jinja_syntax(text: str) -> bool:
+  return ('{{' in text or '}}' in text or '{%' in text or '%}' in text or
+          '{#' in text or '#}' in text)
+
+
+def _validate_jinja_uri(uri: str) -> None:
+  """Validates Jinja2 `{{ ... }}` placeholders via AST without rendering."""
+  if '{%' in uri or '%}' in uri or '{#' in uri or '#}' in uri:
+    raise UriError(
+        f'Jinja control/comment blocks in {uri!r} are not allowed; '
+        'use {{ variable }} value placeholders')
+  if uri.count('{{') != uri.count('}}') or '{{' not in uri:
+    raise UriError(f'unclosed Jinja2 {{ ... }} placeholder in {uri!r}')
+  for m in _JINJA_BLOCK_RE.finditer(uri):
+    if not m.group(1).strip():
+      raise UriError(f'empty Jinja2 {{ }} placeholder in {uri!r}')
+  try:
+    import jinja2
+    from jinja2 import nodes as jnodes
+  except ImportError:
+    return
+  try:
+    parsed_j = jinja2.Environment().parse(uri)
+  except jinja2.TemplateSyntaxError as e:
+    raise UriError(
+        f'invalid Jinja2 syntax in URI {uri!r}: {e.message}') from None
+  for jnode in parsed_j.find_all((jnodes.Getattr, jnodes.Getitem, jnodes.Call)):
+    raise UriError(
+        f'disallowed Jinja2 expression {type(jnode).__name__} in URI {uri!r}; '
+        'only simple {{ param }} or {{ param | default(...) }} placeholders '
+        'are permitted')
+  for nnode in parsed_j.find_all(jnodes.Name):
+    if str(nnode.name).startswith('_'):
+      raise UriError(
+          f'underscore-prefixed Jinja2 variable {nnode.name!r} is not allowed')
+
+
+def _infer_jinja_file_format(location: str) -> str:
+  """Infers file format from Jinja URI templates (`{{ input_csv }}`, etc.)."""
+  stripped = _JINJA_BLOCK_RE.sub('', location)
+  ext_fmt = EXTENSIONS.get(extension_of(stripped), '').lower()
+  if ext_fmt:
+    return ext_fmt
+
+  blocks = _JINJA_BLOCK_RE.findall(location)
+  if not blocks:
+    return ''
+
+  # Check default('...ext') string literals inside the last Jinja block first.
+  last_expr = blocks[-1]
+  for lit in _JINJA_STR_LIT_RE.findall(last_expr):
+    lit_fmt = EXTENSIONS.get(extension_of(lit), '').lower()
+    if lit_fmt:
+      return lit_fmt
+
+  m_var = _JINJA_LEAD_VAR_RE.match(last_expr)
+  if not m_var:
+    return ''
+  tokens = [t for t in m_var.group(1).lower().split('_') if t]
+  matched = {_JINJA_FORMAT_TOKENS[t] for t in tokens if t in _JINJA_FORMAT_TOKENS}
+  if len(matched) == 1:
+    return next(iter(matched))
+  return ''
+
+
 def normalize_bq_table_spec(
-    raw_uri_or_spec: str, default_project: str | None = None
+    raw_uri_or_spec: str,
+    default_project: str | None = None,
+    *,
+    allow_jinja: bool = False,
 ) -> tuple[str, str | None, str, str]:
   """Normalizes `bigquery://P.D.T` or `P:D.T` -> `('P:D.T', P, D, T)`."""
   body = raw_uri_or_spec
   if body.lower().startswith('bigquery://'):
     body = body[len('bigquery://'):]
   body = body.strip('/')
+  if allow_jinja and _has_jinja_syntax(body):
+    _validate_jinja_uri(raw_uri_or_spec)
+    masked = _JINJA_BLOCK_RE.sub('__j__', body)
+    if ':' in masked:
+      spec = body
+    elif masked.count('.') == 2:
+      # Convert first top-level `.` outside `{{ ... }}` into `:`.
+      depth = 0
+      dot_pos = -1
+      for idx, ch in enumerate(body):
+        if body[idx:idx + 2] == '{{':
+          depth += 1
+        elif body[idx:idx + 2] == '}}' and depth > 0:
+          depth -= 1
+        elif ch == '.' and depth == 0:
+          dot_pos = idx
+          break
+      spec = f'{body[:dot_pos]}:{body[dot_pos + 1:]}' if dot_pos != -1 else body
+    elif masked.count('.') == 1 and default_project:
+      spec = f'{default_project}:{body}'
+    else:
+      spec = body
+    return spec, default_project, '', ''
   m = _BQ_TABLE_ID_RE.match(body)
   if not m:
     raise UriError(
@@ -283,11 +389,16 @@ def parse_endpoint(
     allow_sniff: bool = False,
     cdc: bool = False,
     zero_copy: bool = False,
+    allow_jinja: bool = False,
 ) -> ParsedEndpoint:
   """Parses a `--from` or `--to` location into a `ParsedEndpoint`."""
   if not location or not location.strip():
     raise UriError('endpoint path/URI cannot be empty')
   reject_inline_credentials(location)
+  has_jinja = _has_jinja_syntax(location)
+  if allow_jinja and has_jinja:
+    _validate_jinja_uri(location)
+
   opts = dict(options or {})
   verb = 'ReadFrom' if is_read else 'WriteTo'
   flag_hint = '--from-format' if is_read else '--to-format'
@@ -302,19 +413,25 @@ def parse_endpoint(
   # 1. Local or distributed file (`gs://`, `s3://`, `azfs://`, `hdfs://`, `file://`)
   if not scheme or scheme in FILE_SCHEMES:
     fmt = (explicit_format or EXTENSIONS.get(extension_of(location), '')).lower()
-    if not fmt and is_read and allow_sniff:
+    if not fmt and allow_jinja and has_jinja:
+      fmt = _infer_jinja_file_format(location)
+    if not fmt and is_read and allow_sniff and not (allow_jinja and has_jinja):
       fmt = sniff_file_format(location) or ''
     if not fmt:
+      jinja_hint = (
+          '\n  (pass --emit-yaml to emit a parameterized Jinja2 YAML template)'
+          if has_jinja and not allow_jinja else '')
       raise UriError(
           f'cannot tell the format of {location!r} (no known file extension)\n'
-          f'  add {flag_hint}, for example: {flag_hint} json')
+          f'  add {flag_hint}, for example: {flag_hint} json{jinja_hint}')
     if fmt not in FILE_FORMATS:
       valid = ', '.join(k for k in ('csv', 'json', 'parquet', 'avro'))
       raise UriError(
           f'unsupported format {fmt!r} for {location!r}; use one of: {valid}')
     norm_fmt = 'json' if fmt == 'jsonl' else fmt
     read_path = location
-    if is_read and not any(c in location for c in '*?['):
+    if is_read and not (allow_jinja and has_jinja) and not any(
+        c in location for c in '*?['):
       if not scheme and not os.path.exists(location):
         import glob as _glob
         shard_pat = _glob.escape(location) + '-*-of-*'
@@ -347,7 +464,7 @@ def parse_endpoint(
       cfg = dict(opts)
     else:
       table_spec, _, _, _ = normalize_bq_table_spec(
-          location, default_project=default_project)
+          location, default_project=default_project, allow_jinja=allow_jinja)
       cfg = {'table': table_spec, **opts}
     if not is_read:
       disp_map = {

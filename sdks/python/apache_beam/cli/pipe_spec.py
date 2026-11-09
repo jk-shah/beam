@@ -71,6 +71,7 @@ def build_pipe_spec(
     select: str | None = None,
     dlq_sink: str | None = None,
     dlq_format: str | None = None,
+    null_values: Iterable[str] | None = None,
     if_exists: str = 'fail',
     from_opts: Iterable[str] | None = None,
     to_opts: Iterable[str] | None = None,
@@ -87,6 +88,7 @@ def build_pipe_spec(
     cdc_seq_col: str | None = None,
     zero_copy: bool = False,
     prefer_python_lakehouse_and_cdc: bool = False,
+    allow_jinja: bool = False,
 ) -> PipeSpec:
   """Returns the `PipeSpec` for `beam pipe`."""
   if if_exists not in ('fail', 'append', 'replace'):
@@ -109,8 +111,9 @@ def build_pipe_spec(
         explicit_format=from_format,
         options=parsed_from_opts,
         default_project=default_project,
-        allow_sniff=True,
-        cdc=cdc)
+        allow_sniff=not allow_jinja,
+        cdc=cdc,
+        allow_jinja=allow_jinja)
     dst_ep = uris.parse_endpoint(
         sink,
         is_read=False,
@@ -119,17 +122,24 @@ def build_pipe_spec(
         if_exists=if_exists,
         default_project=default_project,
         cdc=cdc,
-        zero_copy=zero_copy)
+        zero_copy=zero_copy,
+        allow_jinja=allow_jinja)
+    dlq_default_fmt = None
+    if dlq_sink and not dlq_format:
+      if not (uris.extension_of(dlq_sink) or (
+          '://' in dlq_sink and
+          dlq_sink.split('://', 1)[0].lower() not in uris.FILE_SCHEMES)):
+        dlq_default_fmt = (
+            (uris._infer_jinja_file_format(dlq_sink) or 'json')
+            if allow_jinja and uris._has_jinja_syntax(dlq_sink) else 'json')
     dlq_ep = (
         uris.parse_endpoint(
             dlq_sink,
             is_read=False,
-            explicit_format=dlq_format or (
-                None if uris.extension_of(dlq_sink) or '://' in dlq_sink and
-                not dlq_sink.split('://', 1)[0].lower() in uris.FILE_SCHEMES
-                else 'json'),
+            explicit_format=dlq_format or dlq_default_fmt,
             if_exists='append' if if_exists == 'append' else 'fail',
-            default_project=default_project) if dlq_sink else None)
+            default_project=default_project,
+            allow_jinja=allow_jinja) if dlq_sink else None)
   except uris.UriError as e:
     raise PipeSpecError(str(e)) from None
 
@@ -238,11 +248,16 @@ def build_pipe_spec(
 
   try:
     where_cfg = (
-        expressions.compile_where(where, known_columns=known_source_columns)[0]
+        expressions.compile_where(
+            where,
+            known_columns=known_source_columns,
+            allow_jinja=allow_jinja)[0]
         if where else None)
     select_cfg = (
         expressions.compile_select(
-            select, known_columns=known_source_columns)[0]
+            select,
+            known_columns=known_source_columns,
+            allow_jinja=allow_jinja)[0]
         if select else None)
   except expressions.ExpressionError as e:
     raise PipeSpecError(str(e)) from None
@@ -264,8 +279,16 @@ def build_pipe_spec(
     select_cfg = {**select_cfg, 'fields': sel_fields}
 
   needs_cli_provider = False
+  if null_values:
+    if src_ep.kind != 'file' or src_ep.format != 'csv':
+      raise PipeSpecError('--null-values applies to CSV sources only')
+    src_ep.config['null_values'] = [str(v) for v in null_values]
   src_type = src_ep.yaml_type
   src_cfg = dict(src_ep.config)
+  if src_type == 'ReadFromCsv' and 'null_values' in src_cfg:
+    # Exported YAML reads CSV with pandas: same markers, no pandas defaults.
+    src_cfg['na_values'] = [''] + src_cfg.pop('null_values')
+    src_cfg['keep_default_na'] = False
   src_java = src_ep.is_java_xlang
 
   sink_type = dst_ep.yaml_type
@@ -339,6 +362,27 @@ def build_pipe_spec(
       src_type = 'ReadFromText'
       src_cfg = {'path': src_ep.config['path']}
       src_java = False
+    elif src_ep.kind == 'file' and src_ep.format == 'json':
+      # Beam's ReadFromJson turns nested objects into Python repr strings
+      # (apache/beam#41098), so local runs use the CLI reader, which keeps them
+      # as nested rows and fails on bad lines unless --dlq routes them.
+      src_type = 'ReadJsonWithDlq'
+      src_cfg = {'path': src_ep.config['path']}
+      src_java = False
+      needs_cli_provider = True
+    elif (src_ep.kind == 'file' and src_ep.format == 'csv' and
+          set(src_ep.config) <= {'path', 'delimiter', 'null_values'}):
+      # Use the CLI's CSV reader (the one --dlq uses) so a column is typed the
+      # same with or without --dlq and on the fast local path. Beam's pandas
+      # reader would turn zip codes like "00501" into the integer 501. Without
+      # --dlq a bad record fails the run instead of being dropped.
+      src_type = 'ReadCsvWithDlq'
+      src_cfg = {
+          k: v
+          for k, v in src_ep.config.items() if k in ('path', 'delimiter', 'null_values')
+      }
+      src_java = False
+      needs_cli_provider = True
     elif cdc and src_ep.kind == 'pubsub' and 'schema' not in src_ep.config:
       src_type = 'ReadFromPubSub'
       src_cfg = {**src_ep.config, 'format': 'STRING'}
@@ -394,6 +438,17 @@ def build_pipe_spec(
       sink_java = False
       needs_cli_provider = True
 
+  # Plain files can't apply upserts or deletes like Iceberg/BigQuery CDC sinks,
+  # so --cdc into a file writes the latest live row per key.
+  materialize_cdc = cdc_norm_cfg is not None and dst_ep.kind == 'file'
+  # Parquet/Avro readers yield dicts for struct columns (apache/beam#41100);
+  # expressions like address.city need rows, so convert them locally.
+  rowify_nested = bool(
+      prefer_python_lakehouse_and_cdc and src_ep.kind == 'file' and
+      src_ep.format in ('parquet', 'avro') and (where_cfg or select_cfg))
+  if rowify_nested:
+    needs_cli_provider = True
+
   # Pure Java-to-Java fast path: skip Python counter stages unless explicitly
   # requested (`include_counters=True` when `--assert-counts` or Python stage).
   pure_java_pipe = (
@@ -411,7 +466,13 @@ def build_pipe_spec(
             'config': src_cfg,
         }
     ]
-    if inject_counters:
+    if rowify_nested:
+      # Must directly follow the source: a schema-typed step in between would
+      # encode the nested dicts with RowCoder and fail.
+      chain_steps.append({'type': 'CliRowifyNested', 'config': {}})
+    if inject_counters and src_type not in ('ReadJsonWithDlq',
+                                            'ReadCsvWithDlq'):
+      # The CLI readers increment rows_read themselves.
       chain_steps.append({
           'type': 'CliCountRows',
           'config': {
@@ -423,6 +484,11 @@ def build_pipe_spec(
           'type': 'CliNormalizeCdc',
           'config': dict(cdc_norm_cfg),
       })
+      if materialize_cdc:
+        chain_steps.append({
+            'type': 'CliMaterializeCdc',
+            'config': {'primary_key': pks},
+        })
     if where_cfg is not None:
       if inject_counters:
         chain_steps.append({
@@ -480,7 +546,7 @@ def build_pipe_spec(
     src_type = 'ReadCsvWithDlq'
     src_cfg = {
         k: v
-        for k, v in src_cfg.items() if k in ('path', 'delimiter')
+        for k, v in src_cfg.items() if k in ('path', 'delimiter', 'null_values')
     }
     src_cfg['error_handling'] = {'output': 'errors'}
     source_counts_internally = True
@@ -505,6 +571,16 @@ def build_pipe_spec(
     dlq_norm_refs.append(norm_name)
   else:
     current_ref = 'ReadSource'
+
+  if rowify_nested:
+    # Must directly follow the source (see the chain form above).
+    dag_transforms.append({
+        'name': 'RowifyNested',
+        'type': 'CliRowifyNested',
+        'input': current_ref,
+        'config': {},
+    })
+    current_ref = 'RowifyNested'
 
   if inject_counters and not source_counts_internally:
     dag_transforms.append({
@@ -531,6 +607,14 @@ def build_pipe_spec(
             'NormalizeCdcDlq', 'NormalizeCdc.errors', 'NormalizeCdc'))
     dlq_norm_refs.append('NormalizeCdcDlq')
     current_ref = 'NormalizeCdc.good'
+    if materialize_cdc:
+      dag_transforms.append({
+          'name': 'MaterializeCdc',
+          'type': 'CliMaterializeCdc',
+          'input': current_ref,
+          'config': {'primary_key': pks},
+      })
+      current_ref = 'MaterializeCdc'
 
   if where_cfg is not None:
     if inject_counters:
@@ -679,6 +763,7 @@ def build_pipe_spec(
 def to_yaml(spec: dict[str, Any], argv: list[str]) -> str:
   """Renders a pipeline as a Beam YAML file to save and run with `beam run`."""
   import yaml
-  header = '# Generated by: beam pipe ' + shlex.join(argv)
+  header = '# Generated by: beam pipe ' + shlex.join(argv).replace('\n', ' ')
   dumper = getattr(yaml, 'CSafeDumper', yaml.SafeDumper)
-  return header + '\n' + yaml.dump(spec, Dumper=dumper, sort_keys=False)
+  return header + '\n' + yaml.dump(
+      spec, Dumper=dumper, sort_keys=False, width=100000)

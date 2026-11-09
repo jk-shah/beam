@@ -284,13 +284,19 @@ def finalize_cli_row_metrics(raw_counters: dict[str, int]) -> dict[str, int]:
   if 'dlq_rows' in raw_counters or dlq_rows > 0:
     out['dlq_rows'] = dlq_rows
   cdc_skipped = int(raw_counters.get('cdc_preimage_skipped', 0))
+  # Older versions and deletes collapsed by CliMaterializeCdc (--cdc into
+  # plain files) are not written, so they count as filtered out.
+  cdc_superseded = int(raw_counters.get('cdc_superseded_rows', 0))
+  if cdc_superseded:
+    out['cdc_superseded_rows'] = cdc_superseded
   if (
       'pre_filter_rows' in raw_counters or 'post_filter_rows' in raw_counters
-      or cdc_skipped > 0):
+      or cdc_skipped > 0 or cdc_superseded > 0):
     pre_f = int(raw_counters.get('pre_filter_rows', 0))
     post_f = int(raw_counters.get('post_filter_rows', 0))
     out['rows_filtered_out'] = (
-        max(0, pre_f - post_f - filter_dlq_rows) + cdc_skipped)
+        max(0, pre_f - post_f - filter_dlq_rows) + cdc_skipped +
+        cdc_superseded)
   if 'pre_sink_rows' in raw_counters or 'rows_read' in raw_counters:
     pre_sink = int(raw_counters.get('pre_sink_rows', 0))
     out['rows_written'] = max(0, pre_sink - sink_dlq_rows)

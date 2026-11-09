@@ -56,31 +56,45 @@ def render_llms_txt() -> str:
     Non-destructive bounded stream peek (default `5s` / `-n 5` for agents) or live
     follow (`-f` / `--follow` like Unix `tail -f`, streaming NDJSON across
     `pubsub://`, `kafka://`, `delta://`, `iceberg://`, and local/`gs://` files).
-- `beam pipe --from <URI> --to <URI> [flags] [pipeline_options]`
-    Move, convert, filter (`--where`), project (`--select`), quarantine dirty rows
-    (`--dlq`), enforce scan budget (`--max-bytes`), verify conservation
-    (`--assert-counts`), reconcile output (`--verify`), apply cross-engine CDC
-    upserts/deletes (`--cdc --primary-key COL`), or register existing Parquet /
+- `beam pipe --from [ALIAS=]URI [--join [ALIAS=]URI ...] [--to URI] [flags]`
+    Move, convert, filter (`--where`), project (`--select`), run multi-input
+    SQL joins & aggregations (`--sql "SELECT ..."` across CSV, Parquet, JSONL,
+    `delta://`, and `iceberg://` in `<100ms` locally or `type: Sql` on Dataflow),
+    quarantine dirty rows (`--dlq`), enforce scan budget (`--max-bytes`), verify
+    conservation (`--assert-counts`), reconcile output (`--verify`), apply
+    cross-engine CDC (`--cdc --primary-key COL`), or register existing Parquet /
     `delta://` files into `iceberg://` in `<100ms` with `0` bytes copied
-    (`--zero-copy`). Pass `--emit-yaml` (alias `--dry-run`) to validate and print
-    portable Beam YAML without running (with `--json`, YAML is in `outputs.yaml`).
-    Sharded Beam outputs (`<prefix>-00000-of-NNNNN`) are auto-resolved.
+    (`--zero-copy`). Pass `--emit-yaml` (alias `--dry-run`) to emit portable
+    Beam YAML (`outputs.yaml` with `--json`), even before source files exist.
+    Local file sinks with explicit extensions (`out/clean.parquet`) materialize
+    exact single files; sharded Beam prefixes are also auto-resolved.
+    Small local file-to-file jobs (CSV/JSONL/Parquet/Avro in, up to 64 MB, an
+    exact CSV/JSONL/Parquet file out, no `--runner`) run in-process in
+    ~0.1-0.4 s with the same typing, DLQ records and metrics (`runner:
+    "local_fast"`); `BEAM_CLI_NO_FAST_PATH=1` or `--runner` uses a Beam runner.
 - `beam package <FILE.yaml | FILE.py | -> --to <gs://.../spec.json> [flags] [--json]`
     Zero-Docker `<1s` Flex Template packager for Beam YAML (auto-extracts Jinja
     `{{{{ vars }}}}` into `metadata.parameters`) and AST-introspected single-image
     Flex Template bundle generator for Python pipelines (no handwritten
     `Dockerfile` or `metadata.json`).
-- `beam diff <LEFT_URI> <RIGHT_URI> [--key COL ...] [--rtol F] [--atol F] [--json]`
+- `beam diff <LEFT_URI> <RIGHT_URI> [--key COL ...] [--columns shared|all] [--rtol F] [--atol F] [--json]`
     Distributed O(1)-memory key/multiset reconciliation across files, `delta://`,
-    `iceberg://`, and `bigquery://` (`0` match, `6` drift).
+    `iceberg://`, and `bigquery://` (`0` match, `6` drift). Compares shared columns
+    and reports added/removed/retyped columns in `outputs.schema_diff`. With
+    `--key`, `outputs.differing_keys` lists up to 100 keys each for
+    `only_in_left`, `only_in_right`, `value_mismatches`, `duplicate_keys`
+    (`truncated` flag; values are untrusted data).
 - `beam check <FILE.yaml | -> [--plan [--trust-providers]] [--json]`
     Offline SafeLoader YAML validator + deterministic `plan_hash` (`sha256`).
+    `--plan` falls back to the static check, with a warning, if expansion needs cloud access;
+    expansion logs are hidden unless `--verbose`.
 - `beam run <FILE.yaml | -> [--no-jinja] [--wait-timeout DUR] [--json]`
     Execute a Beam YAML pipeline locally or on Dataflow / Flink / Spark.
 - `beam wait <JOB_ID> [--timeout DUR] [--json]` / `beam cancel <JOB_ID> [--drain]`
     Poll or cancel/drain detached remote jobs (`~/.beam/jobs/<job_id>.json`).
-- `beam io list [--json]` / `beam io describe <CONNECTOR> [--json]`
-    Offline `<50ms` catalog of supported connectors, transforms, and options.
+- `beam io list [--json]` / `beam io describe <CONNECTOR | TRANSFORM> [--json]`
+    Offline catalog of connectors and options; also describes Beam YAML
+    transforms such as `Filter`, `MapToFields`, `WindowInto`.
 - `beam doctor [--json]`
     Verify Beam version, extras (`yaml`, `pyarrow`, `gcp`), Java 11–25, and ADC.
 - `beam config <set|get|unset|list|use>` / `beam sql [-e QUERY]`
@@ -100,27 +114,46 @@ def render_llms_txt() -> str:
 ## 4. Universal URI Grammar
 - Local / Cloud Files: `./users.csv`, `gs://bucket/path/*.parquet`, `s3://...`, `azfs://...`
 - Delta Lake: `delta://gs://bucket/tables/orders` or `delta:///local/orders?version=3`
-- Iceberg v2: `iceberg://ns.orders?warehouse=gs://bucket/wh` or `?catalog=biglake&warehouse=gs://...`
+- Iceberg v2: `iceberg://ns.orders?warehouse=gs://bucket/wh` or `iceberg:///local/wh/ns.orders`
 - BigQuery: `bigquery://PROJECT.DATASET.TABLE` (CDC UPSERT/DELETE via `--cdc --primary-key id`)
 - PostgreSQL / MySQL: `postgres://HOST:5432/DB?table=public.users`, `mysql://HOST:3306/DB?table=orders`
 - Cloud Spanner: `spanner://PROJECT/INSTANCE/DB?change_stream=orders_cs`
 - Pub/Sub & Kafka: `pubsub://projects/PROJECT/subscriptions/SUB`, `kafka://HOST:9092/TOPIC`
 
-## 5. Safe `--where` & `--select` Expressions
-- `--where "status == 'PAID' AND amount >= 100 AND deleted_at IS NULL"`
-  (Supports `AND`/`OR`/`NOT`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `IN (...)`,
-  `IS [NOT] NULL`, `+`, `-`, `*`, `/`, and safe scalar helpers `lower`, `upper`,
-  `strip`, `len`, `coalesce`, `abs`, `round`, `int`, `float`, `str`, `bool`.)
-- `--select "user_id, lower(email) AS email, round(amount * 1.08, 2) AS total"`
+## 5. Safe `--where`, `--select`, & Multi-Input `--sql`
+- `--where "status = 'PAID' AND amount >= 100 AND deleted_at IS NULL"`
+  (Supports SQL `=` / `<>` and Python `==` / `!=`, `AND`/`OR`/`NOT`, `<`, `<=`,
+  `>`, `>=`, `IN (...)`, `IS [NOT] NULL`, `CAST(col AS INT|FLOAT|STRING|BOOL)`,
+  keyword/backticked columns like `` `class` ``, and scalar helpers `lower`,
+  `upper`, `strip`/`trim`, `len`/`length`, `coalesce`/`ifnull`, `abs`, `round`,
+  `int`, `float`, `str`, `bool`.)
+- `--select "CAST(user_id AS INT) AS user_id, lower(email) AS email, `class`, round(amount * 1.08, 2) AS total"`
+- `--from o=orders.parquet --join c=customers.csv --sql "SELECT COALESCE(c.tier, 'UNMAPPED') AS tier, COUNT(*) AS n, ROUND(SUM(o.amount), 2) AS rev FROM o LEFT JOIN c ON o.cid = c.cid GROUP BY 1"`
+- NULLs follow SQL three-valued logic everywhere: any comparison (`=`, `!=`, `<`, `IN`, `NOT IN`), arithmetic,
+  `NOT`, nested access, string helpers and casts on NULL give NULL, and a row is kept only if the filter is TRUE.
+  So `--where "state != 'CA'"` drops rows with no state, as in SQL. Test for NULL with `IS [NOT] NULL`
+  (`x = NULL` is read as `x IS NULL`); `IN ('CA')` is a one-element list. Simple filters are exported as native
+  Beam YAML (`keep: "state is not None and state != 'CA'"`).
+- CSV: empty cells are NULL (like core `ReadFromCsv`); add markers with `--null-values NA,NULL`. Columns are typed
+  from a 100-row sample; any value with a leading zero (zip `00501`) keeps the column as text.
+- Nested JSON objects and Parquet/Avro structs use dots: `--where "props.amount >= 10" --select "user.id AS user_id"`.
+  With `--dlq`, malformed JSON lines and values that don't fit the inferred type are quarantined; without it they fail the run.
+- Local `--sql` is SQLite (inputs named `alias=URI`; unaliased inputs are named after the file) plus exact
+  `median(x)`, `percentile(x, 95)`, `quantile(x, 0.95)` (linear interpolation, like numpy) and `stddev(x)`;
+  window functions such as `ROW_NUMBER() OVER (PARTITION BY k ORDER BY ts DESC)` work.
+  Not supported locally: `PERCENTILE_CONT ... WITHIN GROUP`, `APPROX_QUANTILES`. Local-only functions are not
+  portable to `--emit-yaml` / remote Beam SQL (Calcite); the CLI warns when you export them.
+- `--cdc --primary-key K` into plain files (Parquet/CSV/JSON/Avro) writes the latest live row per key, ordered by
+  `lsn` / `ts_ms` / `updated_at` or `--cdc-seq-col COL`; deleted keys are dropped.
 
 ## 6. Canonical Agent Workflow Examples
 ```bash
-# 1. Inspect, guard, clean, and reconcile CSV -> BigQuery
+# 1. Inspect, guard, clean, and reconcile CSV -> BigQuery (or exact local Parquet)
 beam inspect gs://my-bucket/raw/orders.csv --json
 beam pipe --from gs://my-bucket/raw/orders.csv \\
           --to bigquery://my-proj.analytics.orders_clean \\
           --dlq gs://my-bucket/dlq/orders_bad.json \\
-          --where "amount > 0 AND order_id IS NOT NULL" \\
+          --where "amount > 0 AND status = 'PAID' AND order_id IS NOT NULL" \\
           --max-bytes 10GB --assert-counts --json
 
 # 2. Zero-copy Delta Lake -> Iceberg v2 registration (0 bytes copied) + diff
@@ -128,7 +161,14 @@ beam pipe --from delta://gs://my-bucket/delta/orders \\
           --to "iceberg://lake.orders?warehouse=gs://my-bucket/iceberg" \\
           --zero-copy --verify --verify-key order_id --json
 
-# 3. Cross-engine CDC (Debezium / Delta CDF -> BigQuery UPSERT/DELETE or Iceberg MoR)
+# 3. Multi-input SQL join + aggregation across Parquet / CSV / Iceberg (<100ms locally)
+beam pipe --from o=out/clean_orders.parquet \\
+          --join c=data/customers.csv \\
+          --to out/revenue_by_tier.json \\
+          --sql "SELECT COALESCE(c.tier, 'UNMAPPED') AS tier, COUNT(*) AS orders, ROUND(SUM(o.amount), 2) AS revenue FROM o LEFT JOIN c ON o.customer_id = c.customer_id GROUP BY 1 ORDER BY revenue DESC" \\
+          --json
+
+# 4. Cross-engine CDC (Debezium / Delta CDF -> BigQuery UPSERT/DELETE or Iceberg MoR)
 beam pipe --from pubsub://projects/my-proj/subscriptions/orders-cdc \\
           --to bigquery://my-proj.analytics.orders_live \\
           --cdc --primary-key order_id --dlq gs://my-bucket/dlq/cdc_bad.json \\

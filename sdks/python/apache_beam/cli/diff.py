@@ -43,6 +43,20 @@ from . import uris
 EXIT_OK = 0
 EXIT_DIFF_MISMATCH = 6
 
+# Most keys listed per category in `differing_keys`; counts stay exact.
+KEY_LIST_LIMIT = 100
+_KEY_CATEGORIES = {
+    'only_in_left': 'only_in_left',
+    'only_in_right': 'only_in_right',
+    'value_mismatch': 'value_mismatches',
+    'duplicate_key_count_mismatch': 'duplicate_keys',
+    'duplicate_key_multiset_mismatch': 'duplicate_keys',
+}
+
+
+def _empty_key_lists() -> dict[str, list[Any]]:
+  return {cat: [] for cat in dict.fromkeys(_KEY_CATEGORIES.values())}
+
 
 def _canonical_number_bytes(val: int | float | decimal.Decimal) -> bytes:
   if isinstance(val, float):
@@ -217,6 +231,58 @@ def _read_endpoint_pcoll(pipeline, label: str, ep: uris.ParsedEndpoint):
       f'and bigquery:// URIs; got {ep.raw!r}')
 
 
+def _endpoint_schema(
+    uri: str,
+    explicit_format: str | None,
+    opts: Iterable[str] | None,
+    default_project: str | None) -> dict[str, str] | None:
+  """Returns {column: canonical type} for a dataset, or None if unknown.
+
+  Used by `run_diff` to report schema drift (columns added, removed, or
+  retyped) separately from row differences, and to pick the shared columns to
+  compare. It reads metadata through `beam inspect` (Parquet footers, Avro
+  headers, Delta/Iceberg/BigQuery schemas, sampled CSV/JSON) because diff
+  reads files as plain dicts that carry no schema.
+  """
+  from . import inspect_cmd
+  try:
+    info = inspect_cmd.run_inspect(
+        uri,
+        explicit_format=explicit_format,
+        sample_count=0,
+        from_opts=list(opts or []),
+        default_project=default_project)
+  except Exception:  # pylint: disable=broad-except
+    return None
+  fields = info.get('schema') or []
+  if not fields:
+    return None
+  return {str(f['name']): _canonical_type(f.get('type')) for f in fields}
+
+
+# Spellings of the same logical type across Arrow, Avro, BigQuery and Python,
+# so a Parquet-vs-Avro or file-vs-BigQuery diff doesn't report false retypes.
+_TYPE_ALIASES = {
+    'int': 'int', 'int8': 'int', 'int16': 'int', 'int32': 'int',
+    'int64': 'int', 'long': 'int', 'integer': 'int',
+    'float': 'float', 'float32': 'float', 'float64': 'float',
+    'double': 'float', 'halffloat': 'float',
+    'str': 'str', 'string': 'str', 'large_string': 'str', 'utf8': 'str',
+    'bool': 'bool', 'boolean': 'bool',
+    'bytes': 'bytes', 'binary': 'bytes', 'large_binary': 'bytes',
+}
+
+
+def _canonical_type(type_str: Any) -> str:
+  raw = str(type_str or '').strip()
+  low = raw.lower()
+  # Avro unions such as ['null', 'long'] or "['null', 'string']".
+  for null_spelling in ("'null', ", ", 'null'", '"null", ', ', "null"'):
+    low = low.replace(null_spelling, '')
+  low = low.strip("[]'\" ")
+  return _TYPE_ALIASES.get(low, raw)
+
+
 def run_diff(
     left_uri: str,
     right_uri: str,
@@ -231,8 +297,17 @@ def run_diff(
     max_bytes: str | None = None,
     pipeline_args: list[str] | None = None,
     default_project: str | None = None,
+    columns: str = 'shared',
 ) -> tuple[int, dict[str, Any]]:
-  """Runs distributed reconciliation and returns `(exit_code, report_dict)`."""
+  """Runs distributed reconciliation and returns `(exit_code, report_dict)`.
+
+  `columns='shared'` (default) compares only columns present on both sides
+  and reports added, removed, and retyped columns in `schema_diff`, so a new
+  column doesn't turn every row into a value mismatch. `columns='all'`
+  compares the union of columns, treating a missing column as null.
+  """
+  if columns not in ('shared', 'all'):
+    raise uris.UriError(f"--columns must be 'shared' or 'all', got {columns!r}")
   import apache_beam as beam
   from apache_beam.options.pipeline_options import GoogleCloudOptions
   from apache_beam.options.pipeline_options import PipelineOptions
@@ -294,6 +369,9 @@ def run_diff(
           limit_bytes=limit)
 
   key_cols = [k.strip() for k in (keys or ()) if k.strip()]
+  # Set once both sources are read: the columns compared when both sides have
+  # a static schema and columns='shared'; None means compare what rows hold.
+  shared_cols: list[frozenset[str] | None] = [None]
   sig_digits = (
       max(1, int(-math.log10(rtol))) if (rtol and rtol > 0) else None)
 
@@ -351,7 +429,17 @@ def run_diff(
           'duplicate_key_mismatches': 0,
           'column_mismatch_counts': {},
           'sample_drifts': [],
+          'key_lists': _empty_key_lists(),
+          'key_lists_truncated': False,
       }
+
+    @staticmethod
+    def _add_key(acc, category, key):
+      bucket = acc['key_lists'][category]
+      if len(bucket) < KEY_LIST_LIMIT:
+        bucket.append(key)
+      else:
+        acc['key_lists_truncated'] = True
 
     def add_input(self, acc, event: dict[str, Any]):
       acc['left_rows'] += event['left_rows']
@@ -364,8 +452,16 @@ def run_diff(
       for col, cnt in event.get('col_mismatches', {}).items():
         acc['column_mismatch_counts'][col] = (
             acc['column_mismatch_counts'].get(col, 0) + cnt)
-      if event.get('sample') is not None and len(acc['sample_drifts']) < 10:
-        acc['sample_drifts'].append(event['sample'])
+      sample = event.get('sample')
+      if sample is not None and len(acc['sample_drifts']) < 10:
+        acc['sample_drifts'].append(sample)
+      if key_cols and sample is not None and 'key' in sample:
+        category = _KEY_CATEGORIES.get(sample.get('kind'))
+        if category:
+          key = sample['key']
+          if len(key_cols) == 1 and isinstance(key, dict):
+            key = key.get(key_cols[0])
+          self._add_key(acc, category, key)
       return acc
 
     def merge_accumulators(self, accumulators):
@@ -384,6 +480,10 @@ def run_diff(
         for s in a['sample_drifts']:
           if len(merged['sample_drifts']) < 10:
             merged['sample_drifts'].append(s)
+        merged['key_lists_truncated'] |= a.get('key_lists_truncated', False)
+        for category, keys in a.get('key_lists', {}).items():
+          for key in keys:
+            self._add_key(merged, category, key)
       return merged
 
     def extract_output(self, acc):
@@ -391,6 +491,8 @@ def run_diff(
 
   def _key_row(row):
     d = _row_to_plain_dict(row)
+    if shared_cols[0] is not None:
+      d = {k: v for k, v in d.items() if k in shared_cols[0]}
     if key_cols:
       missing = [k for k in key_cols if k not in d]
       if missing:
@@ -484,7 +586,10 @@ def run_diff(
       }
 
     if l_cnt == 1 and r_cnt == 1 and l_row is not None and r_row is not None:
-      all_cols = sorted(set(l_row.keys()) | set(r_row.keys()))
+      if columns == 'shared':
+        all_cols = sorted(set(l_row.keys()) & set(r_row.keys()))
+      else:
+        all_cols = sorted(set(l_row.keys()) | set(r_row.keys()))
       bad_cols: dict[str, int] = {}
       diff_fields: dict[str, dict[str, Any]] = {}
       for c in all_cols:
@@ -574,10 +679,26 @@ def run_diff(
     out_file_prefix = os.path.join(tmp_dir, 'summary')
   job_id: str | None = None
   final_state = 'DONE'
+  schema_diff: dict[str, Any] | None = None
   try:
     pipeline = beam.Pipeline(options=opts)
     left_pcoll = _read_endpoint_pcoll(pipeline, 'ReadLeft', left_ep)
     right_pcoll = _read_endpoint_pcoll(pipeline, 'ReadRight', right_ep)
+    left_schema = _endpoint_schema(left_uri, left_format, left_opts, proj)
+    right_schema = _endpoint_schema(right_uri, right_format, right_opts, proj)
+    if left_schema is not None and right_schema is not None:
+      schema_diff = {
+          'columns_added': sorted(set(right_schema) - set(left_schema)),
+          'columns_removed': sorted(set(left_schema) - set(right_schema)),
+          'type_changes': {
+              c: {'left': left_schema[c], 'right': right_schema[c]}
+              for c in sorted(set(left_schema) & set(right_schema))
+              if left_schema[c] != right_schema[c]
+          },
+          'compared_columns': columns,
+      }
+      if columns == 'shared':
+        shared_cols[0] = frozenset(left_schema) & frozenset(right_schema)
 
     left_sum = (
         left_pcoll
@@ -645,11 +766,29 @@ def run_diff(
       shutil.rmtree(tmp_dir, ignore_errors=True)
 
   samples = summary.pop('sample_drifts', [])
+  key_lists = summary.pop('key_lists', None) or _empty_key_lists()
+  keys_truncated = bool(summary.pop('key_lists_truncated', False))
+  differing_keys = None
+  if key_cols:
+    # Key values come from the data: sanitized, capped, and flagged untrusted.
+    differing_keys = {
+        category: sorted(
+            (output.sanitize_untrusted_value(k) for k in keys),
+            key=lambda k: json.dumps(k, sort_keys=True, default=str))
+        for category, keys in key_lists.items()
+    }
+    differing_keys['limit'] = KEY_LIST_LIMIT
+    differing_keys['truncated'] = keys_truncated
+    differing_keys['values_are_untrusted'] = True
+  schema_drift = bool(
+      schema_diff and (
+          schema_diff['columns_added'] or schema_diff['columns_removed'] or
+          schema_diff['type_changes']))
   identical = (
       summary['only_in_left'] == 0 and summary['only_in_right'] == 0 and
       summary['value_mismatches'] == 0 and
       summary['duplicate_key_mismatches'] == 0 and
-      summary['left_rows'] == summary['right_rows'])
+      summary['left_rows'] == summary['right_rows'] and not schema_drift)
   exit_code = EXIT_OK if identical else EXIT_DIFF_MISMATCH
   report = {
       'match': identical,
@@ -659,6 +798,8 @@ def run_diff(
       'rtol': rtol,
       'atol': atol,
       'summary': summary,
+      'schema_diff': schema_diff,
+      'differing_keys': differing_keys,
       'job_id': job_id,
       'state': final_state,
       'untrusted_data': output.wrap_untrusted_rows(

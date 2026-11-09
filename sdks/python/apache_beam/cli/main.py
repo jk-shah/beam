@@ -82,10 +82,14 @@ examples:
   beam pipe --from users.csv --to out/users.parquet
   beam pipe --from gs://raw/orders.csv --to bigquery://proj.ds.orders \\
       --where "amount > 0" --dlq gs://raw/dlq/orders.json --assert-counts --json
+  beam pipe --from orders=out/orders.parquet --join tiers=data/vip_tiers.csv \\
+      --sql "SELECT COALESCE(tiers.tier, 'STANDARD') AS tier, COUNT(*) AS order_count, ROUND(SUM(orders.amount), 2) AS total_amount FROM orders LEFT JOIN tiers USING (email) GROUP BY 1 ORDER BY 1" \\
+      --to out/tier_spend.json --json
   beam pipe --from users.csv --to out/users.parquet --dry-run > pipeline.yaml
 
-Formats: csv, json, parquet, avro, bigquery://, postgres://, pubsub://,
-kafka://, iceberg://. Every other --flag is passed as a Beam pipeline option.
+Formats: csv, json, parquet, avro, delta://, iceberg://, bigquery://,
+postgres://, mysql://, spanner://, pubsub://, kafka://.
+Every other --flag is passed as a Beam pipeline option.
 """ + _EXIT_CODES
 
 _SQL_EPILOG = """\
@@ -178,7 +182,9 @@ _CLI_ONE_FLAGS = {
     'run': frozenset(['--profile', '--wait-timeout']),
     'pipe': frozenset([
         '--from',
+        '--join',
         '--to',
+        '--sql',
         '--format',
         '--from-format',
         '--to-format',
@@ -186,6 +192,7 @@ _CLI_ONE_FLAGS = {
         '--select',
         '--dlq',
         '--dlq-format',
+        '--null-values',
         '--if-exists',
         '--from-opt',
         '--to-opt',
@@ -208,6 +215,7 @@ _CLI_ONE_FLAGS = {
         '--right-opt',
         '--rtol',
         '--atol',
+        '--columns',
         '--max-bytes',
         '--profile',
     ]),
@@ -486,10 +494,38 @@ def _reject_extra_args(extra_args: list[str]) -> None:
         f'unrecognized arguments: {" ".join(extra_args)}', EXIT_USAGE)
 
 
+_TOP_LEVEL_EPILOG = """\
+what you can do (beam --llms-txt prints the full agent manual):
+  convert/filter files    beam pipe --from in.csv --to out.parquet \\
+                            --where "amount > 100" --select "id, amount"
+  small local jobs        run in-process in well under a second; larger or
+                          remote jobs use a Beam runner (or pass --runner)
+  bad records             --dlq bad.jsonl routes unparseable or failing rows
+                          instead of failing the run; --assert-counts checks
+                          rows_read = written + filtered + dlq
+  nested fields           --where "user.tier == 'gold'" on JSON/Parquet/Avro
+  NULLs                   SQL rules: --where "state != 'CA'" drops rows with
+                          no state; empty CSV cells are NULL (--null-values
+                          NA,NULL adds markers); test with IS [NOT] NULL
+  SQL                     beam pipe --from t=in.csv --sql "SELECT ... FROM t"
+                          (local; median/percentile/stddev included)
+  CDC                     --cdc --primary-key id applies change events
+                          (files keep the latest row per key)
+  compare datasets        beam diff left.parquet right.parquet --key id
+                          (schema drift, differing keys, value mismatches)
+  look before moving      beam inspect FILE_OR_TABLE (schema, rows, sample)
+  export for production   beam pipe ... --emit-yaml > pipeline.yaml, then
+                          beam check pipeline.yaml and beam package
+  machine-readable        add --json for one structured envelope on stdout
+"""
+
+
 def _build_parser():
   parser = argparse.ArgumentParser(
       prog='beam',
       description='Apache Beam command-line tool for humans and AI agents.',
+      epilog=_TOP_LEVEL_EPILOG,
+      formatter_class=argparse.RawDescriptionHelpFormatter,
       allow_abbrev=False)
   parser.add_argument(
       '--json',
@@ -558,16 +594,27 @@ def _build_parser():
       allow_abbrev=False)
   pipe.add_argument(
       '--from',
-      dest='source',
+      dest='sources',
+      action='append',
       required=True,
-      metavar='SOURCE',
-      help='source path, glob, or URI (gs://, bigquery://, pubsub://, ...)')
+      metavar='[ALIAS=]SOURCE',
+      help=(
+          'source path, glob, or URI (gs://, bigquery://, delta://, '
+          'iceberg://, ...); repeatable with --sql'))
+  pipe.add_argument(
+      '--join',
+      dest='joins',
+      action='append',
+      default=[],
+      metavar='[ALIAS=]SOURCE',
+      help='additional source URI to join in --sql (repeatable)')
   pipe.add_argument(
       '--to',
       dest='sink',
-      required=True,
+      required=False,
+      default=None,
       metavar='SINK',
-      help='destination path prefix or URI')
+      help='destination path or URI (optional when running --sql queries)')
   pipe.add_argument(
       '--format',
       metavar='FMT',
@@ -583,11 +630,21 @@ def _build_parser():
   pipe.add_argument(
       '--where',
       metavar='EXPR',
-      help='safe SQL-like row filter (e.g. "amount > 0 AND status == \'OK\'")')
+      help='safe SQL/Python row filter (e.g. "amount > 0 AND status = \'OK\'")')
   pipe.add_argument(
       '--select',
       metavar='EXPR',
-      help='projection / scalar expressions (e.g. "id, lower(email) AS email")')
+      help=(
+          'projection / scalar expressions (e.g. '
+          '"CAST(id AS INT) AS id, lower(email) AS email")'))
+  pipe.add_argument(
+      '--sql',
+      dest='sql',
+      default=None,
+      metavar='QUERY',
+      help=(
+          'read-only SQL SELECT/JOIN/GROUP BY query across --from and --join '
+          'sources'))
   pipe.add_argument(
       '--dlq',
       metavar='SINK',
@@ -596,6 +653,11 @@ def _build_parser():
       '--dlq-format',
       metavar='FMT',
       help='dead-letter file format (default: json or inferred from extension)')
+  pipe.add_argument(
+      '--null-values',
+      metavar='LIST',
+      help='comma-separated CSV cell values to read as NULL in addition to '
+      'empty cells, for example NA,NULL,N/A')
   pipe.add_argument(
       '--if-exists',
       choices=['fail', 'append', 'replace'],
@@ -726,6 +788,14 @@ def _build_parser():
       type=float,
       default=0.0,
       help='absolute float tolerance (default: 0.0)')
+  diff_p.add_argument(
+      '--columns',
+      choices=('shared', 'all'),
+      default='shared',
+      help=(
+          'shared (default): compare columns present on both sides and report '
+          'added/removed/retyped columns in schema_diff; all: compare the '
+          'union, treating a missing column as null'))
   diff_p.add_argument(
       '--max-bytes',
       metavar='SIZE',
@@ -1472,7 +1542,8 @@ def _check(args, extra_args, *, json_session, t0: float) -> int:
         expand_plan=args.plan,
         trust_providers=args.trust_providers,
         jinja_variables_json=args.jinja_variables,
-        pipeline_args=resolved)
+        pipeline_args=resolved,
+        verbose=bool(getattr(args, 'verbose', False)))
   except check_cmd.CheckError as e:
     acts = None
     if '--trust-providers' in str(e):
@@ -1488,6 +1559,9 @@ def _check(args, extra_args, *, json_session, t0: float) -> int:
   except Exception as e:  # pylint: disable=broad-except
     raise _CliError(f'could not validate pipeline: {e}', EXIT_USAGE) from None
 
+  check_warnings = (
+      [report['plan_skipped_reason']] if report.get('plan_skipped_reason') else
+      [])
   if json_session.enabled:
     json_session.emit(
         output.build_envelope(
@@ -1495,11 +1569,14 @@ def _check(args, extra_args, *, json_session, t0: float) -> int:
             command='check',
             exit_code=EXIT_OK,
             duration_ms=int((time.monotonic() - t0) * 1000),
-            outputs=report))
+            outputs=report,
+            warnings=check_warnings))
   else:
     print(
         f"Valid Beam YAML ({report['mode']}): {report['transform_count']} "
         f"transform(s), plan_hash={report['plan_hash']}")
+    for w in check_warnings:
+      print(f'warning: {w}', file=sys.stderr)
   return EXIT_OK
 
 
@@ -1522,6 +1599,7 @@ def _diff(args, extra_args, *, json_session, t0: float) -> int:
         right_opts=args.right_opts,
         rtol=args.rtol,
         atol=args.atol,
+        columns=args.columns,
         max_bytes=args.max_bytes,
         pipeline_args=resolved_args,
         default_project=proj)
@@ -1752,6 +1830,182 @@ def _run(args, pipeline_args, *, json_session, t0: float) -> int:
       t0=t0)
 
 
+_PRISM_AVAILABLE_CACHE: bool | None = None
+
+
+def _can_use_prism_locally() -> bool:
+  """Probes in <0.1ms whether PrismRunner has an executable cached binary & localhost socket."""
+  global _PRISM_AVAILABLE_CACHE
+  if _PRISM_AVAILABLE_CACHE is not None:
+    return _PRISM_AVAILABLE_CACHE
+  import socket
+  try:
+    prism_bin_dir = os.path.expanduser('~/.apache_beam/cache/prism/bin')
+    if not os.path.isdir(prism_bin_dir):
+      _PRISM_AVAILABLE_CACHE = False
+      return False
+    bins = [
+        os.path.join(prism_bin_dir, f) for f in os.listdir(prism_bin_dir)
+        if not f.startswith('.')
+    ]
+    candidates = [b for b in bins if os.access(b, os.X_OK)]
+    if not candidates:
+      _PRISM_AVAILABLE_CACHE = False
+      return False
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+      sock.bind(('127.0.0.1', 0))
+    # The executable bit is not enough: sandboxes (and noexec home dirs) deny
+    # exec of the cached binary with PermissionError, which used to surface as
+    # a Prism startup traceback. Run it once, briefly, to be sure.
+    _PRISM_AVAILABLE_CACHE = any(_prism_binary_runs(b) for b in candidates)
+  except OSError:
+    _PRISM_AVAILABLE_CACHE = False
+  return _PRISM_AVAILABLE_CACHE
+
+
+def _prism_binary_runs(path: str) -> bool:
+  """True if the cached Prism binary at `path` can be executed."""
+  import subprocess
+  try:
+    subprocess.run([path, '--help'],
+                   stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL,
+                   timeout=5,
+                   check=False)
+    return True
+  except (OSError, subprocess.SubprocessError):
+    return False
+
+
+_EXACT_LOCAL_FILE_EXTENSIONS = frozenset([
+    '.parquet',
+    '.pq',
+    '.json',
+    '.jsonl',
+    '.ndjson',
+    '.csv',
+    '.tsv',
+    '.avro',
+    '.txt',
+])
+
+
+def _materialize_single_local_file(
+    prefix: str, written: list[str]) -> list[str]:
+  """Materializes sharded local output onto exact `prefix` when explicit."""
+  if not prefix or not written or '://' in prefix:
+    return written
+  if any(ch in prefix for ch in '*?['):
+    return written
+  ext = os.path.splitext(prefix)[1].lower()
+  if ext not in _EXACT_LOCAL_FILE_EXTENSIONS:
+    return written
+  if os.path.exists(prefix):
+    return written
+  if not all(os.path.isfile(p) for p in written):
+    return written
+
+  if len(written) == 1:
+    os.replace(written[0], prefix)
+    return [prefix]
+
+  total_bytes = sum(os.path.getsize(p) for p in written)
+  if total_bytes > 256 * 1024 * 1024:
+    return written
+
+  tmp_path = f'{prefix}.tmp.{os.getpid()}'
+  try:
+    if ext in ('.parquet', '.pq'):
+      import pyarrow as pa
+      import pyarrow.parquet as pq
+      tables = [pq.read_table(p) for p in written]
+      merged = pa.concat_tables(tables, promote_options='default')
+      pq.write_table(merged, tmp_path)
+    elif ext in ('.csv', '.tsv'):
+      with open(tmp_path, 'wb') as out_f:
+        wrote_header = False
+        for idx, p in enumerate(written):
+          with open(p, 'rb') as in_f:
+            if idx == 0 or not wrote_header:
+              data = in_f.read()
+              if data:
+                out_f.write(data)
+                if not data.endswith(b'\n'):
+                  out_f.write(b'\n')
+                wrote_header = True
+            else:
+              _ = in_f.readline()
+              rest = in_f.read()
+              if rest:
+                out_f.write(rest)
+                if not rest.endswith(b'\n'):
+                  out_f.write(b'\n')
+    elif ext == '.avro':
+      import fastavro
+      records = []
+      schema = None
+      for p in written:
+        with open(p, 'rb') as in_f:
+          rdr = fastavro.reader(in_f)
+          if schema is None:
+            schema = rdr.writer_schema
+          records.extend(rdr)
+      if schema is None:
+        return written
+      with open(tmp_path, 'wb') as out_f:
+        fastavro.writer(out_f, schema, records)
+    else:
+      with open(tmp_path, 'wb') as out_f:
+        for p in written:
+          with open(p, 'rb') as in_f:
+            data = in_f.read()
+          if data:
+            out_f.write(data)
+            if not data.endswith(b'\n'):
+              out_f.write(b'\n')
+    os.replace(tmp_path, prefix)
+    for p in written:
+      if p != prefix and os.path.exists(p):
+        try:
+          os.unlink(p)
+        except OSError:
+          pass
+    return [prefix]
+  except Exception:  # pylint: disable=broad-except
+    if os.path.exists(tmp_path):
+      try:
+        os.unlink(tmp_path)
+      except OSError:
+        pass
+    return written
+
+
+def _cleanup_empty_beam_temp_dirs(prefix: str | None) -> None:
+  """Prunes empty `.temp*` sibling directories left by local FileBasedSink."""
+  if not prefix or '://' in prefix:
+    return
+  clean_prefix = prefix.split('*', 1)[0].split('?', 1)[0]
+  parent = os.path.dirname(clean_prefix) or '.'
+  if not os.path.isdir(parent):
+    return
+  try:
+    entries = os.listdir(parent)
+  except OSError:
+    return
+  for name in entries:
+    if not name.startswith('.temp'):
+      continue
+    cand = os.path.join(parent, name)
+    if not os.path.isdir(cand) or os.path.islink(cand):
+      continue
+    for root, _dirs, _files in os.walk(cand, topdown=False):
+      try:
+        os.rmdir(root)
+      except OSError:
+        # Non-empty directory (e.g. concurrent job); never delete files!
+        pass
+
+
 def _pipe(
     args,
     pipeline_args,
@@ -1779,6 +2033,237 @@ def _pipe(
   explicit_runner = _extract_runner_from_args(resolved_args)
   is_local_runner = _runner_name(explicit_runner) in _LOCAL_RUNNERS
 
+  raw_sources = list(args.sources or [])
+  raw_joins = list(args.joins or [])
+  is_sql_mode = bool(args.sql is not None or raw_joins or len(raw_sources) > 1)
+  allow_jinja = bool(args.dry_run)
+
+  if is_sql_mode:
+    from . import pipe_sql
+    from . import uris
+    if args.sql is None:
+      raise _CliError(
+          'multiple --from sources or --join requires --sql "SELECT ..."',
+          EXIT_USAGE)
+    if args.where or args.select or args.cdc or args.zero_copy:
+      raise _CliError(
+          '--sql cannot be combined with --where, --select, --cdc, or '
+          '--zero-copy; express filters and projections inside --sql',
+          EXIT_USAGE)
+    try:
+      parsed_from_opts = uris.parse_kv_options(
+          args.from_opts, args.from_opt_file, '--from-opt')
+      parsed_to_opts = uris.parse_kv_options(
+          args.to_opts, args.to_opt_file, '--to-opt')
+      named_sources = pipe_sql.parse_named_sources(
+          raw_sources,
+          raw_joins,
+          from_format=args.from_format or args.format,
+          from_opts=parsed_from_opts,
+          default_project=default_proj,
+          allow_sniff=not allow_jinja,
+          allow_jinja=allow_jinja)
+      sink_ep = (
+          uris.parse_endpoint(
+              args.sink,
+              is_read=False,
+              explicit_format=args.to_format or args.format,
+              options=parsed_to_opts,
+              if_exists=args.if_exists,
+              default_project=default_proj,
+              allow_jinja=allow_jinja) if args.sink else None)
+      dlq_sql_default_fmt = None
+      if args.dlq and not args.dlq_format:
+        if not (uris.extension_of(args.dlq) or (
+            '://' in args.dlq and
+            args.dlq.split('://', 1)[0].lower() not in uris.FILE_SCHEMES)):
+          dlq_sql_default_fmt = (
+              (uris._infer_jinja_file_format(args.dlq) or 'json')
+              if allow_jinja and uris._has_jinja_syntax(args.dlq) else 'json')
+      dlq_ep = (
+          uris.parse_endpoint(
+              args.dlq,
+              is_read=False,
+              explicit_format=args.dlq_format or dlq_sql_default_fmt,
+              if_exists='append' if args.if_exists == 'append' else 'fail',
+              default_project=default_proj,
+              allow_jinja=allow_jinja) if args.dlq else None)
+      sql_spec = pipe_sql.build_sql_yaml_spec(
+          named_sources, args.sql, sink_ep, allow_jinja=allow_jinja)
+    except (uris.UriError, pipe_sql.SqlPipeError) as e:
+      raise _CliError(str(e), EXIT_USAGE) from None
+    sql_null_values = _split_null_values(args.null_values)
+    if sql_null_values:
+      for ns in named_sources:
+        if ns.endpoint.kind == 'file' and ns.endpoint.format == 'csv':
+          ns.endpoint.config['null_values'] = sql_null_values
+
+    if args.max_bytes:
+      for ns in named_sources:
+        try:
+          cost_guard.check_max_bytes(
+              ns.endpoint, args.max_bytes, default_project=default_proj)
+        except cost_guard.CostLimitError as e:
+          raise _CliError(
+              str(e),
+              EXIT_COST_LIMIT,
+              extra={
+                  'estimated_bytes': e.estimated_bytes,
+                  'limit_bytes': e.limit_bytes,
+                  'outputs': {
+                      'estimated_bytes': e.estimated_bytes,
+                      'limit_bytes': e.limit_bytes,
+                  },
+              }) from None
+        except ValueError as e:
+          raise _CliError(str(e), EXIT_USAGE) from None
+
+    import yaml
+    dumper = getattr(yaml, 'CSafeDumper', yaml.SafeDumper)
+    sql_yaml_str = yaml.dump(
+        sql_spec, Dumper=dumper, sort_keys=False, width=100000)
+    sql_canon = json.dumps(sql_spec, sort_keys=True, separators=(',', ':'))
+    sql_plan_hash = (
+        'sha256:' + hashlib.sha256(sql_canon.encode('utf-8')).hexdigest())
+
+    local_sql_paths = [ns.uri for ns in named_sources]
+    if args.sink:
+      local_sql_paths.append(args.sink)
+    if args.dlq:
+      local_sql_paths.append(args.dlq)
+
+    if args.dry_run or not is_local_runner or (
+        sink_ep is not None and sink_ep.kind != 'file'):
+      if sink_ep is None and not args.dry_run:
+        raise _CliError(
+            'remote --sql execution requires --to <SINK>', EXIT_USAGE)
+      non_portable = pipe_sql.local_only_sql_functions(args.sql)
+      if non_portable:
+        print(
+            'warning: --sql uses ' + ', '.join(non_portable) + ', which run '
+            "locally but are not in Beam SQL's remote dialect (Calcite); the "
+            'exported or remote pipeline may fail to build',
+            file=sys.stderr)
+      return _run_yaml(
+          resolved_args,
+          args.verbose,
+          direct_yaml_text=sql_yaml_str,
+          command_name='pipe',
+          local_paths=local_sql_paths,
+          dry_run_yaml=pipe_spec.to_yaml(sql_spec, pipe_argv)
+          if args.dry_run else None,
+          output_prefix=sink_ep.output_prefix if sink_ep else None,
+          if_exists=args.if_exists,
+          dlq_prefix=dlq_ep.output_prefix if dlq_ep else None,
+          requires_java_xlang=True,
+          wait_timeout_sec=wait_timeout_sec,
+          raw_argv_for_idem=raw_argv,
+          plan_hash=sql_plan_hash,
+          json_session=json_session,
+          t0=t0)
+
+    # Local `<100ms` zero-JVM authorizer-sandboxed `:memory:` SQLite execution!
+    if any('://' in p for p in local_sql_paths):
+      from apache_beam.io.filesystems import FileSystems
+      from apache_beam.options.pipeline_options import PipelineOptions
+      FileSystems.set_options(PipelineOptions(resolved_args))
+
+    sink_prefix = (
+        sink_ep.output_prefix or sink_ep.config.get('path')
+        if sink_ep is not None else None)
+    if sink_prefix and '://' not in sink_prefix:
+      if args.if_exists == 'fail':
+        _refuse_existing_local_output(sink_prefix)
+      elif args.if_exists == 'replace':
+        _remove_existing_output_for_replace(sink_prefix)
+
+    try:
+      out_cols, out_rows, dlq_recs, total_read = pipe_sql.run_in_memory_sql(
+          named_sources,
+          args.sql,
+          default_project=default_proj,
+          enable_dlq=bool(dlq_ep is not None))
+      written_sql: list[str] = []
+      if sink_ep is not None:
+        if '://' in (sink_prefix or ''):
+          raise _CliError(
+              f'remote sink {args.sink!r} with --sql requires '
+              '--runner=DataflowRunner or a local destination path',
+              EXIT_USAGE)
+        written_sql = pipe_sql.write_rows_to_local_file(
+            out_cols, out_rows, sink_ep, if_exists=args.if_exists)
+      dlq_written: list[str] = []
+      if dlq_ep is not None:
+        dlq_written = pipe_sql.write_rows_to_local_file(
+            ['step', 'error_type', 'error', 'raw_payload'],
+            dlq_recs,
+            dlq_ep,
+            if_exists='append' if args.if_exists == 'append' else 'replace')
+    except (pipe_sql.SqlPipeError, FileNotFoundError) as e:
+      raise _CliError(str(e), EXIT_USAGE) from None
+    except ImportError as e:
+      raise _CliError(
+          f'a required package is missing: {e}', EXIT_MISSING_PACKAGE) from None
+    except Exception as e:  # pylint: disable=broad-except
+      _maybe_print_traceback(args.verbose)
+      raise _CliError(
+          f'SQL pipeline failed: {_summarize(e)}',
+          EXIT_PIPELINE_FAILED) from None
+
+    sql_metrics = {
+        'rows_read': int(total_read),
+        'rows_written': int(len(out_rows)),
+        'rows_filtered_out': 0,
+        'dlq_rows': int(len(dlq_recs)),
+    }
+    sql_outputs: dict[str, Any] = {
+        'files': written_sql,
+        'file_count': len(written_sql),
+        'row_count': len(out_rows),
+        'columns': out_cols,
+        'plan_hash': sql_plan_hash,
+    }
+    if dlq_written:
+      sql_outputs['dlq_files'] = dlq_written
+
+    if json_session.enabled:
+      preview_limit = 500
+      json_session.emit(
+          output.build_envelope(
+              ok=True,
+              command='pipe',
+              exit_code=EXIT_OK,
+              runner='local_sql',
+              state='DONE',
+              duration_ms=int((time.monotonic() - t0) * 1000),
+              metrics=sql_metrics,
+              outputs=sql_outputs,
+              untrusted_data=output.wrap_untrusted_rows(
+                  out_rows[:preview_limit],
+                  truncated=len(out_rows) > preview_limit)))
+    else:
+      if written_sql:
+        print('Done. Ran locally on SQLite SQL engine.')
+        print(
+            f'Wrote {len(written_sql)} '
+            f'file{"" if len(written_sql) == 1 else "s"}:')
+        for path in written_sql:
+          print('  ' + path)
+      else:
+        for r in out_rows:
+          print(json.dumps(r, default=str))
+    return EXIT_OK
+
+  if not args.sink:
+    raise _CliError('the following arguments are required: --to', EXIT_USAGE)
+
+  source_uri = raw_sources[0]
+  if '=' in source_uri and not os.path.exists(source_uri):
+    from . import pipe_sql as _ps_mod
+    m_alias = _ps_mod._ALIAS_PREFIX_RE.match(source_uri)
+    if m_alias and m_alias.group('uri').strip():
+      source_uri = m_alias.group('uri').strip()
+
   # Track row counters whenever `--json` or `--assert-counts` is active, except
   # when `--dry-run` is emitting clean minimal YAML without `--assert-counts`.
   want_counters = bool(
@@ -1787,7 +2272,7 @@ def _pipe(
 
   try:
     pipe = pipe_spec.build_pipe_spec(
-        args.source,
+        source_uri,
         args.sink,
         args.from_format or args.format,
         args.to_format or args.format,
@@ -1795,6 +2280,7 @@ def _pipe(
         select=args.select,
         dlq_sink=args.dlq,
         dlq_format=args.dlq_format,
+        null_values=_split_null_values(args.null_values),
         if_exists=args.if_exists,
         from_opts=args.from_opts,
         to_opts=args.to_opts,
@@ -1809,13 +2295,14 @@ def _pipe(
         cdc_op_col=args.cdc_op_col,
         cdc_seq_col=args.cdc_seq_col,
         zero_copy=bool(args.zero_copy),
-        prefer_python_lakehouse_and_cdc=bool(not args.dry_run))
+        prefer_python_lakehouse_and_cdc=bool(not args.dry_run),
+        allow_jinja=allow_jinja)
   except pipe_spec.PipeSpecError as e:
     raise _CliError(str(e), EXIT_USAGE) from None
 
   if pipe.is_unbounded and is_local_runner and not args.dry_run and not wait_timeout_sec:
     raise _CliError(
-        f'source {args.source!r} is an unbounded stream; pass '
+        f'source {source_uri!r} is an unbounded stream; pass '
         '--wait-timeout <DURATION> for a bounded local run, use `beam tail` '
         'for a non-destructive stream peek, or specify a remote runner '
         '(--runner=DataflowRunner)',
@@ -1845,7 +2332,7 @@ def _pipe(
   # (`<100 ms` pure-Python manifest synthesis with `bytes_copied == 0`).
   if args.zero_copy and not args.dry_run:
     from . import lakehouse
-    if ('://' in args.source or '://' in args.sink or any(
+    if ('://' in source_uri or '://' in args.sink or any(
         '://' in str(x) for x in (args.to_opts or ()))):
       from apache_beam.io.filesystems import FileSystems
       from apache_beam.options.pipeline_options import PipelineOptions
@@ -1877,7 +2364,7 @@ def _pipe(
     if args.verify:
       from . import diff
       diff_rc, diff_rep = diff.run_diff(
-          args.source,
+          source_uri,
           args.sink,
           keys=args.verify_keys,
           left_opts=args.from_opts,
@@ -1888,7 +2375,7 @@ def _pipe(
       zc_res['verify'] = diff_rep
       if diff_rc != EXIT_OK:
         raise _CliError(
-            f'--verify detected mismatch between {args.source} and {args.sink}',
+            f'--verify detected mismatch between {source_uri} and {args.sink}',
             EXIT_DIFF_MISMATCH,
             extra={'outputs': zc_res, 'metrics': zc_metrics})
 
@@ -1916,26 +2403,58 @@ def _pipe(
       args.if_exists == 'fail' and not args.dry_run):
     _refuse_existing_local_output(pipe.output_prefix)
 
+  # Small local file-to-file jobs run in-process, skipping the ~2 s Beam
+  # runner start-up (see fast_local.py for what qualifies).
+  from . import fast_local
+  fast_files = fast_local.plan(
+      pipe,
+      explicit_runner=explicit_runner,
+      dry_run=bool(args.dry_run),
+      cdc=bool(args.cdc),
+      zero_copy=bool(args.zero_copy),
+      verify=bool(args.verify),
+      if_exists=args.if_exists,
+      wait_timeout_sec=wait_timeout_sec)
+  if fast_files is not None:
+    fast_rc = _run_fast_local_pipe(
+        pipe, fast_files, args, json_session=json_session, t0=t0)
+    if fast_rc is not None:
+      return fast_rc
+
   import yaml
   dumper = getattr(yaml, 'CSafeDumper', yaml.SafeDumper)
-  yaml_str = yaml.dump(pipe.spec, Dumper=dumper, sort_keys=False)
+  yaml_str = yaml.dump(pipe.spec, Dumper=dumper, sort_keys=False, width=100000)
   canonical_spec = json.dumps(pipe.spec, sort_keys=True, separators=(',', ':'))
   plan_hash = 'sha256:' + hashlib.sha256(canonical_spec.encode('utf-8')).hexdigest()
 
-  local_check_paths = [args.source, args.sink]
+  local_check_paths = [source_uri, args.sink]
   if args.dlq:
     local_check_paths.append(args.dlq)
 
   post_checks = {
       'assert_counts': bool(args.assert_counts),
       'verify_diff': {
-          'left': args.source,
+          'left': source_uri,
           'right': args.sink,
           'keys': list(args.verify_keys),
           'left_opts': list(args.from_opts),
           'right_opts': list(args.to_opts),
       } if args.verify else None,
   }
+  explicit_sharding = any(
+      str(opt).split('=', 1)[0].strip() in ('num_shards', 'shard_name_template')
+      for opt in (args.to_opts or ()))
+
+  extra_warnings: list[str] = []
+  if args.dry_run and _bigquery_write_disposition(pipe.spec) == 'WRITE_EMPTY':
+    note = (
+        'the BigQuery sink uses write_disposition: WRITE_EMPTY (the default, '
+        '--if-exists fail): the job fails if the table already has rows and '
+        'never overwrites data; pass --if-exists append to add rows or '
+        '--if-exists replace to overwrite')
+    extra_warnings.append(note)
+    if not json_session.enabled:
+      print(f'note: {note}', file=sys.stderr)
 
   return _run_yaml(
       resolved_args,
@@ -1954,8 +2473,89 @@ def _pipe(
       raw_argv_for_idem=raw_argv,
       plan_hash=plan_hash,
       post_checks=post_checks,
+      explicit_sharding=explicit_sharding,
+      extra_warnings=extra_warnings,
       json_session=json_session,
       t0=t0)
+
+
+def _bigquery_write_disposition(spec: dict[str, Any]) -> str | None:
+  """The write_disposition of the first BigQuery sink in a pipe spec."""
+  for t in spec.get('pipeline', {}).get('transforms', []):
+    if 'BigQuery' in str(t.get('type', '')) and str(
+        t.get('type', '')).startswith(('Write', 'CliWrite')):
+      return (t.get('config') or {}).get('write_disposition')
+  return None
+
+
+def _split_null_values(raw: str | None) -> list[str] | None:
+  if not raw:
+    return None
+  return [v.strip() for v in raw.split(',') if v.strip()]
+
+
+def _run_fast_local_pipe(pipe, files, args, *, json_session, t0) -> int | None:
+  """Runs a qualifying `beam pipe` in-process; None falls back to Beam."""
+  from . import fast_local
+  from . import jobs
+  canonical_spec = json.dumps(pipe.spec, sort_keys=True, separators=(',', ':'))
+  plan_hash = 'sha256:' + hashlib.sha256(canonical_spec.encode('utf-8')).hexdigest()
+  if args.if_exists == 'replace':
+    _remove_existing_output_for_replace(pipe.output_prefix)
+  try:
+    res = fast_local.run(pipe, files)
+  except ImportError:
+    # pyarrow/fastavro missing: the Beam runner reports it properly.
+    return None
+  except fast_local.FastPipeError as e:
+    raise _CliError(f'pipeline failed: {e}', EXIT_PIPELINE_FAILED) from None
+  except (ValueError, FileNotFoundError) as e:
+    raise _CliError(
+        f'could not build the pipeline: {e}', EXIT_USAGE) from None
+  except Exception as e:  # pylint: disable=broad-except
+    _maybe_print_traceback(args.verbose)
+    raise _CliError(
+        f'pipeline failed: {_summarize(e)}', EXIT_PIPELINE_FAILED) from None
+
+  if args.assert_counts:
+    err_msg = jobs.check_assert_counts(res.metrics)
+    if err_msg:
+      raise _CliError(err_msg, EXIT_PIPELINE_FAILED)
+
+  # Same housekeeping as the runner path: drop empty `.temp*` dirs left by
+  # earlier Beam runs next to the outputs.
+  for prefix in (pipe.output_prefix,
+                 pipe.dlq_endpoint.output_prefix if pipe.dlq_endpoint else None):
+    if prefix:
+      _cleanup_empty_beam_temp_dirs(prefix)
+
+  outputs: dict[str, Any] = {
+      'files': res.files,
+      'file_count': len(res.files),
+      'plan_hash': plan_hash,
+  }
+  if pipe.dlq_endpoint is not None:
+    outputs['dlq_files'] = res.dlq_files
+  if json_session.enabled:
+    json_session.emit(
+        output.build_envelope(
+            ok=True,
+            command='pipe',
+            exit_code=EXIT_OK,
+            runner=fast_local.RUNNER_NAME,
+            state='DONE',
+            duration_ms=int((time.monotonic() - t0) * 1000),
+            metrics=res.metrics,
+            outputs=outputs))
+  else:
+    print(
+        'Done. Ran locally in-process (small local job; set '
+        f'{fast_local.DISABLE_ENV_VAR}=1 or pass --runner to use a Beam '
+        'runner).')
+    print(f'Wrote {len(res.files)} file{"" if len(res.files) == 1 else "s"}:')
+    for path in res.files:
+      print('  ' + path)
+  return EXIT_OK
 
 
 def _run_yaml(
@@ -1974,6 +2574,8 @@ def _run_yaml(
     raw_argv_for_idem: list[str] | None = None,
     plan_hash: str | None = None,
     post_checks: dict[str, Any] | None = None,
+    explicit_sharding: bool = False,
+    extra_warnings: list[str] | None = None,
     json_session=None,
     t0: float = 0.0,
 ) -> int:
@@ -1997,6 +2599,9 @@ def _run_yaml(
         "  Beam YAML needs the [yaml] extra: pip install 'apache-beam[yaml]'",
         EXIT_MISSING_PACKAGE) from None
 
+  from . import dlq as _dlq_mod
+  _dlq_mod.install_keyword_safe_row_hooks()
+
   # Bound local Java XLang expansion heap to 256MB when user hasn't set JVM opts.
   prev_java_opts = os.environ.get('JAVA_TOOL_OPTIONS')
   set_temp_java_opts = bool(requires_java_xlang and not prev_java_opts)
@@ -2005,11 +2610,21 @@ def _run_yaml(
 
   pipeline = None
   result = None
-  warnings_list: list[str] = []
+  warnings_list: list[str] = list(extra_warnings or ())
+  orig_runner_raw = None
+  switched_to_fnapi = False
   try:
     with contextlib.ExitStack() as stack:
       skip_xlang_dry_expand = False
-      if dry_run_yaml is not None and requires_java_xlang:
+      if dry_run_yaml is not None and '{{' in dry_run_yaml:
+        from . import package as pkg_mod
+        try:
+          pkg_mod._validate_yaml_with_jinja_placeholders(dry_run_yaml)
+          pkg_mod.extract_jinja_parameters(dry_run_yaml)
+        except pkg_mod.PackageError as e:
+          raise _CliError(str(e), e.exit_code) from None
+        skip_xlang_dry_expand = True
+      elif dry_run_yaml is not None and requires_java_xlang:
         from . import sql as sql_mod
         try:
           sql_mod._find_java()
@@ -2033,6 +2648,12 @@ def _run_yaml(
             options, constructor, display_data = (
                 yaml_main.build_pipeline_components_from_argv(
                     yaml_or_pipeline_argv))
+
+          orig_runner_raw = options.view_as(StandardOptions).runner
+          if (dry_run_yaml is None and _runner_name(orig_runner_raw) == 'direct'
+              and not requires_java_xlang and not _can_use_prism_locally()):
+            options.view_as(StandardOptions).runner = 'FnApiRunner'
+            switched_to_fnapi = True
 
           stack.enter_context(
               subprocess_server.JavaJarServer.beam_services(
@@ -2064,6 +2685,19 @@ def _run_yaml(
                   'Java',
                   'Service failed to start')):
             options = PipelineOptions(yaml_or_pipeline_argv)
+          elif (dry_run_yaml is not None and command_name == 'pipe' and (
+              isinstance(e, FileNotFoundError) or any(
+                  tok in str(e) for tok in (
+                      'Unable to get schema',
+                      'Found no files',
+                      'No files found',
+                      'no such file',
+                      'does not exist',
+                      'empty or has no header')))):
+            options = PipelineOptions(yaml_or_pipeline_argv)
+            warnings_list.append(
+                'Source files do not exist yet; emitted portable YAML without '
+                'live schema inspection.')
           else:
             _maybe_print_traceback(verbose)
             raise _CliError(
@@ -2095,7 +2729,9 @@ def _run_yaml(
               file=sys.stderr)
         return EXIT_OK
 
-      runner_raw = options.view_as(StandardOptions).runner
+      runner_raw = (
+          orig_runner_raw if switched_to_fnapi else
+          options.view_as(StandardOptions).runner)
       is_local = _runner_name(runner_raw) in _LOCAL_RUNNERS
       no_wait = options.view_as(StandardOptions).no_wait_until_finish
 
@@ -2131,6 +2767,12 @@ def _run_yaml(
 
       state = None
       timed_out = False
+      subproc_logger = logging.getLogger('apache_beam.utils.subprocess_server')
+      suppress_prism_log = bool(
+          not verbose and is_local and _runner_name(runner_raw) == 'direct')
+      prev_subproc_level = subproc_logger.level
+      if suppress_prism_log:
+        subproc_logger.setLevel(logging.CRITICAL)
       try:
         try:
           result = _execute_with_optional_timeout(
@@ -2156,6 +2798,11 @@ def _run_yaml(
             options.view_as(StandardOptions).runner = runner_raw
           else:
             raise
+        finally:
+          if switched_to_fnapi:
+            options.view_as(StandardOptions).runner = orig_runner_raw
+          if suppress_prism_log:
+            subproc_logger.setLevel(prev_subproc_level)
         result, state, timed_out = result
       except KeyboardInterrupt:
         raise
@@ -2203,7 +2850,7 @@ def _run_yaml(
               'detached': True,
               'job_id': job_id,
               'runner': str(runner_raw),
-              'state': str( getattr(result, 'state', 'RUNNING')),
+              'state': str(getattr(result, 'state', 'RUNNING')),
           },
           next_actions=next_acts)
 
@@ -2241,22 +2888,36 @@ def _run_yaml(
 
     outputs_dict: dict[str, Any] = {}
     written: list[str] = []
+    allow_materialize = bool(
+        is_local and command_name == 'pipe' and if_exists != 'append' and
+        not explicit_sharding)
     if output_prefix is not None:
       written = _matching_files(
           output_prefix, verbose, error_exit_code=EXIT_PIPELINE_FAILED)
+      if allow_materialize:
+        written = _materialize_single_local_file(output_prefix, written)
+      if is_local:
+        _cleanup_empty_beam_temp_dirs(output_prefix)
       outputs_dict['files'] = written
       outputs_dict['file_count'] = len(written)
     if dlq_prefix is not None:
       dlq_files = _matching_files(
           dlq_prefix, verbose, error_exit_code=EXIT_PIPELINE_FAILED)
+      if allow_materialize:
+        dlq_files = _materialize_single_local_file(dlq_prefix, dlq_files)
+      if is_local:
+        _cleanup_empty_beam_temp_dirs(dlq_prefix)
       outputs_dict['dlq_files'] = dlq_files
+    if is_local and local_paths:
+      for lp in local_paths:
+        _cleanup_empty_beam_temp_dirs(lp)
 
     if post_checks and post_checks.get('verify_diff'):
       from . import diff
       v_cfg = post_checks['verify_diff']
       v_right = (
-          output_prefix + '*'
-          if output_prefix is not None else v_cfg['right'])
+          written[0] if len(written) == 1 else
+          (output_prefix + '*' if output_prefix is not None else v_cfg['right']))
       diff_rc, diff_rep = diff.run_diff(
           v_cfg['left'],
           v_right,

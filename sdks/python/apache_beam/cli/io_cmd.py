@@ -268,5 +268,49 @@ def describe_connector(name: str) -> dict[str, Any]:
     if (item['name'] == key or item['read_transform'].lower() == key or
         item['write_transform'].lower() == key):
       return item
+  transform = describe_transform(name)
+  if transform is not None:
+    return transform
   valid = ', '.join(item['name'] for item in _CATALOG)
-  raise ValueError(f'unknown connector {name!r}; choose one of: {valid}')
+  raise ValueError(
+      f'unknown connector or transform {name!r}; connectors: {valid}; '
+      'transforms: Beam YAML names such as Filter, MapToFields, Sql, '
+      'Combine, Join, WindowInto')
+
+
+def describe_transform(name: str) -> dict[str, Any] | None:
+  """Describes a Beam YAML transform (e.g. Filter) for `beam io describe`.
+
+  Only transforms implemented inline in Python are introspected, because
+  asking a Java-backed provider for its schema can download expansion jars.
+  Returns None if `name` is not a Beam YAML transform.
+  """
+  from apache_beam.yaml import yaml_provider
+  providers = yaml_provider.standard_providers()
+  wanted = name.strip().lower()
+  # Language-specific transforms are registered as e.g. 'Filter-python'.
+  keys = [t for t in providers if t.lower().split('-')[0] == wanted]
+  if not keys:
+    return None
+  match = keys[0].split('-')[0]
+  inline = [
+      (t, p) for t in sorted(keys, key=lambda k: (k != match, k != f'{match}-python'))
+      for p in providers.get(t, [])
+      if isinstance(p, yaml_provider.InlineProvider)
+  ]
+  info: dict[str, Any] = {
+      'name': match,
+      'kind': 'yaml_transform',
+      'docs': 'https://beam.apache.org/documentation/sdks/yaml/',
+      'config_fields': [],
+      'description': '',
+  }
+  if inline:
+    t, provider = inline[0]
+    try:
+      schema = provider.config_schema(t)
+      info['config_fields'] = [f.name for f in schema.fields] if schema else []
+      info['description'] = (provider.description(t) or '').strip()
+    except Exception:  # pylint: disable=broad-except
+      pass
+  return info

@@ -62,7 +62,94 @@ def _patch_arrow_module(module) -> None:
     conv._cli_preview_patched = True
 
 
+def _make_arbitrary_field_row_tuple(type_name: str, subfields) -> type:
+  import operator
+  field_names = tuple(name for name, _ in subfields)
+  field_index = {name: idx for idx, name in enumerate(field_names)}
+  num_fields = len(field_names)
+
+  def _new(cls, *args, **kwargs):
+    if args and kwargs:
+      if len(args) + len(kwargs) != num_fields:
+        raise TypeError(
+            f'{type_name}() expected {num_fields} arguments, '
+            f'got {len(args) + len(kwargs)}')
+      vals = list(args) + [None] * (num_fields - len(args))
+      for k, v in kwargs.items():
+        idx = field_index.get(k)
+        if idx is None or idx < len(args):
+          raise TypeError(f'{type_name}() got unexpected keyword {k!r}')
+        vals[idx] = v
+      return tuple.__new__(cls, vals)
+    if kwargs:
+      if len(kwargs) != num_fields or set(kwargs) != set(field_names):
+        raise TypeError(
+            f'{type_name}() keyword mismatch: expected {field_names}')
+      return tuple.__new__(cls, (kwargs[name] for name in field_names))
+    if len(args) != num_fields:
+      raise TypeError(
+          f'{type_name}() expected {num_fields} arguments, got {len(args)}')
+    return tuple.__new__(cls, args)
+
+  ns = {
+      '__slots__': (),
+      '_fields': field_names,
+      '__annotations__': dict(subfields),
+      '__new__': _new,
+      '_asdict': lambda self: dict(zip(field_names, self)),
+      '_replace': lambda self, **kw: type(self)(
+          *(kw.get(f, v) for f, v in zip(field_names, self))),
+      '__repr__': lambda self: (
+          f'{type_name}(' +
+          ', '.join(f'{f}={v!r}' for f, v in zip(field_names, self)) + ')'),
+  }
+  cls = type(type_name, (tuple, ), ns)
+  for idx, name in enumerate(field_names):
+    if name not in ('count', 'index') and not name.startswith('__'):
+      setattr(cls, name, property(operator.itemgetter(idx)))
+  return cls
+
+
+def _patch_schemas_module(module) -> None:
+  st_cls = getattr(module, 'SchemaTranslation', None)
+  if st_cls is None or getattr(st_cls, '_cli_preview_patched', False):
+    return
+  orig_nt = st_cls.named_tuple_from_schema
+
+  def _safe_named_tuple_from_schema(self_st, schema):
+    try:
+      return orig_nt(self_st, schema)
+    except (ValueError, TypeError, SyntaxError):
+      from apache_beam import coders
+      from apache_beam.typehints import row_type
+      type_name = 'BeamSchema_{}'.format(schema.id.replace('-', '_'))
+      if schema.id in self_st.schema_registry.by_id:
+        return self_st.schema_registry.by_id[schema.id][0]
+      subfields = []
+      descriptions = {}
+      for field in schema.fields:
+        field_py_type = self_st.typing_from_runner_api(field.type)
+        if isinstance(field_py_type, row_type.RowTypeConstraint):
+          field_py_type = field_py_type.user_type
+        descriptions[field.name] = field.description
+        subfields.append((field.name, field_py_type))
+      user_type = _make_arbitrary_field_row_tuple(type_name, subfields)
+      setattr(
+          user_type,
+          '__reduce__',
+          module._named_tuple_reduce_method(schema.SerializeToString()))
+      setattr(user_type, '_field_descriptions', descriptions)
+      setattr(user_type, row_type._BEAM_SCHEMA_ID, schema.id)
+      self_st.schema_registry.add(user_type, schema)
+      coders.registry.register_coder(user_type, coders.RowCoder)
+      return user_type
+
+  st_cls.named_tuple_from_schema = _safe_named_tuple_from_schema
+  st_cls._cli_preview_patched = True
+
+
 def _patch_yaml_mapping_module(module) -> None:
+  import keyword
   orig_validate = getattr(module, 'validate_generic_expression', None)
   is_literal = getattr(module, 'is_literal', None)
   if (orig_validate is not None and is_literal is not None and
@@ -87,13 +174,45 @@ def _patch_yaml_mapping_module(module) -> None:
     _patched_validate._cli_preview_patched = True
     module.validate_generic_expression = _patched_validate
 
+  orig_expand = getattr(module, '_expand_python_mapping_func', None)
+  py_callable_mod = getattr(module, 'python_callable', None)
+  if (orig_expand is not None and py_callable_mod is not None and
+      not getattr(orig_expand, '_cli_preview_patched', False)):
+
+    def _patched_expand_py(
+        original_fields, expression=None, callable=None, path=None, name=None):
+      if expression and not (path and name):
+        if expression in original_fields:
+          src = f'def fn(__row__):\n  return getattr(__row__, {expression!r})'
+          return py_callable_mod.PythonCallableWithSource(src)
+        safe_fields = [
+            f for f in original_fields
+            if f.isidentifier() and not keyword.iskeyword(f)
+        ]
+        return orig_expand(
+            safe_fields,
+            expression=expression,
+            callable=callable,
+            path=path,
+            name=name)
+      return orig_expand(
+          original_fields,
+          expression=expression,
+          callable=callable,
+          path=path,
+          name=name)
+
+    _patched_expand_py._cli_preview_patched = True
+    module._expand_python_mapping_func = _patched_expand_py
+
 
 class _PreviewCliFinder(importlib.abc.MetaPathFinder):
-  """Redirects `apache_beam.cli.*` and patches Beam 2.75 Arrow/YAML modules."""
+  """Redirects `apache_beam.cli.*` and patches Beam 2.75 Arrow/YAML/Schema modules."""
   def __init__(self, cli_dir: Path):
     self._cli_dir = cli_dir
     self._patching_arrow = False
     self._patching_yaml_mapping = False
+    self._patching_schemas = False
 
   def find_spec(self, fullname, path, target=None):
     del target
@@ -111,6 +230,10 @@ class _PreviewCliFinder(importlib.abc.MetaPathFinder):
     if (fullname == 'apache_beam.typehints.arrow_type_compatibility' and
         not self._patching_arrow):
       return self._wrap_spec(fullname, path, _patch_arrow_module, '_patching_arrow')
+    if (fullname == 'apache_beam.typehints.schemas' and
+        not self._patching_schemas):
+      return self._wrap_spec(
+          fullname, path, _patch_schemas_module, '_patching_schemas')
     if (fullname == 'apache_beam.yaml.yaml_mapping' and
         not self._patching_yaml_mapping):
       return self._wrap_spec(
@@ -143,12 +266,18 @@ class _PreviewCliFinder(importlib.abc.MetaPathFinder):
 
 def install_runtime_hooks() -> Path:
   cli_dir = _locate_cli_dir()
-  if not any(isinstance(f, _PreviewCliFinder) for f in sys.meta_path):
-    sys.meta_path.insert(0, _PreviewCliFinder(cli_dir))
-  # Also patch if either module was already imported before hooks were installed.
+  sys.meta_path[:] = [
+      f for f in sys.meta_path
+      if type(f).__name__ != '_PreviewCliFinder'
+  ]
+  sys.meta_path.insert(0, _PreviewCliFinder(cli_dir))
+  # Also patch if any target module was already imported before hooks were installed.
   arrow_mod = sys.modules.get('apache_beam.typehints.arrow_type_compatibility')
   if arrow_mod is not None:
     _patch_arrow_module(arrow_mod)
+  schemas_mod = sys.modules.get('apache_beam.typehints.schemas')
+  if schemas_mod is not None:
+    _patch_schemas_module(schemas_mod)
   yaml_mod = sys.modules.get('apache_beam.yaml.yaml_mapping')
   if yaml_mod is not None:
     _patch_yaml_mapping_module(yaml_mod)

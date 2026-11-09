@@ -64,6 +64,8 @@ _DEFAULT_SEQ_COLS = (
     'seq',
     'updated_at',
 )
+# Sequence columns that belong to a CDC envelope rather than to the row data.
+_ENVELOPE_SEQ_COLS = frozenset(_DEFAULT_SEQ_COLS) - {'updated_at'}
 
 _UPSERT_OPS = frozenset([
     'c',
@@ -243,7 +245,9 @@ def parse_cdc_event(
     drop_meta = {
         c for c in (
             eff_op_col,
-            eff_seq_col,
+            # A sequence column that is ordinary data (e.g. updated_at) stays
+            # in the row; only CDC envelope sequence columns are dropped.
+            eff_seq_col if eff_seq_col in _ENVELOPE_SEQ_COLS else None,
             'beam_cdc_op',
             'beam_cdc_seq',
             'beam_cdc_hex_seq',
@@ -579,6 +583,67 @@ def cli_normalize_cdc(
               _NormalizeCdcDoFn(resolved_cols)).with_output_types(out_row_type))
 
   return _NormalizeCdcTransform()
+
+
+_CDC_META_COLUMNS = ('beam_cdc_op', 'beam_cdc_seq', 'beam_cdc_hex_seq')
+
+
+def cli_materialize_cdc(primary_key: list[str]):
+  """Collapses normalized CDC rows to the latest live row per primary key.
+
+  `beam pipe --cdc` inserts this after CliNormalizeCdc when the sink is a plain
+  file (Parquet, CSV, JSON, Avro). Unlike Iceberg or BigQuery CDC sinks, files
+  can't apply upserts and deletes, so writing the change rows directly would
+  produce every version of every key plus internal `beam_cdc_*` columns. For
+  each key this keeps the row with the highest `beam_cdc_seq`, drops the key
+  if that row is a DELETE, and removes the `beam_cdc_*` columns. If all
+  changes for a key share one sequence number (no ordering column was found)
+  it fails rather than guess. Superseded rows and deletes are counted in
+  `cdc_superseded_rows`.
+  """
+  import apache_beam as beam
+  from apache_beam.metrics import Metrics
+  from apache_beam.typehints import schemas
+  from apache_beam.typehints.row_type import RowTypeConstraint
+
+  pks = [str(k) for k in primary_key]
+
+  class _LatestLiveRowDoFn(beam.DoFn):
+    def __init__(self, names):
+      self._names = names
+      self._superseded = Metrics.counter('beam_cli', 'cdc_superseded_rows')
+
+    def process(self, keyed):
+      key, rows = keyed
+      rows = list(rows)
+      if len(rows) > 1 and len({r.beam_cdc_seq for r in rows}) == 1:
+        raise ValueError(
+            f'--cdc: {len(rows)} changes for primary key {key!r} share one '
+            'sequence number, so the latest cannot be chosen; pass '
+            '--cdc-seq-col COLUMN naming an ordering column (for example '
+            'updated_at or lsn)')
+      latest = max(rows, key=lambda r: r.beam_cdc_seq)
+      self._superseded.inc(len(rows) - 1)
+      if latest.beam_cdc_op == 'DELETE':
+        self._superseded.inc()
+        return
+      yield beam.Row(**{n: getattr(latest, n) for n in self._names})
+
+  class _MaterializeCdcTransform(beam.PTransform):
+    def expand(self, pcoll):
+      fields = [(name, typ)
+                for name, typ in schemas.named_fields_from_element_type(
+                    pcoll.element_type) if name not in _CDC_META_COLUMNS]
+      names = [name for name, _ in fields]
+      return (
+          pcoll
+          | 'KeyByPrimaryKey' >> beam.Map(
+              lambda r: (tuple(getattr(r, k) for k in pks), r))
+          | 'GroupVersions' >> beam.GroupByKey()
+          | 'LatestLiveRow' >> beam.ParDo(_LatestLiveRowDoFn(names))
+          .with_output_types(RowTypeConstraint.from_fields(fields)))
+
+  return _MaterializeCdcTransform()
 
 
 # ---------------------------------------------------------------------------

@@ -148,7 +148,8 @@ def build_dlq_normalizer_transform(
       "  msg = str(getattr(err_row, 'msg', None) or "
       "getattr(err_row, 'error_message', None) or "
       "getattr(err_row, 'error', None) or 'TransformError')\n"
-      "  head = msg.splitlines()[0].split(':', 1)[0].strip()\n"
+      "  first = msg.splitlines()[0] if msg else ''\n"
+      "  head = first.split('(', 1)[0].split(':', 1)[0].strip()\n"
       "  return head if head.isidentifier() else 'TransformError'\n")
   err_msg_src = (
       'def normalize_dlq(err_row):\n'
@@ -216,11 +217,57 @@ def cli_yaml_provider_spec() -> dict[str, Any]:
           ),
           'CliWriteToIceberg': 'apache_beam.cli.lakehouse.cli_write_to_iceberg',
           'CliNormalizeCdc': 'apache_beam.cli.cdc.cli_normalize_cdc',
+          'CliMaterializeCdc': 'apache_beam.cli.cdc.cli_materialize_cdc',
+          'CliRowifyNested': 'apache_beam.cli.dlq.cli_rowify_nested',
           'CliWriteToBigQueryCDC': (
               'apache_beam.cli.cdc.cli_write_to_bigquery_cdc'
           ),
       },
   }
+
+
+# Compressions Beam's CompressionTypes.AUTO handles that we open natively;
+# anything else on a local path still goes through FileSystems.
+_LOCAL_COMPRESSION_SUFFIXES = ('.gz', '.bz2')
+_OTHER_COMPRESSION_SUFFIXES = ('.zst', '.zstd', '.deflate', '.lzma', '.xz',
+                               '.snappy')
+
+
+def _match_paths(path: str) -> list[str]:
+  """Returns the sorted files matching `path` (a file, glob, or URI).
+
+  Local paths are matched with `glob` so callers such as the CSV schema
+  preflight and the fast local path don't import `apache_beam`.
+  """
+  if '://' not in path:
+    import glob
+    import os
+    if any(ch in path for ch in '*?['):
+      return sorted(p for p in glob.glob(path) if os.path.isfile(p))
+    return [path] if os.path.isfile(path) else []
+  from apache_beam.io.filesystems import FileSystems
+  return sorted(m.path for m in FileSystems.match([path])[0].metadata_list)
+
+
+def _open_auto(path: str):
+  """Opens `path` for binary reading, decompressing like Beam's AUTO mode."""
+  low = path.lower()
+  if '://' not in path and not low.endswith(_OTHER_COMPRESSION_SUFFIXES):
+    if low.endswith('.gz'):
+      import gzip
+      return gzip.open(path, 'rb')
+    if low.endswith('.bz2'):
+      import bz2
+      return bz2.open(path, 'rb')
+    return open(path, 'rb')
+  from apache_beam.io.filesystem import CompressionTypes
+  from apache_beam.io.filesystems import FileSystems
+  return FileSystems.open(path, compression_type=CompressionTypes.AUTO)
+
+
+def _has_leading_zero(v: str) -> bool:
+  digits = v[1:] if v.startswith(('+', '-')) else v
+  return len(digits) > 1 and digits.startswith('0') and digits.isdigit()
 
 
 def _is_int_cell(v: str) -> bool:
@@ -247,11 +294,29 @@ def _is_float_cell(v: str) -> bool:
     return False
 
 
-def _infer_scalar_kind(samples: list[str], *, allow_dirty: bool = False) -> str:
-  """Infers `'int'`, `'float'`, `'bool'`, or `'str'` across non-empty cells."""
-  non_empty = [s.strip() for s in samples if s.strip() != '']
+# Cells read as NULL. Like core ReadFromCsv, an empty field is NULL; extra
+# markers such as NA or NULL are opt-in (`--null-values`) because they can be
+# real values (NA is also North America).
+DEFAULT_CSV_NULL_VALUES = frozenset([''])
+
+
+def _is_null_cell(raw: str, null_values=DEFAULT_CSV_NULL_VALUES) -> bool:
+  return raw.strip() == '' or raw in null_values or raw.strip() in null_values
+
+
+def _infer_scalar_kind(
+    samples: list[str],
+    *,
+    allow_dirty: bool = False,
+    null_values=DEFAULT_CSV_NULL_VALUES) -> str:
+  """Infers `'int'`, `'float'`, `'bool'`, or `'str'` across non-null cells."""
+  non_empty = [s.strip() for s in samples if not _is_null_cell(s, null_values)]
   n = len(non_empty)
   if n == 0:
+    return 'str'
+  if any(_has_leading_zero(v) for v in non_empty):
+    # Zip codes and IDs like "00501": typing the column as int would drop
+    # the zeros from every value, so keep it as text.
     return 'str'
   n_bool = sum(1 for v in non_empty if v.lower() in ('true', 'false'))
   n_int = sum(1 for v in non_empty if _is_int_cell(v))
@@ -266,12 +331,13 @@ def _infer_scalar_kind(samples: list[str], *, allow_dirty: bool = False) -> str:
   return 'str'
 
 
-def _parse_cell(raw: str, kind: str) -> Any:
+def _parse_cell(
+    raw: str, kind: str, null_values=DEFAULT_CSV_NULL_VALUES) -> Any:
+  if _is_null_cell(raw, null_values):
+    return None
   if kind == 'str':
     return raw
   stripped = raw.strip()
-  if stripped == '':
-    return None
   if kind == 'int':
     return int(stripped)
   if kind == 'float':
@@ -291,12 +357,10 @@ def _preflight_csv_schema(
     delimiter: str = ',',
     sample_rows: int = 100,
     allow_dirty: bool = True,
+    null_values=DEFAULT_CSV_NULL_VALUES,
 ) -> tuple[list[str], dict[str, str]]:
   """Reads header + up to `sample_rows` well-formed rows to lock CSV schema."""
-  from apache_beam.io.filesystem import CompressionTypes
-  from apache_beam.io.filesystems import FileSystems
-
-  matches = FileSystems.match([path])[0].metadata_list
+  matches = _match_paths(path)
   if not matches:
     raise ValueError(f'no CSV files matched {path!r}')
 
@@ -304,9 +368,8 @@ def _preflight_csv_schema(
   col_samples: dict[str, list[str]] = {}
   collected = 0
 
-  for meta in sorted(matches, key=lambda m: m.path):
-    with FileSystems.open(
-        meta.path, compression_type=CompressionTypes.AUTO) as raw_stream:
+  for match_path in matches:
+    with _open_auto(match_path) as raw_stream:
       text_stream = io.TextIOWrapper(
           raw_stream, encoding='utf-8-sig', errors='replace', newline='')
       reader = csv.reader(text_stream, delimiter=delimiter)
@@ -339,30 +402,274 @@ def _preflight_csv_schema(
   if not header:
     raise ValueError(f'CSV source {path!r} is empty or has no header row')
   kinds = {
-      c: _infer_scalar_kind(col_samples[c], allow_dirty=allow_dirty)
+      c: _infer_scalar_kind(
+          col_samples[c], allow_dirty=allow_dirty, null_values=null_values)
       for c in header
   }
   return header, kinds
+
+
+def install_keyword_safe_row_hooks() -> None:
+  """Idempotently enables keyword/special column names in Beam Row schemas."""
+  import keyword
+  import operator
+  from apache_beam.typehints import schemas as schemas_mod
+  from apache_beam.yaml import yaml_mapping as yaml_map_mod
+
+  st_cls = getattr(schemas_mod, 'SchemaTranslation', None)
+  if st_cls is not None and not getattr(st_cls, '_cli_preview_patched', False):
+    orig_nt = st_cls.named_tuple_from_schema
+
+    def _make_kw_tuple(type_name: str, subfields) -> type:
+      fnames = tuple(name for name, _ in subfields)
+      fidx = {name: i for i, name in enumerate(fnames)}
+      nfields = len(fnames)
+
+      def _new(cls, *args, **kwargs):
+        if args and kwargs:
+          if len(args) + len(kwargs) != nfields:
+            raise TypeError(f'{type_name}() expected {nfields} args')
+          vals = list(args) + [None] * (nfields - len(args))
+          for k, v in kwargs.items():
+            idx = fidx.get(k)
+            if idx is None or idx < len(args):
+              raise TypeError(f'{type_name}() unexpected keyword {k!r}')
+            vals[idx] = v
+          return tuple.__new__(cls, vals)
+        if kwargs:
+          if len(kwargs) != nfields or set(kwargs) != set(fnames):
+            raise TypeError(f'{type_name}() keyword mismatch')
+          return tuple.__new__(cls, (kwargs[n] for n in fnames))
+        if len(args) != nfields:
+          raise TypeError(f'{type_name}() expected {nfields} args')
+        return tuple.__new__(cls, args)
+
+      cls = type(
+          type_name,
+          (tuple, ),
+          {
+              '__slots__': (),
+              '_fields': fnames,
+              '__annotations__': dict(subfields),
+              '__new__': _new,
+              '_asdict': lambda self: dict(zip(fnames, self)),
+              '_replace': lambda self, **kw: type(self)(
+                  *(kw.get(f, v) for f, v in zip(fnames, self))),
+              '__repr__': lambda self: (
+                  f'{type_name}(' +
+                  ', '.join(f'{f}={v!r}' for f, v in zip(fnames, self)) + ')'),
+          })
+      for idx, fname in enumerate(fnames):
+        if fname not in ('count', 'index') and not fname.startswith('__'):
+          setattr(cls, fname, property(operator.itemgetter(idx)))
+      return cls
+
+    def _safe_nt(self_st, schema):
+      try:
+        return orig_nt(self_st, schema)
+      except (ValueError, TypeError, SyntaxError):
+        from apache_beam import coders
+        from apache_beam.typehints import row_type
+        type_name = 'BeamSchema_{}'.format(schema.id.replace('-', '_'))
+        if schema.id in self_st.schema_registry.by_id:
+          return self_st.schema_registry.by_id[schema.id][0]
+        subfields = []
+        descriptions = {}
+        for field in schema.fields:
+          f_py = self_st.typing_from_runner_api(field.type)
+          if isinstance(f_py, row_type.RowTypeConstraint):
+            f_py = f_py.user_type
+          descriptions[field.name] = field.description
+          subfields.append((field.name, f_py))
+        ut = _make_kw_tuple(type_name, subfields)
+        setattr(
+            ut,
+            '__reduce__',
+            schemas_mod._named_tuple_reduce_method(schema.SerializeToString()))
+        setattr(ut, '_field_descriptions', descriptions)
+        setattr(ut, row_type._BEAM_SCHEMA_ID, schema.id)
+        self_st.schema_registry.add(ut, schema)
+        coders.registry.register_coder(ut, coders.RowCoder)
+        return ut
+
+    st_cls.named_tuple_from_schema = _safe_nt
+    st_cls._cli_preview_patched = True
+
+  orig_exp = getattr(yaml_map_mod, '_expand_python_mapping_func', None)
+  py_call = getattr(yaml_map_mod, 'python_callable', None)
+  if (orig_exp is not None and py_call is not None and
+      not getattr(orig_exp, '_cli_preview_patched', False)):
+
+    def _safe_exp(
+        original_fields, expression=None, callable=None, path=None, name=None):
+      if expression and not (path and name):
+        if expression in original_fields:
+          return py_call.PythonCallableWithSource(
+              f'def fn(__row__):\n  return getattr(__row__, {expression!r})')
+        safe_f = [
+            f for f in original_fields
+            if f.isidentifier() and not keyword.iskeyword(f)
+        ]
+        return orig_exp(
+            safe_f,
+            expression=expression,
+            callable=callable,
+            path=path,
+            name=name)
+      return orig_exp(
+          original_fields,
+          expression=expression,
+          callable=callable,
+          path=path,
+          name=name)
+
+    _safe_exp._cli_preview_patched = True
+    yaml_map_mod._expand_python_mapping_func = _safe_exp
+
+  _install_nested_row_attr_inference()
+
+
+def _nested_row_plan(fields) -> dict[str, Any]:
+  """Maps each field to a sub-plan if it is a (nullable) nested row, else None.
+
+  Used by `cli_rowify_nested` to know which values must become rows.
+  """
+  import typing
+  from apache_beam.typehints import native_type_compatibility as ntc
+  from apache_beam.typehints import schemas
+  from apache_beam.typehints.row_type import RowTypeConstraint
+  plan: dict[str, Any] = {}
+  for name, typ in fields:
+    args = [a for a in typing.get_args(typ) if a is not type(None)]
+    inner = args[0] if len(args) == 1 else typ
+    is_row = isinstance(inner, RowTypeConstraint) or ntc.match_is_named_tuple(
+        inner)
+    plan[name] = (
+        _nested_row_plan(schemas.named_fields_from_element_type(inner))
+        if is_row else None)
+  return plan
+
+
+def _rowify_value(value: Any, plan: dict[str, Any] | None) -> Any:
+  """Builds a beam.Row from a dict or row-like `value` following `plan`."""
+  import apache_beam as beam
+  if value is None or plan is None:
+    return value
+  get = value.get if isinstance(value, dict) else (
+      lambda n: getattr(value, n, None))
+  return beam.Row(**{n: _rowify_value(get(n), sub) for n, sub in plan.items()})
+
+
+def cli_rowify_nested():
+  """Converts nested struct values to rows that match the declared schema.
+
+  `beam pipe` adds this right after a Parquet or Avro source when `--where` or
+  `--select` is used. Beam's `ReadFromParquet(as_rows=True)` declares struct
+  columns as nested rows but yields plain dicts for them (apache/beam#41100), so
+  an expression such as `address.city` fails at runtime with
+  "'dict' object has no attribute 'city'". This is a no-op when the schema has
+  no nested rows. Structs inside lists are left unchanged.
+  """
+  import apache_beam as beam
+  from apache_beam.typehints import schemas
+
+  class _RowifyNested(beam.PTransform):
+    def expand(self, pcoll):
+      try:
+        fields = schemas.named_fields_from_element_type(pcoll.element_type)
+      except Exception:  # pylint: disable=broad-except
+        return pcoll
+      plan = _nested_row_plan(fields)
+      if not any(sub is not None for sub in plan.values()):
+        return pcoll
+      return pcoll | 'RowifyNested' >> beam.Map(_rowify_value, plan).with_output_types(
+          pcoll.element_type)
+
+  return _RowifyNested()
+
+
+def _install_nested_row_attr_inference() -> None:
+  """Lets type inference see through nested rows, e.g. `user.id`.
+
+  Called from `install_keyword_safe_row_hooks`. Released Beam's
+  `opcodes._getattr` only resolves fields on a RowTypeConstraint, so
+  `--select "user.id AS user_id"` on a nested JSON/Parquet field is inferred as
+  Any and WriteToParquet fails at construction. This mirrors the core fix
+  proposed upstream (apache/beam#41099): resolve
+  NamedTuple-typed rows and Optional[row] fields.
+  Idempotent, and a no-op if the installed Beam already resolves them.
+  """
+  import inspect
+  from apache_beam.typehints import native_type_compatibility as ntc
+  from apache_beam.typehints import opcodes
+  from apache_beam.typehints import row_type
+  from apache_beam.typehints import typehints
+
+  orig = opcodes._getattr
+  if getattr(orig, '_cli_preview_patched', False):
+    return
+
+  def _row_type_of(t):
+    if isinstance(t, row_type.RowTypeConstraint):
+      return t
+    if inspect.isclass(t) and ntc.match_is_named_tuple(t):
+      return row_type.RowTypeConstraint.from_user_type(t)
+    return None
+
+  def _nullable_row(t):
+    if not isinstance(t, typehints.UnionConstraint):
+      return None
+    non_none = [u for u in t.union_types if u is not type(None)]
+    return _row_type_of(non_none[0]) if len(non_none) == 1 else None
+
+  def _getattr(o, name):
+    result = orig(o, name)
+    if result is not typehints.Any:
+      return result
+    row = None
+    if isinstance(o, row_type.RowTypeConstraint) or (
+        inspect.isclass(o) and ntc.match_is_named_tuple(o)):
+      row = _row_type_of(o)
+      nullable = False
+    else:
+      row = _nullable_row(ntc.convert_to_beam_type(o))
+      nullable = True
+    if row is None or name not in dict(row._fields):
+      return result
+    field_type = row.get_type_for(name)
+    if not nullable:
+      return field_type
+    return typehints.Optional[ntc.convert_to_beam_type(field_type)]
+
+  _getattr._cli_preview_patched = True
+  opcodes._getattr = _getattr
 
 
 def read_csv_with_dlq(
     path: str,
     *,
     delimiter: str = ',',
+    null_values: Optional[list[str]] = None,
     error_handling: Optional[dict[str, Any]] = None,
 ):
-  """RFC-4180 multi-shard CSV Beam YAML source with structured DLQ output."""
+  """RFC-4180 multi-shard CSV Beam YAML source with structured DLQ output.
+
+  Empty fields, and any `null_values`, are read as NULL.
+  """
   import apache_beam as beam
   from apache_beam.io import fileio
   from apache_beam.metrics import Metrics
   from apache_beam.typehints.row_type import RowTypeConstraint
 
-  header, kinds = _preflight_csv_schema(path, delimiter=delimiter)
+  install_keyword_safe_row_hooks()
+  nulls = DEFAULT_CSV_NULL_VALUES | frozenset(null_values or ())
+  header, kinds = _preflight_csv_schema(
+      path, delimiter=delimiter, null_values=nulls)
   py_type_map = {
       'int': Optional[int],
       'float': Optional[float],
       'bool': Optional[bool],
-      'str': str,
+      'str': Optional[str],
   }
   good_row_type = RowTypeConstraint.from_fields([
       (col, py_type_map[kinds[col]]) for col in header
@@ -375,6 +682,8 @@ def read_csv_with_dlq(
   ])
   err_tag = (error_handling or {}).get('output', 'errors')
 
+  route_errors = bool(error_handling and 'output' in error_handling)
+
   class _ParseCsvShardDoFn(beam.DoFn):
     def __init__(self):
       self._rows_read = Metrics.counter('beam_cli', 'rows_read')
@@ -383,79 +692,16 @@ def read_csv_with_dlq(
     def process(self, readable_file):
       file_path = readable_file.metadata.path
       with readable_file.open() as raw_f:
-        wrapper = io.TextIOWrapper(
-            raw_f, encoding='utf-8-sig', errors='replace', newline='')
-        reader = csv.reader(wrapper, delimiter=delimiter)
-        row_index = 0
-        while True:
-          try:
-            cells = next(reader)
-          except StopIteration:
-            break
-          except csv.Error as exc:
-            self._rows_read.inc()
-            self._dlq_rows.inc()
-            yield beam.pvalue.TaggedOutput(
-                'errors',
-                beam.Row(
-                    step='ReadCsvWithDlq',
-                    error_type='CsvSyntaxError',
-                    error=str(exc),
-                    raw_payload=safe_json_dumps({
-                        'file': file_path,
-                        'row_index': row_index,
-                    })))
-            break
-
-          if row_index == 0 and [
-              c.strip() or f'col_{i}' for i, c in enumerate(cells)
-          ] == header:
-            row_index += 1
-            continue
-          row_index += 1
-          if not cells or (len(cells) == 1 and cells[0] == '' and
-                           len(header) > 1):
-            continue
-
+        for parsed, err in iter_csv_records(
+            file_path, raw_f, header, kinds, delimiter, nulls):
           self._rows_read.inc()
-          if len(cells) != len(header):
-            self._dlq_rows.inc()
-            yield beam.pvalue.TaggedOutput(
-                'errors',
-                beam.Row(
-                    step='ReadCsvWithDlq',
-                    error_type='ColumnCountMismatch',
-                    error=(
-                        f'expected {len(header)} columns, got {len(cells)}'),
-                    raw_payload=safe_json_dumps({
-                        'file': file_path,
-                        'row_index': row_index,
-                        'cells': cells,
-                    })))
+          if err is None:
+            yield beam.Row(**parsed)
             continue
-
-          parsed_vals: dict[str, Any] = {}
-          conv_err: Exception | None = None
-          bad_col = ''
-          for col_name, raw_cell in zip(header, cells):
-            try:
-              parsed_vals[col_name] = _parse_cell(raw_cell, kinds[col_name])
-            except Exception as exc:  # pylint: disable=broad-except
-              conv_err = exc
-              bad_col = col_name
-              break
-          if conv_err is not None:
-            self._dlq_rows.inc()
-            yield beam.pvalue.TaggedOutput(
-                'errors',
-                beam.Row(
-                    step='ReadCsvWithDlq',
-                    error_type=type(conv_err).__name__,
-                    error=f'column {bad_col!r}: {conv_err}',
-                    raw_payload=safe_json_dumps(dict(zip(header, cells)))))
-            continue
-
-          yield beam.Row(**parsed_vals)
+          if not route_errors:
+            raise ValueError(csv_fail_fast_message(err))
+          self._dlq_rows.inc()
+          yield beam.pvalue.TaggedOutput('errors', beam.Row(**err))
 
   class _ReadCsvWithDlqTransform(beam.PTransform):
     def expand(self, pbegin):
@@ -470,11 +716,190 @@ def read_csv_with_dlq(
       bad = outputs['errors']
       good.element_type = good_row_type
       bad.element_type = dlq_row_type
-      if error_handling and 'output' in error_handling:
+      if route_errors:
         return {'good': good, err_tag: bad}
       return good
 
   return _ReadCsvWithDlqTransform()
+
+
+def iter_csv_records(
+    file_path,
+    raw_f,
+    header,
+    kinds,
+    delimiter=',',
+    null_values=DEFAULT_CSV_NULL_VALUES):
+  """Parses one CSV file into `(row_dict, None)` or `(None, dlq_record)`.
+
+  Shared by the `ReadCsvWithDlq` DoFn and the fast local path so both apply
+  the same header handling, typing, and DLQ records. Every yielded item is
+  one record read; a header row matching `header` and blank lines are skipped.
+  """
+  wrapper = io.TextIOWrapper(
+      raw_f, encoding='utf-8-sig', errors='replace', newline='')
+  reader = csv.reader(wrapper, delimiter=delimiter)
+  row_index = 0
+  while True:
+    try:
+      cells = next(reader)
+    except StopIteration:
+      break
+    except csv.Error as exc:
+      yield None, {
+          'step': 'ReadCsvWithDlq',
+          'error_type': 'CsvSyntaxError',
+          'error': str(exc),
+          'raw_payload': safe_json_dumps({
+              'file': file_path,
+              'row_index': row_index,
+          }),
+      }
+      break
+
+    if row_index == 0 and [
+        c.strip() or f'col_{i}' for i, c in enumerate(cells)
+    ] == header:
+      row_index += 1
+      continue
+    row_index += 1
+    if not cells or (len(cells) == 1 and cells[0] == '' and len(header) > 1):
+      continue
+
+    if len(cells) != len(header):
+      yield None, {
+          'step': 'ReadCsvWithDlq',
+          'error_type': 'ColumnCountMismatch',
+          'error': f'expected {len(header)} columns, got {len(cells)}',
+          'raw_payload': safe_json_dumps({
+              'file': file_path,
+              'row_index': row_index,
+              'cells': cells,
+          }),
+      }
+      continue
+
+    parsed_vals: dict[str, Any] = {}
+    conv_err: Exception | None = None
+    bad_col = ''
+    for col_name, raw_cell in zip(header, cells):
+      try:
+        parsed_vals[col_name] = _parse_cell(
+            raw_cell, kinds[col_name], null_values)
+      except Exception as exc:  # pylint: disable=broad-except
+        conv_err = exc
+        bad_col = col_name
+        break
+    if conv_err is not None:
+      yield None, {
+          'step': 'ReadCsvWithDlq',
+          'error_type': type(conv_err).__name__,
+          'error': f'column {bad_col!r}: {conv_err}',
+          'raw_payload': safe_json_dumps(dict(zip(header, cells))),
+      }
+      continue
+    yield parsed_vals, None
+
+
+def csv_fail_fast_message(err: dict[str, Any], step: str = '') -> str:
+  """The error for a bad CSV record when no `--dlq` is configured."""
+  return (
+      f"{err['error_type']}: {err['error']}; CSV record: "
+      f"{err['raw_payload'][:200]}{step} (pass --dlq PATH to route bad "
+      'records instead of failing)')
+
+
+def _infer_json_kind(values: list[Any]) -> Any:
+  """Infers the schema "kind" of one JSON field from sampled non-null values.
+
+  Used by `read_json_with_dlq` at pipeline construction. A kind is either a
+  scalar name ('bool', 'int', 'float', 'str', 'json') or, for JSON objects, a
+  dict mapping field names to kinds. Kinds are plain strings/dicts rather than
+  typing objects so the parsing DoFn can compare them after it is pickled to a
+  worker (typing objects lose identity when unpickled). Mixed numeric/string
+  fields follow the CSV reader's rule: if at least 70% of 3+ samples are
+  numeric the field is numeric and the other values go to the DLQ.
+  """
+  n = len(values)
+  if n == 0:
+    return 'str'
+  objects = [v for v in values if isinstance(v, dict)]
+  if objects and len(objects) == n:
+    keys: dict[str, None] = {}
+    for obj in objects:
+      keys.update(dict.fromkeys(obj))
+    if not keys:
+      return 'json'
+    return {
+        k: _infer_json_kind([o[k] for o in objects if o.get(k) is not None])
+        for k in keys
+    }
+  if objects or any(isinstance(v, list) for v in values):
+    return 'json'
+  n_bool = sum(1 for v in values if isinstance(v, bool))
+  n_int = sum(1 for v in values if isinstance(v, int) and not isinstance(v, bool))
+  n_num = n_int + sum(1 for v in values if isinstance(v, float))
+  dirty_ok = n >= 3
+  if n_bool == n or (dirty_ok and n_bool / n >= 0.7):
+    return 'bool'
+  if n_int == n or (dirty_ok and n_int / n >= 0.7 and n_num == n_int):
+    return 'int'
+  if n_num == n or (dirty_ok and n_num / n >= 0.7):
+    return 'float'
+  return 'str'
+
+
+def _json_kind_type(kind: Any) -> Any:
+  """Maps a kind from `_infer_json_kind` to a nullable Beam field type."""
+  from apache_beam.typehints.row_type import RowTypeConstraint
+  if isinstance(kind, dict):
+    return Optional[RowTypeConstraint.from_fields([
+        (name, _json_kind_type(sub)) for name, sub in kind.items()
+    ])]
+  return {
+      'bool': Optional[bool],
+      'int': Optional[int],
+      'float': Optional[float],
+  }.get(kind, Optional[str])
+
+
+def _coerce_json_value(
+    value: Any, kind: Any, path: str, row_factory=None) -> Any:
+  """Converts one parsed JSON value to `kind`, raising ValueError on mismatch.
+
+  Runs inside the parsing DoFn *before* the row is yielded: a value that does
+  not match the schema would otherwise fail later in the row coder, outside
+  the DoFn's try block, where it can't be routed to the DLQ. `row_factory`
+  builds nested rows from keyword arguments (default: `beam.Row`).
+  """
+  if value is None:
+    return None
+  if isinstance(kind, dict):
+    if not isinstance(value, dict):
+      raise ValueError(
+          f'field {path!r}: expected a JSON object, got {type(value).__name__}')
+    if row_factory is None:
+      import apache_beam as beam
+      row_factory = beam.Row
+    return row_factory(
+        **{
+            name: _coerce_json_value(
+                value.get(name), sub, f'{path}.{name}', row_factory)
+            for name, sub in kind.items()
+        })
+  if kind == 'bool':
+    if isinstance(value, bool):
+      return value
+  elif kind == 'int':
+    if isinstance(value, int) and not isinstance(value, bool):
+      return value
+  elif kind == 'float':
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+      return float(value)
+  else:  # 'str' or 'json'
+    return value if isinstance(value, str) else json.dumps(value)
+  raise ValueError(
+      f'field {path!r}: expected {kind}, got {type(value).__name__} {value!r}')
 
 
 def read_json_with_dlq(
@@ -482,62 +907,31 @@ def read_json_with_dlq(
     *,
     error_handling: Optional[dict[str, Any]] = None,
 ):
-  """JSONL Beam YAML source routing corrupt JSON lines to DLQ."""
+  """JSONL Beam YAML source with a sampled schema and an optional DLQ.
+
+  The schema is inferred from up to 100 valid objects; nested objects become
+  nested rows so `--where`/`--select` can use `user.id`. With
+  `error_handling: {output: ...}` (the CLI's `--dlq`), malformed lines and
+  values that don't match the schema go to that output. Without it they fail
+  the pipeline with the file content's line, rather than being dropped.
+  """
   import apache_beam as beam
   from apache_beam.io import ReadFromText
-  from apache_beam.io.filesystem import CompressionTypes
-  from apache_beam.io.filesystems import FileSystems
   from apache_beam.metrics import Metrics
   from apache_beam.typehints.row_type import RowTypeConstraint
 
-  matches = FileSystems.match([path])[0].metadata_list
-  if not matches:
-    raise ValueError(f'no JSON files matched {path!r}')
-
-  col_types: dict[str, type] = {}
-  sampled = 0
-  for meta in sorted(matches, key=lambda m: m.path):
-    with FileSystems.open(
-        meta.path, compression_type=CompressionTypes.AUTO) as raw_s:
-      for raw_line in io.TextIOWrapper(raw_s, encoding='utf-8', errors='replace'):
-        line = raw_line.strip()
-        if not line:
-          continue
-        try:
-          obj = json.loads(line)
-        except ValueError:
-          continue
-        if isinstance(obj, dict):
-          for k, v in obj.items():
-            if v is not None and k not in col_types:
-              if isinstance(v, bool):
-                col_types[k] = Optional[bool]
-              elif isinstance(v, int):
-                col_types[k] = Optional[int]
-              elif isinstance(v, float):
-                col_types[k] = Optional[float]
-              else:
-                col_types[k] = Optional[str]
-            elif k not in col_types:
-              col_types[k] = Optional[str]
-          sampled += 1
-        if sampled >= 100:
-          break
-    if sampled >= 100:
-      break
-
-  if not col_types:
-    raise ValueError(
-        f'could not infer JSON object schema from {path!r} (no valid objects)')
-
-  cols = list(col_types.keys())
-  good_row_type = RowTypeConstraint.from_fields([(c, col_types[c]) for c in cols])
+  kinds = infer_json_kinds(path)
+  install_keyword_safe_row_hooks()
+  good_row_type = RowTypeConstraint.from_fields([
+      (name, _json_kind_type(kind)) for name, kind in kinds.items()
+  ])
   dlq_row_type = RowTypeConstraint.from_fields([
       ('step', str),
       ('error_type', str),
       ('error', str),
       ('raw_payload', str),
   ])
+  route_errors = bool(error_handling and 'output' in error_handling)
   err_tag = (error_handling or {}).get('output', 'errors')
 
   class _ParseJsonLineDoFn(beam.DoFn):
@@ -551,29 +945,15 @@ def read_json_with_dlq(
         return
       self._rows_read.inc()
       try:
-        obj = json.loads(stripped)
-        if not isinstance(obj, dict):
-          raise ValueError('expected JSON object per line')
-        row_kwargs = {}
-        for c in cols:
-          val = obj.get(c)
-          if val is not None and col_types[c] is Optional[str] and not isinstance(
-              val, str):
-            val = json.dumps(val)
-          elif val is not None and col_types[c] is Optional[float] and isinstance(
-              val, int) and not isinstance(val, bool):
-            val = float(val)
-          row_kwargs[c] = val
-        yield beam.Row(**row_kwargs)
+        row = parse_json_record(stripped, kinds, beam.Row)
       except Exception as exc:  # pylint: disable=broad-except
+        if not route_errors:
+          raise ValueError(json_fail_fast_message(stripped, exc)) from exc
         self._dlq_rows.inc()
         yield beam.pvalue.TaggedOutput(
-            'errors',
-            beam.Row(
-                step='ReadJsonWithDlq',
-                error_type=type(exc).__name__,
-                error=str(exc),
-                raw_payload=safe_json_dumps({'raw_line': stripped[:4096]})))
+            'errors', beam.Row(**json_dlq_record(stripped, exc)))
+        return
+      yield row
 
   class _ReadJsonWithDlqTransform(beam.PTransform):
     def expand(self, pbegin):
@@ -586,11 +966,77 @@ def read_json_with_dlq(
       bad = outputs['errors']
       good.element_type = good_row_type
       bad.element_type = dlq_row_type
-      if error_handling and 'output' in error_handling:
+      if route_errors:
         return {'good': good, err_tag: bad}
       return good
 
   return _ReadJsonWithDlqTransform()
+
+
+def infer_json_kinds(path: str) -> dict[str, Any]:
+  """Infers field kinds from up to 100 valid JSON objects in `path`."""
+  matches = _match_paths(path)
+  if not matches:
+    raise ValueError(f'no JSON files matched {path!r}')
+
+  samples: list[dict[str, Any]] = []
+  for match_path in matches:
+    with _open_auto(match_path) as raw_s, io.TextIOWrapper(
+        raw_s, encoding='utf-8', errors='replace') as text_s:
+      for raw_line in text_s:
+        line = raw_line.strip()
+        if not line:
+          continue
+        try:
+          obj = json.loads(line)
+        except ValueError:
+          continue
+        if isinstance(obj, dict):
+          samples.append(obj)
+        if len(samples) >= 100:
+          break
+    if len(samples) >= 100:
+      break
+
+  if not samples:
+    raise ValueError(
+        f'could not infer JSON object schema from {path!r} (no valid objects)')
+  kinds = _infer_json_kind(samples)
+  if not isinstance(kinds, dict):
+    raise ValueError(
+        f'could not infer JSON object schema from {path!r} (objects have no '
+        'fields)')
+  return kinds
+
+
+def parse_json_record(stripped: str, kinds: dict[str, Any], row_factory):
+  """Parses one stripped JSONL line into a row, raising on any mismatch."""
+  obj = json.loads(stripped)
+  if not isinstance(obj, dict):
+    raise ValueError('expected JSON object per line')
+  return row_factory(
+      **{
+          name: _coerce_json_value(obj.get(name), kind, name, row_factory)
+          for name, kind in kinds.items()
+      })
+
+
+def json_dlq_record(stripped: str, exc: Exception) -> dict[str, Any]:
+  """The DLQ record for a JSONL line that failed `parse_json_record`."""
+  return {
+      'step': 'ReadJsonWithDlq',
+      'error_type': type(exc).__name__,
+      'error': str(exc),
+      'raw_payload': safe_json_dumps({'raw_line': stripped[:4096]}),
+  }
+
+
+def json_fail_fast_message(
+    stripped: str, exc: Exception, step: str = '') -> str:
+  """The error for a bad JSONL line when no `--dlq` is configured."""
+  return (
+      f'{type(exc).__name__}: {exc} in JSON line {stripped[:200]!r}{step} '
+      '(pass --dlq PATH to route bad records instead of failing)')
 
 
 def cli_count_rows(counter: str = 'rows_read'):
