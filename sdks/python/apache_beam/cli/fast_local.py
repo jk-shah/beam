@@ -191,10 +191,11 @@ def plan(
     max_input_bytes: int | None = None,
 ) -> list[str] | None:
   """Returns the matched input files if `pipe` can run on the fast path."""
+  del cdc  # Materialize-to-file CDC is checked via `_transform_configs`.
   if os.environ.get(DISABLE_ENV_VAR, '').strip().lower() not in ('', '0',
                                                                  'false'):
     return None
-  if (explicit_runner or dry_run or cdc or zero_copy or verify or
+  if (explicit_runner or dry_run or zero_copy or verify or
       wait_timeout_sec or if_exists not in ('fail', 'replace') or
       pipe.is_unbounded):
     return None
@@ -225,22 +226,28 @@ def plan(
 
 
 def _transform_configs(spec: dict[str, Any]):
-  """Extracts `(where_cfg, select_cfg)` from the spec, or None if unknown.
+  """Extracts `(cdc_norm_cfg, cdc_mat_cfg, where_cfg, select_cfg)` or None.
 
   Returns None when the spec contains a step the fast path doesn't model, so
   new pipeline features fall back to the runner instead of being skipped.
   """
+  cdc_norm_cfg = None
+  cdc_mat_cfg = None
   where_cfg = None
   select_cfg = None
   known = {
       'ReadFromCsv', 'ReadCsvWithDlq', 'ReadFromJson', 'ReadJsonWithDlq',
-      'ReadFromParquet', 'ReadFromAvro', 'CliRowifyNested', 'CliCountRows',
-      'WriteToCsv', 'WriteToJson', 'WriteToParquet', 'Flatten'
+      'ReadFromText', 'ReadFromParquet', 'ReadFromAvro', 'CliRowifyNested',
+      'CliCountRows', 'WriteToCsv', 'WriteToJson', 'WriteToParquet', 'Flatten'
   }
   for t in spec.get('pipeline', {}).get('transforms', []):
     t_type = t.get('type')
     name = str(t.get('name', ''))
-    if t_type == 'Filter':
+    if t_type == 'CliNormalizeCdc':
+      cdc_norm_cfg = t.get('config', {})
+    elif t_type == 'CliMaterializeCdc':
+      cdc_mat_cfg = t.get('config', {})
+    elif t_type == 'Filter':
       where_cfg = t.get('config', {})
     elif t_type == 'MapToFields' and name.startswith('Normalize'):
       continue
@@ -248,10 +255,12 @@ def _transform_configs(spec: dict[str, Any]):
       select_cfg = t.get('config', {})
     elif t_type not in known:
       return None
+  if (cdc_norm_cfg is not None) != (cdc_mat_cfg is not None):
+    return None
   for cfg in (where_cfg, select_cfg):
     if cfg is not None and cfg.get('language', 'python') != 'python':
       return None
-  return where_cfg, select_cfg
+  return cdc_norm_cfg, cdc_mat_cfg, where_cfg, select_cfg
 
 
 def _compile_callable(src: str):
@@ -372,7 +381,8 @@ def _read_source(
     }
 
   if fmt == 'json':
-    eff_sample = dlq.parse_sample_rows_opt(src.config.get('sample_rows'))
+    eff_sample = dlq.resolve_json_sample_rows(
+        files, src.config.get('sample_rows'))
     allow_unknown = (
         dlq.parse_unknown_fields_opt(src.config.get('on_unknown_fields')) ==
         'ignore')
@@ -458,7 +468,10 @@ def _typed_columns_outside_csv(groups) -> dict[str, str]:
     return {}
   kinds: dict[str, str] = {}
   if 'json' in groups:
-    for col, kind in dlq.infer_json_kinds(list(groups['json'])).items():
+    json_files = list(groups['json'])
+    for col, kind in dlq.infer_json_kinds(
+        json_files,
+        sample_rows=dlq.resolve_json_sample_rows(json_files)).items():
       if kind in ('int', 'float', 'bool'):
         kinds[col] = kind
   if 'parquet' in groups:
@@ -609,6 +622,21 @@ def _stage_json_document(target: str, doc: Any) -> tuple[str, str]:
   return tmp_path, target
 
 
+def _arrow_type_to_kind(arrow_type: Any) -> str:
+  if arrow_type is None:
+    return 'str'
+  import pyarrow as pa
+  if pa.types.is_boolean(arrow_type):
+    return 'bool'
+  if pa.types.is_integer(arrow_type):
+    return 'int'
+  if pa.types.is_floating(arrow_type):
+    return 'float'
+  if pa.types.is_binary(arrow_type) or pa.types.is_large_binary(arrow_type):
+    return 'bytes'
+  return 'str'
+
+
 def run(
     pipe,
     files: list[str],
@@ -622,12 +650,80 @@ def run(
   formats, each file with its own reader. Existing outputs are kept untouched
   until every transform, count assertion, and staged write succeeds.
   """
-  where_cfg, select_cfg = _transform_configs(pipe.spec)
+  cdc_norm_cfg, cdc_mat_cfg, where_cfg, select_cfg = _transform_configs(
+      pipe.spec)
   route_errors = pipe.dlq_endpoint is not None
   dlq_records: list[dict[str, Any]] = []
   drift_state: dict[str, Any] = {'count': 0, 'fields': set()}
+  cdc_superseded = 0
+  cdc_preimage_skipped = 0
 
-  if mixed_groups:
+  if cdc_norm_cfg is not None:
+    from . import cdc as cdc_mod
+    pks = [str(k) for k in (cdc_norm_cfg.get('primary_key') or ())]
+    op_col = cdc_norm_cfg.get('op_col')
+    seq_col = cdc_norm_cfg.get('seq_col') or (
+        (cdc_mat_cfg or {}).get('sequence_column'))
+    if pipe.source_endpoint.format == 'json':
+      raw_records: list[Any] = []
+      for fp in files:
+        with dlq._open_auto(fp) as raw_f:
+          for raw_line in raw_f:
+            stripped = raw_line.decode('utf-8', errors='replace').strip()
+            if stripped:
+              raw_records.append(stripped)
+      rows_read = len(raw_records)
+      col_specs = [
+          (str(p[0]), str(p[1]))
+          for p in (cdc_norm_cfg.get('fields_spec') or ())
+      ]
+    else:
+      src_cols, src_rows, rows_read, src_types = _read_source(
+          pipe.source_endpoint,
+          files,
+          route_errors,
+          dlq_records,
+          drift_state=drift_state)
+      raw_records = src_rows
+      if cdc_norm_cfg.get('fields_spec'):
+        col_specs = [
+            (str(p[0]), str(p[1])) for p in cdc_norm_cfg['fields_spec']
+        ]
+      else:
+        col_specs = cdc_mod.resolve_cdc_source_columns(
+            [(c, _arrow_type_to_kind(src_types.get(c))) for c in src_cols],
+            primary_key=pks,
+            op_col=op_col,
+            seq_col=seq_col)
+    if not col_specs:
+      raise FastPipeError(
+          'Unable to infer CDC payload columns; pass --from-opt '
+          'fields="id:int,col:str,..." or target an existing table')
+    try:
+      (
+          columns, rows, cdc_superseded, cdc_preimage_skipped, cdc_drift_rows,
+          cdc_drift_fields) = cdc_mod.materialize_cdc_records(
+              raw_records,
+              col_specs=col_specs,
+              primary_key=pks,
+              cdc_format=str(cdc_norm_cfg.get('cdc_format', 'auto')),
+              op_col=op_col,
+              seq_col=seq_col,
+              strict_inferred_fields=bool(
+                  cdc_norm_cfg.get('strict_inferred_fields')),
+              on_unknown_fields=str(
+                  cdc_norm_cfg.get('on_unknown_fields', 'error')),
+              route_errors=route_errors,
+              row_factory=Row,
+              dlq_list=dlq_records)
+    except ValueError as exc:
+      raise FastPipeError(
+          f"{exc} [while running 'CliMaterializeCdc']") from None
+    if cdc_drift_rows:
+      drift_state['count'] = int(drift_state.get('count', 0)) + cdc_drift_rows
+      drift_state.setdefault('fields', set()).update(cdc_drift_fields)
+    types = {c: _kind_arrow_type(k) for c, k in col_specs}
+  elif mixed_groups:
     columns, rows, rows_read, types = _read_mixed(
         pipe.source_endpoint,
         mixed_groups,
@@ -690,8 +786,11 @@ def run(
 
   out_rows = [_plain(r) for r in rows]
   metrics: dict[str, int] = {'rows_read': rows_read, 'rows_written': len(out_rows)}
-  if where_cfg is not None:
-    metrics['rows_filtered_out'] = filtered_out
+  if cdc_superseded:
+    metrics['cdc_superseded_rows'] = cdc_superseded
+  if (where_cfg is not None or cdc_superseded > 0 or cdc_preimage_skipped > 0):
+    metrics['rows_filtered_out'] = (
+        filtered_out + cdc_superseded + cdc_preimage_skipped)
   if route_errors:
     metrics['dlq_rows'] = len(dlq_records)
   drift_count = int(drift_state.get('count', 0))

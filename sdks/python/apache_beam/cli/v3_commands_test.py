@@ -3196,9 +3196,31 @@ class UserFeedbackFixesTest(unittest.TestCase):
           rec['user']['badge'] = 'vip'
         f.write(json.dumps(rec) + '\n')
 
-    # 1. Without --dlq: fails fast naming the late field across fast_local,
-    #    Beam runner, and --sql!
+    # 0. Small local JSONL (<= 64 MB) auto-scans all rows out of the box (K1):
+    #    both `coupon` and `user.badge` are preserved with zero flags!
     for idx, env_vars in enumerate(({}, {'BEAM_CLI_NO_FAST_PATH': '1'})):
+      out_auto = os.path.join(self.tmp, f'auto_{idx}.jsonl')
+      rc, env, err = _run_json(
+          ['pipe', '--from', src_jsonl, '--to', out_auto, '--assert-counts'],
+          extra_env=env_vars)
+      self.assertEqual(rc, cli.EXIT_OK, err)
+      self.assertEqual(env['metrics']['rows_written'], 120)
+      with open(out_auto, 'r', encoding='utf-8') as f:
+        by_id = {r['id']: r for r in (json.loads(line) for line in f if line)}
+      self.assertEqual(by_id[105]['coupon'], 'SAVE10')
+      self.assertEqual(by_id[106]['user']['badge'], 'vip')
+      self.assertIsNone(by_id[1]['coupon'])
+
+    # Simulate large (>64 MB) / remote bounded-sample JSONL via env cap.
+    capped_fast = {'BEAM_CLI_JSON_AUTO_SCAN_MAX_BYTES': '100'}
+    capped_runner = {
+        'BEAM_CLI_JSON_AUTO_SCAN_MAX_BYTES': '100',
+        'BEAM_CLI_NO_FAST_PATH': '1',
+    }
+
+    # 1. Under bounded sampling without --dlq: fails fast naming the late field
+    #    across fast_local, Beam runner, and --sql!
+    for idx, env_vars in enumerate((capped_fast, capped_runner)):
       out_f = os.path.join(self.tmp, f'fail_{idx}.jsonl')
       rc, env, _ = _run_json(['pipe', '--from', src_jsonl, '--to', out_f],
                              extra_env=env_vars)
@@ -3207,17 +3229,19 @@ class UserFeedbackFixesTest(unittest.TestCase):
       self.assertIn('coupon', env['error']['message'])
       self.assertFalse(os.path.exists(out_f))
 
-    rc_sql, env_sql, _ = _run_json([
-        'pipe', '--from', src_jsonl, '--sql', 'SELECT id FROM source', '--to',
-        os.path.join(self.tmp, 'fail_sql.jsonl')
-    ])
+    rc_sql, env_sql, _ = _run_json(
+        [
+            'pipe', '--from', src_jsonl, '--sql', 'SELECT id FROM source',
+            '--to', os.path.join(self.tmp, 'fail_sql.jsonl')
+        ],
+        extra_env=capped_fast)
     self.assertEqual(rc_sql, cli.EXIT_USAGE)
     self.assertIn('SchemaDriftError', env_sql['error']['message'])
     self.assertIn('coupon', env_sql['error']['message'])
 
-    # 2. With --dlq: quarantines rows 105 & 106 with full raw_payload AND flags
-    #    warnings so an agent never misses the schema change on ok=True!
-    for idx, env_vars in enumerate(({}, {'BEAM_CLI_NO_FAST_PATH': '1'})):
+    # 2. With --dlq under bounded sampling: quarantines rows 105 & 106 with
+    #    full raw_payload AND flags warnings so an agent never misses it!
+    for idx, env_vars in enumerate((capped_fast, capped_runner)):
       out_ok = os.path.join(self.tmp, f'ok_{idx}.jsonl')
       dlq_ok = os.path.join(self.tmp, f'dlq_{idx}.jsonl')
       rc, env, err = _run_json(
@@ -3245,10 +3269,12 @@ class UserFeedbackFixesTest(unittest.TestCase):
     # Also verify --sql with --dlq quarantines & warns on late JSON fields.
     out_sql_ok = os.path.join(self.tmp, 'sql_ok.jsonl')
     dlq_sql_ok = os.path.join(self.tmp, 'sql_dlq.jsonl')
-    rc, env, err = _run_json([
-        'pipe', '--from', src_jsonl, '--sql', 'SELECT id FROM source', '--to',
-        out_sql_ok, '--dlq', dlq_sql_ok
-    ])
+    rc, env, err = _run_json(
+        [
+            'pipe', '--from', src_jsonl, '--sql', 'SELECT id FROM source',
+            '--to', out_sql_ok, '--dlq', dlq_sql_ok
+        ],
+        extra_env=capped_fast)
     self.assertEqual(rc, cli.EXIT_OK, err)
     self.assertEqual(env['metrics']['rows_written'], 118)
     self.assertEqual(env['metrics']['dlq_rows'], 2)
@@ -3256,9 +3282,8 @@ class UserFeedbackFixesTest(unittest.TestCase):
         any('quarantined to --dlq' in w for w in env['warnings']),
         env['warnings'])
 
-    # 3. --from-opt sample_rows=all widens schema discovery and preserves all
-    #    120 rows including late top-level and nested fields!
-    for idx, env_vars in enumerate(({}, {'BEAM_CLI_NO_FAST_PATH': '1'})):
+    # 3. --from-opt sample_rows=all overrides the cap and preserves all 120 rows!
+    for idx, env_vars in enumerate((capped_fast, capped_runner)):
       out_all = os.path.join(self.tmp, f'all_{idx}.jsonl')
       rc, env, err = _run_json(
           [
@@ -3276,13 +3301,139 @@ class UserFeedbackFixesTest(unittest.TestCase):
 
     # 4. --from-opt on_unknown_fields=ignore intentionally drops unknown fields.
     out_ign = os.path.join(self.tmp, 'ign.jsonl')
-    rc, env, err = _run_json([
-        'pipe', '--from', src_jsonl, '--to', out_ign, '--from-opt',
-        'on_unknown_fields=ignore', '--assert-counts'
-    ])
+    rc, env, err = _run_json(
+        [
+            'pipe', '--from', src_jsonl, '--to', out_ign, '--from-opt',
+            'on_unknown_fields=ignore', '--assert-counts'
+        ],
+        extra_env=capped_fast)
     self.assertEqual(rc, cli.EXIT_OK, err)
     self.assertEqual(env['metrics']['rows_written'], 120)
     self.assertEqual(env['warnings'], [])
+
+
+class Round10FixesTest(unittest.TestCase):
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp(prefix='beam-cli-r10-')
+
+  def tearDown(self):
+    shutil.rmtree(self.tmp, ignore_errors=True)
+
+  def test_local_fast_cdc_with_seq_ts_autodetect_and_select(self):
+    """K2: `--cdc` runs on `local_fast`, auto-detects `seq_ts`, & composes with `--select`."""
+    import pyarrow.parquet as pq
+
+    cdc_jsonl = os.path.join(self.tmp, 'sub_cdc.jsonl')
+    lines = [
+        json.dumps({'sub_id': 1, 'plan': 'basic', 'mrr': 19.0, 'op': 'UPSERT', 'seq_ts': '2026-11-01T10:00:00Z'}),
+        json.dumps({'sub_id': 1, 'plan': 'pro', 'mrr': 49.0, 'op': 'UPSERT', 'seq_ts': '2026-11-02T10:00:00Z'}),
+        json.dumps({'sub_id': 2, 'plan': 'team', 'mrr': 99.0, 'op': 'UPSERT', 'seq_ts': '2026-11-03T08:00:00Z'}),
+        json.dumps({'sub_id': 2, 'plan': 'team', 'mrr': 99.0, 'op': 'UPSERT', 'seq_ts': '2026-11-03T08:00:00Z'}),
+        json.dumps({'sub_id': 3, 'plan': 'basic', 'mrr': 19.0, 'op': 'UPSERT', 'seq_ts': '2026-11-01T08:00:00Z'}),
+        json.dumps({'sub_id': 3, 'plan': 'basic', 'mrr': 19.0, 'op': 'DELETE', 'seq_ts': '2026-11-02T08:00:00Z'}),
+        '{"sub_id": 99, "broken": ',
+    ]
+    with open(cdc_jsonl, 'w', encoding='utf-8') as f:
+      f.write('\n'.join(lines) + '\n')
+
+    for idx, env_vars in enumerate(({}, {'BEAM_CLI_NO_FAST_PATH': '1'})):
+      out_pq = os.path.join(self.tmp, f'live_{idx}.parquet')
+      dlq_jl = os.path.join(self.tmp, f'dlq_{idx}.jsonl')
+      rc, env, err = _run_json(
+          [
+              'pipe', '--from', cdc_jsonl, '--to', out_pq, '--dlq', dlq_jl,
+              '--cdc', '--primary-key', 'sub_id', '--select',
+              'sub_id, plan, mrr', '--assert-counts'
+          ],
+          extra_env=env_vars)
+      self.assertEqual(rc, cli.EXIT_OK, err)
+      if not env_vars:
+        self.assertEqual(env['runner'], 'local_fast')
+      self.assertEqual(env['metrics']['rows_read'], 7)
+      self.assertEqual(env['metrics']['rows_written'], 2)
+      self.assertEqual(env['metrics']['rows_filtered_out'], 4)
+      self.assertEqual(env['metrics']['dlq_rows'], 1)
+      rows = sorted(pq.read_table(out_pq).to_pylist(), key=lambda r: r['sub_id'])
+      self.assertEqual(
+          rows,
+          [
+              {'sub_id': 1, 'plan': 'pro', 'mrr': 49.0},
+              {'sub_id': 2, 'plan': 'team', 'mrr': 99.0},
+          ])
+
+  def test_comma_from_hint_and_sql_exact_percentile_and_duckdb_path_hint(self):
+    """K3 + K5: comma `--from` & DuckDB file-path hints; exact percentiles."""
+    a_csv = os.path.join(self.tmp, 'a.csv')
+    b_csv = os.path.join(self.tmp, 'b.csv')
+    with open(a_csv, 'w', encoding='utf-8') as f:
+      f.write('latency_ms\n10\n12\n15\n20\n25\n30\n45\n60\n80\n200\n')
+    with open(b_csv, 'w', encoding='utf-8') as f:
+      f.write('latency_ms\n50\n50\n60\n200\n')
+
+    # Comma-separated --from exits 2 cleanly without YAML line numbers.
+    rc, env, _ = _run_json([
+        'pipe', '--from', f'{a_csv},{b_csv}', '--to',
+        os.path.join(self.tmp, 'out.csv')
+    ])
+    self.assertEqual(rc, cli.EXIT_USAGE)
+    self.assertIn('comma-separated paths in --from', env['error']['message'])
+    self.assertIn('UNION ALL', env['error']['message'])
+
+    # `FROM source` works AND percentile returns exact 146.0 (no 145.9999999999999).
+    rc_a, env_a, err_a = _run_json([
+        'pipe', '--from', a_csv, '--sql',
+        'SELECT median(latency_ms) AS med, percentile(latency_ms, 95) AS p95 FROM source'
+    ])
+    self.assertEqual(rc_a, cli.EXIT_OK, err_a)
+    row_a = env_a['untrusted_data']['rows'][0]
+    self.assertEqual(row_a['med'], 27.5)
+    self.assertEqual(row_a['p95'], 146.0)
+
+    rc_b, env_b, err_b = _run_json([
+        'pipe', '--from', b_csv, '--sql',
+        'SELECT percentile(latency_ms, 90) AS p90 FROM source'
+    ])
+    self.assertEqual(rc_b, cli.EXIT_OK, err_b)
+    self.assertEqual(env_b['untrusted_data']['rows'][0]['p90'], 158.0)
+
+  def test_diff_explicit_column_subset(self):
+    """K4: `beam diff --columns col1,col2` compares only the requested subset."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    left_pq = os.path.join(self.tmp, 'left.parquet')
+    right_pq = os.path.join(self.tmp, 'right.parquet')
+    pq.write_table(
+        pa.Table.from_pylist([
+            {'item_id': 'I1', 'qty': 10, 'price': 5.0, 'updated_at': 'old'},
+            {'item_id': 'I2', 'qty': 3, 'price': 2.0, 'updated_at': 'old'},
+        ]),
+        left_pq)
+    pq.write_table(
+        pa.Table.from_pylist([
+            {'item_id': 'I1', 'qty': 10, 'price': 5.0, 'updated_at': 'new', 'extra': 1},
+            {'item_id': 'I2', 'qty': 3, 'price': 2.0, 'updated_at': 'new', 'extra': 2},
+        ]),
+        right_pq)
+
+    # Comparing only `qty,price` ignores `updated_at` and `extra` -> match!
+    rc, env, err = _run_json([
+        'diff', left_pq, right_pq, '--key', 'item_id', '--columns',
+        'qty,price'
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertTrue(env['outputs']['match'])
+    self.assertEqual(env['outputs']['summary']['matched_rows'], 2)
+    self.assertEqual(
+        env['outputs']['schema_diff']['compared_columns'], ['qty', 'price'])
+
+    # Unknown column in --columns exits 2 cleanly.
+    rc_bad, env_bad, _ = _run_json([
+        'diff', left_pq, right_pq, '--key', 'item_id', '--columns',
+        'qty,no_such_col'
+    ])
+    self.assertEqual(rc_bad, cli.EXIT_USAGE)
+    self.assertIn('no_such_col', env_bad['error']['message'])
 
 
 if __name__ == '__main__':

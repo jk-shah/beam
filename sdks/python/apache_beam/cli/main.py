@@ -806,12 +806,12 @@ def _build_parser():
       help='absolute float tolerance (default: 0.0)')
   diff_p.add_argument(
       '--columns',
-      choices=('shared', 'all'),
       default='shared',
+      metavar='MODE_OR_COLS',
       help=(
-          'shared (default): compare columns present on both sides and report '
-          'added/removed/retyped columns in schema_diff; all: compare the '
-          'union, treating a missing column as null'))
+          'shared (default): compare columns present on both sides; '
+          'all: compare the union (missing column = null); or '
+          'col1,col2,...: compare only the listed columns'))
   diff_p.add_argument(
       '--to',
       dest='sink',

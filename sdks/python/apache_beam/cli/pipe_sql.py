@@ -29,6 +29,7 @@ Supports:
 from __future__ import annotations
 
 import csv
+import decimal
 import glob
 import io
 import json
@@ -414,7 +415,8 @@ def load_endpoint_rows(
     raw_count = 0
     col_types: dict[str, str] = {}
     try:
-      eff_sample = dlq.parse_sample_rows_opt(ep.config.get('sample_rows'))
+      eff_sample = dlq.resolve_json_sample_rows(
+          files, ep.config.get('sample_rows'))
       allow_unknown = (
           dlq.parse_unknown_fields_opt(ep.config.get('on_unknown_fields')) ==
           'ignore')
@@ -649,26 +651,28 @@ class _Quantile:
 
   def __init__(self):
     self._values: list[float] = []
-    self._q: float | None = None
+    self._q_dec: decimal.Decimal | None = None
 
   def step(self, value, q=None):
     if q is not None:
-      self._q = float(q) / self.scale
+      self._q_dec = (
+          decimal.Decimal(str(q)) / decimal.Decimal(str(self.scale)))
     if value is not None:
       self._values.append(float(value))
 
   def finalize(self):
-    if not self._values or self._q is None:
+    if not self._values or self._q_dec is None:
       return None
-    if not 0.0 <= self._q <= 1.0:
+    if not decimal.Decimal(0) <= self._q_dec <= decimal.Decimal(1):
       raise ValueError(
           f'quantile must be between 0 and 1 (percentile between 0 and 100), '
-          f'got {self._q * self.scale}')
+          f'got {float(self._q_dec) * self.scale}')
     vals = sorted(self._values)
-    pos = (len(vals) - 1) * self._q
-    lo = math.floor(pos)
+    pos_dec = decimal.Decimal(len(vals) - 1) * self._q_dec
+    lo = int(pos_dec)
     hi = min(lo + 1, len(vals) - 1)
-    return vals[lo] + (vals[hi] - vals[lo]) * (pos - lo)
+    frac = float(pos_dec - lo)
+    return vals[lo] + (vals[hi] - vals[lo]) * frac
 
 
 class _Percentile(_Quantile):
@@ -677,7 +681,7 @@ class _Percentile(_Quantile):
 
 class _Median(_Quantile):
   def step(self, value):  # pylint: disable=arguments-differ
-    self._q = 0.5
+    self._q_dec = decimal.Decimal('0.5')
     super().step(value)
 
 
@@ -727,9 +731,10 @@ _SQL_DIALECT_HINTS = (
     (re.compile(r'no such function: (date_trunc|format_timestamp|extract)',
                 re.I),
      "use strftime(), e.g. strftime('%Y-%m', ts)"),
-    (re.compile(r'no such table', re.I),
-     'name each input with --from ALIAS=PATH / --join ALIAS=PATH and use the '
-     'alias in FROM; without an alias the table is named after the file'),
+    (re.compile(r'no such table|table .* does not exist|replacement scan', re.I),
+     'name each input with --from ALIAS=PATH / --join ALIAS=PATH (inputs are '
+     'pre-loaded as tables, never file paths; without an alias use the file '
+     'name or FROM source)'),
 )
 
 
@@ -892,11 +897,15 @@ def _run_duckdb(
       out_cols = [d[0] for d in (cur.description or [])]
       fetched = cur.fetchall()
     except duckdb.Error as e:
-      avail = ', '.join(ns.alias for ns in named_sources)
+      avail_list = [ns.alias for ns in named_sources]
+      if len(named_sources) == 1 and 'source' not in used_lower:
+        avail_list.append('source')
+      avail = ', '.join(avail_list)
       first_line = str(e).splitlines()[0]
       raise SqlPipeError(
           f'SQL execution error (DuckDB): {first_line} '
-          f'(available tables: {avail})') from None
+          f'(available tables: {avail})'
+          f'{_sql_error_hint(first_line, clean_q)}') from None
     return out_cols, [dict(zip(out_cols, t)) for t in fetched], total_read
   finally:
     con.close()
@@ -996,7 +1005,10 @@ def run_in_memory_sql(
       out_cols = [d[0] for d in (cur.description or [])]
       fetched = cur.fetchall()
     except sqlite3.Error as e:
-      avail = ', '.join(ns.alias for ns in named_sources)
+      avail_list = [ns.alias for ns in named_sources]
+      if len(named_sources) == 1 and 'source' not in used_lower:
+        avail_list.append('source')
+      avail = ', '.join(avail_list)
       raise SqlPipeError(
           f'SQL execution error: {e} (available tables: {avail})'
           f'{_sql_error_hint(str(e), clean_q)}') from None

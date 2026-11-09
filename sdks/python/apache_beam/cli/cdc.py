@@ -62,11 +62,21 @@ _DEFAULT_SEQ_COLS = (
     'lsn',
     'ts_ms',
     'sequence_number',
+    'seq_ts',
     'seq',
     'updated_at',
+    'event_ts',
+    'timestamp',
 )
 # Sequence columns that belong to a CDC envelope rather than to the row data.
-_ENVELOPE_SEQ_COLS = frozenset(_DEFAULT_SEQ_COLS) - {'updated_at'}
+_ENVELOPE_SEQ_COLS = frozenset([
+    'beam_cdc_seq',
+    '_commit_version',
+    '_commit_snapshot_sequence_number',
+    'lsn',
+    'ts_ms',
+    'sequence_number',
+])
 
 _UPSERT_OPS = frozenset([
     'c',
@@ -550,24 +560,8 @@ def cli_normalize_cdc(
         beam_schema = schemas.schema_from_element_type(pcoll.element_type)
         fnames = [f.name for f in beam_schema.fields]
         if set(fnames) not in ({'payload'}, {'line'}):
-          meta_skip = {
-              c for c in (
-                  op_col,
-                  # Like parse_cdc_event: a sequence column that is ordinary
-                  # data (--cdc-seq-col updated_at) stays in the output; only
-                  # CDC envelope sequence columns (lsn, ts_ms, ...) are dropped.
-                  seq_col if seq_col in _ENVELOPE_SEQ_COLS else None,
-                  'beam_cdc_op',
-                  'beam_cdc_seq',
-                  'beam_cdc_hex_seq',
-                  '_change_type',
-                  '_commit_version',
-                  '_commit_snapshot_sequence_number',
-              ) if c and c not in pks
-          }
+          raw_cols: list[tuple[str, str]] = []
           for f in beam_schema.fields:
-            if f.name in meta_skip:
-              continue
             atom = f.type.atomic_type
             if atom == schema_pb2.BOOLEAN:
               k = 'bool'
@@ -579,7 +573,9 @@ def cli_normalize_cdc(
               k = 'bytes'
             else:
               k = 'str'
-            resolved_cols.append((f.name, k))
+            raw_cols.append((f.name, k))
+          resolved_cols = resolve_cdc_source_columns(
+              raw_cols, primary_key=pks, op_col=op_col, seq_col=seq_col)
 
       if not resolved_cols:
         raise ValueError(
@@ -690,6 +686,145 @@ def cli_materialize_cdc(
           .with_output_types(RowTypeConstraint.from_fields(fields)))
 
   return _MaterializeCdcTransform()
+
+
+def resolve_cdc_source_columns(
+    source_cols: list[tuple[str, str]],
+    *,
+    primary_key: Iterable[str],
+    op_col: Optional[str] = None,
+    seq_col: Optional[str] = None,
+) -> list[tuple[str, str]]:
+  """Filters source `(col_name, kind)` pairs down to materialized CDC columns."""
+  pks = {str(k) for k in primary_key}
+  col_names = [c for c, _ in source_cols]
+  eff_op = op_col or next(
+      (c for c in _DEFAULT_OP_COLS if c in col_names and c not in pks), None)
+  eff_seq = seq_col or next((c for c in _DEFAULT_SEQ_COLS if c in col_names),
+                            None)
+  meta_skip = {
+      c for c in (
+          eff_op,
+          eff_seq if eff_seq in _ENVELOPE_SEQ_COLS else None,
+          'beam_cdc_op',
+          'beam_cdc_seq',
+          'beam_cdc_hex_seq',
+          '_change_type',
+          '_commit_version',
+          '_commit_snapshot_sequence_number',
+      ) if c and c not in pks
+  }
+  return [(c, k) for c, k in source_cols if c not in meta_skip]
+
+
+def materialize_cdc_records(
+    raw_records: Iterable[Any],
+    *,
+    col_specs: list[tuple[str, str]],
+    primary_key: list[str],
+    cdc_format: str = 'auto',
+    op_col: Optional[str] = None,
+    seq_col: Optional[str] = None,
+    strict_inferred_fields: bool = False,
+    on_unknown_fields: str = 'error',
+    route_errors: bool = False,
+    row_factory,
+    dlq_list: list[dict[str, Any]],
+) -> tuple[list[str], list[Any], int, int, int, set[str]]:
+  """In-memory equivalent of `CliNormalizeCdc | CliMaterializeCdc` (zero Beam import).
+
+  Returns `(col_names, live_rows, superseded_rows, preimage_skipped,
+  schema_drift_rows, drift_fields)`.
+  """
+  pks = [str(k) for k in primary_key]
+  names = [c for c, _ in col_specs]
+  known = set(names)
+  check_unknown = bool(
+      strict_inferred_fields and
+      dlq.parse_unknown_fields_opt(on_unknown_fields) != 'ignore')
+  grouped: dict[tuple[Any, ...], list[tuple[str, int, dict[str, Any]]]] = {}
+  preimage_skipped = 0
+  drift_rows = 0
+  drift_fields: set[str] = set()
+
+  for element in raw_records:
+    try:
+      parsed = parse_cdc_event(
+          element,
+          cdc_format=cdc_format,
+          op_col=op_col,
+          seq_col=seq_col,
+          primary_keys=pks)
+      if parsed is None:
+        preimage_skipped += 1
+        continue
+      canon_op, int_seq, _hex_seq, payload = parsed
+      if check_unknown:
+        extra = [k for k in payload if k not in known]
+        if extra:
+          shown = ', '.join(repr(k) for k in extra[:8])
+          known_str = ', '.join(names)
+          raise dlq.SchemaDriftError(
+              f'new CDC field(s) {shown} appeared after schema sampling '
+              f'(inferred fields: {known_str})',
+              extra_fields=extra)
+      coerced = {
+          cname: _coerce_value(payload.get(cname), ckind)
+          for cname, ckind in col_specs
+      }
+      key = tuple(coerced[k] for k in pks)
+      grouped.setdefault(key, []).append((canon_op, int(int_seq), coerced))
+    except Exception as exc:  # pylint: disable=broad-except
+      if not route_errors:
+        if isinstance(exc, dlq.SchemaDriftError):
+          raise ValueError(
+              f'{type(exc).__name__}: {exc} (pass --dlq PATH to quarantine '
+              'these records for review, --from-opt sample_rows=all to scan '
+              'all records for schema, or --from-opt on_unknown_fields=ignore '
+              'to drop extra fields)') from exc
+        raise ValueError(f'{type(exc).__name__}: {exc}') from exc
+      if isinstance(exc, dlq.SchemaDriftError):
+        drift_rows += 1
+        drift_fields.update(exc.extra_fields)
+      dlq_list.append({
+          'step': 'NormalizeCdc',
+          'error_type': type(exc).__name__,
+          'error': str(exc)[:4096],
+          'raw_payload': dlq.safe_json_dumps(element),
+      })
+
+  superseded = 0
+  live_rows: list[Any] = []
+  for key, versions in grouped.items():
+    top = max(v[1] for v in versions)
+    tied = [v for v in versions if v[1] == top]
+    distinct = {
+        tuple(v[2][n] for n in names) + (v[0], )
+        for v in tied
+    }
+    if len(distinct) > 1:
+      if seq_col:
+        hint = (
+            f'they have the same {seq_col} value, so the latest '
+            'cannot be chosen; use a finer ordering column (for example a '
+            'timestamp with seconds or an LSN) or deduplicate the input '
+            'first')
+      else:
+        hint = (
+            'no ordering column was found, so the latest cannot be chosen; '
+            'pass --cdc-seq-col COLUMN naming an ordering column (for '
+            'example updated_at or lsn)')
+      raise ValueError(
+          f'--cdc: {len(distinct)} different changes for primary key '
+          f'{key!r} share the latest sequence value: {hint}')
+    latest_op, _latest_seq, latest_vals = tied[0]
+    superseded += len(versions) - 1
+    if latest_op == 'DELETE':
+      superseded += 1
+      continue
+    live_rows.append(row_factory(**latest_vals))
+
+  return names, live_rows, superseded, preimage_skipped, drift_rows, drift_fields
 
 
 # ---------------------------------------------------------------------------

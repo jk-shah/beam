@@ -36,6 +36,7 @@ import decimal
 import io
 import json
 import math
+import os
 import re
 from typing import Any
 from typing import Iterable
@@ -1006,6 +1007,40 @@ def parse_sample_rows_opt(raw: Any) -> Optional[int]:
   return n
 
 
+JSON_AUTO_SCAN_MAX_BYTES = 64 * 1024 * 1024
+
+
+def should_scan_all_local_json(path_or_files) -> bool:
+  """True when `path_or_files` are local files whose total size <= 64 MB."""
+  raw_cap = os.environ.get('BEAM_CLI_JSON_AUTO_SCAN_MAX_BYTES', '').strip()
+  try:
+    cap = int(raw_cap) if raw_cap else JSON_AUTO_SCAN_MAX_BYTES
+  except ValueError:
+    cap = JSON_AUTO_SCAN_MAX_BYTES
+  if isinstance(path_or_files, str):
+    if '://' in path_or_files or '{{' in path_or_files:
+      return False
+    files = _match_paths(path_or_files)
+  else:
+    files = list(path_or_files)
+  if not files or any('://' in str(f) for f in files):
+    return False
+  try:
+    return sum(os.path.getsize(f) for f in files) <= cap
+  except OSError:
+    return False
+
+
+def resolve_json_sample_rows(
+    path_or_files, raw_sample_rows: Any = None) -> Optional[int]:
+  """Effective `sample_rows`: explicit user value, else full scan if local <=64MB."""
+  if raw_sample_rows is not None and raw_sample_rows != '':
+    return parse_sample_rows_opt(raw_sample_rows)
+  if should_scan_all_local_json(path_or_files):
+    return None
+  return 100
+
+
 def parse_unknown_fields_opt(raw: Any) -> str:
   """Parses `--from-opt on_unknown_fields=error|ignore` (default `'error'`)."""
   if raw is None or raw == '':
@@ -1095,14 +1130,15 @@ def read_json_with_dlq(
     path: str,
     *,
     types: Optional[dict[str, str]] = None,
-    sample_rows: Any = 100,
+    sample_rows: Any = None,
     on_unknown_fields: str = 'error',
     error_handling: Optional[dict[str, Any]] = None,
 ):
   """JSONL Beam YAML source with a sampled schema and an optional DLQ.
 
-  The schema is inferred from up to `sample_rows` valid objects (default 100,
-  or `'all'` for every record); nested objects become nested rows so
+  The schema is inferred from all records on local files <= 64 MB (or up to
+  `sample_rows` valid objects when set or on larger/remote inputs; `'all'`
+  scans every record); nested objects become nested rows so
   `--where`/`--select` can use `user.id`. Any record with fields absent from
   the inferred schema raises `SchemaDriftError` (routed to `error_handling`
   when `--dlq` is set, or failing fast otherwise) unless
@@ -1113,7 +1149,7 @@ def read_json_with_dlq(
   from apache_beam.metrics import Metrics
   from apache_beam.typehints.row_type import RowTypeConstraint
 
-  eff_sample = parse_sample_rows_opt(sample_rows)
+  eff_sample = resolve_json_sample_rows(path, sample_rows)
   allow_unknown = (parse_unknown_fields_opt(on_unknown_fields) == 'ignore')
   kinds = apply_type_overrides(
       infer_json_kinds(path, sample_rows=eff_sample),

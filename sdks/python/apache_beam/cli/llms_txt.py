@@ -77,10 +77,11 @@ def render_llms_txt() -> str:
     `{{{{ vars }}}}` into `metadata.parameters`) and AST-introspected single-image
     Flex Template bundle generator for Python pipelines (no handwritten
     `Dockerfile` or `metadata.json`).
-- `beam diff <LEFT_URI> <RIGHT_URI> [--key COL ...] [--columns shared|all] [--to FILE] [--exit-zero] [--rtol F] [--atol F] [--json]`
+- `beam diff <LEFT_URI> <RIGHT_URI> [--key COL ...] [--columns shared|all|col1,col2] [--to FILE] [--exit-zero] [--rtol F] [--atol F] [--json]`
     Distributed O(1)-memory key/multiset reconciliation across files, `delta://`,
     `iceberg://`, and `bigquery://` (`0` match, `6` drift). Compares shared columns
-    and reports added/removed/retyped columns in `outputs.schema_diff`. With
+    (or `--columns all`, or an explicit subset `--columns qty,price`) and reports
+    added/removed/retyped columns in `outputs.schema_diff`. With
     `--key`, `outputs.differing_keys` lists up to 100 keys each for
     `only_in_left`, `only_in_right`, `value_mismatches`, `duplicate_keys`
     (`truncated` flag; values are untrusted data).
@@ -147,11 +148,12 @@ def render_llms_txt() -> str:
   `{{"West": {{"events": 6, ...}}, ...}}` (one row per key; NULL or repeated keys fail). Add `--to-opt value=col` for
   `{{"<key>": <col>}}`; JSON text from `json_group_array()` / `json_object()` is embedded as JSON. Local runs only.
 - Nested JSON objects and Parquet/Avro structs use dots: `--where "props.amount >= 10" --select "user.id AS user_id"`.
-  With `--dlq`, malformed JSON lines, type mismatches, and records with new fields absent from the 100-row sample
-  (`SchemaDriftError`) are quarantined to `--dlq` (with an explicit warning in `warnings`); without `--dlq` they fail fast.
-  Use `--from-opt sample_rows=all` (or `fields=COL:TYPE`) to include sparse late fields, or `--from-opt on_unknown_fields=ignore`
-  to drop unknown fields intentionally.
-- Local `--sql` is SQLite (inputs named `alias=URI`; unaliased inputs are named after the file) plus `to_utc(ts)`
+  Local JSONL files (`<= 64 MB`) scan every record automatically for schema discovery so sparse fields past row 100 are
+  included out of the box. On larger/remote streams (or explicit `--from-opt sample_rows=N`), unseen fields raise
+  `SchemaDriftError` (quarantined to `--dlq` with a warning in `warnings`, or failing fast without `--dlq`); pass
+  `--from-opt sample_rows=all` (or `fields=COL:TYPE`) to include them, or `--from-opt on_unknown_fields=ignore` to drop extra fields.
+- Local `--sql` is SQLite (inputs named `alias=URI`; unaliased inputs are named after the file, and the primary input
+  also binds `FROM source`) plus `to_utc(ts)`
   (normalizes ISO `Z`/offsets/naive and epoch sec/ms to `YYYY-MM-DDTHH:MM:SSZ`), exact `median(x)`,
   `percentile(x, 95)`, `quantile(x, 0.95)` (linear interpolation, like numpy) and `stddev(x)`; window functions
   such as `ROW_NUMBER() OVER (PARTITION BY k ORDER BY to_utc(ts) DESC)` work. Schema-evolution append / column
@@ -163,8 +165,8 @@ def render_llms_txt() -> str:
   shows `sql_engines`) runs the same inputs (same typing, NULLs and `--dlq`) in a sandboxed in-memory DuckDB with
   file access disabled: ANSI `PERCENTILE_CONT ... WITHIN GROUP`, `QUALIFY`, `median`, `quantile_cont`, struct fields
   (`u."user".tier`). Without DuckDB the command exits `4` with the install command.
-- `--cdc --primary-key K` into plain files (Parquet/CSV/JSON/Avro) writes the latest live row per key, ordered by
-  `lsn` / `ts_ms` / `updated_at` or `--cdc-seq-col COL`; deleted keys are dropped.
+- `--cdc --primary-key K` into plain files (Parquet/CSV/JSON/Avro) writes the latest live row per key in `<250 ms` locally (`local_fast`),
+  ordered by `lsn` / `ts_ms` / `seq_ts` / `seq` / `updated_at` / `event_ts` / `timestamp` or `--cdc-seq-col COL`; deleted keys are dropped.
 
 ## 6. Canonical Agent Workflow Examples
 ```bash

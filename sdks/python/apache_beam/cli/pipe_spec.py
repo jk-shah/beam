@@ -112,6 +112,15 @@ def build_pipe_spec(
         from_opts, from_opt_file, '--from-opt')
     parsed_to_opts = uris.parse_kv_options(to_opts, to_opt_file, '--to-opt')
     raw_cdc_fields = parsed_from_opts.pop('fields', None) if cdc else None
+    if (',' in source and '://' not in source and not allow_jinja and
+        not dlq._match_paths(source)):
+      parts = [p.strip() for p in source.split(',') if p.strip()]
+      if len(parts) >= 2 and any(
+          uris.extension_of(p) or dlq._match_paths(p) for p in parts):
+        raise PipeSpecError(
+            'comma-separated paths in --from are not supported; pass '
+            '--from a=FIRST --join b=SECOND with --sql and UNION ALL '
+            '(or a single glob such as dir/*)')
     src_ep = uris.parse_endpoint(
         source,
         is_read=True,
@@ -269,12 +278,15 @@ def build_pipe_spec(
   except expressions.ExpressionError as e:
     raise PipeSpecError(str(e)) from None
 
-  if cdc and select_cfg is not None and prefer_python_lakehouse_and_cdc:
-    # Preserve normalized CDC metadata columns through `--select` projections.
+  if (cdc and select_cfg is not None and prefer_python_lakehouse_and_cdc and
+      dst_ep.kind != 'file'):
+    # Preserve normalized CDC metadata columns through `--select` projections
+    # when targeting native CDC sinks (BigQuery / Iceberg); file sinks run
+    # `CliMaterializeCdc` before `MapToFields`, which already strips `beam_cdc_*`.
     sel_fields = dict(select_cfg.get('fields') or {})
     for mcol, mtype in (
         ('beam_cdc_op', 'string'),
-        ('beam_cdc_seq', 'int64'),
+        ('beam_cdc_seq', 'integer'),
         ('beam_cdc_hex_seq', 'string'),
     ):
       sel_fields.setdefault(
@@ -350,8 +362,8 @@ def build_pipe_spec(
       except ValueError as e:
         raise PipeSpecError(str(e)) from None
     elif src_ep.kind == 'file' and src_ep.format == 'json':
-      cdc_sample_rows = dlq.parse_sample_rows_opt(
-          src_ep.config.get('sample_rows'))
+      cdc_sample_rows = dlq.resolve_json_sample_rows(
+          src_ep.config['path'], src_ep.config.get('sample_rows'))
       resolved_cdc_fields = cdc_mod.infer_cdc_jsonl_fields(
           src_ep.config['path'],
           cdc_format=cdc_format,

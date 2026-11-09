@@ -302,12 +302,10 @@ def run_diff(
   """Runs distributed reconciliation and returns `(exit_code, report_dict)`.
 
   `columns='shared'` (default) compares only columns present on both sides
-  and reports added, removed, and retyped columns in `schema_diff`, so a new
-  column doesn't turn every row into a value mismatch. `columns='all'`
-  compares the union of columns, treating a missing column as null.
+  and reports added, removed, and retyped columns in `schema_diff`.
+  `columns='all'` compares the union of columns (missing = null), and
+  `'col1,col2,...'` compares an explicit column subset.
   """
-  if columns not in ('shared', 'all'):
-    raise uris.UriError(f"--columns must be 'shared' or 'all', got {columns!r}")
   import apache_beam as beam
   from apache_beam.options.pipeline_options import GoogleCloudOptions
   from apache_beam.options.pipeline_options import PipelineOptions
@@ -369,9 +367,23 @@ def run_diff(
           limit_bytes=limit)
 
   key_cols = [k.strip() for k in (keys or ()) if k.strip()]
-  # Set once both sources are read: the columns compared when both sides have
-  # a static schema and columns='shared'; None means compare what rows hold.
-  shared_cols: list[frozenset[str] | None] = [None]
+  explicit_cols: list[str] | None = None
+  if columns not in ('shared', 'all'):
+    explicit_cols = [
+        c.strip() for c in str(columns or '').split(',') if c.strip()
+    ]
+    if not explicit_cols or any(
+        not c for c in str(columns or '').split(',')):
+      raise uris.UriError(
+          "--columns: expected 'shared', 'all', or a comma-separated list "
+          'of column names (e.g. --columns qty,location,price)')
+  # Set once both sources are read: the columns retained on each row when
+  # comparing a subset (`explicit_cols` or `columns='shared'`); None means keep
+  # every column on the row.
+  shared_cols: list[frozenset[str] | None] = [
+      (frozenset(explicit_cols) | frozenset(key_cols))
+      if explicit_cols is not None else None
+  ]
   sig_digits = (
       max(1, int(-math.log10(rtol))) if (rtol and rtol > 0) else None)
 
@@ -491,13 +503,14 @@ def run_diff(
 
   def _key_row(row):
     d = _row_to_plain_dict(row)
-    if shared_cols[0] is not None:
-      d = {k: v for k, v in d.items() if k in shared_cols[0]}
     if key_cols:
       missing = [k for k in key_cols if k not in d]
       if missing:
         raise ValueError(
             f'key column(s) {missing} not found in row columns {sorted(d.keys())}')
+    if shared_cols[0] is not None:
+      d = {k: v for k, v in d.items() if k in shared_cols[0]}
+    if key_cols:
       k_tuple = tuple(_encode_key_atom(d[k]) for k in key_cols)
       k_disp = {k: d[k] for k in key_cols}
     else:
@@ -586,7 +599,9 @@ def run_diff(
       }
 
     if l_cnt == 1 and r_cnt == 1 and l_row is not None and r_row is not None:
-      if columns == 'shared':
+      if explicit_cols is not None:
+        all_cols = list(explicit_cols)
+      elif columns == 'shared':
         all_cols = sorted(set(l_row.keys()) & set(r_row.keys()))
       else:
         all_cols = sorted(set(l_row.keys()) | set(r_row.keys()))
@@ -687,6 +702,13 @@ def run_diff(
     left_schema = _endpoint_schema(left_uri, left_format, left_opts, proj)
     right_schema = _endpoint_schema(right_uri, right_format, right_opts, proj)
     if left_schema is not None and right_schema is not None:
+      if explicit_cols is not None:
+        avail_union = set(left_schema) | set(right_schema)
+        unknown_cols = [c for c in explicit_cols if c not in avail_union]
+        if unknown_cols:
+          raise uris.UriError(
+              f'--columns: unknown column(s) {unknown_cols}; available: '
+              f'{sorted(avail_union)}')
       schema_diff = {
           'columns_added': sorted(set(right_schema) - set(left_schema)),
           'columns_removed': sorted(set(left_schema) - set(right_schema)),
@@ -695,7 +717,8 @@ def run_diff(
               for c in sorted(set(left_schema) & set(right_schema))
               if left_schema[c] != right_schema[c]
           },
-          'compared_columns': columns,
+          'compared_columns': (
+              explicit_cols if explicit_cols is not None else columns),
       }
       if columns == 'shared':
         shared_cols[0] = frozenset(left_schema) & frozenset(right_schema)
@@ -780,10 +803,18 @@ def run_diff(
     differing_keys['limit'] = KEY_LIST_LIMIT
     differing_keys['truncated'] = keys_truncated
     differing_keys['values_are_untrusted'] = True
-  schema_drift = bool(
-      schema_diff and (
-          schema_diff['columns_added'] or schema_diff['columns_removed'] or
-          schema_diff['type_changes']))
+  if explicit_cols is not None:
+    req_set = set(explicit_cols)
+    schema_drift = bool(
+        schema_diff and (
+            (req_set & set(schema_diff['columns_added'])) or
+            (req_set & set(schema_diff['columns_removed'])) or
+            (req_set & set(schema_diff['type_changes']))))
+  else:
+    schema_drift = bool(
+        schema_diff and (
+            schema_diff['columns_added'] or schema_diff['columns_removed'] or
+            schema_diff['type_changes']))
   identical = (
       summary['only_in_left'] == 0 and summary['only_in_right'] == 0 and
       summary['value_mismatches'] == 0 and
