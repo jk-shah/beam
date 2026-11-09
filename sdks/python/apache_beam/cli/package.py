@@ -470,8 +470,18 @@ def _read_source_text(
     stdin_text: str | None = None,
     project: str | None = None) -> tuple[str, str]:
   """Returns `(content, inferred_basename)` from local path, `gs://`, or `-`."""
+  from . import output as out_mod
   if source == '-':
-    data = sys.stdin.read() if stdin_text is None else stdin_text
+    try:
+      data = (
+          out_mod.read_bounded_text(sys.stdin, label='stdin pipeline')
+          if stdin_text is None else stdin_text)
+      if len(data.encode('utf-8', errors='replace')) > out_mod.MAX_YAML_BYTES:
+        raise ValueError(
+            f'stdin pipeline exceeds maximum size ({out_mod.MAX_YAML_BYTES:,} bytes)'
+        )
+    except ValueError as e:
+      raise PackageError(str(e), EXIT_USAGE) from None
     if not data.strip():
       raise PackageError('stdin pipeline content is empty.', EXIT_USAGE)
     return data, 'pipeline.yaml'
@@ -488,14 +498,22 @@ def _read_source_text(
           f'google-cloud-storage is required to read {source}: {e}',
           EXIT_MISSING_PACKAGE) from None
     client = storage.Client(project=project) if project else storage.Client()
-    text = client.bucket(parts[0]).blob(parts[1]).download_as_text(
-        encoding='utf-8')
+    blob = client.bucket(parts[0]).blob(parts[1])
+    raw_bytes = blob.download_as_bytes(start=0, end=out_mod.MAX_YAML_BYTES)
+    if len(raw_bytes) > out_mod.MAX_YAML_BYTES:
+      raise PackageError(
+          f'pipeline file {source} exceeds maximum size ({out_mod.MAX_YAML_BYTES:,} bytes)',
+          EXIT_USAGE)
+    text = raw_bytes.decode('utf-8')
     return text, os.path.basename(parts[1]) or 'pipeline.yaml'
 
   p = Path(source)
   if not p.is_file():
     raise PackageError(f'pipeline file not found: {source}', EXIT_USAGE)
-  return p.read_text(encoding='utf-8'), p.name
+  try:
+    return out_mod.read_bounded_text(p, label=source), p.name
+  except ValueError as e:
+    raise PackageError(str(e), EXIT_USAGE) from None
 
 
 def _build_launch_snippets(

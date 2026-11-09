@@ -1804,7 +1804,13 @@ def _run(args, pipeline_args, *, json_session, t0: float) -> int:
     except ValueError as e:
       raise _CliError(str(e), EXIT_USAGE) from None
 
-  def _guard_yaml_budget(raw_text: str) -> None:
+  def _guard_yaml_budget(raw_text: str, *, jinja_active: bool) -> None:
+    if jinja_active and ('{{' in raw_text or '{%' in raw_text):
+      try:
+        output.validate_safe_jinja_template(raw_text)
+      except ValueError as e:
+        raise _CliError(str(e), EXIT_USAGE) from None
+      return
     if '{{' in raw_text or '{%' in raw_text:
       return
     import yaml
@@ -1815,13 +1821,17 @@ def _run(args, pipeline_args, *, json_session, t0: float) -> int:
         raise _CliError(str(e), EXIT_USAGE) from None
 
   if file == '-':
-    stdin_yaml = sys.stdin.read()
+    try:
+      stdin_yaml = output.read_bounded_text(sys.stdin, label='stdin YAML')
+    except ValueError as e:
+      raise _CliError(str(e), EXIT_USAGE) from None
     if not stdin_yaml.strip():
       raise _CliError('stdin (-) is empty; expected Beam YAML pipeline', EXIT_USAGE)
-    _guard_yaml_budget(stdin_yaml)
+    stdin_jinja = bool(args.allow_stdin_jinja and not args.no_jinja)
+    _guard_yaml_budget(stdin_yaml, jinja_active=stdin_jinja)
     resolved_args = _maybe_stage_preview_worker_args(
         _resolve_config_args(args, pipeline_args), dry_run=bool(args.dry_run))
-    if args.allow_stdin_jinja and not args.no_jinja:
+    if stdin_jinja:
       return _run_yaml(
           ['--yaml_pipeline=' + stdin_yaml] + resolved_args,
           args.verbose,
@@ -1847,9 +1857,11 @@ def _run(args, pipeline_args, *, json_session, t0: float) -> int:
     raise _CliError(f'no such file: {file!r}{hint}', EXIT_USAGE)
 
   if '://' not in file:
-    with open(file, encoding='utf-8') as f:
-      file_yaml = f.read()
-    _guard_yaml_budget(file_yaml)
+    try:
+      file_yaml = output.read_bounded_text(file, label=file)
+    except ValueError as e:
+      raise _CliError(str(e), EXIT_USAGE) from None
+    _guard_yaml_budget(file_yaml, jinja_active=not bool(args.no_jinja))
   else:
     file_yaml = None
 

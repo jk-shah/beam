@@ -259,7 +259,11 @@ def _estimate_bigquery_bytes(
     select_cols = ', '.join(f'`{c}`' for c in col_list)
   else:
     select_cols = '*'
-  where_sql = f' WHERE {row_restriction}' if row_restriction else ''
+  if row_restriction:
+    safe_rr = uris.validate_bq_row_restriction(str(row_restriction))
+    where_sql = f' WHERE ({safe_rr})'
+  else:
+    where_sql = ''
   sql_text = f'SELECT {select_cols} FROM `{fq_dot}`{where_sql}'
   job_cfg = bigquery.QueryJobConfig(dry_run=True, use_query_cache=False)
   job = client.query(sql_text, job_config=job_cfg)

@@ -190,7 +190,9 @@ def _read_endpoint_pcoll(pipeline, label: str, ep: uris.ParsedEndpoint):
         needs_sql_view = True
         sql_query = f'SELECT * FROM `{eff_proj}.{ds}.{tbl_name}`'
         if bq_cfg.get('row_restriction'):
-          sql_query += f" WHERE {bq_cfg['row_restriction']}"
+          safe_rr = uris.validate_bq_row_restriction(
+              str(bq_cfg['row_restriction']))
+          sql_query += f' WHERE ({safe_rr})'
     except Exception:  # pylint: disable=broad-except
       needs_sql_view = False
 

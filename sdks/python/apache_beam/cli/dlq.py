@@ -923,7 +923,10 @@ def csv_fail_fast_message(err: dict[str, Any], step: str = '') -> str:
       'records instead of failing)')
 
 
-def _infer_json_kind(values: list[Any]) -> Any:
+MAX_JSON_NESTING_DEPTH = 32
+
+
+def _infer_json_kind(values: list[Any], depth: int = 0) -> Any:
   """Infers the schema "kind" of one JSON field from sampled non-null values.
 
   Used by `read_json_with_dlq` at pipeline construction. A kind is either a
@@ -934,6 +937,8 @@ def _infer_json_kind(values: list[Any]) -> Any:
   fields follow the CSV reader's rule: if at least 70% of 3+ samples are
   numeric the field is numeric and the other values go to the DLQ.
   """
+  if depth > MAX_JSON_NESTING_DEPTH:
+    return 'json'
   n = len(values)
   if n == 0:
     return 'str'
@@ -945,7 +950,8 @@ def _infer_json_kind(values: list[Any]) -> Any:
     if not keys:
       return 'json'
     return {
-        k: _infer_json_kind([o[k] for o in objects if o.get(k) is not None])
+        k: _infer_json_kind(
+            [o[k] for o in objects if o.get(k) is not None], depth + 1)
         for k in keys
     }
   if objects or any(isinstance(v, list) for v in values):
@@ -1074,6 +1080,7 @@ def _coerce_json_value(
     row_factory=None,
     *,
     allow_unknown_fields: bool = False,
+    depth: int = 0,
 ) -> Any:
   """Converts one parsed JSON value to `kind`, raising ValueError on mismatch.
 
@@ -1082,6 +1089,10 @@ def _coerce_json_value(
   the DoFn's try block, where it can't be routed to the DLQ. `row_factory`
   builds nested rows from keyword arguments (default: `beam.Row`).
   """
+  if depth > MAX_JSON_NESTING_DEPTH:
+    raise ValueError(
+        f'field {path!r}: JSON nesting exceeds maximum depth '
+        f'({MAX_JSON_NESTING_DEPTH})')
   if value is None:
     return None
   if isinstance(kind, dict):
@@ -1108,7 +1119,8 @@ def _coerce_json_value(
                 sub,
                 f'{path}.{name}',
                 row_factory,
-                allow_unknown_fields=allow_unknown_fields)
+                allow_unknown_fields=allow_unknown_fields,
+                depth=depth + 1)
             for name, sub in kind.items()
         })
   if kind == 'bool':

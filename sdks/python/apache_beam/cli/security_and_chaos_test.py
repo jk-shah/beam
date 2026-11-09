@@ -786,5 +786,205 @@ class InputValidationAndResourceBoundsTest(unittest.TestCase):
         prev_launcher.ensure_preview_wheel()
 
 
+class TemplateAndConfigHardeningTest(unittest.TestCase):
+  """Template rendering, BigQuery row_restriction, config, and streaming bounds."""
+
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp(prefix='beam-hardening-')
+    self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+  def test_jinja_sandboxed_rendering_in_check_and_run(self):
+    # 1. Legitimate Jinja template renders cleanly with `beam check --jinja-variables`!
+    legit_yaml = os.path.join(self.tmp, 'legit_tmpl.yaml')
+    with open(legit_yaml, 'w', encoding='utf-8') as f:
+      f.write(
+          'pipeline:\n'
+          '  transforms:\n'
+          '    - type: ReadFromCsv\n'
+          '      config:\n'
+          '        path: "{{ input_path }}"\n'
+          '    - type: WriteToParquet\n'
+          '      config:\n'
+          '        path: "{{ output_path | default(\'/tmp/out.parquet\') }}"\n')
+    rc_ok, env_ok, err_ok = _run_json_cli([
+        'check', legit_yaml,
+        '--jinja-variables', '{"input_path": "/tmp/in.csv"}'
+    ])
+    self.assertEqual(rc_ok, cli.EXIT_OK, err_ok)
+    self.assertTrue(env_ok['outputs']['valid'])
+
+    # 2. Private attributes and disallowed globals are rejected in `beam check` and `beam run`.
+    disallowed_exprs = [
+        "{{ ''.__class__.__mro__[1].__subclasses__() }}",
+        "{{ cycler.__init__.__globals__ }}",
+        "{{ lipsum.__globals__ }}",
+        "{{ namespace.__init__ }}",
+        "{{ x['__class__'] }}",
+    ]
+    for idx, expr in enumerate(disallowed_exprs):
+      yp = os.path.join(self.tmp, f'tmpl_{idx}.yaml')
+      with open(yp, 'w', encoding='utf-8') as f:
+        f.write(
+            'pipeline:\n'
+            '  transforms:\n'
+            '    - type: Create\n'
+            f'      config: {{elements: [{{x: "{expr}"}}]}}\n')
+      rc_c1, _, _ = _run_json_cli(['check', yp])
+      self.assertEqual(rc_c1, cli.EXIT_USAGE)
+      rc_c2, _, _ = _run_json_cli(
+          ['check', yp, '--jinja-variables', '{"x": "hi"}'])
+      self.assertEqual(rc_c2, cli.EXIT_USAGE)
+      rc_r, _, _ = _run_json_cli(
+          ['run', yp, '--dry-run', '--jinja_variables={"x": "hi"}'])
+      self.assertEqual(rc_r, cli.EXIT_USAGE)
+
+    # Disallowed variable names (`__builtins__`, `cycler`) in `--jinja-variables` rejected!
+    rc_bv, _, _ = _run_json_cli([
+        'check', legit_yaml,
+        '--jinja-variables', '{"input_path": "/tmp/a.csv", "__builtins__": 1}'
+    ])
+    self.assertEqual(rc_bv, cli.EXIT_USAGE)
+
+  def test_bigquery_row_restriction_predicate_validation(self):
+    from apache_beam.cli import uris
+
+    # Valid row restrictions (including SQL keywords safely inside string literals) pass!
+    ep = uris.parse_endpoint(
+        'bigquery://my-proj.analytics.events',
+        is_read=True,
+        options={
+            'row_restriction': (
+                "country = 'US' AND note != 'SELECT ; -- literal' "
+                "AND (amount > 0)")
+        })
+    self.assertIn("country = 'US'", ep.config['row_restriction'])
+
+    # Compound queries, subqueries, semicolons, comments, and unbalanced parens fail!
+    for invalid_pred in (
+        '1=1 UNION ALL SELECT * FROM `other-proj.secret.payroll`',
+        '1=1; DROP TABLE analytics.events',
+        '1=1 -- trailing comment',
+        '1=1 /* block comment */',
+        'user_id IN (SELECT id FROM secret.users)',
+        '1=1) OR (1=1',
+    ):
+      with self.subTest(predicate=invalid_pred):
+        with self.assertRaises(uris.UriError):
+          uris.validate_bq_row_restriction(invalid_pred)
+        rc, _, _ = _run_json_cli([
+            'pipe', '--from', 'bigquery://my-proj.analytics.events',
+            '--from-opt', f'row_restriction={invalid_pred}',
+            '--to', os.path.join(self.tmp, 'out.parquet'), '--emit-yaml'
+        ])
+        self.assertEqual(rc, cli.EXIT_USAGE)
+
+  def test_config_blocks_code_loading_options_and_world_writable_file(self):
+    from apache_beam.cli import config as cfg_mod
+
+    cfg_file = os.path.join(self.tmp, 'config.yaml')
+    for dangerous_opt in (
+        'beam_plugin',
+        'setup_file',
+        'extra_package',
+        'requirements_file',
+        'pickle_library',
+    ):
+      rc, _, _ = _run_json_cli(
+          ['config', 'set', dangerous_opt, '/tmp/custom'],
+          extra_args=None) if False else (None, None, None)
+      with mock.patch.dict(os.environ, {'BEAM_CONFIG': cfg_file}):
+        rc_set, _, _ = _run_json_cli(
+            ['config', 'set', dangerous_opt, '/tmp/custom'])
+        self.assertEqual(rc_set, cli.EXIT_USAGE)
+
+    # Hand-edited config.yaml with `beam_plugin` is refused by `resolve_pipeline_args`!
+    with open(cfg_file, 'w', encoding='utf-8') as f:
+      f.write(
+          'active_profile: default\n'
+          'profiles:\n'
+          '  default:\n'
+          '    options:\n'
+          '      beam_plugin: custom.plugin_mod\n')
+    if os.name == 'posix':
+      os.chmod(cfg_file, 0o600)
+    with self.assertRaises(cfg_mod.ConfigError):
+      cfg_mod.resolve_pipeline_args([], config_path=cfg_file)
+
+    # World-writable `0666` config.yaml is refused on POSIX!
+    if os.name == 'posix':
+      with open(cfg_file, 'w', encoding='utf-8') as f:
+        f.write(
+            'active_profile: default\n'
+            'profiles:\n'
+            '  default:\n'
+            '    options:\n'
+            '      region: us-central1\n')
+      os.chmod(cfg_file, 0o666)
+      with self.assertRaises(cfg_mod.ConfigError) as ctx:
+        cfg_mod.resolve_pipeline_args([], config_path=cfg_file)
+      self.assertIn('world-writable', str(ctx.exception))
+
+  def test_tail_follow_appended_read_bounded_by_max_scanned_bytes(self):
+    import threading
+    import time
+    from apache_beam.cli import tail as tail_mod
+
+    watched = os.path.join(self.tmp, 'stream.jsonl')
+    with open(watched, 'w', encoding='utf-8') as f:
+      f.write('')
+
+    def _writer():
+      time.sleep(0.08)
+      # Append ~256 KB while `--max-scanned-bytes` is 2 KB.
+      big_chunk = ('{"msg": "' + ('A' * 500) + '"}\n') * 512
+      with open(watched, 'a', encoding='utf-8') as wf:
+        wf.write(big_chunk)
+
+    t = threading.Thread(target=_writer, daemon=True)
+    t.start()
+    report = tail_mod.run_tail(
+        watched,
+        limit=1000,
+        duration='0.4s',
+        follow=True,
+        poll_interval=0.05,
+        max_scanned_bytes='2KB')
+    t.join(timeout=1.0)
+    self.assertTrue(report['untrusted_data']['truncated'])
+    self.assertLessEqual(report['scanned_bytes'], 2048)
+
+  def test_sql_https_redirect_scheme_validated(self):
+    import urllib.error
+    import urllib.request
+    from apache_beam.cli import sql as sql_mod
+
+    handler = sql_mod._HttpsOnlyRedirectHandler()
+    req = urllib.request.Request('https://repo.maven.apache.org/maven2/x.jar')
+    with self.assertRaises(urllib.error.URLError):
+      handler.redirect_request(
+          req, None, 302, 'Found', {}, 'http://mirror.example.com/x.jar')
+    with self.assertRaises(urllib.error.URLError):
+      handler.redirect_request(
+          req, None, 302, 'Found', {}, 'file:///etc/hosts')
+
+  def test_deeply_nested_json_depth_limit_handled_cleanly(self):
+    nested: Any = 'leaf'
+    for _ in range(120):
+      nested = {'a': nested}
+    jl = os.path.join(self.tmp, 'deep.jsonl')
+    with open(jl, 'w', encoding='utf-8') as f:
+      f.write(json.dumps({'id': 1, 'deep': nested}) + '\n')
+      f.write(json.dumps({'id': 2, 'deep': {'a': 'shallow'}}) + '\n')
+    out_pq = os.path.join(self.tmp, 'deep_out.parquet')
+    dlq_jl = os.path.join(self.tmp, 'deep_dlq.jsonl')
+
+    # Never crashes with unhandled `RecursionError`!
+    rc, env, err = _run_json_cli([
+        'pipe', '--from', jl, '--to', out_pq, '--dlq', dlq_jl
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertEqual(env['metrics']['rows_written'], 2)
+
+
 if __name__ == '__main__':
   unittest.main()

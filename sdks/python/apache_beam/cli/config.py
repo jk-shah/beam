@@ -282,6 +282,12 @@ def resolve_pipeline_args(
   by_dest, _ = _option_catalog()
   injected: list[str] = []
   for key, value in options.items():
+    norm_k = str(key).strip().lstrip('-').replace('-', '_').lower()
+    if norm_k in _DANGEROUS_CONFIG_OPTIONS:
+      raise ConfigError(
+          f'refusing code/package option {key!r} from config file {path}; '
+          'pass code-loading options explicitly on the command line',
+          _EXIT_USAGE)
     if key in overridden or value is None:
       continue
     injected.extend(_option_to_flags(key, value, by_dest.get(key)))
@@ -352,6 +358,18 @@ def _select_profile(data, explicit_profile):
   return _validate_profile_name(str(chosen))
 
 
+_DANGEROUS_CONFIG_OPTIONS = frozenset([
+    'beam_plugin',
+    'beam_plugins',
+    'setup_file',
+    'extra_package',
+    'extra_packages',
+    'requirements_file',
+    'sdk_location',
+    'pickle_library',
+])
+
+
 def _load_config(path) -> dict[str, Any]:
   if not os.path.isfile(path):
     return {
@@ -361,13 +379,22 @@ def _load_config(path) -> dict[str, Any]:
             }
         }
     }
+  if os.name == 'posix':
+    try:
+      mode = os.stat(path).st_mode & 0o777
+    except OSError:
+      mode = 0
+    if mode & 0o002:
+      raise ConfigError(
+          f'refusing world-writable config file {path} (mode {oct(mode)}); '
+          f'fix permissions with: chmod 0600 {path}',
+          _EXIT_USAGE)
   import yaml
   from . import output as out_mod
   try:
-    with open(path, encoding='utf-8') as f:
-      raw_text = f.read()
+    raw_text = out_mod.read_bounded_text(path, label=path)
     loaded = out_mod.safe_yaml_load(raw_text) or {}
-  except (OSError, yaml.YAMLError) as e:
+  except (OSError, ValueError, yaml.YAMLError) as e:
     raise ConfigError(f'could not read {path}: {e}', _EXIT_USAGE) from None
   if not isinstance(loaded, dict):
     raise ConfigError(
@@ -412,6 +439,11 @@ def _validate_option_key(raw_option: str) -> str:
     raise ConfigError(
         f'refusing to store secret option {stripped!r} in plain-text config; '
         'use credentials providers or environment variables instead',
+        _EXIT_USAGE)
+  if stripped.replace('-', '_').lower() in _DANGEROUS_CONFIG_OPTIONS:
+    raise ConfigError(
+        f'refusing to store code/package-loading option {stripped!r} in '
+        'default config; pass it explicitly on the command line',
         _EXIT_USAGE)
   return stripped
 

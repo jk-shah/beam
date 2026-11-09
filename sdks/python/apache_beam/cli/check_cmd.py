@@ -52,35 +52,39 @@ def run_check(
   """Validates a Beam YAML pipeline and returns a structured validation report."""
   import yaml
 
+  from . import output as out_mod
+
   if file_or_dash == '-':
-    raw_text = sys.stdin.read()
+    try:
+      raw_text = out_mod.read_bounded_text(sys.stdin, label='<stdin> YAML')
+    except ValueError as e:
+      raise CheckError(str(e)) from None
     source_label = '<stdin>'
-    if jinja_variables_json:
-      from apache_beam.yaml import yaml_utils
-      raw_text = yaml_utils.expand_jinja(
-          raw_text, json.loads(jinja_variables_json))
   else:
     if '://' not in file_or_dash and not os.path.isfile(file_or_dash):
       raise CheckError(f'no such file: {file_or_dash!r}')
-    if '://' in file_or_dash:
-      from apache_beam.io.filesystems import FileSystems
-      with FileSystems.open(file_or_dash) as f:
-        raw_text = f.read().decode('utf-8')
-    else:
-      with open(file_or_dash, encoding='utf-8') as f:
-        raw_text = f.read()
+    try:
+      if '://' in file_or_dash:
+        from apache_beam.io.filesystems import FileSystems
+        with FileSystems.open(file_or_dash) as f:
+          raw_text = out_mod.read_bounded_text(f, label=file_or_dash)
+      else:
+        raw_text = out_mod.read_bounded_text(file_or_dash, label=file_or_dash)
+    except ValueError as e:
+      raise CheckError(str(e)) from None
     source_label = file_or_dash
-    if jinja_variables_json:
-      from apache_beam.yaml import yaml_utils
-      raw_text = yaml_utils.expand_jinja(
-          raw_text, json.loads(jinja_variables_json))
 
-  from . import output as out_mod
-  if not jinja_variables_json and ('{{' in raw_text or '{%' in raw_text):
+  if jinja_variables_json:
+    try:
+      raw_text = out_mod.safe_expand_jinja(raw_text, jinja_variables_json)
+    except ValueError as e:
+      raise CheckError(f'{source_label}: {e}') from None
+  elif '{{' in raw_text or '{%' in raw_text:
     from . import package as pkg_mod
     try:
+      out_mod.validate_safe_jinja_template(raw_text)
       pkg_mod.extract_jinja_parameters(raw_text)
-    except pkg_mod.PackageError as e:
+    except (ValueError, pkg_mod.PackageError) as e:
       raise CheckError(f'Jinja2 syntax error in {source_label}: {e}') from None
   try:
     spec = out_mod.safe_yaml_load(raw_text)

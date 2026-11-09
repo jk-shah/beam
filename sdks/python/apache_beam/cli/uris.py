@@ -216,10 +216,9 @@ def parse_kv_options(
       raise UriError(f'options file not found: {opt_file!r}')
     import yaml
     try:
-      with open(opt_file, encoding='utf-8') as f:
-        raw_text = f.read()
+      raw_text = out_mod.read_bounded_text(opt_file, label=opt_file)
       loaded = out_mod.safe_yaml_load(raw_text) or {}
-    except (OSError, yaml.YAMLError) as e:
+    except (OSError, ValueError, yaml.YAMLError) as e:
       raise UriError(f'could not parse {opt_file!r}: {e}') from None
     if not isinstance(loaded, dict):
       raise UriError(f'expected key/value mapping in {opt_file!r}')
@@ -258,6 +257,69 @@ def parse_kv_options(
           'environment variables')
     merged[key] = coerced
   return merged
+
+
+_BQ_DISALLOWED_ROW_RESTRICTION_KW_RE = re.compile(
+    r'\b(SELECT|UNION|INTERSECT|EXCEPT|FROM|JOIN|INTO|INSERT|UPDATE|DELETE|'
+    r'DROP|ALTER|CREATE|MERGE|CALL|EXECUTE|GRANT|REVOKE|TRUNCATE)\b',
+    re.IGNORECASE)
+
+
+def validate_bq_row_restriction(raw: str) -> str:
+  """Validates that a BigQuery `row_restriction` is a single filter predicate."""
+  expr = str(raw or '').strip()
+  if not expr:
+    return ''
+  if len(expr) > 4096:
+    raise UriError('BigQuery row_restriction exceeds maximum length (4096)')
+  unquoted_chars: list[str] = []
+  quote: str | None = None
+  escaped = False
+  paren_depth = 0
+  i = 0
+  n = len(expr)
+  while i < n:
+    ch = expr[i]
+    if quote is not None:
+      if escaped:
+        escaped = False
+      elif ch == '\\':
+        escaped = True
+      elif ch == quote:
+        quote = None
+      i += 1
+      continue
+    if ch in ("'", '"', '`'):
+      quote = ch
+      unquoted_chars.append(' ')
+      i += 1
+      continue
+    if expr[i:i + 2] in ('--', '/*', '*/'):
+      raise UriError(
+          'SQL comments are not allowed in BigQuery row_restriction')
+    if ch == ';':
+      raise UriError(
+          'semicolons are not allowed in BigQuery row_restriction')
+    if ch == '(':
+      paren_depth += 1
+    elif ch == ')':
+      paren_depth -= 1
+      if paren_depth < 0:
+        raise UriError(
+            'unbalanced parentheses in BigQuery row_restriction')
+    unquoted_chars.append(ch)
+    i += 1
+  if quote is not None or paren_depth != 0:
+    raise UriError(
+        'unterminated quote or unbalanced parentheses in BigQuery row_restriction'
+    )
+  unquoted = ''.join(unquoted_chars)
+  m_kw = _BQ_DISALLOWED_ROW_RESTRICTION_KW_RE.search(unquoted)
+  if m_kw:
+    raise UriError(
+        f'SQL keyword {m_kw.group(1).upper()!r} is not allowed in BigQuery '
+        'row_restriction; pass a full query via --from-opt query="..." instead')
+  return expr
 
 
 def _coerce_opt_value(raw: str) -> Any:
@@ -523,6 +585,10 @@ def parse_endpoint(
       table_spec, _, _, _ = normalize_bq_table_spec(
           location, default_project=default_project, allow_jinja=allow_jinja)
       cfg = {'table': table_spec, **opts}
+    if cfg.get('row_restriction') and not (
+        allow_jinja and _has_jinja_syntax(str(cfg['row_restriction']))):
+      cfg['row_restriction'] = validate_bq_row_restriction(
+          str(cfg['row_restriction']))
     if not is_read:
       disp_map = {
           'fail': 'WRITE_EMPTY',

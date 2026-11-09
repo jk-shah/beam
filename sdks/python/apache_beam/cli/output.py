@@ -292,6 +292,100 @@ def safe_yaml_load(
   return loaded
 
 
+MAX_YAML_BYTES = 2 * 1024 * 1024
+_BLOCKED_JINJA_GLOBALS = frozenset(
+    ['cycler', 'joiner', 'namespace', 'lipsum', 'dict', 'range'])
+
+
+def read_bounded_text(
+    path_or_stream: Any,
+    *,
+    max_bytes: int = MAX_YAML_BYTES,
+    label: str = 'input',
+) -> str:
+  """Reads UTF-8 text capped at `max_bytes` BEFORE full allocation."""
+  if isinstance(path_or_stream, (str, Path)):
+    with open(path_or_stream, 'rb') as f:
+      chunk = f.read(max_bytes + 1)
+    if len(chunk) > max_bytes:
+      raise ValueError(
+          f'{label} exceeds maximum size ({max_bytes:,} bytes)')
+    return chunk.decode('utf-8')
+  # File-like stream (`sys.stdin` or `io.StringIO` / binary stream).
+  data = path_or_stream.read(max_bytes + 1)
+  if isinstance(data, bytes):
+    if len(data) > max_bytes:
+      raise ValueError(f'{label} exceeds maximum size ({max_bytes:,} bytes)')
+    return data.decode('utf-8')
+  encoded = data.encode('utf-8', errors='replace')
+  if len(encoded) > max_bytes:
+    raise ValueError(f'{label} exceeds maximum size ({max_bytes:,} bytes)')
+  return data
+
+
+def validate_safe_jinja_template(template_text: str) -> None:
+  """Validates Jinja2 template AST against private attributes and disallowed globals."""
+  import jinja2
+  from jinja2 import nodes as jnodes
+
+  env = jinja2.Environment()
+  try:
+    parsed = env.parse(template_text)
+  except jinja2.TemplateSyntaxError as e:
+    raise ValueError(
+        f'invalid Jinja2 syntax (line {e.lineno}): {e.message}') from None
+
+  for nnode in parsed.find_all(jnodes.Name):
+    name_s = str(nnode.name)
+    if name_s.startswith('_') or name_s in _BLOCKED_JINJA_GLOBALS:
+      raise ValueError(
+          f'disallowed Jinja2 identifier {name_s!r} in template')
+  for gnode in parsed.find_all(jnodes.Getattr):
+    if str(gnode.attr).startswith('_'):
+      raise ValueError(
+          f'disallowed private Jinja2 attribute .{gnode.attr} in template')
+  for inode in parsed.find_all(jnodes.Getitem):
+    if isinstance(inode.arg, jnodes.Const) and str(inode.arg.value).startswith(
+        '_'):
+      raise ValueError(
+          f'disallowed private Jinja2 key {inode.arg.value!r} in template')
+
+
+def safe_expand_jinja(template_text: str, variables_json_or_dict: Any) -> str:
+  """Renders `template_text` inside `ImmutableSandboxedEnvironment`."""
+  import datetime as _dt
+  import jinja2
+  from jinja2 import sandbox as jsandbox
+
+  if isinstance(variables_json_or_dict, str):
+    try:
+      variables = json.loads(variables_json_or_dict)
+    except ValueError as e:
+      raise ValueError(f'invalid --jinja-variables JSON: {e}') from None
+  else:
+    variables = variables_json_or_dict
+  if not isinstance(variables, dict):
+    raise ValueError('--jinja-variables must be a JSON object mapping')
+  for k in variables:
+    if str(k).startswith('_') or str(k) in _BLOCKED_JINJA_GLOBALS:
+      raise ValueError(f'disallowed Jinja2 variable name {k!r}')
+
+  validate_safe_jinja_template(template_text)
+  env = jsandbox.ImmutableSandboxedEnvironment(
+      undefined=jinja2.StrictUndefined, autoescape=False)
+  env.globals.clear()
+  env.globals['datetime'] = _dt
+  try:
+    rendered = env.from_string(template_text).render(**variables)
+  except (jsandbox.SecurityError, jinja2.TemplateError) as e:
+    raise ValueError(f'Jinja2 template error: {e}') from None
+  if len(rendered.encode('utf-8', errors='replace')) > MAX_YAML_BYTES:
+    raise ValueError(
+        f'expanded Jinja2 template exceeds maximum size ({MAX_YAML_BYTES:,} bytes)'
+    )
+  return rendered
+
+
 _AUTH_PATTERNS = re.compile(
     r'(DefaultCredentialsError|RefreshError|Reauthentication is needed|'
     r'401 Unauthorized|403 Forbidden|PermissionDenied|Caller does not have '

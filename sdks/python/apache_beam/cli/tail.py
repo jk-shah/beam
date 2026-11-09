@@ -582,7 +582,13 @@ def _list_watch_targets(
 
 
 def _read_appended_bytes(
-    item_uri: str, offset: int, default_project: str | None) -> bytes:
+    item_uri: str,
+    offset: int,
+    default_project: str | None,
+    *,
+    max_bytes: int = 64 * 1024 * 1024,
+) -> bytes:
+  cap = max(1, int(max_bytes))
   if item_uri.startswith('gs://'):
     from google.cloud import storage
     without_scheme = item_uri[len('gs://'):]
@@ -591,11 +597,11 @@ def _read_appended_bytes(
         storage.Client(project=default_project)
         if default_project else storage.Client())
     blob = client.bucket(bucket_name).blob(blob_name)
-    return blob.download_as_bytes(start=offset)
+    return blob.download_as_bytes(start=offset, end=offset + cap - 1)
 
   with open(item_uri, 'rb') as f:
     f.seek(offset)
-    return f.read()
+    return f.read(cap)
 
 
 def _parse_text_lines_from_chunk(
@@ -657,7 +663,8 @@ def _tail_files_follow(
     lower = uri_item.lower()
     if sz > 0 and (lower.endswith('.csv') or '.csv-' in lower):
       try:
-        head_bytes = _read_appended_bytes(uri_item, 0, default_project)[:4096]
+        head_bytes = _read_appended_bytes(
+            uri_item, 0, default_project, max_bytes=4096)
         first_line = head_bytes.decode('utf-8', errors='replace').splitlines()
         if first_line:
           hdr_rows = list(csv.reader([first_line[0]]))
@@ -702,9 +709,14 @@ def _tail_files_follow(
             if limit is not None and len(rows) >= limit:
               break
         else:
-          delta = _read_appended_bytes(uri_item, prev_off, default_project)
+          rem_budget = max(1, byte_budget - scanned_bytes)
+          delta = _read_appended_bytes(
+              uri_item, prev_off, default_project, max_bytes=rem_budget + 1)
           if not delta:
             continue
+          if len(delta) > rem_budget:
+            truncated_budget = True
+            break
           # Only advance up to the last complete newline so partial writes are
           # re-read once completed.
           last_nl = delta.rfind(b'\n')

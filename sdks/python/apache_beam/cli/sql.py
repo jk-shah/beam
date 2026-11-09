@@ -310,14 +310,35 @@ def _ensure_maven_wrapper(beam_home):
   return mvnw
 
 
-def _download_https(url, dest_path):
+class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+  """Refuses any redirect from `https://` to a non-`https://` scheme."""
+  def redirect_request(self, req, fp, code, msg, headers, newurl):
+    if not str(newurl).lower().startswith('https://'):
+      raise urllib.error.URLError(
+          f'refusing non-HTTPS redirect target {newurl!r}')
+    return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _https_urlopen(url: str, timeout: int):
+  if not url.startswith('https://'):
+    raise ValueError(f'expected https:// URL, got {url!r}')
+  opener = urllib.request.build_opener(
+      urllib.request.HTTPSHandler(), _HttpsOnlyRedirectHandler())
+  return opener.open(url, timeout=timeout)
+
+
+def _download_https(url, dest_path, max_bytes: int = 32 * 1024 * 1024):
   """Downloads an `https://` URL atomically to `dest_path`."""
   if not url.startswith('https://'):
     raise ValueError(f'expected https:// URL, got {url!r}')
   tmp_path = dest_path + '.part'
   try:
-    with urllib.request.urlopen(url, timeout=30) as resp:
-      data = resp.read()
+    with _https_urlopen(url, timeout=30) as resp:
+      data = resp.read(max_bytes + 1)
+    if len(data) > max_bytes:
+      raise SqlError(
+          f'download from {url} exceeded maximum size ({max_bytes:,} bytes)',
+          _EXIT_FAILED)
     with open(tmp_path, 'wb') as f:
       f.write(data)
     os.replace(tmp_path, dest_path)
@@ -528,12 +549,15 @@ _EXCLUDED_RUNNER_RE = re.compile(
     r'local-java-core|portability-java|prism-java|reference-java)')
 
 
-def _fetch_text(url):
+def _fetch_text(url, max_bytes: int = 2 * 1024 * 1024):
   if not url.startswith('https://'):
     raise ValueError(f'expected https:// URL, got {url!r}')
   try:
-    with urllib.request.urlopen(url, timeout=15) as resp:
-      return resp.read().decode('utf-8')
+    with _https_urlopen(url, timeout=15) as resp:
+      raw = resp.read(max_bytes + 1)
+      if len(raw) > max_bytes:
+        return None
+      return raw.decode('utf-8')
   except (urllib.error.URLError, OSError, UnicodeDecodeError):
     return None
 
