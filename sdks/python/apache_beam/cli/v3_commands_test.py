@@ -282,15 +282,20 @@ class CdcIntoFilesTest(unittest.TestCase):
               '1,suspended,2026-11-03T08:00:00\n'
               '2,active,2026-11-01T09:00:00\n'
               '1,active,2026-11-02T15:00:00\n')
-    rc, env, err, out = self._pipe(src)
-    self.assertEqual(rc, cli.EXIT_OK, err)
-    self.assertEqual(env['metrics']['rows_written'], 2)
-    self.assertEqual(env['metrics']['cdc_superseded_rows'], 2)
-    rows = sorted(pq.read_table(out).to_pylist(), key=lambda r: r['id'])
-    self.assertEqual(rows, [
+    expected = [
         {'id': 1, 'status': 'suspended', 'updated_at': '2026-11-03T08:00:00'},
         {'id': 2, 'status': 'active', 'updated_at': '2026-11-01T09:00:00'},
-    ])
+    ]
+    # Round 7 H1: naming the data column with --cdc-seq-col must not drop it.
+    for extra in ((), ('--cdc-seq-col', 'updated_at')):
+      if os.path.exists(os.path.join(self.tmp, 'latest.parquet')):
+        os.remove(os.path.join(self.tmp, 'latest.parquet'))
+      rc, env, err, out = self._pipe(src, *extra)
+      self.assertEqual(rc, cli.EXIT_OK, err)
+      self.assertEqual(env['metrics']['rows_written'], 2)
+      self.assertEqual(env['metrics']['cdc_superseded_rows'], 2)
+      rows = sorted(pq.read_table(out).to_pylist(), key=lambda r: r['id'])
+      self.assertEqual(rows, expected, extra)
 
   def test_debezium_delete_removes_key(self):
     src = os.path.join(self.tmp, 'cdc.jsonl')
@@ -2758,6 +2763,103 @@ class Round6FixesTest(unittest.TestCase):
     finally:
       output_mod.DLQ_REQUESTED = False
     self.assertFalse(any('--dlq' in a['command'] for a in after))
+
+
+class Round7FixesTest(unittest.TestCase):
+  """Keyed JSON documents and the text-vs-number filter hint."""
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp(prefix='beam-r7-test-')
+    self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+    self.events = os.path.join(self.tmp, 'events.parquet')
+    pq.write_table(
+        pa.Table.from_pylist([
+            {'store_id': 'S01', 'amount': 10.0},
+            {'store_id': 'S01', 'amount': 30.0},
+            {'store_id': 'S02', 'amount': 5.0},
+            {'store_id': 'S09', 'amount': 7.0},
+        ]),
+        self.events)
+    self.stores = os.path.join(self.tmp, 'stores.csv')
+    with open(self.stores, 'w', encoding='utf-8') as f:
+      f.write('store_id,region\nS01,West\nS02,East\n')
+
+  def _path(self, name):
+    return os.path.join(self.tmp, name)
+
+  def _load(self, path):
+    with open(path, encoding='utf-8') as f:
+      return json.load(f)
+
+  def test_sql_keyed_document(self):
+    out = self._path('answer.json')
+    rc, env, err = _run_json([
+        'pipe', '--from', 's=' + self.events, '--join', 'st=' + self.stores,
+        '--sql',
+        "SELECT COALESCE(st.region, 'UNMAPPED') AS region, COUNT(*) AS events, "
+        'median(s.amount) AS median FROM s LEFT JOIN st USING (store_id) '
+        'GROUP BY 1', '--to', out, '--to-opt', 'key=region'
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertEqual(
+        self._load(out), {
+            'West': {'events': 2, 'median': 20.0},
+            'East': {'events': 1, 'median': 5.0},
+            'UNMAPPED': {'events': 1, 'median': 7.0},
+        })
+
+  def test_sql_keyed_value_embeds_json_arrays(self):
+    out = self._path('lists.json')
+    rc, env, err = _run_json([
+        'pipe', '--from', 's=' + self.events, '--sql',
+        "SELECT 'big' AS k, json_group_array(store_id) AS ids FROM "
+        "(SELECT DISTINCT store_id FROM s WHERE amount >= 10 ORDER BY 1) "
+        "UNION ALL SELECT 'small', json_group_array(store_id) FROM "
+        '(SELECT DISTINCT store_id FROM s WHERE amount < 10 ORDER BY 1)',
+        '--to', out, '--to-opt', 'key=k', '--to-opt', 'value=ids'
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertEqual(self._load(out), {'big': ['S01'], 'small': ['S02', 'S09']})
+
+  def test_pipe_keyed_document_on_fast_path(self):
+    out = self._path('stores.json')
+    rc, env, err = _run_json(
+        ['pipe', '--from', self.stores, '--to', out, '--to-opt', 'key=store_id'])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertEqual(env['runner'], 'local_fast')
+    self.assertEqual(
+        self._load(out), {'S01': {'region': 'West'}, 'S02': {'region': 'East'}})
+
+  def test_keyed_document_errors(self):
+    cases = [
+        # Duplicate key values.
+        (['pipe', '--from', self.events, '--to', self._path('d.json'),
+          '--to-opt', 'key=store_id'], 'appears more than once'),
+        # Not a .json file.
+        (['pipe', '--from', 's=' + self.events, '--sql', 'SELECT * FROM s',
+          '--to', self._path('d.jsonl'), '--to-opt', 'key=store_id'],
+         'must be a local .json file'),
+        # Runner path.
+        (['pipe', '--from', self.stores, '--to', self._path('r.json'),
+          '--to-opt', 'key=store_id', '--runner=FnApiRunner'],
+         'small local runs'),
+    ]
+    for argv, needle in cases:
+      rc, env, _ = _run_json(argv)
+      self.assertNotEqual(rc, cli.EXIT_OK, argv)
+      self.assertIn(needle, env['error']['message'], argv)
+
+  def test_text_number_filter_hint(self):
+    src = self._path('t.csv')
+    with open(src, 'w', encoding='utf-8') as f:
+      f.write('id,amount\n1,100.0\n2,oops\n')
+    rc, env, err = _run_json([
+        'pipe', '--from', src, '--to', self._path('t.jsonl'), '--dlq',
+        self._path('t-bad.jsonl'), '--where', 'amount > 0'
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertTrue(
+        any('--from-opt fields=amount:float' in w for w in env['warnings']),
+        env['warnings'])
 
 
 if __name__ == '__main__':

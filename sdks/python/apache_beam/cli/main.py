@@ -2154,6 +2154,10 @@ def _pipe(
       if sink_ep is None and not args.dry_run:
         raise _CliError(
             'remote --sql execution requires --to <SINK>', EXIT_USAGE)
+      if sink_ep is not None and 'key' in (sink_ep.config or {}):
+        raise _CliError(
+            '--to-opt key= (one keyed JSON document) is only for local --sql '
+            'runs, not --emit-yaml or remote runners', EXIT_USAGE)
       non_portable = (
           pipe_sql.local_only_sql_functions(args.sql)
           if args.sql_engine == 'sqlite' else [])
@@ -2460,6 +2464,12 @@ def _pipe(
       verify=bool(args.verify),
       if_exists=args.if_exists,
       wait_timeout_sec=wait_timeout_sec)
+  if (fast_files is None and pipe.sink_endpoint is not None and
+      'key' in (pipe.sink_endpoint.config or {})):
+    raise _CliError(
+        '--to-opt key= (one keyed JSON document) works for small local runs '
+        'and local --sql only; without it, --to writes JSON lines',
+        EXIT_USAGE)
   if mixed_groups and fast_files is None:
     counts = ', '.join(
         f'{len(files)} {fmt}' for fmt, files in mixed_groups.items())
@@ -2611,8 +2621,11 @@ def _run_fast_local_pipe(
             state='DONE',
             duration_ms=int((time.monotonic() - t0) * 1000),
             metrics=res.metrics,
-            outputs=outputs))
+            outputs=outputs,
+            warnings=list(res.warnings)))
   else:
+    for warning in res.warnings:
+      print(f'warning: {warning}', file=sys.stderr)
     print(
         'Done. Ran locally in-process (small local job; set '
         f'{fast_local.DISABLE_ENV_VAR}=1 or pass --runner to use a Beam '

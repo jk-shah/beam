@@ -180,7 +180,9 @@ def run_check(
           'check passed (offline static validation); full plan expansion was '
           'skipped because it needs access to remote storage or credentials '
           'that are not available here')
-      plan_skipped_detail = str(e).splitlines()[0][:300]
+      plan_skipped_detail = (
+          'informational, not an error (the check passed): '
+          f'{str(e).splitlines()[0][:300]}')
 
   result = {
       'valid': True,

@@ -917,6 +917,79 @@ def run_in_memory_sql(
     conn.close()
 
 
+# `--to out.json --to-opt key=COL [--to-opt value=COL]`: one JSON document
+# keyed by COL instead of JSON lines, for answers such as
+# {"West": {"events": 6, ...}, "East": {...}}.
+KEYED_JSON_OPTIONS = frozenset(['key', 'value'])
+
+
+def keyed_json_options(sink_ep) -> dict[str, str] | None:
+  """The key/value options of a keyed JSON document sink, or None."""
+  if sink_ep is None or 'key' not in (sink_ep.config or {}):
+    return None
+  target = str(sink_ep.output_prefix or sink_ep.config.get('path') or '')
+  if sink_ep.format != 'json' or not target.lower().endswith('.json'):
+    raise SqlPipeError(
+        '--to-opt key= writes one JSON document, so --to must be a local '
+        '.json file (not .jsonl or another format)')
+  return {k: str(sink_ep.config[k]) for k in KEYED_JSON_OPTIONS
+          if k in sink_ep.config}
+
+
+def _embedded_json(value):
+  """JSON text from json_object()/json_group_array() is embedded as JSON."""
+  if isinstance(value, str) and value[:1] in ('[', '{'):
+    try:
+      return json.loads(value)
+    except ValueError:
+      return value
+  return value
+
+
+def keyed_json_document(columns, rows, key: str, value: str | None = None):
+  """`{row[key]: {other columns} | row[value]}`; fails on missing/dup keys."""
+  if key not in columns:
+    raise SqlPipeError(
+        f'--to-opt key={key}: no such output column (columns: '
+        f'{", ".join(columns)})')
+  if value is not None and value not in columns:
+    raise SqlPipeError(
+        f'--to-opt value={value}: no such output column (columns: '
+        f'{", ".join(columns)})')
+  doc: dict[str, Any] = {}
+  for r in rows:
+    k = r.get(key)
+    if k is None:
+      raise SqlPipeError(
+          f'--to-opt key={key}: a row has NULL {key}; replace it first, for '
+          f"example COALESCE({key}, 'UNMAPPED')")
+    k = str(k)
+    if k in doc:
+      raise SqlPipeError(
+          f'--to-opt key={key}: value {k!r} appears more than once; '
+          f'aggregate to one row per {key} first (GROUP BY {key})')
+    if value is not None:
+      doc[k] = _embedded_json(r.get(value))
+    else:
+      doc[k] = {c: _embedded_json(r.get(c)) for c in columns if c != key}
+  return doc
+
+
+def write_json_document(path: str, doc: Any) -> str:
+  parent = os.path.dirname(os.path.abspath(path))
+  os.makedirs(parent, exist_ok=True)
+  tmp_path = f'{path}.tmp.{os.getpid()}'
+  try:
+    with open(tmp_path, 'w', encoding='utf-8') as f:
+      json.dump(doc, f, indent=2, default=str)
+      f.write('\n')
+    os.replace(tmp_path, path)
+  finally:
+    if os.path.exists(tmp_path):
+      os.unlink(tmp_path)
+  return path
+
+
 def _mixed_columns_as_text(columns, rows, warnings=None):
   import pyarrow as pa
   arrays = {}
@@ -951,6 +1024,16 @@ def write_rows_to_local_file(
   target = sink_ep.output_prefix or sink_ep.config.get('path')
   if not target:
     raise SqlPipeError(f'missing target path for sink {sink_ep.raw!r}')
+  keyed = keyed_json_options(sink_ep)
+  if keyed is not None:
+    if if_exists == 'append':
+      raise SqlPipeError('--to-opt key= cannot be combined with --if-exists append')
+    return [
+        write_json_document(
+            target,
+            keyed_json_document(
+                out_cols, out_rows, keyed['key'], keyed.get('value')))
+    ]
   parent = os.path.dirname(os.path.abspath(target))
   if parent:
     os.makedirs(parent, exist_ok=True)

@@ -527,7 +527,10 @@ def cli_normalize_cdc(
           meta_skip = {
               c for c in (
                   op_col,
-                  seq_col,
+                  # Like parse_cdc_event: a sequence column that is ordinary
+                  # data (--cdc-seq-col updated_at) stays in the output; only
+                  # CDC envelope sequence columns (lsn, ts_ms, ...) are dropped.
+                  seq_col if seq_col in _ENVELOPE_SEQ_COLS else None,
                   'beam_cdc_op',
                   'beam_cdc_seq',
                   'beam_cdc_hex_seq',

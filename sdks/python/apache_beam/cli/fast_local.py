@@ -83,6 +83,28 @@ class FastPipeResult(NamedTuple):
   dlq_files: list[str]
   metrics: dict[str, int]
   columns: list[str]
+  warnings: list[str] = []
+
+
+def _text_number_columns(exc: Exception, row: Row, columns) -> list[str]:
+  """Columns that hold text when a comparison mixed text and numbers."""
+  if not (isinstance(exc, TypeError) and
+          'not supported between instances of' in str(exc) and
+          "'str'" in str(exc)):
+    return []
+  return [
+      c for c in columns
+      if isinstance(row._row_fields.get(c), str) and _looks_numeric(
+          row._row_fields.get(c))
+  ]
+
+
+def _looks_numeric(value: str) -> bool:
+  try:
+    float(value)
+    return True
+  except ValueError:
+    return False
 
 
 class Row:
@@ -147,7 +169,9 @@ def _exact_sink_path(ep: uris.ParsedEndpoint | None) -> str | None:
   target = ep.output_prefix
   if not _is_local(target) or any(ch in target for ch in '*?['):
     return None
-  if set(ep.config) - {'path'}:
+  extra = set(ep.config) - {'path'}
+  if extra and not (ep.format == 'json' and extra <= {'key', 'value'} and
+                    target.lower().endswith('.json')):
     return None
   if not target.lower().endswith(_SINK_EXTENSIONS[ep.format]):
     return None
@@ -574,6 +598,7 @@ def run(pipe, files: list[str], mixed_groups=None) -> FastPipeResult:
         pipe.source_endpoint, files, route_errors, dlq_records)
 
   filtered_out = 0
+  text_number_cols: set[str] = set()
   if where_cfg is not None:
     keep = _compile_field(where_cfg.get('keep'))
     kept = []
@@ -586,6 +611,7 @@ def run(pipe, files: list[str], mixed_groups=None) -> FastPipeResult:
               f"{type(exc).__name__}: {exc} [while running 'Filter']"
           ) from None
         dlq_records.append(_error_record('Filter', exc, row))
+        text_number_cols.update(_text_number_columns(exc, row, columns))
         continue
       if ok:
         kept.append(row)
@@ -618,7 +644,19 @@ def run(pipe, files: list[str], mixed_groups=None) -> FastPipeResult:
     types = out_types
 
   out_rows = [_plain(r) for r in rows]
-  written = [_write(pipe.sink_endpoint, columns, out_rows, types)]
+  from . import pipe_sql
+  keyed = pipe_sql.keyed_json_options(pipe.sink_endpoint)
+  if keyed is not None:
+    try:
+      doc = pipe_sql.keyed_json_document(
+          columns, out_rows, keyed['key'], keyed.get('value'))
+    except pipe_sql.SqlPipeError as e:
+      raise FastPipeError(str(e)) from None
+    written = [
+        pipe_sql.write_json_document(pipe.sink_endpoint.output_prefix, doc)
+    ]
+  else:
+    written = [_write(pipe.sink_endpoint, columns, out_rows, types)]
   dlq_files: list[str] = []
   if route_errors:
     dlq_files.append(
@@ -631,5 +669,18 @@ def run(pipe, files: list[str], mixed_groups=None) -> FastPipeResult:
     metrics['rows_filtered_out'] = filtered_out
   if route_errors:
     metrics['dlq_rows'] = len(dlq_records)
+  warnings = []
+  if text_number_cols:
+    cols = ', '.join(sorted(text_number_cols))
+    spec = ','.join(f'{c}:float' for c in sorted(text_number_cols))
+    warnings.append(
+        f'rows went to the DLQ because --where compared text with a number: '
+        f'column(s) {cols} were read as text (some sampled values are not '
+        f'numbers); set the type with --from-opt fields={spec} so valid '
+        'numbers are kept and only bad values go to the DLQ')
   return FastPipeResult(
-      files=written, dlq_files=dlq_files, metrics=metrics, columns=columns)
+      files=written,
+      dlq_files=dlq_files,
+      metrics=metrics,
+      columns=columns,
+      warnings=warnings)
