@@ -2947,6 +2947,163 @@ class Round8FixesTest(unittest.TestCase):
             "token 'abcdefghijklmnopqrstuvwxyz0123456789' leaked"))
 
 
+class Round9FixesTest(unittest.TestCase):
+  """CDC ties at the latest sequence value; readable step labels/paths."""
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp(prefix='beam-r9-test-')
+    self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+  def _cdc(self, body, *extra):
+    src = os.path.join(self.tmp, f'u{len(os.listdir(self.tmp))}.csv')
+    with open(src, 'w', encoding='utf-8') as f:
+      f.write('id,status,updated_at\n' + body)
+    out = os.path.join(self.tmp, f'o{len(os.listdir(self.tmp))}.jsonl')
+    rc, env, err = _run_json([
+        'pipe', '--from', src, '--to', out, '--cdc', '--primary-key', 'id',
+        '--cdc-seq-col', 'updated_at', '--runner=FnApiRunner', *extra
+    ])
+    return rc, env, err, out
+
+  def test_exact_duplicate_changes_collapse(self):
+    rc, env, err, out = self._cdc('1,active,2026-11-01T10:00:00\n'
+                                  '1,active,2026-11-01T10:00:00\n'
+                                  '2,closed,2026-11-02T10:00:00\n')
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    with open(out, encoding='utf-8') as f:
+      rows = sorted((json.loads(l) for l in f), key=lambda r: r['id'])
+    self.assertEqual([r['status'] for r in rows], ['active', 'closed'])
+
+  def test_conflicting_tie_at_latest_fails_with_correct_hint(self):
+    # Older version first, then two different changes at the same latest
+    # timestamp: before, one was picked arbitrarily.
+    rc, env, _, _ = self._cdc('1,new,2026-11-01T09:00:00\n'
+                              '1,active,2026-11-01T10:00:00\n'
+                              '1,closed,2026-11-01T10:00:00\n')
+    self.assertEqual(rc, cli.EXIT_PIPELINE_FAILED)
+    msg = env['error']['message']
+    self.assertIn('2 different changes', msg)
+    self.assertIn('same updated_at value', msg)
+    self.assertNotIn('pass --cdc-seq-col', msg)
+
+  def test_scrubber_keeps_step_labels_and_existing_paths(self):
+    from apache_beam.cli import output as output_mod
+    path = os.path.join(self.tmp, 'a_rather_long_input_file_name.csv')
+    open(path, 'w').close()
+    msg = (f"could not read '{path}' [while running "
+           "'ReadCsvWithDlq/ParseShards/ParDo(_ParseCsvShardDoFn)']")
+    self.assertEqual(output_mod.scrub_error_message(msg), msg)
+    self.assertIn(
+        '<redacted-value>',
+        output_mod.scrub_error_message(
+            "password='hunter2-correct-horse-battery-staple' rejected"))
+    missing = os.path.join(self.tmp, 'missing_long_input_dataset_2026.csv')
+    miss_msg = f"no such file: '{missing}'"
+    self.assertEqual(output_mod.scrub_error_message(miss_msg), miss_msg)
+
+  def test_conflicting_tie_does_not_suggest_dlq(self):
+    rc, env, _, _ = self._cdc('1,active,2026-11-01T10:00:00\n'
+                              '1,closed,2026-11-01T10:00:00\n')
+    self.assertEqual(rc, cli.EXIT_PIPELINE_FAILED)
+    self.assertFalse(
+        any('--dlq' in a['command'] for a in env.get('next_actions') or []))
+
+  def test_to_utc_normalizes_mixed_timestamps_in_sqlite_and_duckdb(self):
+    ev = os.path.join(self.tmp, 'events.parquet')
+    pq.write_table(
+        pa.Table.from_pylist([
+            {'id': 1, 'ts': '2026-11-01T10:00:00Z', 'amt': 10.0},
+            {'id': 2, 'ts': '2026-11-01 12:30:00+02:00', 'amt': 20.0},
+            {'id': 2, 'ts': '2026-11-01T11:45:00+00:00', 'amt': 25.0},
+            {'id': 3, 'ts': '2026-11-01T05:00:00-05:00', 'amt': 30.0},
+            {'id': 4, 'ts': '1762000800', 'amt': 40.0},
+            {'id': 5, 'ts': None, 'amt': 50.0},
+        ]),
+        ev)
+    query = (
+        'SELECT id, ts_utc, amt FROM ('
+        'SELECT id, to_utc(ts) AS ts_utc, amt, '
+        'ROW_NUMBER() OVER (PARTITION BY id ORDER BY to_utc(ts) DESC) AS rn '
+        'FROM e) WHERE rn = 1 ORDER BY id')
+    expected = [
+        {'id': 1, 'ts_utc': '2026-11-01T10:00:00Z', 'amt': 10.0},
+        {'id': 2, 'ts_utc': '2026-11-01T11:45:00Z', 'amt': 25.0},
+        {'id': 3, 'ts_utc': '2026-11-01T10:00:00Z', 'amt': 30.0},
+        {'id': 4, 'ts_utc': '2025-11-01T12:40:00Z', 'amt': 40.0},
+        {'id': 5, 'ts_utc': None, 'amt': 50.0},
+    ]
+    engines = ('sqlite', 'duckdb') if _has_duckdb() else ('sqlite', )
+    for eng in engines:
+      rc, env, err = _run_json([
+          'pipe', '--from', f'e={ev}', '--sql', query, '--sql-engine', eng
+      ])
+      self.assertEqual(rc, cli.EXIT_OK, (eng, err))
+      self.assertEqual(env['untrusted_data']['rows'], expected, eng)
+
+  def test_diff_to_file_and_exit_zero(self):
+    left = os.path.join(self.tmp, 'left.jsonl')
+    right = os.path.join(self.tmp, 'right.jsonl')
+    with open(left, 'w', encoding='utf-8') as f:
+      f.write('{"id": 1, "v": 10}\n{"id": 2, "v": 20}\n')
+    with open(right, 'w', encoding='utf-8') as f:
+      f.write('{"id": 1, "v": 10}\n{"id": 3, "v": 30}\n')
+    rep = os.path.join(self.tmp, 'diff_report.json')
+    rc, env, err = _run_json([
+        'diff', left, right, '--key', 'id', '--to', rep, '--exit-zero'
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertTrue(env['ok'])
+    self.assertFalse(env['outputs']['match'])
+    self.assertEqual(env['outputs']['file'], rep)
+    with open(rep, encoding='utf-8') as f:
+      saved = json.load(f)
+    self.assertFalse(saved['match'])
+    self.assertEqual(saved['differing_keys']['only_in_left'], [2])
+    self.assertEqual(saved['differing_keys']['only_in_right'], [3])
+    # Without --exit-zero, drift still exits 6 while writing --to.
+    rep2 = os.path.join(self.tmp, 'diff_report2.json')
+    rc2, _, _ = _run_json(['diff', left, right, '--key', 'id', '--to', rep2])
+    self.assertEqual(rc2, cli.EXIT_DIFF_MISMATCH)
+    self.assertTrue(os.path.isfile(rep2))
+
+  def test_in_place_replace_preserves_inputs_and_siblings(self):
+    target_pq = os.path.join(self.tmp, 'customers.parquet')
+    bak = target_pq + '.bak'
+    open(bak, 'w').close()
+    pq.write_table(pa.Table.from_pylist([{'id': 1, 'name': 'Alice'}]), target_pq)
+    batch2 = os.path.join(self.tmp, 'batch2.jsonl')
+    with open(batch2, 'w', encoding='utf-8') as f:
+      f.write('{"id": 2, "full_name": "Bob", "tier": "gold"}\n')
+    rc, env, err = _run_json([
+        'pipe', '--from', f't={target_pq}', '--join', f'b={batch2}', '--sql',
+        'SELECT id, name, CAST(NULL AS TEXT) AS tier FROM t UNION ALL '
+        'SELECT id, full_name AS name, tier FROM b ORDER BY id',
+        '--to', target_pq, '--if-exists', 'replace'
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertTrue(os.path.isfile(bak))
+    self.assertEqual(
+        pq.read_table(target_pq).to_pylist(), [
+            {'id': 1, 'name': 'Alice', 'tier': None},
+            {'id': 2, 'name': 'Bob', 'tier': 'gold'},
+        ])
+    # Fast-path in-place filter also reads before replacing.
+    rc, env, err = _run_json([
+        'pipe', '--from', target_pq, '--to', target_pq, '--where', 'id > 1',
+        '--if-exists', 'replace'
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertEqual(
+        pq.read_table(target_pq).to_pylist(),
+        [{'id': 2, 'name': 'Bob', 'tier': 'gold'}])
+    # Runner path refuses in-place replace instead of deleting the input first.
+    rc, env, _ = _run_json(
+        ['pipe', '--from', target_pq, '--to', target_pq, '--if-exists', 'replace'],
+        extra_env={'BEAM_CLI_NO_FAST_PATH': '1'})
+    self.assertEqual(rc, cli.EXIT_USAGE)
+    self.assertIn('is also an input', env['error']['message'])
+    self.assertTrue(os.path.isfile(target_pq))
+
+
 if __name__ == '__main__':
   unittest.main()
 

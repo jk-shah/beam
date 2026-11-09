@@ -170,13 +170,47 @@ def safe_column_hint(target: str, candidates: Iterable[str]) -> str | None:
   return matches[0] if matches else None
 
 
+def _keep_quoted(literal: str) -> bool:
+  """Long quoted literals that are safe and useful to show.
+
+  Beam step labels (`while running 'ReadCsvWithDlq/ParseShards/...'`) and
+  paths of files that exist locally or URIs without credentials tell the user
+  where an error happened; they aren't secrets.
+  """
+  import os
+  if re.fullmatch(r'[A-Za-z0-9_.:/()\[\]-]+', literal) and (
+      '/' in literal and not literal.startswith('/') and
+      not re.search(r'[A-Za-z0-9+/]{40,}', literal)):
+    return True  # A step label such as ReadCsvWithDlq/ParseShards/ParDo(...)
+  if re.fullmatch(r'(gs|s3|azfs|hdfs|file)://[^\s@?#]+', literal):
+    return True
+  # Safe local file/glob path (even when missing, e.g. "no such file: '...'"):
+  # contains a directory separator or known file extension, only path/glob
+  # characters, and no 32+ char extensionless segment that could be a token.
+  if re.fullmatch(r'[A-Za-z0-9_./*?\[\]-]+', literal) and (
+      '/' in literal or literal.lower().endswith((
+          '.csv', '.json', '.jsonl', '.parquet', '.avro', '.yaml', '.yml',
+          '.txt', '.sql', '.py'))):
+    if not any(len(seg) >= 32 and '.' not in seg for seg in literal.split('/')):
+      return True
+  try:
+    return os.path.exists(literal)
+  except (OSError, ValueError):
+    return False
+
+
 def scrub_error_message(message: str, verbose: bool = False) -> str:
   """Strips terminal escapes/BiDi chars and scrubs long quoted literals."""
   clean = sanitize_untrusted_text(message, max_chars=16384 if verbose else 4096)
   if verbose:
     return clean
-  return _LONG_QUOTED_RE.sub(lambda m: f'{m.group(1)}<redacted-value>{m.group(1)}',
-                             clean)
+
+  def _redact(m):
+    if _keep_quoted(m.group(0)[1:-1]):
+      return m.group(0)
+    return f'{m.group(1)}<redacted-value>{m.group(1)}'
+
+  return _LONG_QUOTED_RE.sub(_redact, clean)
 
 
 _AUTH_PATTERNS = re.compile(
@@ -246,7 +280,8 @@ def classify_error(
               'public IPs for enterprise GCP org policies.'),
           'requires_human': False,
       })
-    elif command == 'pipe' and not DLQ_REQUESTED:
+    elif command == 'pipe' and not DLQ_REQUESTED and not (
+        '--cdc:' in message and 'share the latest sequence value' in message):
       next_actions.append({
           'command': 'beam pipe ... --dlq ./dlq/errors.json',
           'description': 'Route malformed or failing records to a dead-letter sink.',

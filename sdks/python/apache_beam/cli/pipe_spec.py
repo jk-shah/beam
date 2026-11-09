@@ -61,6 +61,13 @@ def _normalize_primary_keys(primary_keys: Iterable[str] | None) -> list[str]:
   return out
 
 
+def _materialize_cdc_config(pks, seq_col):
+  cfg: dict[str, Any] = {'primary_key': pks}
+  if seq_col:
+    cfg['sequence_column'] = seq_col
+  return cfg
+
+
 def build_pipe_spec(
     source: str,
     sink: str,
@@ -513,7 +520,7 @@ def build_pipe_spec(
       if materialize_cdc:
         chain_steps.append({
             'type': 'CliMaterializeCdc',
-            'config': {'primary_key': pks},
+            'config': _materialize_cdc_config(pks, cdc_seq_col),
         })
     if where_cfg is not None:
       if inject_counters:
@@ -641,7 +648,7 @@ def build_pipe_spec(
           'name': 'MaterializeCdc',
           'type': 'CliMaterializeCdc',
           'input': current_ref,
-          'config': {'primary_key': pks},
+          'config': _materialize_cdc_config(pks, cdc_seq_col),
       })
       current_ref = 'MaterializeCdc'
 

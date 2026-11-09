@@ -22,7 +22,7 @@ uv pip install "apache-beam[yaml,gcp]>=2.71.0" pyarrow fastavro
 uv pip install "git+https://github.com/jk-shah/beam.git@beam-cli-preview#subdirectory=sdks/python/cli-preview"
 ```
 
-*(Local-only without GCP connectors: drop `,gcp` in step 2 -> `uv pip install "apache-beam[yaml]>=2.71.0" pyarrow fastavro`)*
+*(Local-only without GCP connectors: drop `,gcp` in step 2 -> `uv pip install "apache-beam[yaml]>=2.71.0" pyarrow fastavro`; optional ANSI SQL engine for `--sql-engine duckdb`: also install `duckdb`)*
 
 ### Option B: Standard `pip`
 ```bash

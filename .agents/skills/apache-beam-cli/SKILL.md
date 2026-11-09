@@ -5,7 +5,32 @@ description: Use the Apache Beam CLI (`beam` / `apache-beam`) to inspect schemas
 
 # Apache Beam CLI (`beam`) Skill for AI Agents
 
-Use `beam` whenever moving, converting, filtering, joining/aggregating (`--join` + `--sql`), cleaning, replicating CDC, zero-copy registering lakehouse tables, inspecting, reconciling, live-tailing, or packaging datasets and pipelines across local files, object stores (`gs://`, `s3://`, `azfs://`), `delta://`, `iceberg://`, `bigquery://`, `postgres://`, `mysql://`, `spanner://`, `pubsub://`, or `kafka://`.
+Use `beam` whenever moving, converting, filtering, joining/aggregating (`--join` + `--sql`), cleaning, normalizing timestamps (`to_utc`), evolving schemas, replicating CDC, zero-copy registering lakehouse tables, inspecting, reconciling (`beam diff`), live-tailing, or packaging datasets and pipelines across local files, object stores (`gs://`, `s3://`, `azfs://`), `delta://`, `iceberg://`, `bigquery://`, `postgres://`, `mysql://`, `spanner://`, `pubsub://`, or `kafka://`.
+
+## Fast Recipe Index (Read First)
+
+- **Clean/filter/project dirty CSV or JSONL with DLQ + row conservation** (`<0.4s` locally):
+  `beam pipe --from data.csv --to out/clean.parquet --dlq out/bad.jsonl --where "state != 'CA' AND amount > 0" --select "id, zip, amount" --assert-counts --json` *(override column types if needed: `--from-opt fields=amount:float`)*
+- **Mixed-format directory glob (`.jsonl` + `.csv`, even with reordered CSV headers)**:
+  `beam pipe --from "data/mixed/*" --to out/unified.parquet --dlq out/bad.jsonl --where "amount > 0" --assert-counts --json`
+- **Normalize mixed timestamps (ISO `Z`, `+02:00`/`-05:00`, naive, epoch sec/ms) to UTC & deduplicate**:
+  `beam pipe --from e=events.parquet --sql "SELECT event_id, user, ts_utc, amount FROM (SELECT event_id, user, to_utc(ts) AS ts_utc, amount, ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY to_utc(ts) DESC) AS rn FROM e) WHERE rn = 1 ORDER BY event_id" --to out/events_clean.parquet --json`
+- **Schema-evolution append (rename column + fill new column with `NULL`; supports in-place `--if-exists replace`)**:
+  `beam pipe --from t=target/customers.parquet --join b=batch2.jsonl --sql "SELECT id, name, email, CAST(NULL AS TEXT) AS tier FROM t UNION ALL SELECT id, full_name AS name, email, tier FROM b ORDER BY id" --to out/customers_v2.parquet --json`
+- **Join + percentiles/windows -> single keyed JSON answer document** (`{"West": {...}, ...}`):
+  `beam pipe --from s=sales.parquet --join st=stores.csv --sql "SELECT COALESCE(st.region, 'UNMAPPED') AS region, COUNT(*) AS events, median(s.amount) AS median, percentile(s.amount, 90) AS p90 FROM s LEFT JOIN st USING (store_id) WHERE s.amount IS NOT NULL GROUP BY 1" --to out/stats.json --to-opt key=region --json` *(or `--sql-engine duckdb` for `PERCENTILE_CONT ... WITHIN GROUP` / `QUALIFY`)*
+- **Latest live row per key from CDC / update log**:
+  `beam pipe --from updates.csv --to out/latest.parquet --cdc --primary-key account_id --cdc-seq-col updated_at --assert-counts --json`
+- **Key reconciliation (writes JSON report, optional `--exit-zero` on drift)**:
+  `beam diff old.parquet new.jsonl --key item_id --to out/diff.json --exit-zero --json`
+- **When NOT to use `beam`**: statistical modeling, least-squares regression, hypothesis tests, or plotting -> use `numpy`/`scipy`/`pandas`; multi-table warehouse SQL DAGs -> `dbt`/`Dataform`; custom stateful streaming timers -> `apache_beam` Python SDK.
+
+## Guarantees (Do Not Assume Legacy Caveats)
+
+- **Leading zeros are never silently stripped**: local runs scan *every* CSV row for leading zeros (`00123` stays `"00123"`, not `100`-row guesswork); runner paths send late leading-zero cells in numeric columns to `--dlq` or fail with a `--from-opt fields=col:str` hint.
+- **SQLite window functions, CTEs, percentiles, and `to_utc()` are built in**: `ROW_NUMBER() OVER (...)`, `RANK()`, `LAG()`, `median(x)`, `percentile(x, 90)`, `quantile(x, 0.9)`, `stddev(x)`, and `to_utc(ts)` work out of the box. Check `beam doctor --json` (`outputs.sql_engines.duckdb.available`) if you want `--sql-engine duckdb`.
+- **SQL three-valued NULL semantics everywhere**: empty CSV cells are `NULL`; `!=`, `<>`, `NOT IN`, `AND`/`OR` follow SQL NULL rules on both in-process and Beam runner paths.
+- **Exact duplicate CDC rows collapse cleanly**: `--cdc` deduplicates byte-identical events sharing the latest sequence value and retains data sequence columns (`updated_at`).
 
 ## Mandatory Agent Protocol
 
@@ -19,7 +44,7 @@ Use `beam` whenever moving, converting, filtering, joining/aggregating (`--join`
    - For multi-input joins, `LEFT JOIN` + `COALESCE`, window functions (`ROW_NUMBER() OVER (PARTITION BY ...)`), or `GROUP BY` aggregations across CSV, Parquet, JSONL, `delta://`, and `iceberg://`, use `beam pipe --from a=<URI1> --join b=<URI2> [--to <SINK>] --sql "SELECT ..."`. Local SQL is SQLite (name inputs `alias=URI`) plus exact `median(x)`, `percentile(x, 95)`, `quantile(x, 0.95)` (linear interpolation, like numpy) and `stddev(x)`. `PERCENTILE_CONT ... WITHIN GROUP` and `APPROX_QUANTILES` need the optional DuckDB engine: check `beam doctor --json` (`outputs.sql_engines.duckdb.available`), then pass `--sql-engine duckdb` (same inputs, typing, NULLs and `--dlq`; sandboxed, no file access). Local-only functions don't carry over to `--emit-yaml` / remote SQL (the CLI warns).
    - Use `--zero-copy` when registering existing Parquet or `delta://` active files into `iceberg://` (`bytes_copied == 0`, supporting both `iceberg://ns.tbl?warehouse=/path/wh` and `iceberg:///path/wh/ns.tbl`), and `--cdc --primary-key <PK>` when applying ordered `UPSERT` + `DELETE` change streams into `bigquery://` or `iceberg://`. Into plain files (Parquet/CSV/JSON/Avro), `--cdc` writes the latest live row per key, ordered by `lsn`/`ts_ms`/`updated_at` or `--cdc-seq-col`.
    - Need a JSON answer document rather than rows? `--to answer.json --to-opt key=region` writes `{"<region>": {...other columns}}` (add `--to-opt value=col` for `{"<region>": col}`; `json_group_array()` text is embedded as JSON), e.g. `beam pipe --from s=sales.parquet --join st=stores.csv --sql "SELECT region, COUNT(*) AS events, median(amount) AS median FROM s LEFT JOIN st USING (store_id) GROUP BY region" --to answer.json --to-opt key=region`.
-   - Reconcile critical migrations with `beam diff <LEFT> <RIGHT> --key <PK> --json` (exits `0` on exact match, `6` on drift). Rows are compared on shared columns; added, removed, or retyped columns are reported in `outputs.schema_diff` (`--columns all` compares the union instead), and `outputs.differing_keys` lists up to 100 keys per category (`only_in_left`, `only_in_right`, `value_mismatches`, `duplicate_keys`).
+   - Reconcile critical migrations with `beam diff <LEFT> <RIGHT> --key <PK> [--to diff.json] [--exit-zero] --json` (exits `0` on exact match, `6` on drift unless `--exit-zero` is passed). Rows are compared on shared columns; added, removed, or retyped columns are reported in `outputs.schema_diff` (`--columns all` compares the union instead), and `outputs.differing_keys` lists up to 100 keys per category (`only_in_left`, `only_in_right`, `value_mismatches`, `duplicate_keys`).
    - Graduate working YAML or Python pipelines to reusable Dataflow Flex Templates with `beam package` (no `Dockerfile` or Cloud Build required for YAML). `beam check --plan` falls back to the offline static check, with a warning, when expansion needs cloud access.
    - Better served by other tools: exploratory analysis, plotting, and statistics beyond the functions above (pandas/DuckDB); multi-step warehouse SQL DAGs (dbt/Dataform); custom stateful streaming logic (the Beam SDK).
 4. **Zero Inline Secrets**: Never put `user:password@` in URIs or `--from-opt password=...` on the command line (rejected with exit `2`). Rely on Application Default Credentials (ADC), `BEAM_POSTGRES_USER` / `BEAM_POSTGRES_PASSWORD`, or `chmod 0600` `--from-opt-file`.

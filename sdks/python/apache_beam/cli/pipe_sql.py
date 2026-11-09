@@ -579,6 +579,36 @@ def _register_scalar_functions(conn: sqlite3.Connection) -> None:
     return parts[pos - 1]
 
   conn.create_function('SPLIT_PART', 3, _split_part, deterministic=True)
+  def _to_utc(val: Any) -> str | None:
+    """Normalizes ISO-8601 (Z / offset / naive) or epoch sec/ms to ISO UTC."""
+    if val is None:
+      return None
+    s = str(val).strip()
+    if not s:
+      return None
+    from datetime import datetime
+    from datetime import timezone
+    try:
+      num = float(s)
+      if s.lstrip('+-').replace('.', '', 1).isdigit():
+        if abs(num) >= 1e11:
+          num /= 1000.0
+        dt = datetime.fromtimestamp(num, tz=timezone.utc)
+        return (
+            dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+            if dt.microsecond == 0 else dt.isoformat().replace('+00:00', 'Z'))
+    except (ValueError, OverflowError, OSError):
+      pass
+    iso = s[:-1] + '+00:00' if s.endswith(('Z', 'z')) else s
+    dt = datetime.fromisoformat(iso)
+    dt = (
+        dt.replace(tzinfo=timezone.utc)
+        if dt.tzinfo is None else dt.astimezone(timezone.utc))
+    return (
+        dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+        if dt.microsecond == 0 else dt.isoformat().replace('+00:00', 'Z'))
+
+  conn.create_function('TO_UTC', 1, _to_utc, deterministic=True)
   _register_aggregate_functions(conn)
 
 
@@ -684,9 +714,9 @@ def _sql_error_hint(message: str, query: str) -> str:
       return f'; hint: {hint}'
   if 'no such function' in message.lower():
     return (
-        '; hint: local SQL is SQLite plus median, percentile, quantile, '
-        'stddev, concat, split_part, floor, ceil, power and sqrt; for ANSI '
-        'analytics pass --sql-engine duckdb')
+        '; hint: local SQL is SQLite plus to_utc, median, percentile, '
+        'quantile, stddev, concat, split_part, floor, ceil, power and sqrt; '
+        'for ANSI analytics pass --sql-engine duckdb')
   return ''
 
 
@@ -694,7 +724,8 @@ def _sql_error_hint(message: str, query: str) -> str:
 # but Beam's remote SQL dialect (Calcite) does not.
 _LOCAL_ONLY_SQL_FUNCTIONS = (
     'median', 'percentile', 'quantile', 'quantile_cont', 'split_part',
-    'strftime', 'julianday', 'ifnull', 'group_concat', 'printf', 'instr')
+    'to_utc', 'strftime', 'julianday', 'ifnull', 'group_concat', 'printf',
+    'instr')
 
 
 def local_only_sql_functions(query: str) -> list[str]:
@@ -802,6 +833,28 @@ def _run_duckdb(named_sources, clean_q, *, default_project, dlq_records):
           con.execute(
               f'CREATE VIEW {_quote_ident(view_name)} AS '
               f'SELECT * FROM {_quote_ident(first_alias)}')
+    con.execute("SET TimeZone = 'UTC'")
+    con.execute(r'''
+      CREATE MACRO to_utc(x) AS (
+        CASE
+          WHEN x IS NULL OR trim(CAST(x AS VARCHAR)) = '' THEN NULL
+          WHEN regexp_matches(trim(CAST(x AS VARCHAR)), '^[+-]?[0-9]+(\.[0-9]+)?$') THEN
+            strftime(
+              to_timestamp(
+                CASE WHEN abs(TRY_CAST(x AS DOUBLE)) >= 1e11
+                     THEN TRY_CAST(x AS DOUBLE) / 1000.0
+                     ELSE TRY_CAST(x AS DOUBLE) END
+              ) AT TIME ZONE 'UTC',
+              '%Y-%m-%dT%H:%M:%SZ'
+            )
+          ELSE
+            strftime(
+              CAST(trim(CAST(x AS VARCHAR)) AS TIMESTAMPTZ) AT TIME ZONE 'UTC',
+              '%Y-%m-%dT%H:%M:%SZ'
+            )
+        END
+      )
+    ''')
     con.execute('SET lock_configuration = true')
     try:
       cur = con.execute(clean_q)

@@ -591,7 +591,8 @@ def cli_normalize_cdc(
 _CDC_META_COLUMNS = ('beam_cdc_op', 'beam_cdc_seq', 'beam_cdc_hex_seq')
 
 
-def cli_materialize_cdc(primary_key: list[str]):
+def cli_materialize_cdc(
+    primary_key: list[str], sequence_column: Optional[str] = None):
   """Collapses normalized CDC rows to the latest live row per primary key.
 
   `beam pipe --cdc` inserts this after CliNormalizeCdc when the sink is a plain
@@ -619,13 +620,29 @@ def cli_materialize_cdc(primary_key: list[str]):
     def process(self, keyed):
       key, rows = keyed
       rows = list(rows)
-      if len(rows) > 1 and len({r.beam_cdc_seq for r in rows}) == 1:
+      top = max(r.beam_cdc_seq for r in rows)
+      tied = [r for r in rows if r.beam_cdc_seq == top]
+      # Exact duplicates (same values and operation) are one change.
+      distinct = {
+          tuple(getattr(r, n) for n in self._names) + (r.beam_cdc_op, )
+          for r in tied
+      }
+      if len(distinct) > 1:
+        if sequence_column:
+          hint = (
+              f'they have the same {sequence_column} value, so the latest '
+              'cannot be chosen; use a finer ordering column (for example a '
+              'timestamp with seconds or an LSN) or deduplicate the input '
+              'first')
+        else:
+          hint = (
+              'no ordering column was found, so the latest cannot be chosen; '
+              'pass --cdc-seq-col COLUMN naming an ordering column (for '
+              'example updated_at or lsn)')
         raise ValueError(
-            f'--cdc: {len(rows)} changes for primary key {key!r} share one '
-            'sequence number, so the latest cannot be chosen; pass '
-            '--cdc-seq-col COLUMN naming an ordering column (for example '
-            'updated_at or lsn)')
-      latest = max(rows, key=lambda r: r.beam_cdc_seq)
+            f'--cdc: {len(distinct)} different changes for primary key '
+            f'{key!r} share the latest sequence value: {hint}')
+      latest = tied[0]
       self._superseded.inc(len(rows) - 1)
       if latest.beam_cdc_op == 'DELETE':
         self._superseded.inc()

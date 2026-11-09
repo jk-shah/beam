@@ -41,6 +41,7 @@ import sys
 import time
 import traceback
 from typing import Any
+from typing import Iterable
 
 from . import _option_arity
 from . import output
@@ -158,7 +159,7 @@ _CLI_ZERO_FLAGS = {
         '--no-config',
         '--help',
     ]),
-    'diff': frozenset(['--verbose', '--no-config', '--help']),
+    'diff': frozenset(['--exit-zero', '--verbose', '--no-config', '--help']),
     'check': frozenset([
         '--plan',
         '--trust-providers',
@@ -217,6 +218,7 @@ _CLI_ONE_FLAGS = {
         '--rtol',
         '--atol',
         '--columns',
+        '--to',
         '--max-bytes',
         '--profile',
     ]),
@@ -807,6 +809,15 @@ def _build_parser():
           'shared (default): compare columns present on both sides and report '
           'added/removed/retyped columns in schema_diff; all: compare the '
           'union, treating a missing column as null'))
+  diff_p.add_argument(
+      '--to',
+      dest='sink',
+      metavar='FILE',
+      help='write the structured JSON reconciliation report to FILE')
+  diff_p.add_argument(
+      '--exit-zero',
+      action='store_true',
+      help='exit 0 even when datasets differ (drift is still in outputs.match)')
   diff_p.add_argument(
       '--max-bytes',
       metavar='SIZE',
@@ -1639,12 +1650,22 @@ def _diff(args, extra_args, *, json_session, t0: float) -> int:
   diff_job_id = report.pop('job_id', None)
   diff_state = report.pop('state', None)
   summary = report['summary']
+  drift_detected = (rc != EXIT_OK)
+  if getattr(args, 'sink', None):
+    if '://' in args.sink or args.sink == '-':
+      raise _CliError(
+          'beam diff --to requires a local file path (for example out/diff.json)',
+          EXIT_USAGE)
+    from . import pipe_sql as _ps_diff
+    _ps_diff.write_json_document(args.sink, report)
+    report = {**report, 'file': args.sink}
+  eff_rc = EXIT_OK if (drift_detected and getattr(args, 'exit_zero', False)) else rc
   if json_session.enabled:
     json_session.emit(
         output.build_envelope(
-            ok=(rc == EXIT_OK),
+            ok=(eff_rc == EXIT_OK),
             command='diff',
-            exit_code=rc,
+            exit_code=eff_rc,
             runner=diff_runner,
             job_id=diff_job_id,
             state=diff_state,
@@ -1661,21 +1682,21 @@ def _diff(args, extra_args, *, json_session, t0: float) -> int:
             outputs=report,
             error=output.classify_error(
                 'datasets differ', rc, command='diff')[0]
-            if rc != EXIT_OK else None,
+            if eff_rc != EXIT_OK else None,
             untrusted_data=untrusted))
   else:
-    if rc == EXIT_OK:
+    if not drift_detected:
       print(
           f"MATCH: {summary['matched_rows']} row(s) identical between "
           f"{args.left} and {args.right}.")
     else:
       print(
-          f"MISMATCH (exit {rc}): left={summary['left_rows']}, "
+          f"MISMATCH (exit {eff_rc}): left={summary['left_rows']}, "
           f"right={summary['right_rows']}, matched={summary['matched_rows']}, "
           f"only_in_left={summary['only_in_left']}, "
           f"only_in_right={summary['only_in_right']}, "
           f"value_mismatches={summary['value_mismatches']}")
-  return rc
+  return eff_rc
 
 
 def _wait(args, extra_args, *, json_session, t0: float) -> int:
@@ -2202,8 +2223,8 @@ def _pipe(
     if sink_prefix and '://' not in sink_prefix:
       if args.if_exists == 'fail':
         _refuse_existing_local_output(sink_prefix)
-      elif args.if_exists == 'replace':
-        _remove_existing_output_for_replace(sink_prefix)
+      # --if-exists replace: the inputs (possibly the output itself, for an
+      # in-place append) are read first; stale files go after the write.
 
     try:
       out_cols, out_rows, dlq_recs, total_read = pipe_sql.run_in_memory_sql(
@@ -2226,6 +2247,8 @@ def _pipe(
             sink_ep,
             if_exists=args.if_exists,
             warnings=sql_warnings)
+        if args.if_exists == 'replace' and sink_prefix:
+          _remove_existing_output_for_replace(sink_prefix, keep=written_sql)
       dlq_written: list[str] = []
       if dlq_ep is not None:
         dlq_written = pipe_sql.write_rows_to_local_file(
@@ -2492,6 +2515,13 @@ def _pipe(
     if fast_rc is not None:
       return fast_rc
 
+  if args.if_exists == 'replace' and not args.dry_run:
+    src_path = (pipe.source_endpoint.config.get('path')
+                if pipe.source_endpoint is not None else None)
+    if isinstance(src_path, str) and '://' not in src_path:
+      from . import dlq as dlq_mod
+      _refuse_replace_of_input(pipe.output_prefix, dlq_mod._match_paths(src_path))
+
   import yaml
   dumper = getattr(yaml, 'CSafeDumper', yaml.SafeDumper)
   yaml_str = yaml.dump(pipe.spec, Dumper=dumper, sort_keys=False, width=100000)
@@ -2572,8 +2602,6 @@ def _run_fast_local_pipe(
   from . import jobs
   canonical_spec = json.dumps(pipe.spec, sort_keys=True, separators=(',', ':'))
   plan_hash = 'sha256:' + hashlib.sha256(canonical_spec.encode('utf-8')).hexdigest()
-  if args.if_exists == 'replace':
-    _remove_existing_output_for_replace(pipe.output_prefix)
   try:
     res = fast_local.run(pipe, files, mixed_groups=mixed_groups)
   except ImportError as e:
@@ -2596,6 +2624,9 @@ def _run_fast_local_pipe(
     err_msg = jobs.check_assert_counts(res.metrics)
     if err_msg:
       raise _CliError(err_msg, EXIT_PIPELINE_FAILED)
+  if args.if_exists == 'replace':
+    # The inputs were read before the new output replaced the old one.
+    _remove_existing_output_for_replace(pipe.output_prefix, keep=res.files)
 
   # Same housekeeping as the runner path: drop empty `.temp*` dirs left by
   # earlier Beam runs next to the outputs.
@@ -3150,16 +3181,56 @@ def _extract_job_id(result: Any) -> str | None:
   return None
 
 
-def _remove_existing_output_for_replace(prefix: str) -> None:
+def _output_files_for_replace(prefix: str) -> list[str]:
+  """The files `--if-exists replace` may delete: the exact output file and
+  its Beam shards (`PREFIX-00000-of-00004...`), never other sibling files
+  such as `out.parquet.bak`."""
   if '://' not in prefix:
-    for p in glob.glob(glob.escape(prefix) + '*'):
-      if os.path.isfile(p):
-        os.unlink(p)
+    found = [prefix] if os.path.isfile(prefix) else []
+    found += [
+        p for p in glob.glob(glob.escape(prefix) + '-*-of-*')
+        if os.path.isfile(p)
+    ]
+    return found
+  from apache_beam.io.filesystems import FileSystems
+  found = [m.path for m in FileSystems.match([prefix])[0].metadata_list]
+  found += [
+      m.path for m in FileSystems.match([prefix + '-*-of-*'])[0].metadata_list
+  ]
+  return found
+
+
+def _remove_existing_output_for_replace(
+    prefix: str, keep: Iterable[str] = ()) -> None:
+  keep_abs = {os.path.abspath(k) for k in keep if '://' not in k}
+  targets = [
+      p for p in _output_files_for_replace(prefix)
+      if os.path.abspath(p) not in keep_abs and p not in keep
+  ]
+  if not targets:
+    return
+  if '://' not in prefix:
+    for p in targets:
+      os.unlink(p)
     return
   from apache_beam.io.filesystems import FileSystems
-  matches = FileSystems.match([prefix + '*'])[0].metadata_list
-  if matches:
-    FileSystems.delete([m.path for m in matches])
+  FileSystems.delete(targets)
+
+
+def _refuse_replace_of_input(prefix: str | None, input_files: Iterable[str]):
+  """Runner paths delete the old output before reading: refuse in-place."""
+  if not prefix:
+    return
+  outputs = {os.path.abspath(p) for p in _output_files_for_replace(prefix)}
+  overlap = sorted(
+      p for p in input_files if os.path.abspath(p) in outputs)
+  if overlap:
+    raise _CliError(
+        f'--to {prefix} is also an input ({overlap[0]}); with --if-exists '
+        'replace on this runner the old output is deleted before the inputs '
+        'are read. Write to a new file and move it over the old one, or run '
+        'it as a small local job (in-process or local --sql), which reads the '
+        'inputs first', EXIT_USAGE)
 
 
 def _format_existing_output_error(prefix, existing):

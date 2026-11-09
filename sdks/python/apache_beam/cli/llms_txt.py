@@ -77,7 +77,7 @@ def render_llms_txt() -> str:
     `{{{{ vars }}}}` into `metadata.parameters`) and AST-introspected single-image
     Flex Template bundle generator for Python pipelines (no handwritten
     `Dockerfile` or `metadata.json`).
-- `beam diff <LEFT_URI> <RIGHT_URI> [--key COL ...] [--columns shared|all] [--rtol F] [--atol F] [--json]`
+- `beam diff <LEFT_URI> <RIGHT_URI> [--key COL ...] [--columns shared|all] [--to FILE] [--exit-zero] [--rtol F] [--atol F] [--json]`
     Distributed O(1)-memory key/multiset reconciliation across files, `delta://`,
     `iceberg://`, and `bigquery://` (`0` match, `6` drift). Compares shared columns
     and reports added/removed/retyped columns in `outputs.schema_diff`. With
@@ -148,9 +148,12 @@ def render_llms_txt() -> str:
   `{{"<key>": <col>}}`; JSON text from `json_group_array()` / `json_object()` is embedded as JSON. Local runs only.
 - Nested JSON objects and Parquet/Avro structs use dots: `--where "props.amount >= 10" --select "user.id AS user_id"`.
   With `--dlq`, malformed JSON lines and values that don't fit the inferred type are quarantined; without it they fail the run.
-- Local `--sql` is SQLite (inputs named `alias=URI`; unaliased inputs are named after the file) plus exact
-  `median(x)`, `percentile(x, 95)`, `quantile(x, 0.95)` (linear interpolation, like numpy) and `stddev(x)`;
-  window functions such as `ROW_NUMBER() OVER (PARTITION BY k ORDER BY ts DESC)` work.
+- Local `--sql` is SQLite (inputs named `alias=URI`; unaliased inputs are named after the file) plus `to_utc(ts)`
+  (normalizes ISO `Z`/offsets/naive and epoch sec/ms to `YYYY-MM-DDTHH:MM:SSZ`), exact `median(x)`,
+  `percentile(x, 95)`, `quantile(x, 0.95)` (linear interpolation, like numpy) and `stddev(x)`; window functions
+  such as `ROW_NUMBER() OVER (PARTITION BY k ORDER BY to_utc(ts) DESC)` work. Schema-evolution append / column
+  rename is one query: `SELECT id, name, CAST(NULL AS TEXT) AS tier FROM old UNION ALL SELECT id, full_name AS name, tier FROM batch2`
+  (in-place `--to target.parquet --if-exists replace` reads inputs before replacing).
   Not supported by SQLite: `PERCENTILE_CONT ... WITHIN GROUP`, `APPROX_QUANTILES`. Local-only functions are not
   portable to `--emit-yaml` / remote Beam SQL (Calcite); the CLI warns when you export them.
 - Optional DuckDB engine: `--sql-engine duckdb` (install with `pip install duckdb` or the `[duckdb]` extra; `beam doctor`
