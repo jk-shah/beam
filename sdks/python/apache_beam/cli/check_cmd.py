@@ -75,7 +75,7 @@ def run_check(
       raw_text = yaml_utils.expand_jinja(
           raw_text, json.loads(jinja_variables_json))
 
-  loader = getattr(yaml, 'CSafeLoader', yaml.SafeLoader)
+  from . import output as out_mod
   if not jinja_variables_json and ('{{' in raw_text or '{%' in raw_text):
     from . import package as pkg_mod
     try:
@@ -83,9 +83,10 @@ def run_check(
     except pkg_mod.PackageError as e:
       raise CheckError(f'Jinja2 syntax error in {source_label}: {e}') from None
   try:
-    spec = yaml.load(raw_text, Loader=loader)
+    spec = out_mod.safe_yaml_load(raw_text)
   except yaml.YAMLError as e:
-    if not jinja_variables_json and '{{' in raw_text:
+    if (not jinja_variables_json and '{{' in raw_text and
+        'alias expansion' not in str(e) and 'maximum' not in str(e)):
       from . import package as pkg_mod
       try:
         spec = pkg_mod._validate_yaml_with_jinja_placeholders(raw_text)
@@ -141,6 +142,7 @@ def run_check(
         val not in _builtin_cli_targets for val in t_map.values()):
       has_untrusted_providers = True
       break
+  has_untrusted_code = _has_executable_python_transforms(pipeline_block)
 
   canonical_json = json.dumps(spec, sort_keys=True, separators=(',', ':'))
   plan_hash = 'sha256:' + hashlib.sha256(
@@ -149,11 +151,12 @@ def run_check(
   expanded_transforms: list[str] | None = None
   plan_skipped_reason: str | None = None
   if expand_plan:
-    if has_untrusted_providers and not trust_providers:
+    if (has_untrusted_providers or has_untrusted_code) and not trust_providers:
       raise CheckError(
-          f'{source_label} declares custom "providers:" which execute code '
-          'during --plan expansion; re-run with --trust-providers to allow '
-          'provider execution')
+          f'{source_label} declares custom "providers:" or inline Python '
+          'transforms (such as PyTransform or language: python callables) '
+          'which execute code during --plan expansion; re-run with '
+          '--trust-providers to allow code execution')
     import apache_beam as beam
     from apache_beam.yaml import main as yaml_main
     dumper = getattr(yaml, 'CSafeDumper', yaml.SafeDumper)
@@ -240,6 +243,102 @@ def _check_transform_keys(transforms, source_label: str, path: str = '') -> None
       for extra in ('source', 'sink'):
         if isinstance(t.get(extra), dict):
           _check_transform_keys([t[extra]], source_label, f'{label} > ')
+
+
+_SAFE_CALLABLE_IMPORTS = frozenset(
+    ['json', 'math', 're', 'datetime', 'decimal', 'base64'])
+_DANGEROUS_CALLABLE_NAMES = frozenset([
+    '__import__', 'eval', 'exec', 'compile', 'open', 'input', 'breakpoint',
+    'globals', 'locals', 'vars', 'dir', 'delattr', 'setattr', 'builtins',
+    'os', 'sys', 'subprocess', 'shutil', 'socket', 'urllib', 'http', 'ctypes',
+    'importlib', 'pathlib', 'pickle', 'marshal',
+])
+
+
+def _is_safe_inline_callable(src: str) -> bool:
+  """True only for pure side-effect-free `def fn(row):` or `lambda row:`."""
+  import ast
+  try:
+    mod = ast.parse(src)
+  except SyntaxError:
+    return False
+  if len(mod.body) != 1:
+    return False
+  stmt = mod.body[0]
+  if isinstance(stmt, ast.FunctionDef):
+    args = stmt.args
+    if (stmt.decorator_list or stmt.returns is not None or args.defaults or
+        any(d is not None for d in args.kw_defaults)):
+      return False
+    all_arg_nodes = (
+        list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs) +
+        ([args.vararg] if args.vararg else []) +
+        ([args.kwarg] if args.kwarg else []))
+    if any(a.annotation is not None for a in all_arg_nodes):
+      return False
+  elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Lambda):
+    args = stmt.value.args
+    if args.defaults or any(d is not None for d in args.kw_defaults):
+      return False
+  else:
+    return False
+
+  for node in ast.walk(stmt):
+    if isinstance(node, ast.Import):
+      if any(alias.name not in _SAFE_CALLABLE_IMPORTS for alias in node.names):
+        return False
+    elif isinstance(node, ast.ImportFrom):
+      if (node.module or '') not in _SAFE_CALLABLE_IMPORTS:
+        return False
+    elif isinstance(node, ast.Name):
+      if node.id in _DANGEROUS_CALLABLE_NAMES or (
+          node.id.startswith('__') and node.id != '__row__'):
+        return False
+    elif isinstance(node, ast.Attribute):
+      if node.attr.startswith('__') or node.attr in (
+          'gi_frame', 'f_globals', 'f_builtins', 'tb_frame', 'cr_frame',
+          'ag_frame'):
+        return False
+  return True
+
+
+def _config_has_untrusted_python(obj: Any) -> bool:
+  if isinstance(obj, dict):
+    if 'path' in obj and isinstance(obj.get('path'), str):
+      return True
+    if 'callable' in obj:
+      c = obj.get('callable')
+      if not isinstance(c, str) or not _is_safe_inline_callable(c):
+        return True
+    return any(_config_has_untrusted_python(v) for v in obj.values())
+  if isinstance(obj, list):
+    return any(_config_has_untrusted_python(item) for item in obj)
+  return False
+
+
+def _has_executable_python_transforms(block: Any) -> bool:
+  """Detects `PyTransform` or untrusted Python callables before `--plan`."""
+  if isinstance(block, list):
+    return any(_has_executable_python_transforms(item) for item in block)
+  if not isinstance(block, dict):
+    return False
+  t_type = str(block.get('type') or '')
+  if t_type in ('PyTransform', 'PythonCallable'):
+    return True
+  cfg = block.get('config')
+  if isinstance(cfg, dict):
+    lang = str(cfg.get('language') or '').lower()
+    if lang == 'python' and _config_has_untrusted_python(cfg):
+      return True
+    if 'constructor' in cfg and t_type not in (
+        'ReadFromCsv', 'ReadFromJson', 'ReadFromParquet', 'ReadFromAvro',
+        'ReadFromText'):
+      return True
+  for child_key in ('transforms', 'extra_transforms', 'source', 'sink'):
+    if child_key in block and _has_executable_python_transforms(
+        block[child_key]):
+      return True
+  return False
 
 
 _REMOTE_ACCESS_MARKERS = (

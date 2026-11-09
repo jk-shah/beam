@@ -89,7 +89,7 @@ def run_inspect(
       'format': ep.format,
       'yaml_transform': ep.yaml_type,
       'config_preview': {
-          k: ('<redacted>' if 'pass' in k.lower() else v)
+          k: ('<redacted>' if uris._SECRET_KEY_RE.search(str(k)) else v)
           for k, v in ep.config.items()
       },
       'schema': [],
@@ -263,10 +263,14 @@ def _inspect_files(
       for c in header:
         strict_t = dlq._infer_scalar_kind(col_samples[c], allow_dirty=False)
         dirty_t = dlq._infer_scalar_kind(col_samples[c], allow_dirty=True)
+        safe_c = output.sanitize_untrusted_text(str(c), max_chars=256)
         if dirty_t != strict_t:
-          dirty_cols.append(f'{c} ({dirty_t} with non-{dirty_t} outlier cells)')
+          shown_c = (
+              safe_c if output.SAFE_IDENTIFIER_RE.match(safe_c) else
+              '<unsafe-column-name>')
+          dirty_cols.append(f'{shown_c} ({dirty_t} with non-{dirty_t} outlier cells)')
         schema_fields.append({
-            'name': c,
+            'name': safe_c,
             'type': dirty_t,
             'nullable': True,
         })
@@ -319,7 +323,9 @@ def _inspect_files(
           f'Detected {malformed_in_sample} malformed JSON line(s) in sample; '
           'pass --dlq <path> to `beam pipe` to quarantine corrupt records.')
     schema_fields = [{
-        'name': k, 'type': t, 'nullable': True
+        'name': output.sanitize_untrusted_text(str(k), max_chars=256),
+        'type': t,
+        'nullable': True,
     } for k, t in inferred_types.items()]
 
   stats: dict[str, Any] | None = None

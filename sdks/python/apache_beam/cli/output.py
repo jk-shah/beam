@@ -199,9 +199,35 @@ def _keep_quoted(literal: str) -> bool:
     return False
 
 
+# Explicit credential patterns (unquoted or <28 chars) scrubbed in error text.
+_URI_USERINFO_SECRET_RE = re.compile(
+    r'([A-Za-z][A-Za-z0-9+.-]*://[^/\s:@\'"]+:)(?!<redacted)([^@\s/\'"]+)(@)')
+_AUTH_HEADER_SECRET_RE = re.compile(
+    r'\b(Bearer|Basic)\s+(?!<redacted)[A-Za-z0-9._~+/=-]{8,}', re.IGNORECASE)
+_KV_SECRET_RE = re.compile(
+    r'(\b(?:password|passwd|secret|token|api_key|access_key|private_key|'
+    r'client_secret|aws_secret_access_key|sasl\.jaas\.config)\b\s*[:=]\s*)'
+    r"""(?!['"]?<redacted)(?:(['"])(?:\\.|(?!\2).)*?\2|[^\s,'";)\]}]+)""",
+    re.IGNORECASE)
+_KNOWN_TOKEN_RE = re.compile(
+    r'\b(?:'
+    r'ya29\.[A-Za-z0-9._-]{12,}|'
+    r'gh[pousr]_[A-Za-z0-9_]{16,}|'
+    r'github_pat_[A-Za-z0-9_]{16,}|'
+    r'AKIA[0-9A-Z]{16}|'
+    r'AIza[0-9A-Za-z_-]{30,}|'
+    r'sk-[A-Za-z0-9_-]{16,}|'
+    r'xox[baprs]-[A-Za-z0-9-]{10,}'
+    r')\b')
+
+
 def scrub_error_message(message: str, verbose: bool = False) -> str:
-  """Strips terminal escapes/BiDi chars and scrubs long quoted literals."""
+  """Strips terminal escapes/BiDi chars and scrubs credentials & long literals."""
   clean = sanitize_untrusted_text(message, max_chars=16384 if verbose else 4096)
+  clean = _URI_USERINFO_SECRET_RE.sub(r'\1<redacted-value>\3', clean)
+  clean = _AUTH_HEADER_SECRET_RE.sub(r'\1 <redacted-value>', clean)
+  clean = _KV_SECRET_RE.sub(r'\1<redacted-value>', clean)
+  clean = _KNOWN_TOKEN_RE.sub('<redacted-value>', clean)
   if verbose:
     return clean
 
@@ -211,6 +237,59 @@ def scrub_error_message(message: str, verbose: bool = False) -> str:
     return f'{m.group(1)}<redacted-value>{m.group(1)}'
 
   return _LONG_QUOTED_RE.sub(_redact, clean)
+
+
+def safe_yaml_load(
+    raw_text: str,
+    *,
+    max_bytes: int = 2 * 1024 * 1024,
+    max_expanded_nodes: int = 25_000,
+    max_depth: int = 64,
+) -> Any:
+  """Parses YAML with `SafeLoader` and enforces size, depth, and node budgets."""
+  import yaml
+  if len(raw_text.encode('utf-8', errors='replace')) > max_bytes:
+    raise yaml.YAMLError(
+        f'YAML input exceeds maximum size ({max_bytes:,} bytes)')
+  loader = getattr(yaml, 'CSafeLoader', yaml.SafeLoader)
+  loaded = yaml.load(raw_text, Loader=loader)
+  visited = 0
+  active_ids: set[int] = set()
+
+  def _walk_budget(obj: Any, depth: int) -> None:
+    nonlocal visited
+    visited += 1
+    if visited > max_expanded_nodes:
+      raise yaml.YAMLError(
+          f'YAML exceeds maximum expanded node budget ({max_expanded_nodes:,} '
+          'nodes)')
+    if depth > max_depth:
+      raise yaml.YAMLError(
+          f'YAML nesting exceeds maximum depth ({max_depth})')
+    if isinstance(obj, dict):
+      oid = id(obj)
+      if oid in active_ids:
+        raise yaml.YAMLError('cyclic YAML anchor reference is not allowed')
+      active_ids.add(oid)
+      try:
+        for k, v in obj.items():
+          _walk_budget(k, depth + 1)
+          _walk_budget(v, depth + 1)
+      finally:
+        active_ids.discard(oid)
+    elif isinstance(obj, list):
+      oid = id(obj)
+      if oid in active_ids:
+        raise yaml.YAMLError('cyclic YAML anchor reference is not allowed')
+      active_ids.add(oid)
+      try:
+        for item in obj:
+          _walk_budget(item, depth + 1)
+      finally:
+        active_ids.discard(oid)
+
+  _walk_budget(loaded, 0)
+  return loaded
 
 
 _AUTH_PATTERNS = re.compile(

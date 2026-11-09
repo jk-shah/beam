@@ -1804,10 +1804,21 @@ def _run(args, pipeline_args, *, json_session, t0: float) -> int:
     except ValueError as e:
       raise _CliError(str(e), EXIT_USAGE) from None
 
+  def _guard_yaml_budget(raw_text: str) -> None:
+    if '{{' in raw_text or '{%' in raw_text:
+      return
+    import yaml
+    try:
+      output.safe_yaml_load(raw_text)
+    except yaml.YAMLError as e:
+      if 'node budget' in str(e) or 'maximum' in str(e) or 'cyclic' in str(e):
+        raise _CliError(str(e), EXIT_USAGE) from None
+
   if file == '-':
     stdin_yaml = sys.stdin.read()
     if not stdin_yaml.strip():
       raise _CliError('stdin (-) is empty; expected Beam YAML pipeline', EXIT_USAGE)
+    _guard_yaml_budget(stdin_yaml)
     resolved_args = _maybe_stage_preview_worker_args(
         _resolve_config_args(args, pipeline_args), dry_run=bool(args.dry_run))
     if args.allow_stdin_jinja and not args.no_jinja:
@@ -1835,25 +1846,27 @@ def _run(args, pipeline_args, *, json_session, t0: float) -> int:
       hint = '\n  custom pipeline options go after FILE, written as --flag=value'
     raise _CliError(f'no such file: {file!r}{hint}', EXIT_USAGE)
 
+  if '://' not in file:
+    with open(file, encoding='utf-8') as f:
+      file_yaml = f.read()
+    _guard_yaml_budget(file_yaml)
+  else:
+    file_yaml = None
+
   resolved_args = _maybe_stage_preview_worker_args(
       _resolve_config_args(args, pipeline_args), dry_run=bool(args.dry_run))
-  if args.no_jinja and '://' not in file:
-    with open(file, encoding='utf-8') as f:
-      raw_yaml = f.read()
+  if args.no_jinja and file_yaml is not None:
     return _run_yaml(
         resolved_args,
         args.verbose,
-        direct_yaml_text=raw_yaml,
+        direct_yaml_text=file_yaml,
         command_name='run',
-        dry_run_yaml=raw_yaml if args.dry_run else None,
+        dry_run_yaml=file_yaml if args.dry_run else None,
         wait_timeout_sec=wait_timeout_sec,
         json_session=json_session,
         t0=t0)
 
-  dry_text = None
-  if args.dry_run and '://' not in file:
-    with open(file, encoding='utf-8') as f:
-      dry_text = f.read()
+  dry_text = file_yaml if args.dry_run else None
 
   return _run_yaml(
       ['--yaml_pipeline_file=' + file] + resolved_args,

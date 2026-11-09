@@ -328,11 +328,26 @@ def ensure_preview_wheel() -> str:
   except OSError:
     if explicit_cache:
       raise
-    wheel_dir = Path(tempfile.gettempdir()) / 'beam-cli-cache' / 'wheels' / digest
+    uid_suffix = f'-{os.getuid()}' if hasattr(os, 'getuid') else ''
+    user_tmp_root = Path(tempfile.gettempdir()) / f'beam-cli-cache{uid_suffix}'
+    user_tmp_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.path.islink(user_tmp_root):
+      raise RuntimeError(
+          f'refusing symlinked cache directory {str(user_tmp_root)!r}')
+    if hasattr(os, 'getuid'):
+      st = os.lstat(user_tmp_root)
+      if st.st_uid != os.getuid():
+        raise RuntimeError(
+            f'refusing foreign-owned cache directory {str(user_tmp_root)!r}')
+      try:
+        os.chmod(user_tmp_root, 0o700)
+      except OSError:
+        pass
+    wheel_dir = user_tmp_root / 'wheels' / digest
     wheel_path = wheel_dir / wheel_name
-    if wheel_path.is_file():
+    if wheel_path.is_file() and not os.path.islink(wheel_path):
       return str(wheel_path)
-    wheel_dir.mkdir(parents=True, exist_ok=True)
+    wheel_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
 
   dist_info = f'apache_beam_cli_preview-{__version__}.dist-info'
   metadata_bytes = (

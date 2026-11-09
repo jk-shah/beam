@@ -891,11 +891,28 @@ def _run_duckdb(
         END
       )
     ''')
+    raw_mem = os.environ.get('BEAM_CLI_DUCKDB_MAX_MEMORY', '').strip() or '512MB'
+    if not re.fullmatch(r'\d+\s*(?:KB|MB|GB|KiB|MiB|GiB)', raw_mem, re.I):
+      raw_mem = '512MB'
+    raw_max_rows = os.environ.get('BEAM_CLI_SQL_MAX_RESULT_ROWS', '').strip()
+    max_sql_rows = int(raw_max_rows) if raw_max_rows else 1_000_000
+    con.execute(f"SET memory_limit = '{raw_mem}'")
+    con.execute("SET max_temp_directory_size = '0B'")
+    con.execute('SET threads = 2')
     con.execute('SET lock_configuration = true')
     try:
       cur = con.execute(clean_q)
       out_cols = [d[0] for d in (cur.description or [])]
-      fetched = cur.fetchall()
+      fetched: list[Any] = []
+      while True:
+        chunk = cur.fetchmany(4096)
+        if not chunk:
+          break
+        fetched.extend(chunk)
+        if len(fetched) > max_sql_rows:
+          raise SqlPipeError(
+              f'SQL query exceeded local result limit ({max_sql_rows:,} rows); '
+              'add LIMIT or run distributed SQL with --runner=DataflowRunner')
     except duckdb.Error as e:
       avail_list = [ns.alias for ns in named_sources]
       if len(named_sources) == 1 and 'source' not in used_lower:
@@ -999,12 +1016,42 @@ def run_in_memory_sql(
         return sqlite3.SQLITE_OK
       return sqlite3.SQLITE_DENY
 
+    import time as _time
+    raw_max_sec = os.environ.get('BEAM_CLI_SQL_MAX_SECONDS', '').strip()
+    max_sql_sec = float(raw_max_sec) if raw_max_sec else 30.0
+    raw_max_rows = os.environ.get('BEAM_CLI_SQL_MAX_RESULT_ROWS', '').strip()
+    max_sql_rows = int(raw_max_rows) if raw_max_rows else 1_000_000
+    sql_deadline = _time.monotonic() + max_sql_sec
+    timed_out = False
+
+    def _progress_guard() -> int:
+      nonlocal timed_out
+      if _time.monotonic() > sql_deadline:
+        timed_out = True
+        return 1
+      return 0
+
+    conn.set_progress_handler(_progress_guard, 10_000)
     conn.set_authorizer(_readonly_authorizer)
     try:
       cur = conn.execute(clean_q)
       out_cols = [d[0] for d in (cur.description or [])]
-      fetched = cur.fetchall()
+      fetched: list[Any] = []
+      while True:
+        chunk = cur.fetchmany(4096)
+        if not chunk:
+          break
+        fetched.extend(chunk)
+        if len(fetched) > max_sql_rows:
+          raise SqlPipeError(
+              f'SQL query exceeded local result limit ({max_sql_rows:,} rows); '
+              'add LIMIT or run distributed SQL with --runner=DataflowRunner')
     except sqlite3.Error as e:
+      if timed_out or 'interrupted' in str(e).lower():
+        raise SqlPipeError(
+            f'SQL query exceeded local execution time limit '
+            f'({max_sql_sec:g}s); check for unbounded recursive CTEs or '
+            'cross joins') from None
       avail_list = [ns.alias for ns in named_sources]
       if len(named_sources) == 1 and 'source' not in used_lower:
         avail_list.append('source')

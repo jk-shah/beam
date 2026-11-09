@@ -300,5 +300,491 @@ class SecurityAndChaosTest(unittest.TestCase):
     self.assertEqual(parsed['metrics']['rows_written'], 2)
 
 
+class InputValidationAndResourceBoundsTest(unittest.TestCase):
+  """Input validation, path containment, and resource bounds across CLI modules."""
+
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp(prefix='beam-bounds-')
+    self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+  def test_check_plan_blocks_pytransform_and_untrusted_python_callables(self):
+    sentinel_file = os.path.join(self.tmp, 'never_created.txt')
+    payloads = {
+        'pytransform_ctor': (
+            'pipeline:\n'
+            '  type: chain\n'
+            '  transforms:\n'
+            '    - type: Create\n'
+            '      config: {elements: [{x: 1}]}\n'
+            '    - type: PyTransform\n'
+            '      config:\n'
+            '        constructor: __constructor__\n'
+            '        kwargs:\n'
+            f'          source: "lambda p: open({sentinel_file!r}, \'w\')"\n'
+        ),
+        'callable_default_arg': (
+            'pipeline:\n'
+            '  type: chain\n'
+            '  transforms:\n'
+            '    - type: Create\n'
+            '      config: {elements: [{x: 1}]}\n'
+            '    - type: MapToFields\n'
+            '      config:\n'
+            '        language: python\n'
+            '        fields:\n'
+            '          y:\n'
+            '            callable: |\n'
+            f'              def f(row, side=open({sentinel_file!r}, "w")):\n'
+            '                return row.x\n'
+        ),
+        'callable_untrusted_import': (
+            'pipeline:\n'
+            '  type: chain\n'
+            '  transforms:\n'
+            '    - type: Create\n'
+            '      config: {elements: [{x: 1}]}\n'
+            '    - type: MapToFields\n'
+            '      config:\n'
+            '        language: python\n'
+            '        fields:\n'
+            '          y:\n'
+            '            callable: |\n'
+            '              def f(row):\n'
+            '                import subprocess\n'
+            '                return row.x\n'
+        ),
+        'callable_external_path': (
+            'pipeline:\n'
+            '  type: chain\n'
+            '  transforms:\n'
+            '    - type: Create\n'
+            '      config: {elements: [{x: 1}]}\n'
+            '    - type: MapToFields\n'
+            '      config:\n'
+            '        language: python\n'
+            '        fields:\n'
+            '          y:\n'
+            '            path: /tmp/external_udf.py\n'
+            '            name: fn\n'
+        ),
+    }
+    for name, yaml_body in payloads.items():
+      with self.subTest(case=name):
+        yp = os.path.join(self.tmp, f'{name}.yaml')
+        with open(yp, 'w', encoding='utf-8') as f:
+          f.write(yaml_body)
+        rc, env, _ = _run_json_cli(['check', yp, '--plan'])
+        self.assertEqual(rc, cli.EXIT_USAGE)
+        self.assertIn('--trust-providers', env['error']['message'])
+        self.assertFalse(os.path.exists(sentinel_file))
+
+    # Legitimate CLI-emitted YAML (`_cli_fn(__row__)`) still passes `beam check --plan`!
+    src_csv = os.path.join(self.tmp, 'ok.csv')
+    with open(src_csv, 'w', encoding='utf-8') as f:
+      f.write('id,email\n1,ALICE@EXAMPLE.COM\n')
+    rc_e, env_e, _ = _run_json_cli([
+        'pipe', '--from', src_csv, '--to', os.path.join(self.tmp, 'out.jsonl'),
+        '--select', 'id, lower(email) AS email', '--emit-yaml'
+    ])
+    self.assertEqual(rc_e, cli.EXIT_OK)
+    safe_yaml = os.path.join(self.tmp, 'emitted.yaml')
+    with open(safe_yaml, 'w', encoding='utf-8') as f:
+      f.write(env_e['outputs']['yaml'])
+    rc_ok, env_ok, err_ok = _run_json_cli(['check', safe_yaml, '--plan'])
+    self.assertEqual(rc_ok, cli.EXIT_OK, err_ok)
+    self.assertEqual(env_ok['outputs']['mode'], 'expanded_plan')
+
+  def test_iceberg_rest_catalog_https_and_auth_origin_validation(self):
+    from apache_beam.cli import lakehouse
+
+    # 1. `file://` scheme rejected.
+    with self.assertRaises(lakehouse.LakehouseError):
+      lakehouse.resolve_iceberg_table_dir({
+          'table': 'ns.tbl',
+          'catalog_properties': {
+              'type': 'rest',
+              'uri': 'file:///etc/hosts',
+          },
+      })
+
+    # 2. Plaintext `http://` remote host rejected.
+    with self.assertRaises(lakehouse.LakehouseError):
+      lakehouse.resolve_iceberg_table_dir({
+          'table': 'ns.tbl',
+          'catalog_properties': {
+              'type': 'rest',
+              'uri': 'http://catalog.external.example:8080',
+          },
+      })
+
+    # 3. `rest.auth.type=google` to non-Google HTTPS host rejected BEFORE ADC fetch!
+    with mock.patch('google.auth.default') as mock_adc:
+      with self.assertRaises(lakehouse.LakehouseError) as ctx:
+        lakehouse.resolve_iceberg_table_dir({
+            'table': 'ns.tbl',
+            'catalog_properties': {
+                'type': 'rest',
+                'uri': 'https://catalog.external.example',
+                'rest.auth.type': 'google',
+            },
+        })
+      self.assertIn('non-Google', str(ctx.exception))
+      mock_adc.assert_not_called()
+
+    # 4. Cross-origin / HTTPS-downgrade redirect blocked.
+    handler = lakehouse._SameOriginHttpsRedirectHandler()
+    import urllib.error
+    import urllib.request
+    req = urllib.request.Request('https://biglake.googleapis.com/v1/tables')
+    with self.assertRaises(urllib.error.URLError):
+      handler.redirect_request(
+          req, None, 302, 'Found', {}, 'https://other.example.com/v1/tables')
+    with self.assertRaises(urllib.error.URLError):
+      handler.redirect_request(
+          req, None, 302, 'Found', {}, 'http://biglake.googleapis.com/downgrade')
+
+  def test_delta_and_iceberg_metadata_path_containment(self):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    outside_pq = os.path.join(self.tmp, 'outside_secret.parquet')
+    pq.write_table(pa.Table.from_pylist([{'secret': 'TOP_SECRET_ROW'}]), outside_pq)
+
+    for idx, bad_rel in enumerate((
+        '../outside_secret.parquet',
+        '%2e%2e%2foutside_secret.parquet',
+        outside_pq,
+        f'file://{outside_pq}',
+    )):
+      delta_dir = os.path.join(self.tmp, f'delta_case_{idx}')
+      log_dir = os.path.join(delta_dir, '_delta_log')
+      os.makedirs(log_dir, exist_ok=True)
+      commit0 = os.path.join(log_dir, '00000000000000000000.json')
+      meta_line = json.dumps({
+          'metaData': {
+              'id': 't1',
+              'schemaString': json.dumps({
+                  'type': 'struct',
+                  'fields': [{'name': 'secret', 'type': 'string', 'nullable': True}],
+              }),
+          }
+      })
+      add_line = json.dumps({'add': {'path': bad_rel, 'size': 128, 'dataChange': True}})
+      with open(commit0, 'w', encoding='utf-8') as f:
+        f.write(meta_line + '\n' + add_line + '\n')
+
+      rc, env, _ = _run_json_cli(['inspect', f'delta://{delta_dir}'])
+      self.assertNotEqual(rc, cli.EXIT_OK)
+      self.assertNotIn('TOP_SECRET_ROW', json.dumps(env))
+
+    # Symlink inside Delta table directory pointing outside `table_root` is ALSO blocked!
+    sym_delta = os.path.join(self.tmp, 'delta_symlink')
+    os.makedirs(os.path.join(sym_delta, '_delta_log'), exist_ok=True)
+    os.symlink(outside_pq, os.path.join(sym_delta, 'part-00000.parquet'))
+    with open(
+        os.path.join(sym_delta, '_delta_log', '00000000000000000000.json'),
+        'w',
+        encoding='utf-8') as f:
+      f.write(
+          json.dumps({
+              'metaData': {
+                  'id': 't2',
+                  'schemaString': json.dumps({
+                      'type': 'struct',
+                      'fields': [{'name': 'secret', 'type': 'string', 'nullable': True}],
+                  }),
+              }
+          }) + '\n' +
+          json.dumps({'add': {'path': 'part-00000.parquet', 'size': 128, 'dataChange': True}}) +
+          '\n')
+    rc_sym, env_sym, _ = _run_json_cli(['inspect', f'delta://{sym_delta}'])
+    self.assertNotEqual(rc_sym, cli.EXIT_OK)
+    self.assertNotIn('TOP_SECRET_ROW', json.dumps(env_sym))
+
+    # Iceberg warehouse `..` traversal in table identifier rejected!
+    wh = os.path.join(self.tmp, 'wh')
+    os.makedirs(wh, exist_ok=True)
+    rc_ice, env_ice, _ = _run_json_cli(
+        ['inspect', f'iceberg://ns.../escape?warehouse={wh}'])
+    self.assertNotEqual(rc_ice, cli.EXIT_OK)
+
+  def test_opt_file_permissions_and_emit_yaml_secret_redaction(self):
+    canary_pw = 'CanaryDbSecretValue99!'
+    canary_key = 'CanaryApiKeyValue88!'
+    opt_path = os.path.join(self.tmp, 'creds.yaml')
+    with open(opt_path, 'w', encoding='utf-8') as f:
+      f.write(f'password: "{canary_pw}"\napi_key: "{canary_key}"\n')
+
+    if os.name == 'posix':
+      os.chmod(opt_path, 0o644)
+      rc_perm, env_perm, err_perm = _run_json_cli([
+          'pipe', '--from', 'postgres://db.example.com:5432/app?table=users',
+          '--from-opt-file', opt_path, '--to', os.path.join(self.tmp, 'u.parquet'),
+          '--emit-yaml'
+      ])
+      self.assertEqual(rc_perm, cli.EXIT_USAGE)
+      self.assertIn('chmod 0600', env_perm['error']['message'])
+      self.assertNotIn(canary_pw, json.dumps(env_perm) + err_perm)
+      os.chmod(opt_path, 0o600)
+
+    # With 0600 permissions, `--emit-yaml` and `beam inspect` redact secrets!
+    rc_emit, env_emit, err_emit = _run_json_cli([
+        'pipe', '--from', 'postgres://db.example.com:5432/app?table=users',
+        '--from-opt-file', opt_path, '--to', os.path.join(self.tmp, 'u.parquet'),
+        '--emit-yaml'
+    ])
+    self.assertEqual(rc_emit, cli.EXIT_OK, err_emit)
+    self.assertIn('<REDACTED_SECRET>', env_emit['outputs']['yaml'])
+    self.assertNotIn(canary_pw, json.dumps(env_emit) + err_emit)
+    self.assertNotIn(canary_key, json.dumps(env_emit) + err_emit)
+
+    rc_ins, env_ins, err_ins = _run_json_cli([
+        'inspect', 'postgres://db.example.com:5432/app?table=users',
+        '--from-opt-file', opt_path
+    ])
+    self.assertEqual(rc_ins, cli.EXIT_OK, err_ins)
+    self.assertNotIn(canary_pw, json.dumps(env_ins) + err_ins)
+    self.assertNotIn(canary_key, json.dumps(env_ins) + err_ins)
+
+    # Bare accidental secret in `--from-opt` without `=` is never echoed!
+    bare_secret = 'BarePassWithoutEquals!99'
+    rc_bare, env_bare, err_bare = _run_json_cli([
+        'pipe', '--from', 'postgres://db.example.com:5432/app?table=users',
+        '--from-opt', bare_secret, '--to', os.path.join(self.tmp, 'u.parquet')
+    ])
+    self.assertEqual(rc_bare, cli.EXIT_USAGE)
+    self.assertNotIn(bare_secret, json.dumps(env_bare) + err_bare)
+
+    # Nested JSON secret inside `--from-opt catalog_properties={"token": ...}` rejected!
+    nested_tok = 'NestedCatalogTokenVal77!'
+    rc_nest, env_nest, err_nest = _run_json_cli([
+        'pipe', '--from', 'iceberg://ns.tbl',
+        '--from-opt', f'catalog_properties={{"type":"rest","token":"{nested_tok}"}}',
+        '--to', os.path.join(self.tmp, 'u.parquet')
+    ])
+    self.assertEqual(rc_nest, cli.EXIT_USAGE)
+    self.assertNotIn(nested_tok, json.dumps(env_nest) + err_nest)
+
+    # Legitimate column named `token_count` is NOT clobbered in `--emit-yaml`!
+    tok_csv = os.path.join(self.tmp, 'tok.csv')
+    with open(tok_csv, 'w', encoding='utf-8') as f:
+      f.write('id,token_count\n1,42\n')
+    rc_col, env_col, err_col = _run_json_cli([
+        'pipe', '--from', tok_csv, '--select', 'id, token_count',
+        '--to', os.path.join(self.tmp, 'tok.parquet'), '--emit-yaml'
+    ])
+    self.assertEqual(rc_col, cli.EXIT_OK, err_col)
+    self.assertIn('token_count: token_count', env_col['outputs']['yaml'])
+    self.assertNotIn('<REDACTED_SECRET>', env_col['outputs']['yaml'])
+
+  def test_package_region_format_dockerfile_validation_and_shell_quoting(self):
+    from apache_beam.cli import package as pkg_mod
+
+    ok_yaml = os.path.join(self.tmp, 'p.yaml')
+    with open(ok_yaml, 'w', encoding='utf-8') as f:
+      f.write('pipeline:\n  transforms:\n    - type: Create\n      config: {elements: [{x: 1}]}\n')
+
+    # 1. Invalid `--region` rejected before any network call.
+    with mock.patch('urllib.request.urlopen') as mock_open:
+      rc, env, _ = _run_json_cli([
+          'package', ok_yaml, '--region', 'us-central1@other.example.com/#',
+          '--to', 'gs://my-bkt/spec.json', '--dry-run'
+      ])
+      self.assertEqual(rc, cli.EXIT_USAGE)
+      mock_open.assert_not_called()
+
+    # 2. Dockerfile newline/instruction injection via `--base-image` or entrypoint blocked.
+    py_file = os.path.join(self.tmp, 'job.py')
+    with open(py_file, 'w', encoding='utf-8') as f:
+      f.write('import apache_beam as beam\n')
+    rc_df, _, _ = _run_json_cli([
+        'package', py_file, '--sdk=python',
+        '--base-image', 'python:3.12\nRUN touch /injected',
+        '--dry-run'
+    ])
+    self.assertEqual(rc_df, cli.EXIT_USAGE)
+    with self.assertRaises(pkg_mod.PackageError):
+      pkg_mod.generate_python_dockerfile('../escape.py')
+    with self.assertRaises(pkg_mod.PackageError):
+      pkg_mod.generate_python_dockerfile('bad\nRUN id.py')
+
+    # 3. Shell metacharacters in `--to` / `--project` are safely quoted in gcloud snippet.
+    rc_sh, env_sh, err_sh = _run_json_cli([
+        'package', ok_yaml, '--to', 'gs://my-bkt/dir$(whoami)/spec.json',
+        '--project', 'proj;id', '--dry-run'
+    ])
+    self.assertEqual(rc_sh, cli.EXIT_OK, err_sh)
+    gcloud_cmd = env_sh['outputs']['launch']['gcloud']
+    self.assertIn("'gs://my-bkt/dir$(whoami)/spec.json'", gcloud_cmd)
+    self.assertIn("'proj;id'", gcloud_cmd)
+
+  def test_yaml_expanded_node_budget_enforced(self):
+    # 7 levels x 10 = 10,000,000 expanded nodes in <450 bytes!
+    lines = ['a0: &a0 ["x", "x", "x", "x", "x", "x", "x", "x", "x", "x"]']
+    for i in range(1, 8):
+      refs = ', '.join([f'*a{i - 1}'] * 10)
+      lines.append(f'a{i}: &a{i} [{refs}]')
+    lines.append('pipeline:\n  transforms:\n    - type: Create\n      config:\n        elements: *a7\n')
+    bomb_yaml = '\n'.join(lines)
+    bomb_path = os.path.join(self.tmp, 'bomb.yaml')
+    with open(bomb_path, 'w', encoding='utf-8') as f:
+      f.write(bomb_yaml)
+
+    for cmd_argv in (
+        ['check', bomb_path],
+        ['run', bomb_path, '--dry-run'],
+        ['package', bomb_path, '--dry-run'],
+    ):
+      with self.subTest(cmd=cmd_argv[0]):
+        rc, env, _ = _run_json_cli(cmd_argv)
+        self.assertEqual(rc, cli.EXIT_USAGE)
+        self.assertFalse(env['ok'])
+
+  def test_error_scrubber_redacts_short_and_unquoted_credentials(self):
+    raw_err = (
+        'conn failed: postgres://admin:ShortPass99@db.internal:5432/prod; '
+        'Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.shortPayload; '
+        'password=MyShortSecret1!; api_key: "sk-1234567890abcdef1234"; '
+        'gcp=ya29.a0AfH6SMBx1234567890 aws=AKIAIOSFODNN7EXAMPLE '
+        'gh=ghp_1234567890abcdef1234567890')
+    scrubbed = output.scrub_error_message(raw_err)
+    for secret in (
+        'ShortPass99',
+        'eyJhbGciOiJIUzI1NiJ9',
+        'MyShortSecret1!',
+        'sk-1234567890abcdef1234',
+        'ya29.a0AfH6SMBx1234567890',
+        'AKIAIOSFODNN7EXAMPLE',
+        'ghp_1234567890abcdef1234567890',
+    ):
+      self.assertNotIn(secret, scrubbed)
+    self.assertIn('<redacted-value>', scrubbed)
+
+  def test_sql_sandbox_blocks_ddl_dml_attach_duckdb_external_and_infinite_cte(self):
+    src_csv = os.path.join(self.tmp, 'items.csv')
+    with open(src_csv, 'w', encoding='utf-8') as f:
+      f.write('"id); DROP TABLE source; --",val\n1,10\n2,20\n')
+
+    # Malicious SQL-injection column header is safely quoted and queryable!
+    rc_hdr, env_hdr, err_hdr = _run_json_cli(
+        ['pipe', '--from', src_csv, '--sql', 'SELECT SUM(val) AS s FROM source'])
+    self.assertEqual(rc_hdr, cli.EXIT_OK, err_hdr)
+    self.assertEqual(env_hdr['untrusted_data']['rows'][0]['s'], 30)
+
+    # SQLite blocks ATTACH / PRAGMA / stacked statements / load_extension.
+    for bad_sql in (
+        "ATTACH DATABASE ':memory:' AS aux",
+        'PRAGMA table_info(source)',
+        'SELECT 1; DROP TABLE source',
+        "SELECT load_extension('ext_mod')",
+    ):
+      rc_b, _, _ = _run_json_cli(['pipe', '--from', src_csv, '--sql', bad_sql])
+      self.assertEqual(rc_b, cli.EXIT_USAGE)
+
+    # Infinite recursive CTE is interrupted cleanly by `set_progress_handler`!
+    with mock.patch.dict(os.environ, {'BEAM_CLI_SQL_MAX_SECONDS': '0.05'}):
+      rc_cte, env_cte, _ = _run_json_cli([
+          'pipe', '--from', src_csv, '--sql',
+          'WITH RECURSIVE r(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM r) SELECT * FROM r'
+      ])
+    self.assertEqual(rc_cte, cli.EXIT_USAGE)
+    self.assertIn('time limit', env_cte['error']['message'])
+
+    # Result-row flood is capped cleanly by `BEAM_CLI_SQL_MAX_RESULT_ROWS`!
+    with mock.patch.dict(os.environ, {'BEAM_CLI_SQL_MAX_RESULT_ROWS': '5'}):
+      rc_cap, env_cap, _ = _run_json_cli([
+          'pipe', '--from', src_csv, '--sql',
+          'WITH RECURSIVE r(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM r WHERE x < 100) SELECT * FROM r'
+      ])
+    self.assertEqual(rc_cap, cli.EXIT_USAGE)
+    self.assertIn('result limit', env_cap['error']['message'])
+
+    # DuckDB sandbox blocks external file reads (`enable_external_access=False`, `lock_configuration=true`).
+    try:
+      import duckdb  # pylint: disable=unused-import
+      has_duckdb = True
+    except ImportError:
+      has_duckdb = False
+    if has_duckdb:
+      for duck_attack in (
+          f"SELECT * FROM read_csv_auto({src_csv!r})",
+          'SET enable_external_access = true',
+          'SELECT 1; SELECT 2',
+      ):
+        rc_d, _, _ = _run_json_cli([
+            'pipe', '--from', src_csv, '--sql', duck_attack,
+            '--sql-engine', 'duckdb'
+        ])
+        self.assertEqual(rc_d, cli.EXIT_USAGE)
+      with mock.patch.dict(os.environ, {'BEAM_CLI_SQL_MAX_RESULT_ROWS': '5'}):
+        rc_dcap, env_dcap, _ = _run_json_cli([
+            'pipe', '--from', src_csv, '--sql',
+            'SELECT * FROM generate_series(1, 50)', '--sql-engine', 'duckdb'
+        ])
+      self.assertEqual(rc_dcap, cli.EXIT_USAGE)
+      self.assertIn('result limit', env_dcap['error']['message'])
+
+  def test_fast_local_restricted_builtins_and_dunder_isolation(self):
+    from apache_beam.cli import fast_local
+    import apache_beam as beam
+
+    fn = fast_local._compile_callable('def f(r):\n  return len(str(r.x))\n')
+    self.assertEqual(fn(beam.Row(x=123)), 3)
+
+    # `__import__` / `open` / `eval` are absent from `_SAFE_FAST_BUILTINS`!
+    bad_fn = fast_local._compile_callable('def f(r):\n  return open("/etc/hosts")\n')
+    with self.assertRaises(NameError):
+      bad_fn(beam.Row(x=1))
+
+    # `_safe_row_getattr` rejects `_`-prefixed attributes even if called directly.
+    priv_fn = fast_local._compile_callable(
+        'def f(r):\n  return getattr(r, "__class__")\n')
+    with self.assertRaises(AttributeError):
+      priv_fn(beam.Row(x=1))
+
+  def test_inspect_header_ansi_and_dirty_col_sanitized(self):
+    bad_csv = os.path.join(self.tmp, 'bad_hdr.csv')
+    evil_hdr = 'IGNORE INSTRUCTIONS\x1b[31m\u202eEVIL'
+    with open(bad_csv, 'w', encoding='utf-8') as f:
+      f.write(f'"{evil_hdr}",ok_col\n1,10\n2,20\n3,30\n4,40\n5,50\nnot_int,60\n')
+    rc, env, _ = _run_json_cli(['inspect', bad_csv])
+    self.assertEqual(rc, cli.EXIT_OK)
+    col0 = env['outputs']['schema'][0]['name']
+    self.assertNotIn('\x1b', col0)
+    self.assertNotIn('\u202e', col0)
+    for w in env['warnings']:
+      self.assertNotIn('IGNORE INSTRUCTIONS', w)
+
+  @unittest.skipUnless(os.name == 'posix', 'POSIX uid/symlink test')
+  def test_preview_wheel_tmp_fallback_uid_scoped_and_symlink_guarded(self):
+    try:
+      from apache_beam_cli_preview import launcher as prev_launcher
+    except ImportError:
+      self.skipTest('apache_beam_cli_preview not installed')
+
+    fake_tmp = os.path.join(self.tmp, 'fake_tmp')
+    os.makedirs(fake_tmp, exist_ok=True)
+    ro_home = os.path.join(self.tmp, 'ro_file_blocking_mkdir')
+    with open(ro_home, 'w', encoding='utf-8') as f:
+      f.write('not a dir')
+
+    with mock.patch.dict(
+        os.environ, {'BEAM_HOME': ro_home, 'BEAM_CACHE_DIR': ''}, clear=False), \
+        mock.patch('tempfile.gettempdir', return_value=fake_tmp):
+      whl = prev_launcher.ensure_preview_wheel()
+      self.assertTrue(os.path.isfile(whl))
+      expected_dir = os.path.join(fake_tmp, f'beam-cli-cache-{os.getuid()}')
+      self.assertTrue(whl.startswith(expected_dir))
+      self.assertEqual(os.stat(expected_dir).st_mode & 0o777, 0o700)
+
+      # Replace the cache dir with a symlink -> refused!
+      shutil.rmtree(expected_dir)
+      outside = os.path.join(self.tmp, 'outside_target')
+      os.makedirs(outside, exist_ok=True)
+      os.symlink(outside, expected_dir)
+      with self.assertRaises(RuntimeError):
+        prev_launcher.ensure_preview_wheel()
+
+
 if __name__ == '__main__':
   unittest.main()

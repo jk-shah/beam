@@ -262,6 +262,56 @@ _DELTA_COMMIT_RE = re.compile(r'^(\d{20})\.json$')
 _DELTA_CHECKPOINT_RE = re.compile(r'^(\d{20})\.checkpoint(?:\.\d+\.\d+)?\.parquet$')
 
 
+def _check_no_dotdot_or_controls(raw_path: str, label: str) -> None:
+  if any(ord(c) < 32 for c in raw_path):
+    raise LakehouseError(f'control character in {label} path is not allowed')
+  norm = raw_path.replace('\\', '/')
+  if '://' in norm:
+    norm = urllib.parse.urlsplit(norm).path
+  segments = [seg for seg in norm.split('/') if seg]
+  if any(seg == '..' for seg in segments):
+    raise LakehouseError(
+        f'path traversal ("..") in {label} path {raw_path!r} is not allowed')
+
+
+def _resolve_delta_child_path(root: str, raw_rel: str) -> str:
+  """Resolves a relative Delta action path strictly inside `root`."""
+  rel = urllib.parse.unquote(str(raw_rel or ''))
+  if not rel or '://' in rel or rel.startswith(('/', '\\')):
+    raise LakehouseError(
+        f'Delta log action path {raw_rel!r} must be a relative path inside '
+        'the table root')
+  _check_no_dotdot_or_controls(rel, 'Delta log action')
+  joined = _join_fs(root, rel)
+  if '://' not in root:
+    real_root = os.path.realpath(root)
+    real_joined = os.path.realpath(joined)
+    if os.path.commonpath([real_root, real_joined]) != real_root:
+      raise LakehouseError(
+          f'Delta log action path {raw_rel!r} escapes table root {root!r}')
+  return joined
+
+
+def _resolve_iceberg_metadata_child(table_dir: str, raw_uri: str, label: str) -> str:
+  """Resolves an Iceberg manifest-list or manifest path inside `table_dir`."""
+  resolved = _from_iceberg_uri(str(raw_uri or ''))
+  _check_no_dotdot_or_controls(resolved, label)
+  if '://' not in table_dir and '://' not in resolved:
+    real_root = os.path.realpath(table_dir)
+    real_child = os.path.realpath(resolved)
+    if os.path.commonpath([real_root, real_child]) != real_root:
+      raise LakehouseError(
+          f'Iceberg {label} {raw_uri!r} escapes table directory {table_dir!r}')
+  return resolved
+
+
+def _resolve_iceberg_data_path(raw_uri: str, label: str = 'data_file') -> str:
+  """Resolves an Iceberg data/delete file path while rejecting `..` traversal."""
+  resolved = _from_iceberg_uri(str(raw_uri or ''))
+  _check_no_dotdot_or_controls(resolved, label)
+  return resolved
+
+
 def parse_delta_log(
     table_root: str,
     *,
@@ -318,9 +368,10 @@ def parse_delta_log(
             add = row.get('add')
             if add and add.get('path'):
               rel = urllib.parse.unquote(add['path'])
+              safe_p = _resolve_delta_child_path(root, add['path'])
               active_files[rel] = {
                   'rel_path': rel,
-                  'path': _join_fs(root, rel),
+                  'path': safe_p,
                   'size': int(add.get('size') or 0),
                   'partition_values': dict(add.get('partitionValues') or {}),
                   'stats': add.get('stats'),
@@ -328,6 +379,7 @@ def parse_delta_log(
               }
             rem = row.get('remove')
             if rem and rem.get('path'):
+              _resolve_delta_child_path(root, rem['path'])
               active_files.pop(urllib.parse.unquote(rem['path']), None)
     start_ver = cp_ver + 1
 
@@ -346,9 +398,10 @@ def parse_delta_log(
       add = act.get('add')
       if add and add.get('path'):
         rel = urllib.parse.unquote(add['path'])
+        safe_p = _resolve_delta_child_path(root, add['path'])
         active_files[rel] = {
             'rel_path': rel,
-            'path': _join_fs(root, rel),
+            'path': safe_p,
             'size': int(add.get('size') or 0),
             'partition_values': dict(add.get('partitionValues') or {}),
             'stats': add.get('stats'),
@@ -356,6 +409,7 @@ def parse_delta_log(
         }
       rem = act.get('remove')
       if rem and rem.get('path'):
+        _resolve_delta_child_path(root, rem['path'])
         active_files.pop(urllib.parse.unquote(rem['path']), None)
 
   schema_fields = [{
@@ -434,10 +488,9 @@ def list_delta_cdc_actions(
       for obj in ver_objs:
         cdc = obj.get('cdc')
         if cdc and cdc.get('path'):
-          rel = urllib.parse.unquote(cdc['path'])
           actions.append({
               'kind': 'cdc_file',
-              'path': _join_fs(root, rel),
+              'path': _resolve_delta_child_path(root, cdc['path']),
               'partition_values': dict(cdc.get('partitionValues') or {}),
               'version': ver,
           })
@@ -445,19 +498,17 @@ def list_delta_cdc_actions(
       for obj in ver_objs:
         add = obj.get('add')
         if add and add.get('path') and add.get('dataChange', True):
-          rel = urllib.parse.unquote(add['path'])
           actions.append({
               'kind': 'added_file',
-              'path': _join_fs(root, rel),
+              'path': _resolve_delta_child_path(root, add['path']),
               'partition_values': dict(add.get('partitionValues') or {}),
               'version': ver,
           })
         rem = obj.get('remove')
         if rem and rem.get('path') and rem.get('dataChange', True):
-          rel = urllib.parse.unquote(rem['path'])
           actions.append({
               'kind': 'removed_file',
-              'path': _join_fs(root, rel),
+              'path': _resolve_delta_child_path(root, rem['path']),
               'partition_values': dict(rem.get('partitionValues') or {}),
               'version': ver,
           })
@@ -611,6 +662,26 @@ _ICEBERG_V2_MANIFEST_LIST_SCHEMA: dict[str, Any] = {
 }
 
 
+class _SameOriginHttpsRedirectHandler(urllib.request.HTTPRedirectHandler):
+  """Blocks cross-host or HTTPS-downgrade redirects to protect Bearer tokens."""
+  def redirect_request(self, req, fp, code, msg, headers, newurl):
+    orig = urllib.parse.urlsplit(req.full_url)
+    target = urllib.parse.urlsplit(newurl)
+    if (target.scheme != orig.scheme or
+        (target.hostname or '').lower() != (orig.hostname or '').lower()):
+      raise urllib.error.URLError(
+          f'refusing cross-origin or downgrade redirect from {orig.hostname!r}')
+    return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def _validate_iceberg_ident_parts(parts: list[str], raw_ident: str) -> None:
+  for part in parts:
+    if not part or part in ('.', '..') or '/' in part or '\\' in part or any(
+        ord(c) < 32 for c in part):
+      raise LakehouseError(
+          f'unsafe Iceberg table identifier {raw_ident!r}')
+
+
 def resolve_iceberg_table_dir(
     config: dict[str, Any], default_project: Optional[str] = None
 ) -> str:
@@ -622,31 +693,55 @@ def resolve_iceberg_table_dir(
 
   # Explicit direct table location if passed.
   if config.get('location'):
+    _check_no_dotdot_or_controls(str(config['location']), 'Iceberg location')
     return _normalize_fs_root(str(config['location']))
 
   # REST / BigLake catalog: query `/v1/.../namespaces/{ns}/tables/{tbl}` if URI set.
   if cat_type == 'rest' and cat_props.get('uri') and table_ident:
     parts = [p for p in table_ident.split('.') if p]
+    _validate_iceberg_ident_parts(parts, table_ident)
     if len(parts) >= 2:
-      ns = '%1F'.join(parts[:-1])
-      tbl = parts[-1]
+      ns = '%1F'.join(urllib.parse.quote(p, safe='') for p in parts[:-1])
+      tbl = urllib.parse.quote(parts[-1], safe='')
       rest_uri = str(cat_props['uri']).rstrip('/')
+      parsed_rest = urllib.parse.urlsplit(rest_uri)
+      scheme = (parsed_rest.scheme or '').lower()
+      host = (parsed_rest.hostname or '').lower()
+      is_loopback = host in ('127.0.0.1', 'localhost', '::1')
+      wants_google_auth = (
+          str(cat_props.get('rest.auth.type', '')).lower() == 'google')
+      if scheme == 'https':
+        pass
+      elif scheme == 'http' and is_loopback and not wants_google_auth and not cat_props.get('token'):
+        pass
+      else:
+        raise LakehouseError(
+            f'Iceberg REST catalog URI must use https:// (got {scheme or "none"}://); '
+            'plaintext http:// is only allowed on localhost without bearer tokens')
+      if wants_google_auth and not (
+          host == 'biglake.googleapis.com' or host.endswith('.googleapis.com')):
+        raise LakehouseError(
+            f'refusing to send Google cloud-platform credentials to non-Google '
+            f'REST catalog host {host!r}')
       warehouse = str(cat_props.get('warehouse') or '')
       prefix = ''
-      if 'biglake.googleapis.com' in rest_uri and warehouse.startswith('gs://'):
-        bkt = warehouse[len('gs://'):].split('/', 1)[0]
-        proj = (
-            cat_props.get('header.x-goog-user-project') or default_project or '')
+      if host == 'biglake.googleapis.com' and warehouse.startswith('gs://'):
+        bkt = urllib.parse.quote(
+            warehouse[len('gs://'):].split('/', 1)[0], safe='')
+        proj = urllib.parse.quote(
+            str(cat_props.get('header.x-goog-user-project') or default_project or ''),
+            safe='')
         if proj:
           prefix = f'/projects/{proj}/catalogs/{bkt}'
       url = f'{rest_uri}/v1{prefix}/namespaces/{ns}/tables/{tbl}'
       headers = {'Accept': 'application/json'}
       if cat_props.get('header.x-goog-user-project'):
         headers['x-goog-user-project'] = str(
-            cat_props['header.x-goog-user-project'])
+            cat_props['header.x-goog-user-project']).replace('\r', '').replace('\n', '')
       if cat_props.get('token'):
-        headers['Authorization'] = f"Bearer {cat_props['token']}"
-      elif str(cat_props.get('rest.auth.type', '')).lower() == 'google':
+        headers['Authorization'] = (
+            f"Bearer {str(cat_props['token']).replace(chr(13), '').replace(chr(10), '')}")
+      elif wants_google_auth:
         try:
           import google.auth
           import google.auth.transport.requests
@@ -658,15 +753,22 @@ def resolve_iceberg_table_dir(
         except Exception:  # pylint: disable=broad-except
           pass
       try:
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(),
+            urllib.request.HTTPHandler(),
+            _SameOriginHttpsRedirectHandler())
         req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with opener.open(req, timeout=10) as resp:
           payload = json.loads(resp.read().decode('utf-8'))
           if payload.get('metadata-location'):
             meta_loc = str(payload['metadata-location'])
+            _check_no_dotdot_or_controls(meta_loc, 'Iceberg metadata-location')
             # Strip `/metadata/vN.metadata.json`.
             return meta_loc.rsplit('/metadata/', 1)[0]
           if isinstance(payload.get('metadata'), dict) and payload['metadata'].get('location'):
-            return str(payload['metadata']['location']).rstrip('/')
+            loc = str(payload['metadata']['location']).rstrip('/')
+            _check_no_dotdot_or_controls(loc, 'Iceberg table location')
+            return loc
       except Exception:  # pylint: disable=broad-except
         pass
 
@@ -676,6 +778,7 @@ def resolve_iceberg_table_dir(
     # and `iceberg://rel/wh/ns.tbl`) without stripping leading `/`!
     if ('/' in raw_table or os.sep in raw_table or
         raw_table.startswith('.')):
+      _check_no_dotdot_or_controls(raw_table, 'Iceberg table')
       norm_path = _normalize_fs_root(raw_table)
       # If literal `<norm_path>/metadata` already exists locally, keep it as-is.
       if '://' not in norm_path and os.path.isdir(
@@ -693,8 +796,10 @@ def resolve_iceberg_table_dir(
         '(e.g. iceberg://namespace.table?warehouse=gs://my-bucket/warehouse '
         'or --from-opt warehouse=/path/to/warehouse)')
 
+  _check_no_dotdot_or_controls(warehouse, 'Iceberg warehouse')
   wh_norm = _normalize_fs_root(warehouse)
   parts = [p for p in table_ident.split('.') if p]
+  _validate_iceberg_ident_parts(parts, table_ident)
   # If a 3-part `catalog.namespace.table` was supplied alongside `catalog_name`,
   # strip the leading catalog prefix when matching `catalog_name`.
   cat_name = config.get('catalog_name')
@@ -777,12 +882,14 @@ def load_iceberg_state(
   manifest_list_entries: list[dict[str, Any]] = []
 
   if cur_snap and cur_snap.get('manifest-list'):
-    ml_path = _from_iceberg_uri(str(cur_snap['manifest-list']))
+    ml_path = _resolve_iceberg_metadata_child(
+        table_dir, str(cur_snap['manifest-list']), 'manifest-list')
     with _fs_open_read(ml_path) as ml_f:
       manifest_list_entries = [dict(r) for r in fastavro.reader(ml_f)]
 
     for m_entry in manifest_list_entries:
-      m_path = _from_iceberg_uri(str(m_entry['manifest_path']))
+      m_path = _resolve_iceberg_metadata_child(
+          table_dir, str(m_entry['manifest_path']), 'manifest_path')
       inh_seq = int(m_entry.get('sequence_number') or 0)
       inh_snap = int(m_entry.get('added_snapshot_id') or 0)
       m_content = int(m_entry.get('content') or 0)
@@ -797,7 +904,7 @@ def load_iceberg_state(
               entry.get('sequence_number')
               if entry.get('sequence_number') is not None else inh_seq)
           rec_info = {
-              'path': _from_iceberg_uri(str(df['file_path'])),
+              'path': _resolve_iceberg_data_path(str(df['file_path'])),
               'uri': str(df['file_path']),
               'record_count': int(df.get('record_count') or 0),
               'file_size_in_bytes': int(df.get('file_size_in_bytes') or 0),
@@ -845,7 +952,7 @@ def _load_iceberg_deletes(
       pf = pq.ParquetFile(fobj)
       for batch in pf.iter_batches():
         for r in batch.to_pylist():
-          fp = _from_iceberg_uri(str(r.get('file_path', '')))
+          fp = _resolve_iceberg_data_path(str(r.get('file_path', '')))
           pos = int(r.get('pos', -1))
           if fp and pos >= 0:
             pos_deletes.setdefault(fp, set()).add(pos)
@@ -1004,7 +1111,8 @@ def list_iceberg_cdc_changes(
   for snap in selected_snaps:
     snap_id = int(snap['snapshot-id'])
     snap_seq = int(snap.get('sequence-number') or 1)
-    ml_path = _from_iceberg_uri(str(snap['manifest-list']))
+    ml_path = _resolve_iceberg_metadata_child(
+        table_dir, str(snap['manifest-list']), 'manifest-list')
     with _fs_open_read(ml_path) as ml_f:
       ml_entries = [
           dict(r) for r in fastavro.reader(ml_f)
@@ -1013,7 +1121,8 @@ def list_iceberg_cdc_changes(
     # Process equality deletes added in this snapshot first, then added data.
     ml_entries.sort(key=lambda e: (0 if int(e.get('content') or 0) == 1 else 1))
     for m_entry in ml_entries:
-      m_path = _from_iceberg_uri(str(m_entry['manifest_path']))
+      m_path = _resolve_iceberg_metadata_child(
+          table_dir, str(m_entry['manifest_path']), 'manifest_path')
       m_content = int(m_entry.get('content') or 0)
       with _fs_open_read(m_path) as mf:
         for entry in fastavro.reader(mf):
@@ -1021,7 +1130,7 @@ def list_iceberg_cdc_changes(
             continue
           df = entry['data_file']
           ckind = int(df.get('content', 2 if m_content == 1 else 0))
-          fpath = _from_iceberg_uri(str(df['file_path']))
+          fpath = _resolve_iceberg_data_path(str(df['file_path']))
           if ckind == 0:
             with _fs_open_read(fpath) as fobj:
               pf = pq.ParquetFile(fobj)

@@ -91,7 +91,8 @@ EXTENSIONS = {
 _SHARD_OR_GLOB_SUFFIX = re.compile(r'(-\d+-of-\d+|[-*?])+$')
 _SECRET_KEY_RE = re.compile(
     r'(password|passwd|secret|token|private_key|client_secret|'
-    r'access_key|api_key|jaas|credential|connection_string)',
+    r'access_key|api_key|apikey|authorization|bearer|jaas|credential|'
+    r'connection_string)',
     re.IGNORECASE)
 _BQ_TABLE_ID_RE = re.compile(
     r'^(?:(?P<project>[A-Za-z0-9_.:-]+)[:.])?'
@@ -185,41 +186,77 @@ def reject_inline_credentials(uri: str) -> None:
           'environment variables or --from-opt-file / --to-opt-file')
 
 
+def _mapping_has_secret_key(obj: Any) -> str | None:
+  """Returns the first key name matching `_SECRET_KEY_RE` in `obj`, or None."""
+  if isinstance(obj, dict):
+    for k, v in obj.items():
+      if _SECRET_KEY_RE.search(str(k)):
+        return str(k)
+      nested = _mapping_has_secret_key(v)
+      if nested:
+        return nested
+  elif isinstance(obj, list):
+    for item in obj:
+      nested = _mapping_has_secret_key(item)
+      if nested:
+        return nested
+  return None
+
+
 def parse_kv_options(
     opt_items: Iterable[str] | None,
     opt_file: str | None = None,
     flag_name: str = '--from-opt',
 ) -> dict[str, Any]:
   """Parses repeatable `KEY=VALUE` flags + optional YAML/JSON `--*-opt-file`."""
+  from . import output as out_mod
   merged: dict[str, Any] = {}
   if opt_file:
     if not os.path.isfile(opt_file):
       raise UriError(f'options file not found: {opt_file!r}')
     import yaml
-    loader = getattr(yaml, 'CSafeLoader', yaml.SafeLoader)
     try:
       with open(opt_file, encoding='utf-8') as f:
-        loaded = yaml.load(f, Loader=loader) or {}
+        raw_text = f.read()
+      loaded = out_mod.safe_yaml_load(raw_text) or {}
     except (OSError, yaml.YAMLError) as e:
       raise UriError(f'could not parse {opt_file!r}: {e}') from None
     if not isinstance(loaded, dict):
       raise UriError(f'expected key/value mapping in {opt_file!r}')
+    secret_key = _mapping_has_secret_key(loaded)
+    if secret_key and os.name == 'posix':
+      try:
+        mode = os.stat(opt_file).st_mode & 0o777
+      except OSError:
+        mode = 0
+      if mode & 0o077:
+        raise UriError(
+            f'options file {opt_file!r} contains secret key {secret_key!r} '
+            f'with overly permissive mode {oct(mode)}; restrict permissions '
+            f'first with: chmod 0600 {opt_file}')
     merged.update(loaded)
 
   for raw in opt_items or ():
     if '=' not in raw:
-      raise UriError(
-          f'expected KEY=VALUE for {flag_name}, got {raw!r}')
+      shown = raw if re.fullmatch(r'[A-Za-z0-9_.-]{1,32}', raw) else '<redacted>'
+      raise UriError(f'expected KEY=VALUE for {flag_name}, got {shown!r}')
     key, val = raw.split('=', 1)
     key = key.strip()
     if not key:
-      raise UriError(f'empty option key in {flag_name} {raw!r}')
+      raise UriError(f'empty option key in {flag_name}')
     if _SECRET_KEY_RE.search(key):
       raise UriError(
           f'refusing secret option {key!r} on the command line ({flag_name}); '
           f'place secrets in {flag_name}-file (chmod 0600) or environment '
           'variables')
-    merged[key] = _coerce_opt_value(val)
+    coerced = _coerce_opt_value(val)
+    nested_secret = _mapping_has_secret_key(coerced)
+    if nested_secret:
+      raise UriError(
+          f'refusing nested secret key {nested_secret!r} in {flag_name} '
+          f'{key}=...; place secrets in {flag_name}-file (chmod 0600) or '
+          'environment variables')
+    merged[key] = coerced
   return merged
 
 

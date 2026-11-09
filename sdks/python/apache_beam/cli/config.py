@@ -362,10 +362,11 @@ def _load_config(path) -> dict[str, Any]:
         }
     }
   import yaml
-  loader = getattr(yaml, 'CSafeLoader', yaml.SafeLoader)
+  from . import output as out_mod
   try:
     with open(path, encoding='utf-8') as f:
-      loaded = yaml.load(f, Loader=loader) or {}
+      raw_text = f.read()
+    loaded = out_mod.safe_yaml_load(raw_text) or {}
   except (OSError, yaml.YAMLError) as e:
     raise ConfigError(f'could not read {path}: {e}', _EXIT_USAGE) from None
   if not isinstance(loaded, dict):

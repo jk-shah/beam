@@ -263,8 +263,37 @@ def _transform_configs(spec: dict[str, Any]):
   return cdc_norm_cfg, cdc_mat_cfg, where_cfg, select_cfg
 
 
+def _safe_row_getattr(obj: Any, attr: str):
+  if not isinstance(attr, str) or attr.startswith('_'):
+    raise AttributeError(f'private attribute {attr!r} is not allowed')
+  return getattr(obj, attr)
+
+
+_SAFE_FAST_BUILTINS: dict[str, Any] = {
+    'abs': abs,
+    'bool': bool,
+    'float': float,
+    'getattr': _safe_row_getattr,
+    'int': int,
+    'isinstance': isinstance,
+    'len': len,
+    'list': list,
+    'max': max,
+    'min': min,
+    'round': round,
+    'str': str,
+    'tuple': tuple,
+    'bytes': bytes,
+    'TypeError': TypeError,
+    'ValueError': ValueError,
+    'None': None,
+    'True': True,
+    'False': False,
+}
+
+
 def _compile_callable(src: str):
-  namespace: dict[str, Any] = {'__builtins__': builtins}
+  namespace: dict[str, Any] = {'__builtins__': _SAFE_FAST_BUILTINS}
   exec(compile(src, '<beam-cli-fast-path>', 'exec'), namespace)  # pylint: disable=exec-used
   fns = [
       v for k, v in namespace.items()
@@ -279,7 +308,7 @@ def _compile_expression(expr: str):
   code = compile(expr, '<beam-cli-fast-path>', 'eval')
 
   def fn(row):
-    return eval(code, {'__builtins__': builtins}, row._asdict())  # pylint: disable=eval-used
+    return eval(code, {'__builtins__': _SAFE_FAST_BUILTINS}, row._asdict())  # pylint: disable=eval-used
 
   return fn
 
@@ -292,8 +321,8 @@ def _compile_field(spec_value: Any):
       return _compile_expression(spec_value['expression'])
     raise FastPipeError(f'unsupported field spec {spec_value!r}')
   name = str(spec_value)
-  if name.isidentifier():
-    return lambda row: getattr(row, name)
+  if name.isidentifier() and not name.startswith('_'):
+    return lambda row: _safe_row_getattr(row, name)
   return _compile_expression(name)
 
 

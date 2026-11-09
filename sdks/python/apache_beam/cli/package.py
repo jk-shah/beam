@@ -139,11 +139,41 @@ def extract_jinja_parameters(yaml_text: str) -> list[dict[str, Any]]:
   return params
 
 
+def _validate_region(region: str | None) -> str:
+  reg = (region or DEFAULT_REGION).strip()
+  if not re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)+', reg):
+    raise PackageError(
+        f'invalid GCP region {region!r}; expected lowercase region such as '
+        "'us-central1'",
+        EXIT_USAGE)
+  return reg
+
+
+def _validate_image_uri(image_uri: str, flag_name: str = '--image') -> str:
+  cleaned = image_uri.strip()
+  if not cleaned or not re.fullmatch(
+      r'[A-Za-z0-9][A-Za-z0-9._/:@-]{0,511}', cleaned):
+    raise PackageError(
+        f'invalid container image URI for {flag_name}: {image_uri!r}',
+        EXIT_USAGE)
+  return cleaned
+
+
+def _validate_entrypoint_filename(filename: str) -> str:
+  if not re.fullmatch(r'[A-Za-z0-9_.-]+\.py', filename) or '..' in filename:
+    raise PackageError(
+        f'unsafe Python entrypoint filename {filename!r}; expected simple '
+        'alphanumeric .py basename',
+        EXIT_USAGE)
+  return filename
+
+
 def _validate_yaml_with_jinja_placeholders(yaml_text: str) -> dict[str, Any]:
   """Validates top-level Beam YAML structure even when `{{ vars }}` are present."""
+  from . import output as out_mod
   scrubbed = _JINJA_EXPR_RE.sub('__BEAM_JINJA_PLACEHOLDER__', yaml_text)
   try:
-    doc = yaml.safe_load(scrubbed)
+    doc = out_mod.safe_yaml_load(scrubbed)
   except yaml.YAMLError as e:
     raise PackageError(f'invalid YAML syntax: {e}', EXIT_USAGE) from None
   if not isinstance(doc, dict) or 'pipeline' not in doc:
@@ -258,12 +288,13 @@ def resolve_yaml_template_image(
     allow_network: bool = True,
 ) -> tuple[str, list[str]]:
   """Resolves Google's hosted regional `Yaml_Template` container image."""
+  safe_reg = _validate_region(region)
   if explicit_image:
-    return explicit_image, []
+    return _validate_image_uri(explicit_image, '--image'), []
 
   warnings_out: list[str] = []
   if allow_network:
-    for reg in (region or DEFAULT_REGION, DEFAULT_REGION):
+    for reg in (safe_reg, DEFAULT_REGION):
       url = (
           f'https://storage.googleapis.com/dataflow-templates-{reg}/'
           'latest/flex/Yaml_Template')
@@ -274,7 +305,7 @@ def resolve_yaml_template_image(
           spec = json.loads(resp.read().decode('utf-8'))
           img = spec.get('image')
           if isinstance(img, str) and img.strip():
-            return img.strip(), warnings_out
+            return _validate_image_uri(img.strip(), 'Yaml_Template'), warnings_out
       except Exception:  # pylint: disable=broad-except
         continue
     warnings_out.append(
@@ -332,15 +363,21 @@ def generate_python_dockerfile(
     extra_wheels: list[str] | None = None,
 ) -> str:
   """Generates a single-image Flex Template Dockerfile (launcher + worker)."""
+  safe_base = _validate_image_uri(base_image, '--base-image')
+  safe_ep = _validate_entrypoint_filename(entrypoint_filename)
   lines = [
-      f'FROM {base_image}',
+      f'FROM {safe_base}',
       '',
       'WORKDIR /template',
   ]
   if extra_wheels:
+    safe_wheels: list[str] = []
     for whl in extra_wheels:
+      if not re.fullmatch(r'[A-Za-z0-9_.-]+\.whl', whl) or '..' in whl:
+        raise PackageError(f'unsafe wheel filename {whl!r}', EXIT_USAGE)
+      safe_wheels.append(whl)
       lines.append(f'COPY {whl} /template/{whl}')
-    whl_paths = ' '.join(f'/template/{w}' for w in extra_wheels)
+    whl_paths = ' '.join(f'/template/{w}' for w in safe_wheels)
     lines.append(f'RUN pip install --no-cache-dir {whl_paths}')
   if has_requirements:
     lines.extend([
@@ -348,8 +385,8 @@ def generate_python_dockerfile(
         'RUN pip install --no-cache-dir -r /template/requirements.txt',
     ])
   lines.extend([
-      f'COPY {entrypoint_filename} /template/{entrypoint_filename}',
-      f'ENV FLEX_TEMPLATE_PYTHON_PY_FILE="/template/{entrypoint_filename}"',
+      f'COPY {safe_ep} /template/{safe_ep}',
+      f'ENV FLEX_TEMPLATE_PYTHON_PY_FILE="/template/{safe_ep}"',
       '',
   ])
   return '\n'.join(lines)
@@ -469,14 +506,15 @@ def _build_launch_snippets(
     project: str | None,
     parameters: list[dict[str, Any]],
 ) -> dict[str, str]:
+  import shlex
   required_params = [p['name'] for p in parameters if not p.get('isOptional')]
   sample_kv = ','.join(f'{k}=<VALUE>' for k in required_params)
-  proj_flag = f' --project={project}' if project else ''
-  param_flag = f' --parameters={sample_kv}' if sample_kv else ''
+  proj_flag = f' --project={shlex.quote(project)}' if project else ''
+  param_flag = f' --parameters={shlex.quote(sample_kv)}' if sample_kv else ''
   gcloud_cmd = (
-      f'gcloud dataflow flex-template run {template_name}-job'
-      f' --template-file-gcs-location={template_location}'
-      f' --region={region}{proj_flag}{param_flag}')
+      f'gcloud dataflow flex-template run {shlex.quote(template_name + "-job")}'
+      f' --template-file-gcs-location={shlex.quote(template_location)}'
+      f' --region={shlex.quote(region)}{proj_flag}{param_flag}')
 
   params_dict_literal = (
       '{' + ', '.join(f'{k!r}: "<VALUE>"' for k in required_params) + '}'
@@ -555,6 +593,7 @@ def run_package(
         '--output-dir <DIR>, or --dry-run.',
         EXIT_USAGE)
 
+  region = _validate_region(region)
   stem = Path(source_basename).stem or 'beam-pipeline'
   safe_name = re.sub(r'[^a-z0-9-]+', '-', (name or stem).lower()).strip('-')
   if not safe_name:
@@ -697,7 +736,8 @@ def run_package(
         '--build-image requires --image <REGION-docker.pkg.dev/PROJECT/REPO/IMG:TAG>.',
         EXIT_USAGE)
 
-  resolved_py_image = image or (
+  resolved_py_image = (
+      _validate_image_uri(image, '--image') if image else
       f'{region}-docker.pkg.dev/{project or "<PROJECT>"}/dataflow/{safe_name}:latest'
   )
   if not image:
