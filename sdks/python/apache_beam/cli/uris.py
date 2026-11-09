@@ -464,13 +464,103 @@ def normalize_bq_table_spec(
   return spec, proj, dataset, table
 
 
-def parse_pubsub_uri(uri: str) -> tuple[str, str]:
+_SAFE_GCP_RESOURCE_SEG_RE = re.compile(r'^[A-Za-z0-9_.:~+%=-]{1,256}$')
+_BLOCKED_JDBC_PROPS = frozenset([
+    'allowloadlocalinfile',
+    'allowloadlocalinfileinpath',
+    'allowurlinlocalinfile',
+    'authenticationpluginclassname',
+    'autodeserialize',
+    'clientcertificatekeystoreurl',
+    'connectionlifecycleinterceptors',
+    'customsocketfactory',
+    'detectcustomcollations',
+    'exceptioninterceptors',
+    'loggerfile',
+    'loggerlevel',
+    'propertiestransform',
+    'queryinterceptors',
+    'socketfactory',
+    'socketfactoryarg',
+    'socksproxyhost',
+    'sslfactory',
+    'sslfactoryarg',
+    'sslpasswordcallback',
+    'statementinterceptors',
+    'trustcertificatekeystoreurl',
+])
+_BLOCKED_KAFKA_CLIENT_PROPS = frozenset([
+    'interceptor.classes',
+    'metric.reporters',
+    'sasl.client.callback.handler.class',
+    'sasl.login.callback.handler.class',
+    'sasl.login.class',
+    'security.providers',
+    'ssl.engine.factory.class',
+])
+
+
+def _validate_resource_seg(seg: str, label: str, allow_jinja: bool = False) -> str:
+  if allow_jinja and _has_jinja_syntax(seg):
+    _validate_jinja_uri(seg)
+    return seg
+  if not seg or seg in ('.', '..') or '..' in seg or not _SAFE_GCP_RESOURCE_SEG_RE.match(seg):
+    raise UriError(f'invalid {label} identifier {seg!r}')
+  return seg
+
+
+def _validate_jdbc_properties(
+    qparams: dict[str, Any],
+    conn_props: Iterable[Any],
+    extra_opts: dict[str, Any],
+) -> None:
+  for k in qparams:
+    norm = str(k).strip().lower()
+    if norm in _BLOCKED_JDBC_PROPS or any(ord(c) < 32 for c in str(k)):
+      raise UriError(f'disallowed JDBC driver property {k!r}')
+  for prop in conn_props:
+    prop_s = str(prop)
+    if any(ord(c) < 32 for c in prop_s):
+      raise UriError('control character in connection_properties is not allowed')
+    pk = prop_s.split('=', 1)[0].strip().lower()
+    if pk in _BLOCKED_JDBC_PROPS:
+      raise UriError(f'disallowed JDBC connection property {pk!r}')
+  for k, v in extra_opts.items():
+    norm = str(k).strip().lower()
+    if norm in _BLOCKED_JDBC_PROPS:
+      raise UriError(f'disallowed JDBC option {k!r}')
+    if isinstance(v, dict):
+      for sub_k in v:
+        if str(sub_k).strip().lower() in _BLOCKED_JDBC_PROPS:
+          raise UriError(f'disallowed JDBC property {sub_k!r}')
+
+
+def _validate_kafka_options(opts: dict[str, Any]) -> None:
+  for cfg_key in ('consumer_config', 'producer_config'):
+    sub = opts.get(cfg_key)
+    if isinstance(sub, dict):
+      for k, v in sub.items():
+        nk = str(k).strip().lower()
+        if nk in _BLOCKED_KAFKA_CLIENT_PROPS:
+          raise UriError(f'disallowed Kafka client class option {k!r}')
+        if nk == 'sasl.jaas.config' and 'ldaploginmodule' in str(v).lower():
+          raise UriError('disallowed JNDI LdapLoginModule in sasl.jaas.config')
+
+
+def parse_pubsub_uri(uri: str, *, allow_jinja: bool = False) -> tuple[str, str]:
   """Returns `('topic'|'subscription', 'projects/<p>/topics/<t>')`."""
   reject_inline_credentials(uri)
+  parsed = urllib.parse.urlsplit(uri)
+  if parsed.query or parsed.fragment:
+    raise UriError(
+        f'unexpected query/fragment in Pub/Sub URI {uri!r}; pass options via '
+        '--from-opt / --to-opt')
   body = uri[len('pubsub://'):].strip('/')
   parts = body.split('/')
   if (len(parts) == 4 and parts[0] == 'projects' and
       parts[2] in ('topics', 'subscriptions') and parts[1] and parts[3]):
+    _validate_resource_seg(parts[1], 'Pub/Sub project', allow_jinja=allow_jinja)
+    _validate_resource_seg(parts[3], f'Pub/Sub {parts[2][:-1]}', allow_jinja=allow_jinja)
     kind = 'topic' if parts[2] == 'topics' else 'subscription'
     return kind, body
   raise UriError(
@@ -479,7 +569,9 @@ def parse_pubsub_uri(uri: str) -> tuple[str, str]:
       'pubsub://projects/<project>/subscriptions/<subscription>')
 
 
-def parse_spanner_uri(uri: str) -> tuple[str, str, str, dict[str, str]]:
+def parse_spanner_uri(
+    uri: str, *, allow_jinja: bool = False
+) -> tuple[str, str, str, dict[str, str]]:
   """Parses `spanner://projects/P/instances/I/databases/D?...` or `spanner://P/I/D?...`."""
   reject_inline_credentials(uri)
   parsed = urllib.parse.urlsplit(uri)
@@ -488,9 +580,15 @@ def parse_spanner_uri(uri: str) -> tuple[str, str, str, dict[str, str]]:
   qparams = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=False))
   if (len(parts) == 6 and parts[0] == 'projects' and
       parts[2] == 'instances' and parts[4] == 'databases'):
-    return parts[1], parts[3], parts[5], qparams
+    proj = _validate_resource_seg(parts[1], 'Spanner project', allow_jinja=allow_jinja)
+    inst = _validate_resource_seg(parts[3], 'Spanner instance', allow_jinja=allow_jinja)
+    db = _validate_resource_seg(parts[5], 'Spanner database', allow_jinja=allow_jinja)
+    return proj, inst, db, qparams
   if len(parts) == 3 and parts[0] != 'projects':
-    return parts[0], parts[1], parts[2], qparams
+    proj = _validate_resource_seg(parts[0], 'Spanner project', allow_jinja=allow_jinja)
+    inst = _validate_resource_seg(parts[1], 'Spanner instance', allow_jinja=allow_jinja)
+    db = _validate_resource_seg(parts[2], 'Spanner database', allow_jinja=allow_jinja)
+    return proj, inst, db, qparams
   raise UriError(
       f'invalid Spanner URI {uri!r}; expected '
       'spanner://projects/<project>/instances/<instance>/databases/<database>'
@@ -634,6 +732,12 @@ def parse_endpoint(
           + ('' if cdc else ' (or --from-opt query="SELECT ...")'))
     port_num = parsed.port or default_port
     db_name = parsed.path.lstrip('/')
+    if not (allow_jinja and _has_jinja_syntax(db_name)):
+      if any(ch in db_name for ch in (';', '?', '&', '#', '/', '\\')) or any(
+          ord(c) <= 32 for c in db_name) or '..' in db_name:
+        raise UriError(f'invalid {label_db} database name {db_name!r}')
+    conn_props_in = list(opts.get('connection_properties') or [])
+    _validate_jdbc_properties(qparams, conn_props_in, opts)
     env_prefix = 'BEAM_POSTGRES' if is_pg else 'BEAM_MYSQL'
     user = opts.pop('username', None) or os.environ.get(f'{env_prefix}_USER')
     pwd = opts.pop('password', None) or os.environ.get(f'{env_prefix}_PASSWORD')
@@ -701,7 +805,8 @@ def parse_endpoint(
 
   # 4. Cloud Spanner (`spanner://projects/P/instances/I/databases/D?table=T`)
   if scheme == 'spanner':
-    sp_proj, sp_inst, sp_db, qparams = parse_spanner_uri(location)
+    sp_proj, sp_inst, sp_db, qparams = parse_spanner_uri(
+        location, allow_jinja=allow_jinja)
     sp_cfg: dict[str, Any] = {
         'project': sp_proj,
         'instance': sp_inst,
@@ -729,7 +834,7 @@ def parse_endpoint(
 
   # 5. Pub/Sub (`pubsub://projects/P/topics/T` or `.../subscriptions/S`)
   if scheme == 'pubsub':
-    ps_kind, ps_resource = parse_pubsub_uri(location)
+    ps_kind, ps_resource = parse_pubsub_uri(location, allow_jinja=allow_jinja)
     if not is_read and ps_kind != 'topic':
       raise UriError(
           f'WriteToPubSub requires a topic URI, got subscription {location!r}')
@@ -750,10 +855,18 @@ def parse_endpoint(
   if scheme == 'kafka':
     parsed = urllib.parse.urlsplit(location)
     topic = parsed.path.strip('/')
-    if not parsed.netloc or not topic:
+    if not parsed.netloc or not topic or parsed.query or parsed.fragment:
       raise UriError(
           f'invalid Kafka URI {location!r}; expected '
           'kafka://BOOTSTRAP_SERVERS/TOPIC')
+    if not (allow_jinja and _has_jinja_syntax(parsed.netloc)) and not re.fullmatch(
+        r'[A-Za-z0-9._:,\[\]-]+', parsed.netloc):
+      raise UriError(f'invalid Kafka bootstrap_servers {parsed.netloc!r}')
+    if not (allow_jinja and _has_jinja_syntax(topic)) and (
+        topic in ('.', '..') or '..' in topic or
+        not re.fullmatch(r'[A-Za-z0-9._-]+', topic)):
+      raise UriError(f'invalid Kafka topic name {topic!r}')
+    _validate_kafka_options(opts)
     fmt = (explicit_format or opts.pop('format', 'JSON')).upper()
     cfg = {
         'bootstrap_servers': parsed.netloc,

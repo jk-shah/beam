@@ -103,7 +103,10 @@ def parse_duration_seconds(raw: str | int | float) -> float:
 def _jobs_dir() -> Path:
   beam_home = os.path.expanduser(os.environ.get('BEAM_HOME', '~/.beam'))
   d = Path(beam_home) / 'jobs'
-  d.mkdir(parents=True, exist_ok=True)
+  d.mkdir(mode=0o700, parents=True, exist_ok=True)
+  if os.path.islink(d):
+    raise JobError(
+        f'refusing symlinked jobs directory {str(d)!r}', EXIT_USAGE)
   try:
     os.chmod(d, 0o700)
   except OSError:
@@ -129,7 +132,7 @@ def validate_job_id(job_id: str) -> str:
 
 
 def _atomic_write_json(target: Path, payload: dict[str, Any]) -> None:
-  target.parent.mkdir(parents=True, exist_ok=True)
+  target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
   fd, tmp_path = tempfile.mkstemp(
       prefix='.tmp-job-', suffix='.json', dir=str(target.parent))
   try:
@@ -157,11 +160,13 @@ def compute_idempotency_key(argv: list[str], plan_hash: str) -> str:
 def lookup_recent_submission(
     idem_key: str, ttl_seconds: int = 1800) -> dict[str, Any] | None:
   """Returns an active/recent remote job record if submitted within `ttl_seconds`."""
+  from . import output as out_mod
   ledger_path = _jobs_dir() / '_idempotency_ledger.json'
-  if not ledger_path.is_file():
+  if not ledger_path.is_file() or os.path.islink(ledger_path):
     return None
   try:
-    ledger = json.loads(ledger_path.read_text(encoding='utf-8'))
+    ledger = json.loads(
+        out_mod.read_bounded_text(ledger_path, label=str(ledger_path)))
   except (OSError, ValueError):
     return None
   entry = ledger.get(idem_key)
@@ -196,6 +201,7 @@ def record_job_submission(
     outputs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
   """Persists `~/.beam/jobs/<job_id>.json` (`0600`) and updates the ledger."""
+  from . import output as out_mod
   safe_id = validate_job_id(job_id)
   now = time.time()
   record = {
@@ -217,9 +223,10 @@ def record_job_submission(
   if idem_key:
     ledger_path = _jobs_dir() / '_idempotency_ledger.json'
     ledger: dict[str, Any] = {}
-    if ledger_path.is_file():
+    if ledger_path.is_file() and not os.path.islink(ledger_path):
       try:
-        ledger = json.loads(ledger_path.read_text(encoding='utf-8'))
+        ledger = json.loads(
+            out_mod.read_bounded_text(ledger_path, label=str(ledger_path)))
       except (OSError, ValueError):
         ledger = {}
     # Prune entries older than 2 hours.
@@ -235,15 +242,16 @@ def record_job_submission(
 
 
 def load_job_record(job_id: str) -> dict[str, Any]:
+  from . import output as out_mod
   safe_id = validate_job_id(job_id)
   job_path = _jobs_dir() / f'{safe_id}.json'
-  if not job_path.is_file():
+  if not job_path.is_file() or os.path.islink(job_path):
     raise JobError(
         f'no local job record for {safe_id!r} in {_jobs_dir()}; pass '
         '--project and --region if querying a remote Dataflow job directly',
         EXIT_USAGE)
   try:
-    return json.loads(job_path.read_text(encoding='utf-8'))
+    return json.loads(out_mod.read_bounded_text(job_path, label=str(job_path)))
   except (OSError, ValueError) as e:
     raise JobError(f'corrupt job record for {safe_id!r}: {e}', EXIT_USAGE) from None
 

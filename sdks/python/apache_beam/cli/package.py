@@ -302,7 +302,7 @@ def resolve_yaml_template_image(
         req = urllib.request.Request(
             url, headers={'User-Agent': 'apache-beam-cli-package'})
         with urllib.request.urlopen(req, timeout=5.0) as resp:
-          spec = json.loads(resp.read().decode('utf-8'))
+          spec = json.loads(resp.read(65536).decode('utf-8'))
           img = spec.get('image')
           if isinstance(img, str) and img.strip():
             return _validate_image_uri(img.strip(), 'Yaml_Template'), warnings_out
@@ -395,7 +395,14 @@ def generate_python_dockerfile(
 def _generate_yaml_python_wrapper(
     yaml_filename: str, param_names: list[str] | None = None) -> str:
   """Generates a minimal Python Flex entrypoint wrapping a Beam YAML file."""
-  names_literal = repr(sorted(set(param_names or ())))
+  if not re.fullmatch(r'[A-Za-z0-9_.-]+\.ya?ml', yaml_filename) or '..' in yaml_filename:
+    raise PackageError(f'unsafe YAML filename {yaml_filename!r}', EXIT_USAGE)
+  clean_params: list[str] = []
+  for p in sorted(set(param_names or ())):
+    if not _SAFE_PARAM_NAME_RE.match(str(p)):
+      raise PackageError(f'invalid parameter name {p!r}', EXIT_USAGE)
+    clean_params.append(str(p))
+  names_literal = repr(clean_params)
   return (
       '"""Auto-generated Beam YAML Flex Template launcher."""\n'
       'import json\n'

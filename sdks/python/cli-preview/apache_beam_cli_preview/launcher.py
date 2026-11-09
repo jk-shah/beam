@@ -223,9 +223,12 @@ class _PreviewCliFinder(importlib.abc.MetaPathFinder):
           submodule_search_locations=[str(self._cli_dir)])
     for pkg_prefix in ('apache_beam.cli.', f'{_FAST_PKG}.'):
       if fullname.startswith(pkg_prefix):
-        rel = fullname[len(pkg_prefix):].replace('.', '/')
-        mod_py = self._cli_dir / f'{rel}.py'
-        if mod_py.is_file():
+        sub = fullname[len(pkg_prefix):]
+        parts = sub.split('.')
+        if not parts or not all(seg.isidentifier() for seg in parts):
+          return None
+        mod_py = self._cli_dir.joinpath(*parts[:-1], f'{parts[-1]}.py')
+        if mod_py.is_file() and not os.path.islink(mod_py):
           return importlib.util.spec_from_file_location(fullname, mod_py)
     if (fullname == 'apache_beam.typehints.arrow_type_compatibility' and
         not self._patching_arrow):

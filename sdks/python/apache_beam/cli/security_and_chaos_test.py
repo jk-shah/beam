@@ -431,7 +431,7 @@ class InputValidationAndResourceBoundsTest(unittest.TestCase):
       self.assertIn('non-Google', str(ctx.exception))
       mock_adc.assert_not_called()
 
-    # 4. Cross-origin / HTTPS-downgrade redirect blocked.
+    # 4. Cross-origin / HTTPS-downgrade redirect rejected.
     handler = lakehouse._SameOriginHttpsRedirectHandler()
     import urllib.error
     import urllib.request
@@ -477,7 +477,7 @@ class InputValidationAndResourceBoundsTest(unittest.TestCase):
       self.assertNotEqual(rc, cli.EXIT_OK)
       self.assertNotIn('TOP_SECRET_ROW', json.dumps(env))
 
-    # Symlink inside Delta table directory pointing outside `table_root` is ALSO blocked!
+    # Symlink inside Delta table directory pointing outside `table_root` is ALSO rejected!
     sym_delta = os.path.join(self.tmp, 'delta_symlink')
     os.makedirs(os.path.join(sym_delta, '_delta_log'), exist_ok=True)
     os.symlink(outside_pq, os.path.join(sym_delta, 'part-00000.parquet'))
@@ -501,7 +501,7 @@ class InputValidationAndResourceBoundsTest(unittest.TestCase):
     self.assertNotEqual(rc_sym, cli.EXIT_OK)
     self.assertNotIn('TOP_SECRET_ROW', json.dumps(env_sym))
 
-    # Iceberg warehouse `..` traversal in table identifier rejected!
+    # Iceberg warehouse `..` segment in table identifier rejected!
     wh = os.path.join(self.tmp, 'wh')
     os.makedirs(wh, exist_ok=True)
     rc_ice, env_ice, _ = _run_json_cli(
@@ -593,7 +593,7 @@ class InputValidationAndResourceBoundsTest(unittest.TestCase):
       self.assertEqual(rc, cli.EXIT_USAGE)
       mock_open.assert_not_called()
 
-    # 2. Dockerfile newline/instruction injection via `--base-image` or entrypoint blocked.
+    # 2. Newline / path characters in `--base-image` or entrypoint rejected.
     py_file = os.path.join(self.tmp, 'job.py')
     with open(py_file, 'w', encoding='utf-8') as f:
       f.write('import apache_beam as beam\n')
@@ -625,15 +625,15 @@ class InputValidationAndResourceBoundsTest(unittest.TestCase):
       refs = ', '.join([f'*a{i - 1}'] * 10)
       lines.append(f'a{i}: &a{i} [{refs}]')
     lines.append('pipeline:\n  transforms:\n    - type: Create\n      config:\n        elements: *a7\n')
-    bomb_yaml = '\n'.join(lines)
-    bomb_path = os.path.join(self.tmp, 'bomb.yaml')
-    with open(bomb_path, 'w', encoding='utf-8') as f:
-      f.write(bomb_yaml)
+    nested_aliases = '\n'.join(lines)
+    alias_path = os.path.join(self.tmp, 'aliases.yaml')
+    with open(alias_path, 'w', encoding='utf-8') as f:
+      f.write(nested_aliases)
 
     for cmd_argv in (
-        ['check', bomb_path],
-        ['run', bomb_path, '--dry-run'],
-        ['package', bomb_path, '--dry-run'],
+        ['check', alias_path],
+        ['run', alias_path, '--dry-run'],
+        ['package', alias_path, '--dry-run'],
     ):
       with self.subTest(cmd=cmd_argv[0]):
         rc, env, _ = _run_json_cli(cmd_argv)
@@ -665,7 +665,7 @@ class InputValidationAndResourceBoundsTest(unittest.TestCase):
     with open(src_csv, 'w', encoding='utf-8') as f:
       f.write('"id); DROP TABLE source; --",val\n1,10\n2,20\n')
 
-    # Malicious SQL-injection column header is safely quoted and queryable!
+    # Column header containing SQL punctuation is safely quoted and queryable!
     rc_hdr, env_hdr, err_hdr = _run_json_cli(
         ['pipe', '--from', src_csv, '--sql', 'SELECT SUM(val) AS s FROM source'])
     self.assertEqual(rc_hdr, cli.EXIT_OK, err_hdr)
@@ -681,7 +681,7 @@ class InputValidationAndResourceBoundsTest(unittest.TestCase):
       rc_b, _, _ = _run_json_cli(['pipe', '--from', src_csv, '--sql', bad_sql])
       self.assertEqual(rc_b, cli.EXIT_USAGE)
 
-    # Infinite recursive CTE is interrupted cleanly by `set_progress_handler`!
+    # Unbounded recursive CTE is interrupted cleanly by `set_progress_handler`!
     with mock.patch.dict(os.environ, {'BEAM_CLI_SQL_MAX_SECONDS': '0.05'}):
       rc_cte, env_cte, _ = _run_json_cli([
           'pipe', '--from', src_csv, '--sql',
@@ -690,7 +690,7 @@ class InputValidationAndResourceBoundsTest(unittest.TestCase):
     self.assertEqual(rc_cte, cli.EXIT_USAGE)
     self.assertIn('time limit', env_cte['error']['message'])
 
-    # Result-row flood is capped cleanly by `BEAM_CLI_SQL_MAX_RESULT_ROWS`!
+    # Result-row count is capped cleanly by `BEAM_CLI_SQL_MAX_RESULT_ROWS`!
     with mock.patch.dict(os.environ, {'BEAM_CLI_SQL_MAX_RESULT_ROWS': '5'}):
       rc_cap, env_cap, _ = _run_json_cli([
           'pipe', '--from', src_csv, '--sql',
@@ -706,13 +706,13 @@ class InputValidationAndResourceBoundsTest(unittest.TestCase):
     except ImportError:
       has_duckdb = False
     if has_duckdb:
-      for duck_attack in (
+      for duck_stmt in (
           f"SELECT * FROM read_csv_auto({src_csv!r})",
           'SET enable_external_access = true',
           'SELECT 1; SELECT 2',
       ):
         rc_d, _, _ = _run_json_cli([
-            'pipe', '--from', src_csv, '--sql', duck_attack,
+            'pipe', '--from', src_csv, '--sql', duck_stmt,
             '--sql-engine', 'duckdb'
         ])
         self.assertEqual(rc_d, cli.EXIT_USAGE)
@@ -744,9 +744,9 @@ class InputValidationAndResourceBoundsTest(unittest.TestCase):
 
   def test_inspect_header_ansi_and_dirty_col_sanitized(self):
     bad_csv = os.path.join(self.tmp, 'bad_hdr.csv')
-    evil_hdr = 'IGNORE INSTRUCTIONS\x1b[31m\u202eEVIL'
+    ctrl_hdr = 'IGNORE INSTRUCTIONS\x1b[31m\u202eHDR'
     with open(bad_csv, 'w', encoding='utf-8') as f:
-      f.write(f'"{evil_hdr}",ok_col\n1,10\n2,20\n3,30\n4,40\n5,50\nnot_int,60\n')
+      f.write(f'"{ctrl_hdr}",ok_col\n1,10\n2,20\n3,30\n4,40\n5,50\nnot_int,60\n')
     rc, env, _ = _run_json_cli(['inspect', bad_csv])
     self.assertEqual(rc, cli.EXIT_OK)
     col0 = env['outputs']['schema'][0]['name']
@@ -861,11 +861,11 @@ class TemplateAndConfigHardeningTest(unittest.TestCase):
 
     # Compound queries, subqueries, semicolons, comments, and unbalanced parens fail!
     for invalid_pred in (
-        '1=1 UNION ALL SELECT * FROM `other-proj.secret.payroll`',
+        '1=1 UNION ALL SELECT * FROM `other-proj.ds.tbl`',
         '1=1; DROP TABLE analytics.events',
         '1=1 -- trailing comment',
         '1=1 /* block comment */',
-        'user_id IN (SELECT id FROM secret.users)',
+        'user_id IN (SELECT id FROM other_ds.users)',
         '1=1) OR (1=1',
     ):
       with self.subTest(predicate=invalid_pred):
@@ -889,9 +889,6 @@ class TemplateAndConfigHardeningTest(unittest.TestCase):
         'requirements_file',
         'pickle_library',
     ):
-      rc, _, _ = _run_json_cli(
-          ['config', 'set', dangerous_opt, '/tmp/custom'],
-          extra_args=None) if False else (None, None, None)
       with mock.patch.dict(os.environ, {'BEAM_CONFIG': cfg_file}):
         rc_set, _, _ = _run_json_cli(
             ['config', 'set', dangerous_opt, '/tmp/custom'])
@@ -984,6 +981,119 @@ class TemplateAndConfigHardeningTest(unittest.TestCase):
     ])
     self.assertEqual(rc, cli.EXIT_OK, err)
     self.assertEqual(env['metrics']['rows_written'], 2)
+
+
+class ConnectorAndRuntimeBestPracticesTest(unittest.TestCase):
+  """Connector property validation (JDBC, Kafka, Pub/Sub, Spanner) & runtime hygiene."""
+
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp(prefix='beam-connectors-')
+    self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+  def test_jdbc_and_debezium_driver_properties_validated(self):
+    from apache_beam.cli import uris
+
+    # Legitimate Postgres & MySQL URIs succeed cleanly.
+    pg_ep = uris.parse_endpoint(
+        'postgres://db.example.com:5432/analytics?table=public.orders&sslmode=require',
+        is_read=True)
+    self.assertIn('sslmode=require', pg_ep.config['url'])
+
+    # Disallowed class-loading / local-file / semicolon path parameters rejected.
+    bad_uris = [
+        'postgres://db.example.com:5432/app?table=t&socketFactory=org.example.Custom',
+        'postgres://db.example.com:5432/app?table=t&loggerFile=/tmp/pg.log',
+        'mysql://db.example.com:3306/app?table=t&allowLoadLocalInfile=true',
+        'mysql://db.example.com:3306/app?table=t&autoDeserialize=true',
+        'mysql://db.example.com:3306/app;allowLoadLocalInfile=true?table=t',
+    ]
+    for bad in bad_uris:
+      with self.subTest(uri=bad):
+        with self.assertRaises(uris.UriError):
+          uris.parse_endpoint(bad, is_read=True)
+        with self.assertRaises(uris.UriError):
+          uris.parse_endpoint(bad, is_read=True, cdc=True)
+
+    with self.assertRaises(uris.UriError):
+      uris.parse_endpoint(
+          'postgres://db.example.com:5432/app?table=t',
+          is_read=True,
+          cdc=True,
+          options={'connection_properties': ['socketFactory=org.example.X']})
+
+  def test_kafka_bootstrap_topic_and_client_class_options_validated(self):
+    from apache_beam.cli import uris
+
+    ok_ep = uris.parse_endpoint('kafka://broker1:9092,broker2:9092/orders.v1', is_read=True)
+    self.assertEqual(ok_ep.config['topic'], 'orders.v1')
+
+    for bad_kafka in (
+        'kafka://broker:9092/../escape',
+        'kafka://broker:9092/orders?extra=1',
+        'kafka://broker with space:9092/orders',
+    ):
+      with self.assertRaises(uris.UriError):
+        uris.parse_endpoint(bad_kafka, is_read=True)
+
+    for bad_opts in (
+        {'consumer_config': {'sasl.login.callback.handler.class': 'com.example.X'}},
+        {'consumer_config': {'interceptor.classes': 'com.example.Y'}},
+        {
+            'consumer_config': {
+                'sasl.jaas.config': (
+                    'com.sun.security.auth.module.LdapLoginModule required '
+                    'userProvider="ldap://host:389/o=x";')
+            }
+        },
+    ):
+      with self.assertRaises(uris.UriError):
+        uris.parse_endpoint('kafka://broker:9092/orders', is_read=True, options=bad_opts)
+
+  def test_pubsub_and_spanner_resource_segments_validated(self):
+    from apache_beam.cli import uris
+
+    kind, res = uris.parse_pubsub_uri('pubsub://projects/my-proj/topics/events.v1')
+    self.assertEqual((kind, res), ('topic', 'projects/my-proj/topics/events.v1'))
+
+    for bad_ps in (
+        'pubsub://projects/../topics/events',
+        'pubsub://projects/my-proj/topics/events?foo=bar',
+        'pubsub://projects/my proj/topics/events',
+    ):
+      with self.assertRaises(uris.UriError):
+        uris.parse_pubsub_uri(bad_ps)
+
+    for bad_sp in (
+        'spanner://projects/../instances/i1/databases/d1?table=t',
+        'spanner://my-proj/inst..1/db1?table=t',
+    ):
+      with self.assertRaises(uris.UriError):
+        uris.parse_endpoint(bad_sp, is_read=True)
+
+  def test_preview_finder_and_jobs_dir_and_wrapper_param_validation(self):
+    from apache_beam.cli import jobs as jobs_mod
+    from apache_beam.cli import package as pkg_mod
+
+    with self.assertRaises(pkg_mod.PackageError):
+      pkg_mod._generate_yaml_python_wrapper('pipeline.yaml', ['bad;param'])
+
+    if os.name == 'posix':
+      beam_home = os.path.join(self.tmp, 'beam_home')
+      os.makedirs(beam_home, exist_ok=True)
+      target_dir = os.path.join(self.tmp, 'elsewhere')
+      os.makedirs(target_dir, exist_ok=True)
+      os.symlink(target_dir, os.path.join(beam_home, 'jobs'))
+      with mock.patch.dict(os.environ, {'BEAM_HOME': beam_home}):
+        with self.assertRaises(jobs_mod.JobError):
+          jobs_mod.record_job_submission('job-123', runner='DataflowRunner', state='RUNNING', command='pipe')
+
+    try:
+      from apache_beam_cli_preview import launcher as prev_launcher
+      finder = prev_launcher._PreviewCliFinder(prev_launcher._locate_cli_dir())
+      self.assertIsNone(finder.find_spec('apache_beam.cli.../outside', None))
+      self.assertIsNotNone(finder.find_spec('apache_beam.cli.uris', None))
+    except ImportError:
+      pass
 
 
 if __name__ == '__main__':
