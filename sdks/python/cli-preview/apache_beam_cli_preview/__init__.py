@@ -17,4 +17,4 @@
 
 """Pure-Python `<3s` preview overlay for the Apache Beam CLI (`beam`)."""
 
-__version__ = '0.1.0'
+__version__ = '0.2.0'

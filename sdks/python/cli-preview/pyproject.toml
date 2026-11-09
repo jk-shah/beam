@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "apache-beam-cli-preview"
-version = "0.1.0"
+version = "0.2.0"
 description = "Fast (<90ms) pure-Python preview overlay for the Apache Beam CLI (`beam` & `apache-beam`)."
 readme = "README.md"
 requires-python = ">=3.10"

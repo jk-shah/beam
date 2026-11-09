@@ -42,18 +42,20 @@ This package implements the `beam` (and `apache-beam`) command-line interface tr
 | `output.py` | Schema v1.0 `--json` envelope, `os.dup2` stdout isolation, NDJSON streaming, and `untrusted_data` sanitizer |
 | `uris.py` | Universal URI parser (`csv`, `json`, `parquet`, `avro`, `delta://`, `iceberg://`, `bigquery://`, `postgres://`, `mysql://`, `spanner://`, `pubsub://`, `kafka://`) |
 | `pipe_spec.py` | Declarative `beam pipe` -> Beam YAML compiler (`--where`, `--select`, `--dlq`, `--assert-counts`, `--cdc`, `--zero-copy`) |
+| `fast_local.py` | `<80 ms` zero-SDK local ETL & CDC materializer (`csv`, `json`/`jsonl`, `parquet`, `avro`, atomic `--if-exists replace`) |
+| `pipe_sql.py` | Local analytical `--sql` engine (`sqlite` built-in + optional `duckdb`), multi-source `--join`, `median`/`quantile`/`to_utc` |
 | `expressions.py` | Tokenized, AST-allowlisted, DoS-bounded `--where` / `--select` Python callable compiler |
-| `dlq.py` | RFC-4180 multi-shard `ReadCsvWithDlq`, `ReadJsonWithDlq`, and flat primitive DLQ normalizers |
+| `dlq.py` | RFC-4180 multi-shard `ReadCsvWithDlq`, schema-drift-aware `ReadJsonWithDlq`, and flat primitive DLQ normalizers |
 | `cost_guard.py` | Pre-flight `--max-bytes` cost estimator (`EXIT_COST_LIMIT = 8`) across files, Lakehouse logs, Postgres, and `$0` BigQuery metadata/`dryRun` |
-| `diff.py` | Distributed $O(1)$-RAM `CombinePerKey` multiset hash & float-tolerance dataset reconciliation (`EXIT_DIFF_MISMATCH = 6`) |
+| `diff.py` | Distributed $O(1)$-RAM `CombinePerKey` multiset hash & float-tolerance dataset reconciliation (`--columns`, `--to`, `EXIT_DIFF_MISMATCH = 6`) |
 | `inspect_cmd.py` | Sub-second PyArrow, Lakehouse snapshot, and `$0` BigQuery schema/stats/sample inspector |
 | `tail.py` | Non-destructive bounded stream peek & live `tail -f` follow (files, GCS shards, Pub/Sub, Kafka, Delta/Iceberg commits) |
 | `package.py` | `<2 s` Zero-Docker YAML Flex Templates (`jinja2` AST parameter extraction) & Python `ast` single-image Flex bundles |
 | `lakehouse.py` | Pure-Python Delta Lake `_delta_log` & Apache Iceberg v2 reader, Merge-on-Read writer, and `--zero-copy` Avro manifest synthesizer |
-| `cdc.py` | Cross-engine Debezium / Spanner / Lakehouse CDC normalizer & BigQuery Storage Write API `_default` (`UPSERT`/`DELETE`) sink |
+| `cdc.py` | Cross-engine Debezium / Spanner / Lakehouse CDC normalizer, file-sink materializer, & BigQuery Storage Write API `_default` (`UPSERT`/`DELETE`) sink |
 | `jobs.py` | Detached job state (`~/.beam/jobs/`), 30m idempotency ledger, `beam wait` deferred post-checks, and `beam cancel` |
-| `check_cmd.py` | Static YAML & provider trust validator + optional `--plan` graph expansion |
-| `io_cmd.py` / `doctor.py` | Connector reference cards (`beam io`) and environment/ADC pre-flight diagnostics (`beam doctor`) |
+| `check_cmd.py` | Static YAML, sandboxed `--jinja-variables`, and provider trust validator + optional `--plan` graph expansion |
+| `io_cmd.py` / `doctor.py` | Connector reference cards (`beam io`) and environment/SQL-engine/ADC pre-flight diagnostics (`beam doctor`) |
 | `sql.py` / `config.py` | Beam Calcite SQL runner (`beam sql`) and persistent `PipelineOptions` profiles (`beam config`) |
 | `llms_txt.py` | Self-contained Markdown agent reference (`beam --llms-txt`) |
 
@@ -63,8 +65,8 @@ This package implements the `beam` (and `apache-beam`) command-line interface tr
 
 | Exit Code | Constant | Meaning |
 | :--- | :--- | :--- |
-| `0` | `EXIT_OK` | Command succeeded (`beam diff` datasets matched; pipeline completed) |
-| `1` | `EXIT_PIPELINE_FAILED` | Pipeline execution failed or `--assert-counts` conservation failed |
+| `0` | `EXIT_OK` | Command succeeded (`beam diff` datasets matched or `--exit-zero` passed; pipeline completed) |
+| `1` | `EXIT_PIPELINE_FAILED` | Pipeline execution, schema-drift fail-fast, or `--assert-counts` conservation failed |
 | `2` | `EXIT_USAGE` | CLI usage, YAML schema, AST expression, existing-output, or inline-secret error |
 | `3` | `EXIT_CAPABILITY` | Feature/flag unsupported on the selected runner |
 | `4` | `EXIT_MISSING_PACKAGE` | Missing optional Python extra or Java 11–25 runtime (`next_actions` gives fix) |
@@ -75,13 +77,13 @@ This package implements the `beam` (and `apache-beam`) command-line interface tr
 
 ---
 
-## 5. Documentation & Running the Automated Test Suite (`101` Tests)
+## 5. Documentation & Running the Automated Test Suite (`209` Tests)
 
 * **Preview Quickstart & Recipes**: [`sdks/python/cli-preview/README.md`](../../cli-preview/README.md)
 * **Website CLI Reference**: [`website/www/site/content/en/documentation/sdks/cli.md`](../../../../website/www/site/content/en/documentation/sdks/cli.md)
 * **AI Agent Skill**: [`.agents/skills/apache-beam-cli/SKILL.md`](../../../../.agents/skills/apache-beam-cli/SKILL.md)
 
-After installing the preview overlay (`sdks/python/cli-preview`) into a virtual environment, run the full `101`-test CLI unit, `<90 ms` startup-isolation, pipeline integration, Lakehouse/CDC, and adversarial security suite from the repository root:
+After installing the preview overlay (`sdks/python/cli-preview`) into a virtual environment, run the full `209`-test CLI unit, `<90 ms` startup-isolation, pipeline integration, Lakehouse/CDC, and input-validation/resource-bounds suite from the repository root:
 
 ```bash
 python -m unittest discover -s sdks/python/apache_beam/cli -p '*_test.py'

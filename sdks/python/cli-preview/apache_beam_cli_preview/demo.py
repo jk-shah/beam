@@ -15,7 +15,7 @@
 # limitations under the License.
 #
 
-"""Runs the interactive 10-step `beam` CLI showcase (`beam-demo` / `python -m apache_beam_cli_preview.demo`)."""
+"""Runs the interactive 12-step `beam` CLI showcase (`beam-demo` / `python -m apache_beam_cli_preview.demo`)."""
 
 import os
 from pathlib import Path
