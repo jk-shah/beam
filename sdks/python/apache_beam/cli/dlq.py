@@ -233,12 +233,15 @@ _OTHER_COMPRESSION_SUFFIXES = ('.zst', '.zstd', '.deflate', '.lzma', '.xz',
                                '.snappy')
 
 
-def _match_paths(path: str) -> list[str]:
-  """Returns the sorted files matching `path` (a file, glob, or URI).
+def _match_paths(path) -> list[str]:
+  """Returns the sorted files matching `path` (a file, glob, URI, or list).
 
   Local paths are matched with `glob` so callers such as the CSV schema
-  preflight and the fast local path don't import `apache_beam`.
+  preflight and the fast local path don't import `apache_beam`. A list or
+  tuple is an explicit set of files (one format group of a mixed glob).
   """
+  if isinstance(path, (list, tuple)):
+    return sorted(str(p) for p in path)
   if '://' not in path:
     import glob
     import os
@@ -379,9 +382,13 @@ def _preflight_csv_schema(
         continue
       if not first_row:
         continue
+      norm = [col.strip() or f'col_{i}' for i, col in enumerate(first_row)]
+      order = None
       if header is None:
-        header = [col.strip() or f'col_{i}' for i, col in enumerate(first_row)]
+        header = norm
         col_samples = {c: [] for c in header}
+      else:
+        order = header_order(norm, header)
       while collected < sample_rows:
         try:
           row = next(reader, None)
@@ -393,6 +400,8 @@ def _preflight_csv_schema(
           break
         if len(row) != len(header):
           continue
+        if order is not None:
+          row = [row[i] for i in order]
         for col_name, cell in zip(header, row):
           col_samples[col_name].append(cell)
         collected += 1
@@ -407,6 +416,45 @@ def _preflight_csv_schema(
       for c in header
   }
   return header, kinds
+
+
+def header_order(file_header: list[str], header: list[str]):
+  """Column positions that reorder `file_header` into `header`, or None.
+
+  Files in one glob may list the same columns in a different order; their
+  rows are matched by column name. None means same order, or not the same set
+  of columns (then rows are read by position, as before).
+  """
+  if file_header == header or len(file_header) != len(header):
+    return None
+  if sorted(file_header) != sorted(header) or len(set(header)) != len(header):
+    return None
+  return [file_header.index(h) for h in header]
+
+
+_TYPE_KINDS = ('int', 'float', 'bool', 'str')
+
+
+def apply_type_overrides(kinds: dict[str, Any], types, source: str):
+  """Applies explicit column types (`--from-opt fields=amount:float`).
+
+  Values that don't parse as the given type go to the DLQ (or fail the run
+  without `--dlq`) instead of the whole column falling back to text.
+  """
+  if not types:
+    return kinds
+  out = dict(kinds)
+  for col, kind in dict(types).items():
+    if col not in out:
+      raise ValueError(
+          f'--from-opt fields: column {col!r} is not in {source} (columns: '
+          f'{", ".join(out)})')
+    if kind not in _TYPE_KINDS:
+      raise ValueError(
+          f'--from-opt fields: unsupported type {kind!r} for {col!r}; use '
+          'int, float, bool, or str')
+    out[col] = kind
+  return out
 
 
 def install_keyword_safe_row_hooks() -> None:
@@ -650,6 +698,7 @@ def read_csv_with_dlq(
     *,
     delimiter: str = ',',
     null_values: Optional[list[str]] = None,
+    types: Optional[dict[str, str]] = None,
     error_handling: Optional[dict[str, Any]] = None,
 ):
   """RFC-4180 multi-shard CSV Beam YAML source with structured DLQ output.
@@ -665,6 +714,7 @@ def read_csv_with_dlq(
   nulls = DEFAULT_CSV_NULL_VALUES | frozenset(null_values or ())
   header, kinds = _preflight_csv_schema(
       path, delimiter=delimiter, null_values=nulls)
+  kinds = apply_type_overrides(kinds, types, path)
   py_type_map = {
       'int': Optional[int],
       'float': Optional[float],
@@ -740,6 +790,7 @@ def iter_csv_records(
       raw_f, encoding='utf-8-sig', errors='replace', newline='')
   reader = csv.reader(wrapper, delimiter=delimiter)
   row_index = 0
+  order = None
   while True:
     try:
       cells = next(reader)
@@ -757,11 +808,12 @@ def iter_csv_records(
       }
       break
 
-    if row_index == 0 and [
-        c.strip() or f'col_{i}' for i, c in enumerate(cells)
-    ] == header:
-      row_index += 1
-      continue
+    if row_index == 0:
+      norm = [c.strip() or f'col_{i}' for i, c in enumerate(cells)]
+      order = header_order(norm, header)
+      if norm == header or order is not None:
+        row_index += 1
+        continue
     row_index += 1
     if not cells or (len(cells) == 1 and cells[0] == '' and len(header) > 1):
       continue
@@ -779,6 +831,8 @@ def iter_csv_records(
       }
       continue
 
+    if order is not None:
+      cells = [cells[i] for i in order]
     parsed_vals: dict[str, Any] = {}
     conv_err: Exception | None = None
     bad_col = ''
@@ -905,6 +959,7 @@ def _coerce_json_value(
 def read_json_with_dlq(
     path: str,
     *,
+    types: Optional[dict[str, str]] = None,
     error_handling: Optional[dict[str, Any]] = None,
 ):
   """JSONL Beam YAML source with a sampled schema and an optional DLQ.
@@ -920,7 +975,7 @@ def read_json_with_dlq(
   from apache_beam.metrics import Metrics
   from apache_beam.typehints.row_type import RowTypeConstraint
 
-  kinds = infer_json_kinds(path)
+  kinds = apply_type_overrides(infer_json_kinds(path), types, path)
   install_keyword_safe_row_hooks()
   good_row_type = RowTypeConstraint.from_fields([
       (name, _json_kind_type(kind)) for name, kind in kinds.items()

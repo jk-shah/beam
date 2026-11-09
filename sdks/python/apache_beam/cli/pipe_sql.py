@@ -411,6 +411,10 @@ def load_endpoint_rows(
     rows = []
     raw_count = 0
     col_types: dict[str, str] = {}
+    # JSONL is typed from a sample like `beam pipe` does, so a value that
+    # doesn't fit its column (amount "abc") goes to --dlq or fails with a
+    # hint, instead of reaching SQLite as text and breaking the output.
+    kinds = _jsonl_kinds(files)
     for fp in files:
       with _open_binary(fp) as bf:
         text = bf.read().decode('utf-8', errors='replace')
@@ -435,6 +439,14 @@ def load_endpoint_rows(
         if not s:
           continue
         raw_count += 1
+        if kinds is not None:
+          try:
+            rows.append(dlq.parse_json_record(s, kinds, _dict_row))
+          except Exception as e:  # pylint: disable=broad-except
+            if dlq_records is None:
+              raise SqlPipeError(dlq.json_fail_fast_message(s, e)) from None
+            dlq_records.append(dlq.json_dlq_record(s, e))
+          continue
         try:
           obj = json.loads(s)
           if not isinstance(obj, dict):
@@ -460,6 +472,12 @@ def load_endpoint_rows(
             })
             continue
           raise SqlPipeError(f'invalid JSON record in {fp}: {e}') from None
+    if kinds is not None:
+      col_types = {
+          k: ('INTEGER' if v in ('int', 'bool') else
+              'REAL' if v == 'float' else 'TEXT')
+          for k, v in kinds.items()
+      }
     cols = list(col_types.items())
     return cols, rows, raw_count
 
@@ -482,6 +500,27 @@ def load_endpoint_rows(
     return list(col_types.items()), rows, len(rows)
 
   raise SqlPipeError(f'unsupported local --sql input format {fmt!r}')
+
+
+def _dict_row(**fields):
+  return dict(fields)
+
+
+def _jsonl_kinds(files):
+  """Sampled JSONL field kinds, or None for JSON array files or no sample."""
+  for fp in files:
+    try:
+      with _open_binary(fp) as bf:
+        head = bf.read(256).decode('utf-8', errors='replace').lstrip()
+    except OSError:
+      return None
+    if head.startswith('['):
+      return None
+  try:
+    kinds = dlq.infer_json_kinds(list(files))
+  except Exception:  # pylint: disable=broad-except
+    return None
+  return kinds or None
 
 
 def _quote_ident(name: str) -> str:
@@ -878,12 +917,35 @@ def run_in_memory_sql(
     conn.close()
 
 
+def _mixed_columns_as_text(columns, rows, warnings=None):
+  import pyarrow as pa
+  arrays = {}
+  for col in columns:
+    values = [r.get(col) for r in rows]
+    try:
+      arrays[col] = pa.array(values)
+    except (pa.ArrowInvalid, pa.ArrowTypeError):
+      if warnings is not None:
+        warnings.append(
+            f'column {col!r} mixes numbers and text, so it was written as '
+            f'text; use CAST({col} AS REAL) in --sql (non-numbers become '
+            'NULL) or fix the source values')
+      arrays[col] = pa.array([
+          None if v is None else
+          json.dumps(v, default=str) if isinstance(v, (dict, list)) else str(v)
+          for v in values
+      ],
+                             type=pa.string())
+  return pa.table(arrays)
+
+
 def write_rows_to_local_file(
     out_cols: list[str],
     out_rows: list[dict[str, Any]],
     sink_ep: uris.ParsedEndpoint,
     *,
     if_exists: str = 'fail',
+    warnings: list[str] | None = None,
 ) -> list[str]:
   """Writes `out_rows` directly to a local file (`parquet`, `json`, `csv`)."""
   target = sink_ep.output_prefix or sink_ep.config.get('path')
@@ -919,7 +981,12 @@ def write_rows_to_local_file(
       import pyarrow as pa
       import pyarrow.parquet as pq
       if rows_to_write:
-        tbl = pa.Table.from_pylist(rows_to_write)
+        try:
+          tbl = pa.Table.from_pylist(rows_to_write)
+        except (pa.ArrowInvalid, pa.ArrowTypeError):
+          # A column holds mixed types (SQLite is dynamically typed): write
+          # those columns as text rather than failing the whole run.
+          tbl = _mixed_columns_as_text(out_cols, rows_to_write, warnings)
       else:
         tbl = pa.table({c: pa.array([], type=pa.string()) for c in out_cols})
       pq.write_table(tbl, tmp_path)

@@ -66,8 +66,8 @@ _SINK_EXTENSIONS = {
 # Source config keys the fast path understands; any other reader option means
 # the user tuned the Beam reader, so the runner path handles it.
 _SOURCE_KEYS = {
-    'csv': frozenset(['path', 'delimiter', 'null_values']),
-    'json': frozenset(['path']),
+    'csv': frozenset(['path', 'delimiter', 'null_values', 'types']),
+    'json': frozenset(['path', 'types']),
     'parquet': frozenset(['path']),
     'avro': frozenset(['path']),
 }
@@ -318,6 +318,8 @@ def _read_source(
         src.config.get('null_values') or ())
     header, kinds = dlq._preflight_csv_schema(
         src.config['path'], delimiter=delim, null_values=nulls)
+    kinds = dlq.apply_type_overrides(
+        kinds, src.config.get('types'), str(src.raw))
     rows = []
     rows_read = 0
     for fp in files:
@@ -339,7 +341,9 @@ def _read_source(
     }
 
   if fmt == 'json':
-    kinds = dlq.infer_json_kinds(src.config['path'])
+    kinds = dlq.apply_type_overrides(
+        dlq.infer_json_kinds(src.config['path']), src.config.get('types'),
+        str(src.raw))
     rows = []
     rows_read = 0
     for fp in files:
@@ -389,6 +393,95 @@ def _read_source(
       for rec in reader:
         rows.append(_rowify(dict(rec)))
   return columns, rows, len(rows), {k: v for k, v in types.items() if v}
+
+
+def _merge_arrow_type(a, b):
+  """Common Arrow type of one column read from two formats, or None."""
+  import pyarrow as pa
+  if a is None or b is None or a == b:
+    return a if b is None else b if a is None else a
+  if pa.types.is_integer(a) and pa.types.is_floating(b):
+    return b
+  if pa.types.is_floating(a) and pa.types.is_integer(b):
+    return a
+  return None
+
+
+def _typed_columns_outside_csv(groups) -> dict[str, str]:
+  """`{column: kind}` for int/float/bool columns of the non-CSV files."""
+  if 'csv' not in groups:
+    return {}
+  kinds: dict[str, str] = {}
+  if 'json' in groups:
+    for col, kind in dlq.infer_json_kinds(list(groups['json'])).items():
+      if kind in ('int', 'float', 'bool'):
+        kinds[col] = kind
+  if 'parquet' in groups:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    for field in pq.read_schema(groups['parquet'][0]):
+      t = field.type
+      kind = ('bool' if pa.types.is_boolean(t) else
+              'int' if pa.types.is_integer(t) else
+              'float' if pa.types.is_floating(t) else None)
+      if kind:
+        kinds[field.name] = (
+            'float' if {kinds.get(field.name), kind} == {'int', 'float'} else
+            kind)
+  # Only columns the CSV files have; extra columns are just NULL there.
+  csv_header, _ = dlq._preflight_csv_schema(list(groups['csv']))
+  return {c: k for c, k in kinds.items() if c in csv_header}
+
+
+def _read_mixed(src, groups, route_errors, dlq_records):
+  """Reads a glob that matched several formats, each file with its own reader.
+
+  Rows are unified by column name: columns appear in first-seen order and a
+  column missing from one format is NULL there. A column whose type differs
+  between formats keeps its values as they are and lets Arrow pick the type.
+  """
+  columns: list[str] = []
+  rows: list[Row] = []
+  rows_read = 0
+  types: dict[str, Any] = {}
+  conflicts: set[str] = set()
+  csv_types = _typed_columns_outside_csv(groups)
+  for fmt, fmt_files in groups.items():
+    keys = _SOURCE_KEYS[fmt] - {'path'}
+    cfg = {
+        'path': list(fmt_files),
+        **{k: v for k, v in src.config.items() if k in keys}
+    }
+    if fmt == 'csv' and csv_types:
+      # CSV has no types: a column that is numeric/boolean in the JSONL or
+      # Parquet files is read with that type, so "100.0" becomes 100.0 and
+      # a value such as "oops" goes to the DLQ instead of turning the whole
+      # column into text. Explicit --from-opt fields still win.
+      cfg['types'] = {**csv_types, **(cfg.get('types') or {})}
+    sub = src._replace(format=fmt, config=cfg)
+    cols, fmt_rows, n, fmt_types = _read_source(
+        sub, fmt_files, route_errors, dlq_records)
+    for c in cols:
+      if c not in columns:
+        columns.append(c)
+    for c, t in fmt_types.items():
+      if c in conflicts:
+        continue
+      if c in types:
+        merged = _merge_arrow_type(types[c], t)
+        if merged is None:
+          conflicts.add(c)
+          types.pop(c)
+        else:
+          types[c] = merged
+      else:
+        types[c] = t
+    rows.extend(fmt_rows)
+    rows_read += n
+  rows = [
+      Row(**{c: r._row_fields.get(c) for c in columns}) for r in rows
+  ]
+  return columns, rows, rows_read, types
 
 
 def _error_record(step: str, exc: Exception, row: Row) -> dict[str, Any]:
@@ -463,14 +556,22 @@ def _write(
   return target
 
 
-def run(pipe, files: list[str]) -> FastPipeResult:
-  """Runs `pipe` in-process. Raises FastPipeError like a failed pipeline."""
+def run(pipe, files: list[str], mixed_groups=None) -> FastPipeResult:
+  """Runs `pipe` in-process. Raises FastPipeError like a failed pipeline.
+
+  `mixed_groups` (`{format: files}`) reads a glob that matched several file
+  formats, each file with its own reader.
+  """
   where_cfg, select_cfg = _transform_configs(pipe.spec)
   route_errors = pipe.dlq_endpoint is not None
   dlq_records: list[dict[str, Any]] = []
 
-  columns, rows, rows_read, types = _read_source(
-      pipe.source_endpoint, files, route_errors, dlq_records)
+  if mixed_groups:
+    columns, rows, rows_read, types = _read_mixed(
+        pipe.source_endpoint, mixed_groups, route_errors, dlq_records)
+  else:
+    columns, rows, rows_read, types = _read_source(
+        pipe.source_endpoint, files, route_errors, dlq_records)
 
   filtered_out = 0
   if where_cfg is not None:

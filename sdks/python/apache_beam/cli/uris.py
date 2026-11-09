@@ -103,6 +103,26 @@ def extension_of(path: str) -> str:
   return os.path.splitext(name)[1].lower()
 
 
+def local_format_groups(path: str) -> dict[str, list[str]]:
+  """`{format: files}` when a local glob matches files in 2+ formats, else {}.
+
+  Only files with a known extension count; a glob that also matches files
+  without one (for example Beam shards) keeps the single-format behavior.
+  """
+  if '://' in path or not any(c in path for c in '*?['):
+    return {}
+  import glob as _glob
+  groups: dict[str, list[str]] = {}
+  for p in sorted(_glob.glob(path)):
+    if not os.path.isfile(p):
+      continue
+    fmt = EXTENSIONS.get(extension_of(p))
+    if fmt not in ('csv', 'json', 'parquet', 'avro'):
+      return {}
+    groups.setdefault(fmt, []).append(p)
+  return groups if len(groups) > 1 else {}
+
+
 def sniff_file_format(path: str) -> str | None:
   """Sniffs `PAR1` / `Obj\\x01` / JSON magic bytes on extensionless shards."""
   try:

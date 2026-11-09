@@ -283,12 +283,36 @@ def build_pipe_spec(
     if src_ep.kind != 'file' or src_ep.format != 'csv':
       raise PipeSpecError('--null-values applies to CSV sources only')
     src_ep.config['null_values'] = [str(v) for v in null_values]
+  if (not cdc and src_ep.kind == 'file' and src_ep.format in ('csv', 'json') and
+      'fields' in src_ep.config):
+    # Explicit column types override sampling: `fields=amount:float,id:int`.
+    from . import cdc as cdc_mod
+    try:
+      parsed_types = dict(
+          cdc_mod.parse_fields_shorthand(str(src_ep.config.pop('fields'))))
+    except ValueError as e:
+      raise PipeSpecError(f'--from-opt fields: {e}') from None
+    bad = {c: t for c, t in parsed_types.items() if t == 'bytes'}
+    if bad:
+      raise PipeSpecError(
+          f'--from-opt fields: bytes is not supported for {src_ep.format} '
+          f'columns ({", ".join(bad)})')
+    src_ep.config['types'] = parsed_types
   src_type = src_ep.yaml_type
   src_cfg = dict(src_ep.config)
   if src_type == 'ReadFromCsv' and 'null_values' in src_cfg:
     # Exported YAML reads CSV with pandas: same markers, no pandas defaults.
     src_cfg['na_values'] = [''] + src_cfg.pop('null_values')
     src_cfg['keep_default_na'] = False
+  if src_type in ('ReadFromCsv', 'ReadFromJson') and 'types' in src_cfg:
+    # pandas equivalents of the explicit column types.
+    src_cfg['dtype'] = {
+        c: {
+            'int': 'Int64', 'float': 'float64', 'bool': 'boolean',
+            'str': 'string'
+        }[t]
+        for c, t in src_cfg.pop('types').items()
+    }
   src_java = src_ep.is_java_xlang
 
   sink_type = dst_ep.yaml_type
@@ -367,11 +391,13 @@ def build_pipe_spec(
       # (apache/beam#41098), so local runs use the CLI reader, which keeps them
       # as nested rows and fails on bad lines unless --dlq routes them.
       src_type = 'ReadJsonWithDlq'
-      src_cfg = {'path': src_ep.config['path']}
+      src_cfg = {
+          k: v for k, v in src_ep.config.items() if k in ('path', 'types')
+      }
       src_java = False
       needs_cli_provider = True
     elif (src_ep.kind == 'file' and src_ep.format == 'csv' and
-          set(src_ep.config) <= {'path', 'delimiter', 'null_values'}):
+          set(src_ep.config) <= {'path', 'delimiter', 'null_values', 'types'}):
       # Use the CLI's CSV reader (the one --dlq uses) so a column is typed the
       # same with or without --dlq and on the fast local path. Beam's pandas
       # reader would turn zip codes like "00501" into the integer 501. Without
@@ -379,7 +405,7 @@ def build_pipe_spec(
       src_type = 'ReadCsvWithDlq'
       src_cfg = {
           k: v
-          for k, v in src_ep.config.items() if k in ('path', 'delimiter', 'null_values')
+          for k, v in src_ep.config.items() if k in ('path', 'delimiter', 'null_values', 'types')
       }
       src_java = False
       needs_cli_provider = True
@@ -546,13 +572,16 @@ def build_pipe_spec(
     src_type = 'ReadCsvWithDlq'
     src_cfg = {
         k: v
-        for k, v in src_cfg.items() if k in ('path', 'delimiter', 'null_values')
+        for k, v in src_cfg.items() if k in ('path', 'delimiter', 'null_values', 'types')
     }
     src_cfg['error_handling'] = {'output': 'errors'}
     source_counts_internally = True
   elif src_ep.kind == 'file' and src_ep.format == 'json' and not cdc:
     src_type = 'ReadJsonWithDlq'
-    src_cfg = {'path': src_cfg['path'], 'error_handling': {'output': 'errors'}}
+    src_cfg = {
+        **{k: v for k, v in src_cfg.items() if k in ('path', 'types')},
+        'error_handling': {'output': 'errors'},
+    }
     source_counts_internally = True
   elif (
       src_type in dlq.TRANSFORMS_SUPPORTING_ERROR_HANDLING

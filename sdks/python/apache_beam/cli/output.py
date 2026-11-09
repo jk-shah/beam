@@ -69,6 +69,10 @@ _CONTROL_AND_INJECTION_RE = re.compile(
 _LONG_QUOTED_RE = re.compile(r"""(['"])(?:\\.|(?!\1).){28,}?\1""", re.DOTALL)
 
 
+# Set by `beam pipe` when --dlq was passed, so a failure doesn't suggest it.
+DLQ_REQUESTED = False
+
+
 def installed_beam_version() -> str:
   """Returns the installed `apache-beam` version without importing the SDK."""
   version_file = Path(__file__).resolve().parents[1] / 'version.py'
@@ -237,7 +241,7 @@ def classify_error(
               'public IPs for enterprise GCP org policies.'),
           'requires_human': False,
       })
-    elif command == 'pipe':
+    elif command == 'pipe' and not DLQ_REQUESTED:
       next_actions.append({
           'command': 'beam pipe ... --dlq ./dlq/errors.json',
           'description': 'Route malformed or failing records to a dead-letter sink.',

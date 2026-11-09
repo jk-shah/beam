@@ -2612,6 +2612,154 @@ class DuckDbSqlEngineTest(unittest.TestCase):
       self.assertIn('pip install', engines['duckdb']['install'])
 
 
+class Round6FixesTest(unittest.TestCase):
+  """Mixed-format globs, explicit types, static check keys, SQL --dlq."""
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp(prefix='beam-r6-test-')
+    self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+    self.mixed = os.path.join(self.tmp, 'mixed')
+    os.makedirs(self.mixed)
+    with open(os.path.join(self.mixed, 'a.jsonl'), 'w', encoding='utf-8') as f:
+      f.write('{"order_id": 1, "region": "EU", "amount": 10.5}\n')
+      f.write('{"order_id": 2, "region": "US", "amount": "abc"}\n')
+      f.write('{"order_id": 3, "region": "US", "amount": 0.0}\n')
+      f.write('{"order_id": 4, "region": "EU", "amount": 7.25}\n')
+    with open(os.path.join(self.mixed, 'b.csv'), 'w', encoding='utf-8') as f:
+      # Different column order than the JSONL files, and dirty values.
+      f.write('region,order_id,amount\nUS,9,100.0\nEU,10,\nAPAC,11,oops\n')
+
+  def _path(self, name):
+    return os.path.join(self.tmp, name)
+
+  def _rows(self, path):
+    with open(path, encoding='utf-8') as f:
+      return [json.loads(l) for l in f if l.strip()]
+
+  def test_mixed_glob_reads_each_file_with_its_format(self):
+    out, bad = self._path('out.jsonl'), self._path('bad.jsonl')
+    rc, env, err = _run_json([
+        'pipe', '--from', os.path.join(self.mixed, '*'), '--to', out, '--dlq',
+        bad, '--where', 'amount > 0', '--assert-counts'
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertEqual(env['runner'], 'local_fast')
+    self.assertEqual(
+        env['metrics'], {
+            'rows_read': 7, 'rows_written': 3, 'rows_filtered_out': 2,
+            'dlq_rows': 2
+        })
+    self.assertEqual(
+        self._rows(out), [
+            {'order_id': 1, 'region': 'EU', 'amount': 10.5},
+            {'order_id': 4, 'region': 'EU', 'amount': 7.25},
+            {'order_id': 9, 'region': 'US', 'amount': 100.0},
+        ])
+    self.assertEqual(
+        sorted(r['step'] for r in self._rows(bad)),
+        ['ReadCsvWithDlq', 'ReadJsonWithDlq'])
+
+  def test_mixed_glob_outside_fast_path_fails_clearly(self):
+    rc, env, _ = _run_json([
+        'pipe', '--from', os.path.join(self.mixed, '*'), '--to',
+        self._path('x.jsonl'), '--emit-yaml'
+    ])
+    self.assertEqual(rc, cli.EXIT_USAGE)
+    self.assertIn('several formats (1 json, 1 csv)', env['error']['message'])
+    self.assertIn('UNION ALL', env['error']['message'])
+
+  def test_csv_files_with_reordered_headers_match_by_name(self):
+    d = os.path.join(self.tmp, 'csvs')
+    os.makedirs(d)
+    with open(os.path.join(d, '1.csv'), 'w', encoding='utf-8') as f:
+      f.write('id,name,qty\n1,a,5\n')
+    with open(os.path.join(d, '2.csv'), 'w', encoding='utf-8') as f:
+      f.write('qty,id,name\n7,2,b\n')
+    for env_vars in ({}, {'BEAM_CLI_NO_FAST_PATH': '1'}):
+      out = self._path(f'csvs-{len(env_vars)}.jsonl')
+      rc, env, err = _run_json(
+          ['pipe', '--from', os.path.join(d, '*.csv'), '--to', out],
+          extra_env=env_vars)
+      self.assertEqual(rc, cli.EXIT_OK, err)
+      self.assertEqual(
+          sorted(self._rows(out), key=lambda r: r['id']), [
+              {'id': 1, 'name': 'a', 'qty': 5},
+              {'id': 2, 'name': 'b', 'qty': 7},
+          ], env_vars)
+
+  def test_explicit_csv_types_both_paths(self):
+    src = self._path('t.csv')
+    with open(src, 'w', encoding='utf-8') as f:
+      f.write('id,amount\n1,100.0\n2,oops\n')
+    for env_vars in ({}, {'BEAM_CLI_NO_FAST_PATH': '1'}):
+      out = self._path(f't-{len(env_vars)}.jsonl')
+      bad = self._path(f't-{len(env_vars)}-bad.jsonl')
+      rc, env, err = _run_json([
+          'pipe', '--from', src, '--to', out, '--dlq', bad, '--from-opt',
+          'fields=amount:float', '--where', 'amount > 0'
+      ],
+                               extra_env=env_vars)
+      self.assertEqual(rc, cli.EXIT_OK, err)
+      self.assertEqual(self._rows(out), [{'id': 1, 'amount': 100.0}])
+      self.assertEqual(len(self._rows(bad)), 1)
+    rc, env, _ = _run_json([
+        'pipe', '--from', src, '--to', self._path('u.jsonl'), '--from-opt',
+        'fields=nope:int'
+    ])
+    self.assertNotEqual(rc, cli.EXIT_OK)
+    self.assertIn("column 'nope' is not in", env['error']['message'])
+
+  def test_static_check_rejects_params_outside_config(self):
+    path = self._path('bad.yaml')
+    with open(path, 'w', encoding='utf-8') as f:
+      f.write('pipeline:\n  type: chain\n  transforms:\n'
+              '  - type: ReadFromCsv\n    path: in.csv\n'
+              '  - type: LogForTesting\n')
+    rc, env, _ = _run_json(['check', path])
+    self.assertEqual(rc, cli.EXIT_USAGE)
+    self.assertIn('path outside config:', env['error']['message'])
+
+  def test_stdout_sink_is_rejected(self):
+    src = self._path('s.csv')
+    with open(src, 'w', encoding='utf-8') as f:
+      f.write('id\n1\n')
+    rc, env, _ = _run_json(['pipe', '--from', src, '--to', '-'])
+    self.assertEqual(rc, cli.EXIT_USAGE)
+    self.assertIn('standard output', env['error']['message'])
+    self.assertFalse(os.path.exists('--00000-of-00001'))
+
+  def test_sql_honors_dlq_and_does_not_suggest_it_again(self):
+    out, bad = self._path('sql.parquet'), self._path('sql-bad.jsonl')
+    rc, env, err = _run_json([
+        'pipe', '--from', 'j=' + os.path.join(self.mixed, '*.jsonl'),
+        '--join', 'c=' + os.path.join(self.mixed, '*.csv'), '--sql',
+        'SELECT order_id, amount FROM j UNION ALL '
+        'SELECT order_id, amount FROM c', '--to', out, '--dlq', bad
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertEqual(env['metrics']['dlq_rows'], 1)  # amount "abc"
+    # The CSV amount column mixes numbers and text: written as text, warned.
+    self.assertTrue(any("'amount' mixes numbers" in w for w in env['warnings']))
+    # Without --dlq the bad JSON value fails, with a --dlq hint; with --dlq
+    # given, a failure never suggests passing it.
+    rc, env, _ = _run_json([
+        'pipe', '--from', 'j=' + os.path.join(self.mixed, '*.jsonl'), '--sql',
+        'SELECT * FROM j', '--to', self._path('sql2.jsonl')
+    ])
+    self.assertEqual(rc, cli.EXIT_USAGE)
+    self.assertIn('pass --dlq', env['error']['message'])
+    from apache_beam.cli import output as output_mod
+    _, before = output_mod.classify_error(
+        'pipeline failed: boom', cli.EXIT_PIPELINE_FAILED, 'pipe')
+    self.assertTrue(any('--dlq' in a['command'] for a in before))
+    output_mod.DLQ_REQUESTED = True
+    try:
+      _, after = output_mod.classify_error(
+          'pipeline failed: boom', cli.EXIT_PIPELINE_FAILED, 'pipe')
+    finally:
+      output_mod.DLQ_REQUESTED = False
+    self.assertFalse(any('--dlq' in a['command'] for a in after))
+
+
 if __name__ == '__main__':
   unittest.main()
 

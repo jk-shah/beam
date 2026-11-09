@@ -335,6 +335,8 @@ def main(argv=None) -> int:
   """Runs the `beam` command and returns its exit code."""
   t0 = time.monotonic()
   raw_argv = list(sys.argv[1:] if argv is None else argv)
+  output.DLQ_REQUESTED = any(
+      a == '--dlq' or a.startswith('--dlq=') for a in raw_argv)
   stripped_argv, json_mode, top_version, llms_txt = _extract_global_flags(
       raw_argv)
 
@@ -2025,6 +2027,12 @@ def _pipe(
     t0: float,
 ) -> int:
   """Runs `beam pipe`; `pipe_argv` is its command line, for `--dry-run`."""
+  if args.sink == '-':
+    raise _CliError(
+        '--to - (standard output) is not supported: write to a file instead '
+        '(for example --to out.jsonl) and preview it with beam inspect '
+        'out.jsonl --sample 20; with --sql, omit --to to print the result '
+        'rows', EXIT_USAGE)
   from . import cost_guard
   from . import jobs
   from . import pipe_spec
@@ -2201,6 +2209,7 @@ def _pipe(
           enable_dlq=bool(dlq_ep is not None),
           engine=args.sql_engine)
       written_sql: list[str] = []
+      sql_warnings: list[str] = []
       if sink_ep is not None:
         if '://' in (sink_prefix or ''):
           raise _CliError(
@@ -2208,7 +2217,11 @@ def _pipe(
               '--runner=DataflowRunner or a local destination path',
               EXIT_USAGE)
         written_sql = pipe_sql.write_rows_to_local_file(
-            out_cols, out_rows, sink_ep, if_exists=args.if_exists)
+            out_cols,
+            out_rows,
+            sink_ep,
+            if_exists=args.if_exists,
+            warnings=sql_warnings)
       dlq_written: list[str] = []
       if dlq_ep is not None:
         dlq_written = pipe_sql.write_rows_to_local_file(
@@ -2258,10 +2271,13 @@ def _pipe(
               duration_ms=int((time.monotonic() - t0) * 1000),
               metrics=sql_metrics,
               outputs=sql_outputs,
+              warnings=sql_warnings,
               untrusted_data=output.wrap_untrusted_rows(
                   out_rows[:preview_limit],
                   truncated=len(out_rows) > preview_limit)))
     else:
+      for warning in sql_warnings:
+        print(f'warning: {warning}', file=sys.stderr)
       if written_sql:
         engine_name = 'DuckDB' if args.sql_engine == 'duckdb' else 'SQLite'
         print(f'Done. Ran locally on the {engine_name} SQL engine.')
@@ -2291,11 +2307,19 @@ def _pipe(
       args.assert_counts or (json_session.enabled and not args.dry_run))
   prefer_py_bq = bool(not args.dry_run or args.dlq)
 
+  # A local glob over several formats (`data/*` with .csv and .jsonl files)
+  # is read file by file on the in-process path; elsewhere it's an error
+  # instead of reading every file with the first file's format.
+  from . import uris as uris_mod
+  mixed_groups = ({} if (args.from_format or args.format or args.cdc) else
+                  uris_mod.local_format_groups(source_uri))
+  mixed_from_format = next(iter(mixed_groups), None)
+
   try:
     pipe = pipe_spec.build_pipe_spec(
         source_uri,
         args.sink,
-        args.from_format or args.format,
+        args.from_format or args.format or mixed_from_format,
         args.to_format or args.format,
         where=args.where,
         select=args.select,
@@ -2436,9 +2460,25 @@ def _pipe(
       verify=bool(args.verify),
       if_exists=args.if_exists,
       wait_timeout_sec=wait_timeout_sec)
+  if mixed_groups and fast_files is None:
+    counts = ', '.join(
+        f'{len(files)} {fmt}' for fmt, files in mixed_groups.items())
+    raise _CliError(
+        f'--from {source_uri} matches files in several formats ({counts}). '
+        'Mixed formats are read automatically only for small local jobs (up '
+        'to 64 MB, an exact local output file, no --runner, --emit-yaml or '
+        '--cdc). Otherwise use one glob per format, for example --from '
+        'a=DIR/*.csv --join b=DIR/*.jsonl with --sql SELECT ... FROM a '
+        'UNION ALL SELECT ... FROM b, or pass --from-format to read every '
+        'file as one format', EXIT_USAGE)
   if fast_files is not None:
     fast_rc = _run_fast_local_pipe(
-        pipe, fast_files, args, json_session=json_session, t0=t0)
+        pipe,
+        fast_files,
+        args,
+        json_session=json_session,
+        t0=t0,
+        mixed_groups=mixed_groups)
     if fast_rc is not None:
       return fast_rc
 
@@ -2515,7 +2555,8 @@ def _split_null_values(raw: str | None) -> list[str] | None:
   return [v.strip() for v in raw.split(',') if v.strip()]
 
 
-def _run_fast_local_pipe(pipe, files, args, *, json_session, t0) -> int | None:
+def _run_fast_local_pipe(
+    pipe, files, args, *, json_session, t0, mixed_groups=None) -> int | None:
   """Runs a qualifying `beam pipe` in-process; None falls back to Beam."""
   from . import fast_local
   from . import jobs
@@ -2524,8 +2565,11 @@ def _run_fast_local_pipe(pipe, files, args, *, json_session, t0) -> int | None:
   if args.if_exists == 'replace':
     _remove_existing_output_for_replace(pipe.output_prefix)
   try:
-    res = fast_local.run(pipe, files)
-  except ImportError:
+    res = fast_local.run(pipe, files, mixed_groups=mixed_groups)
+  except ImportError as e:
+    if mixed_groups:
+      raise _CliError(
+          f'a required package is missing: {e}', EXIT_MISSING_PACKAGE) from None
     # pyarrow/fastavro missing: the Beam runner reports it properly.
     return None
   except fast_local.FastPipeError as e:

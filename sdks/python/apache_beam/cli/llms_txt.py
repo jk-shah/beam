@@ -135,7 +135,12 @@ def render_llms_txt() -> str:
   (`x = NULL` is read as `x IS NULL`); `IN ('CA')` is a one-element list. Simple filters are exported as native
   Beam YAML (`keep: "state is not None and state != 'CA'"`).
 - CSV: empty cells are NULL (like core `ReadFromCsv`); add markers with `--null-values NA,NULL`. Columns are typed
-  from a 100-row sample; any value with a leading zero (zip `00501`) keeps the column as text.
+  from a 100-row sample; any value with a leading zero (zip `00501`) keeps the column as text. Set types explicitly
+  with `--from-opt fields=amount:float,id:int` (CSV and JSONL); values that don't parse go to `--dlq`.
+- Globs: CSV files in one glob may list columns in different orders (matched by name). A local glob over several
+  formats (`data/*` with `.jsonl` and `.csv`) is read file by file and unified by column name on small local runs;
+  elsewhere it exits `2` with a hint (one glob per format, or `--sql ... UNION ALL ...`).
+- `--to -` (stdout) is rejected; write a file and `beam inspect` it, or omit `--to` with `--sql` to print rows.
 - Nested JSON objects and Parquet/Avro structs use dots: `--where "props.amount >= 10" --select "user.id AS user_id"`.
   With `--dlq`, malformed JSON lines and values that don't fit the inferred type are quarantined; without it they fail the run.
 - Local `--sql` is SQLite (inputs named `alias=URI`; unaliased inputs are named after the file) plus exact

@@ -109,6 +109,12 @@ def run_check(
         f'{source_label}: "pipeline.transforms" must be a non-empty list')
 
   stages: list[dict[str, Any]] = []
+  _check_transform_keys(transforms, source_label)
+  for extra in ('source', 'sink', 'extra_transforms'):
+    if extra in pipeline_block:
+      block = pipeline_block[extra]
+      _check_transform_keys(
+          block if isinstance(block, list) else [block], source_label)
   for idx, t in enumerate(transforms):
     if not isinstance(t, dict) or 'type' not in t:
       raise CheckError(
@@ -191,6 +197,47 @@ def run_check(
     result['plan_skipped_reason'] = plan_skipped_reason
     result['plan_skipped_detail'] = plan_skipped_detail
   return result
+
+
+# Keys Beam YAML accepts on a transform (pipeline.schema.yaml). Anything else,
+# such as `path:` next to `type: ReadFromCsv`, is a parameter that belongs
+# under `config:`; Beam only reports it at expansion, with a schema dump.
+_LEAF_TRANSFORM_KEYS = frozenset([
+    'type', 'name', 'input', 'output', 'output_schema', 'windowing',
+    'resource_hints', 'config', '__line__', '__uuid__'
+])
+_NESTED_TRANSFORM_KEYS = frozenset([
+    'type', 'name', 'input', 'output', 'windowing', 'resource_hints',
+    'transforms', 'extra_transforms', 'source', 'sink', '__line__', '__uuid__'
+])
+
+
+def _check_transform_keys(transforms, source_label: str, path: str = '') -> None:
+  """Offline check that each transform only uses keys Beam YAML accepts."""
+  for idx, t in enumerate(transforms or []):
+    if not isinstance(t, dict) or 'type' not in t:
+      continue
+    label = f'{path}transform #{idx + 1} ({t.get("name") or t["type"]})'
+    nested = t['type'] in ('composite', 'chain')
+    allowed = _NESTED_TRANSFORM_KEYS if nested else _LEAF_TRANSFORM_KEYS
+    unknown = [k for k in t if k not in allowed]
+    if unknown:
+      if nested:
+        raise CheckError(
+            f'{source_label}: {label} has unknown keys {", ".join(unknown)}; '
+            f'a {t["type"]} transform takes {", ".join(sorted(allowed - {"__line__", "__uuid__"}))}')
+      example = unknown[0]
+      raise CheckError(
+          f'{source_label}: {label} has {", ".join(unknown)} outside '
+          f'config:; transform parameters go under config:, for example\n'
+          f'  - type: {t["type"]}\n    config:\n      {example}: ...')
+    if 'config' in t and not isinstance(t['config'], dict):
+      raise CheckError(f'{source_label}: {label}: config: must be a mapping')
+    if nested:
+      _check_transform_keys(t.get('transforms'), source_label, f'{label} > ')
+      for extra in ('source', 'sink'):
+        if isinstance(t.get(extra), dict):
+          _check_transform_keys([t[extra]], source_label, f'{label} > ')
 
 
 _REMOTE_ACCESS_MARKERS = (
