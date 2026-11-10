@@ -68,6 +68,85 @@ def _materialize_cdc_config(pks, seq_col):
   return cfg
 
 
+def parse_window_spec(spec: str | dict[str, Any]) -> dict[str, Any]:
+  """Parses a `--window` string into a Beam YAML windowing dict."""
+  if isinstance(spec, dict):
+    res = dict(spec)
+    w_type = str(res.get('type') or '').lower()
+    if w_type == 'session':
+      res['type'] = 'sessions'
+    return res
+
+  s = str(spec or '').strip()
+  if not s:
+    raise PipeSpecError('--window specification cannot be empty')
+
+  if s.startswith('{') and s.endswith('}'):
+    import json
+    try:
+      d = json.loads(s)
+      return parse_window_spec(d)
+    except Exception as e:
+      raise PipeSpecError(f'malformed JSON in --window: {e}') from None
+
+  if '=' in s and ':' not in s.split('=', 1)[0]:
+    parts = [p.strip() for p in s.split(',') if p.strip()]
+    kv: dict[str, Any] = {}
+    for p in parts:
+      if '=' in p:
+        k, v = p.split('=', 1)
+        kv[k.strip().lower()] = v.strip()
+    if 'type' in kv:
+      if kv['type'] == 'session':
+        kv['type'] = 'sessions'
+      return kv
+
+  prefix = ''
+  rest = s
+  if ':' in s:
+    cand_prefix, cand_rest = s.split(':', 1)
+    if cand_prefix.lower() in ('fixed', 'sliding', 'session', 'sessions', 'global'):
+      prefix = cand_prefix.lower()
+      rest = cand_rest.strip()
+
+  if not prefix:
+    prefix = 'fixed'
+
+  if prefix == 'fixed':
+    parts = [p.strip() for p in rest.split(',') if p.strip()]
+    if not parts:
+      raise PipeSpecError(
+          f"invalid fixed window specification {s!r}; expected fixed:DURATION (e.g. 'fixed:60s')")
+    out: dict[str, Any] = {'type': 'fixed', 'size': parts[0]}
+    if len(parts) > 1:
+      out['offset'] = parts[1]
+    return out
+
+  elif prefix == 'sliding':
+    parts = [p.strip() for p in rest.split(',') if p.strip()]
+    if len(parts) < 2:
+      raise PipeSpecError(
+          f"invalid sliding window specification {s!r}; expected sliding:SIZE,PERIOD (e.g. 'sliding:5m,1m')")
+    out = {'type': 'sliding', 'size': parts[0], 'period': parts[1]}
+    if len(parts) > 2:
+      out['offset'] = parts[2]
+    return out
+
+  elif prefix in ('session', 'sessions'):
+    parts = [p.strip() for p in rest.split(',') if p.strip()]
+    if not parts:
+      raise PipeSpecError(
+          f"invalid session window specification {s!r}; expected session:GAP (e.g. 'session:30m')")
+    return {'type': 'sessions', 'gap': parts[0]}
+
+  elif prefix == 'global':
+    return {'type': 'global'}
+
+  raise PipeSpecError(
+      f"unknown window type in --window {s!r}; expected fixed:DURATION, "
+      "sliding:SIZE,PERIOD, or session:GAP")
+
+
 def build_pipe_spec(
     source: str,
     sink: str,
@@ -96,6 +175,8 @@ def build_pipe_spec(
     zero_copy: bool = False,
     prefer_python_lakehouse_and_cdc: bool = False,
     allow_jinja: bool = False,
+    window: str | dict[str, Any] | None = None,
+    timestamp_col: str | None = None,
 ) -> PipeSpec:
   """Returns the `PipeSpec` for `beam pipe`."""
   if if_exists not in ('fail', 'append', 'replace'):
@@ -160,11 +241,11 @@ def build_pipe_spec(
     raise PipeSpecError(str(e)) from None
 
   if zero_copy:
-    if cdc or where or select or dlq_ep is not None:
+    if cdc or where or select or dlq_ep is not None or window or timestamp_col:
       raise PipeSpecError(
           '--zero-copy registers existing Parquet files in-place without '
           'rewriting data, so it cannot be combined with --cdc, --where, '
-          '--select, or --dlq')
+          '--select, --window, --timestamp-col, or --dlq')
     if dst_ep.kind != 'iceberg':
       raise PipeSpecError(
           f'--zero-copy requires an iceberg:// destination, got {dst_ep.raw!r}')
@@ -261,6 +342,11 @@ def build_pipe_spec(
         '--if-exists=append is only supported for table/stream sinks '
         '(such as bigquery://, iceberg://, or postgres://); file sinks write '
         'immutable shards (use a new prefix or --if-exists=replace)')
+
+  window_spec = parse_window_spec(window) if window else None
+  clean_timestamp_col = str(timestamp_col).strip() if timestamp_col else None
+  if clean_timestamp_col == '':
+    raise PipeSpecError('--timestamp-col cannot be empty')
 
   try:
     where_cfg = (
@@ -548,6 +634,20 @@ def build_pipe_spec(
               'counter': 'rows_read'
           },
       })
+    if clean_timestamp_col:
+      chain_steps.append({
+          'type': 'AssignTimestamps',
+          'config': {
+              'timestamp': clean_timestamp_col
+          },
+      })
+    if window_spec is not None:
+      chain_steps.append({
+          'type': 'WindowInto',
+          'config': {
+              'windowing': window_spec
+          },
+      })
     if cdc_norm_cfg is not None:
       chain_steps.append({
           'type': 'CliNormalizeCdc',
@@ -668,6 +768,28 @@ def build_pipe_spec(
         },
     })
     current_ref = 'CountRead'
+
+  if clean_timestamp_col:
+    dag_transforms.append({
+        'name': 'AssignTimestamps',
+        'type': 'AssignTimestamps',
+        'input': current_ref,
+        'config': {
+            'timestamp': clean_timestamp_col
+        },
+    })
+    current_ref = 'AssignTimestamps'
+
+  if window_spec is not None:
+    dag_transforms.append({
+        'name': 'WindowInto',
+        'type': 'WindowInto',
+        'input': current_ref,
+        'config': {
+            'windowing': window_spec
+        },
+    })
+    current_ref = 'WindowInto'
 
   if cdc_norm_cfg is not None:
     norm_cdc = dict(cdc_norm_cfg)

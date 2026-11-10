@@ -3649,6 +3649,115 @@ class Round12FixesTest(unittest.TestCase):
       self.assertEqual(rc, cli.EXIT_OK, err)
       self.assertEqual(env['untrusted_data']['rows'], [{'s': 5}])
 
+  def test_mixed_format_local_glob_sql(self):
+    """Enhancement 1: Mixed-format local globs in pipe_sql."""
+    mixed_dir = os.path.join(self.tmp, 'mixed_shards')
+    os.makedirs(mixed_dir, exist_ok=True)
+    with open(os.path.join(mixed_dir, 'shard1.csv'), 'w', encoding='utf-8') as f:
+      f.write('id,category,amount\n1,shoes,25.5\n2,hat,15.0\n')
+    with open(os.path.join(mixed_dir, 'shard2.jsonl'), 'w', encoding='utf-8') as f:
+      f.write(json.dumps({'id': 3, 'category': 'shoes', 'amount': 40.0}) + '\n')
+      f.write(json.dumps({'id': 4, 'category': 'coat', 'amount': 120.0}) + '\n')
+
+    rc, env, err = _run_json([
+        'pipe', '--from', f'{mixed_dir}/*',
+        '--sql', 'SELECT category, SUM(amount) AS tot FROM PCOLLECTION GROUP BY category ORDER BY tot DESC'
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    rows = env['untrusted_data']['rows']
+    self.assertEqual(len(rows), 3)
+    self.assertEqual(rows[0], {'category': 'coat', 'tot': 120.0})
+    self.assertEqual(rows[1], {'category': 'shoes', 'tot': 65.5})
+    self.assertEqual(rows[2], {'category': 'hat', 'tot': 15.0})
+
+    # Test --emit-yaml for mixed formats emits Flatten
+    out_buf = io.StringIO()
+    with contextlib.redirect_stdout(out_buf):
+      rc_yaml = cli.main([
+          'pipe', '--from', f'{mixed_dir}/*',
+          '--sql', 'SELECT * FROM PCOLLECTION',
+          '--emit-yaml'
+      ])
+    self.assertEqual(rc_yaml, cli.EXIT_OK)
+    self.assertIn('Flatten', out_buf.getvalue())
+
+  def test_pipe_windowing_and_timestamp_col(self):
+    """Enhancement 2: --window + --timestamp-col on beam pipe & --emit-yaml."""
+    out_buf = io.StringIO()
+    with contextlib.redirect_stdout(out_buf):
+      rc = cli.main([
+          'pipe',
+          '--from', 'pubsub://projects/p/topics/t',
+          '--to', 'bigquery://p:d.t',
+          '--timestamp-col', 'event_ts',
+          '--window', 'sliding:5m,1m',
+          '--emit-yaml'
+      ])
+    self.assertEqual(rc, cli.EXIT_OK)
+    yaml_text = out_buf.getvalue()
+    self.assertIn('AssignTimestamps', yaml_text)
+    self.assertIn('event_ts', yaml_text)
+    self.assertIn('WindowInto', yaml_text)
+    self.assertIn('sliding', yaml_text)
+    self.assertIn('5m', yaml_text)
+
+  def test_check_warns_untyped_python_map_to_parquet(self):
+    """Enhancement 3: Offline warning in beam check for untyped Python preceding WriteToParquet."""
+    pipeline_yaml = (
+        'pipeline:\n'
+        '  transforms:\n'
+        '    - type: ReadFromCsv\n'
+        '      config: {path: in.csv}\n'
+        '    - type: MapToFields\n'
+        '      config:\n'
+        '        language: python\n'
+        '        fields:\n'
+        '          val2: "r.val * 2"\n'
+        '    - type: WriteToParquet\n'
+        '      config: {path: out.parquet}\n'
+    )
+    p_path = os.path.join(self.tmp, 'untyped_pipe.yaml')
+    with open(p_path, 'w', encoding='utf-8') as f:
+      f.write(pipeline_yaml)
+
+    rc, env, _ = _run_json(['check', p_path])
+    self.assertEqual(rc, cli.EXIT_OK)
+    warnings = env.get('warnings') or []
+    self.assertTrue(
+        any('untyped Python expression' in w and 'WriteToParquet' in w for w in warnings),
+        msg=warnings)
+
+  def test_package_flag_aliases_and_case_insensitive_sdk(self):
+    """Enhancement 4: Package flag aliases in package.py and main.py."""
+    pipeline_yaml = (
+        'pipeline:\n'
+        '  transforms:\n'
+        '    - type: Create\n'
+        '      config: {elements: [1, 2, 3]}\n'
+    )
+    p_path = os.path.join(self.tmp, 'pkg_pipe.yaml')
+    with open(p_path, 'w', encoding='utf-8') as f:
+      f.write(pipeline_yaml)
+
+    # 1. --sdk YAML with --to
+    rc1, env1, err1 = _run_json([
+        'package', p_path, '--sdk', 'YAML', '--to', 'gs://bucket/spec.json', '--dry-run'
+    ])
+    self.assertEqual(rc1, cli.EXIT_OK, err1)
+
+    # 2. --sdk yaml with -o
+    rc2, env2, err2 = _run_json([
+        'package', p_path, '--sdk', 'yaml', '-o', 'gs://bucket/spec.json', '--dry-run'
+    ])
+    self.assertEqual(rc2, cli.EXIT_OK, err2)
+
+    # 3. --sdk auto with --output
+    rc3, env3, err3 = _run_json([
+        'package', p_path, '--sdk', 'auto', '--output', 'gs://bucket/spec.json', '--dry-run'
+    ])
+    self.assertEqual(rc3, cli.EXIT_OK, err3)
+
 
 if __name__ == '__main__':
   unittest.main()
+

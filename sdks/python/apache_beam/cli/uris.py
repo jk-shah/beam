@@ -163,6 +163,14 @@ def sniff_file_format(path: str) -> str | None:
   stripped = head.lstrip()
   if stripped.startswith(b'{'):
     return 'json'
+
+  cand_paths = candidates if '://' not in path else [m.path for m in matches]
+  for c_path in cand_paths:
+    ext = extension_of(c_path)
+    if ext in EXTENSIONS:
+      ext_fmt = EXTENSIONS[ext]
+      return 'json' if ext_fmt == 'jsonl' else ext_fmt
+
   return None
 
 
@@ -647,7 +655,7 @@ def parse_endpoint(
     fmt = (explicit_format or EXTENSIONS.get(extension_of(location), '')).lower()
     if not fmt and allow_jinja and has_jinja:
       fmt = _infer_jinja_file_format(location)
-    if not fmt and is_read and allow_sniff and not (allow_jinja and has_jinja):
+    if not fmt and is_read and (allow_sniff or not has_jinja):
       fmt = sniff_file_format(location) or ''
     if not fmt:
       jinja_hint = (

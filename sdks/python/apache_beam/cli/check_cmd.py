@@ -191,6 +191,8 @@ def run_check(
           'informational, not an error (the check passed): '
           f'{str(e).splitlines()[0][:300]}')
 
+  check_warnings: list[str] = _check_parquet_untyped_python_expressions(pipeline_block)
+
   result = {
       'valid': True,
       'source': source_label,
@@ -201,6 +203,7 @@ def run_check(
       'transforms': stages,
       'has_custom_providers': has_custom_providers,
       'expanded_top_level_transforms': expanded_transforms,
+      'warnings': check_warnings,
   }
   if plan_skipped_reason:
     result['plan_skipped_reason'] = plan_skipped_reason
@@ -247,6 +250,105 @@ def _check_transform_keys(transforms, source_label: str, path: str = '') -> None
       for extra in ('source', 'sink'):
         if isinstance(t.get(extra), dict):
           _check_transform_keys([t[extra]], source_label, f'{label} > ')
+
+
+def _extract_untyped_python_map_fields(transform: dict[str, Any]) -> list[str]:
+  """Returns field names of untyped Python expressions in MapToFields."""
+  if not isinstance(transform, dict) or transform.get('type') != 'MapToFields':
+    return []
+  cfg = transform.get('config')
+  if not isinstance(cfg, dict):
+    return []
+  lang = str(cfg.get('language') or '').lower()
+  if lang != 'python':
+    return []
+  fields = cfg.get('fields')
+  if not isinstance(fields, dict):
+    return []
+  untyped: list[str] = []
+  for fname, fval in fields.items():
+    if isinstance(fval, str):
+      untyped.append(str(fname))
+    elif isinstance(fval, dict) and not fval.get('output_type') and not fval.get('type'):
+      untyped.append(str(fname))
+  return untyped
+
+
+def _check_parquet_untyped_python_expressions(
+    pipeline_block: dict[str, Any]) -> list[str]:
+  """Warns when untyped `language: python` in MapToFields feeds WriteToParquet."""
+  warnings: list[str] = []
+  if not isinstance(pipeline_block, dict):
+    return warnings
+
+  def _flatten_sequence(block: dict[str, Any]) -> list[dict[str, Any]]:
+    seq: list[dict[str, Any]] = []
+    if 'source' in block:
+      src = block['source']
+      seq.extend(src if isinstance(src, list) else [src])
+    if 'transforms' in block and isinstance(block['transforms'], list):
+      seq.extend(block['transforms'])
+    if 'sink' in block:
+      sink = block['sink']
+      seq.extend(sink if isinstance(sink, list) else [sink])
+    return [t for t in seq if isinstance(t, dict)]
+
+  def _scan_sequence(seq: list[dict[str, Any]]):
+    for idx, t in enumerate(seq):
+      t_type = t.get('type')
+      untyped = _extract_untyped_python_map_fields(t)
+      if untyped:
+        t_name = t.get('name') or f'MapToFields (stage #{idx + 1})'
+        for downstream in seq[idx + 1:]:
+          d_type = downstream.get('type')
+          if d_type == 'WriteToParquet':
+            warnings.append(
+                f'{t_name} has untyped Python expression(s) for '
+                f'{", ".join(repr(f) for f in untyped[:5])} preceding WriteToParquet; '
+                'consider adding output_type: <type> (or using language: sql) '
+                'to prevent PyArrow LogicalType Any conversion errors.')
+            break
+          elif d_type in ('SqlTransform', 'Sql', 'beam:transform:org.apache.beam:sql:v1'):
+            break
+          elif d_type in ('chain', 'composite'):
+            inner = _flatten_sequence(downstream)
+            if any(x.get('type') == 'WriteToParquet' for x in inner):
+              warnings.append(
+                  f'{t_name} has untyped Python expression(s) for '
+                  f'{", ".join(repr(f) for f in untyped[:5])} preceding WriteToParquet; '
+                  'consider adding output_type: <type> (or using language: sql) '
+                  'to prevent PyArrow LogicalType Any conversion errors.')
+              break
+      elif t_type in ('chain', 'composite'):
+        _scan_sequence(_flatten_sequence(t))
+
+  root_seq = _flatten_sequence(pipeline_block)
+  _scan_sequence(root_seq)
+
+  named_transforms: dict[str, dict[str, Any]] = {}
+  for t in root_seq:
+    if 'name' in t and isinstance(t['name'], str):
+      named_transforms[t['name']] = t
+
+  for t in root_seq:
+    if t.get('type') == 'WriteToParquet':
+      inp = t.get('input')
+      inputs = inp if isinstance(inp, list) else ([inp] if isinstance(inp, str) else [])
+      for ref in inputs:
+        producer = named_transforms.get(ref)
+        if producer:
+          untyped = _extract_untyped_python_map_fields(producer)
+          if untyped:
+            p_name = producer.get('name') or 'MapToFields'
+            msg = (
+                f'{p_name} has untyped Python expression(s) for '
+                f'{", ".join(repr(f) for f in untyped[:5])} preceding WriteToParquet; '
+                'consider adding output_type: <type> (or using language: sql) '
+                'to prevent PyArrow LogicalType Any conversion errors.')
+            if msg not in warnings:
+              warnings.append(msg)
+
+  return warnings
 
 
 _SAFE_CALLABLE_IMPORTS = frozenset(

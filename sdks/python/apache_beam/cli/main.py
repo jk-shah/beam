@@ -647,6 +647,20 @@ def _build_parser():
           'projection / scalar expressions (e.g. '
           '"CAST(id AS INT) AS id, lower(email) AS email")'))
   pipe.add_argument(
+      '--window',
+      metavar='SPEC',
+      help=(
+          'windowing specification for event-time processing: '
+          'fixed:DURATION (or plain DURATION, e.g. 60s), '
+          'sliding:SIZE,PERIOD (e.g. sliding:5m,1m), or '
+          'session:GAP (e.g. session:30m)'))
+  pipe.add_argument(
+      '--timestamp-col',
+      '--timestamp_col',
+      dest='timestamp_col',
+      metavar='COL',
+      help='source column to assign timestamps from (e.g. ts, event_time)')
+  pipe.add_argument(
       '--sql',
       dest='sql',
       default=None,
@@ -1079,6 +1093,8 @@ def _build_parser():
       help='pipeline .yaml/.py path, gs:// URI, or - for stdin YAML')
   pkg_p.add_argument(
       '--to',
+      '-o',
+      '--output',
       dest='to_location',
       metavar='SPEC_URI',
       help='destination Flex Template spec JSON (gs://... or local path)')
@@ -1088,6 +1104,7 @@ def _build_parser():
   pkg_p.add_argument(
       '--sdk',
       default='auto',
+      type=str.lower,
       choices=['auto', 'yaml', 'python'],
       help='Flex Template SDK mode (default: auto)')
   pkg_p.add_argument(
@@ -1591,9 +1608,9 @@ def _check(args, extra_args, *, json_session, t0: float) -> int:
   except Exception as e:  # pylint: disable=broad-except
     raise _CliError(f'could not validate pipeline: {e}', EXIT_USAGE) from None
 
-  check_warnings = (
-      [report['plan_skipped_reason']] if report.get('plan_skipped_reason') else
-      [])
+  check_warnings = list(report.get('warnings') or [])
+  if report.get('plan_skipped_reason'):
+    check_warnings.append(report['plan_skipped_reason'])
   if json_session.enabled:
     json_session.emit(
         output.build_envelope(
@@ -2463,7 +2480,9 @@ def _pipe(
         cdc_seq_col=args.cdc_seq_col,
         zero_copy=bool(args.zero_copy),
         prefer_python_lakehouse_and_cdc=bool(not args.dry_run),
-        allow_jinja=allow_jinja)
+        allow_jinja=allow_jinja,
+        window=getattr(args, 'window', None),
+        timestamp_col=getattr(args, 'timestamp_col', None))
   except pipe_spec.PipeSpecError as e:
     raise _CliError(str(e), EXIT_USAGE) from None
 

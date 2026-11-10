@@ -136,14 +136,24 @@ def parse_named_sources(
       alias = _derive_alias_from_uri(target_uri, used_aliases)
     used_aliases.add(alias)
 
+    has_jinja_syntax = uris._has_jinja_syntax(target_uri)
+    mixed_groups = (
+        uris.local_format_groups(target_uri)
+        if (not from_format and (allow_sniff or not has_jinja_syntax)) else {})
+    eff_format = from_format or (next(iter(mixed_groups), None) if mixed_groups else None)
+
     ep = uris.parse_endpoint(
         target_uri,
         is_read=True,
-        explicit_format=from_format,
+        explicit_format=eff_format,
         options=dict(from_opts or {}),
         default_project=default_project,
         allow_sniff=allow_sniff,
         allow_jinja=allow_jinja)
+    if mixed_groups:
+      ep.config['_mixed_groups'] = mixed_groups
+    elif from_format:
+      ep.config['_explicit_format'] = True
     out.append(NamedSource(alias=alias, uri=target_uri, endpoint=ep))
   return out
 
@@ -190,11 +200,38 @@ def build_sql_yaml_spec(
   sql_inputs: dict[str, str] = {}
   for ns in named_sources:
     read_name = f'Read_{ns.alias}'
-    transforms.append({
-        'name': read_name,
-        'type': ns.endpoint.yaml_type,
-        'config': dict(ns.endpoint.config),
-    })
+    mixed_groups = ns.endpoint.config.get('_mixed_groups')
+    if mixed_groups:
+      sub_inputs = []
+      for sub_fmt, sub_files in mixed_groups.items():
+        sub_read_name = f'Read_{ns.alias}_{sub_fmt}'
+        sub_yaml_type = f'ReadFrom{uris.FILE_FORMATS.get(sub_fmt, sub_fmt.capitalize())}'
+        sub_cfg = {
+            k: v for k, v in ns.endpoint.config.items()
+            if not k.startswith('_')
+        }
+        sub_cfg['path'] = list(sub_files)
+        transforms.append({
+            'name': sub_read_name,
+            'type': sub_yaml_type,
+            'config': sub_cfg,
+        })
+        sub_inputs.append(sub_read_name)
+      transforms.append({
+          'name': read_name,
+          'type': 'Flatten',
+          'input': sub_inputs,
+      })
+    else:
+      cfg = {
+          k: v for k, v in ns.endpoint.config.items()
+          if not k.startswith('_')
+      }
+      transforms.append({
+          'name': read_name,
+          'type': ns.endpoint.yaml_type,
+          'config': cfg,
+      })
     sql_inputs[ns.alias] = read_name
 
   sql_input_val: Any = (
@@ -223,7 +260,10 @@ def build_sql_yaml_spec(
   }
 
 
-def _match_source_files(path_pattern: str) -> list[str]:
+def _match_source_files(
+    path_pattern: str | list[str] | tuple[str, ...]) -> list[str]:
+  if isinstance(path_pattern, (list, tuple)):
+    return sorted(str(p) for p in path_pattern if os.path.isfile(str(p)))
   if '://' not in path_pattern:
     if os.path.isfile(path_pattern):
       return [path_pattern]
@@ -329,6 +369,48 @@ def load_endpoint_rows(
         f'delta://, and iceberg:// sources (got {ep.kind!r}); use --emit-yaml '
         'or --runner=DataflowRunner for remote connectors')
 
+  mixed_groups = ep.config.get('_mixed_groups')
+  if not mixed_groups and not ep.config.get('_explicit_format'):
+    p_val = ep.config.get('path')
+    if isinstance(p_val, str):
+      mixed_groups = uris.local_format_groups(p_val)
+
+  if mixed_groups:
+    merged_cols: list[tuple[str, str]] = []
+    seen_col_names: set[str] = set()
+    col_type_map: dict[str, str] = {}
+    rows: list[dict[str, Any]] = []
+    total_raw_count = 0
+
+    for sub_fmt, sub_files in mixed_groups.items():
+      sub_cfg = dict(ep.config)
+      sub_cfg['path'] = list(sub_files)
+      sub_cfg['_explicit_format'] = True
+      sub_cfg.pop('_mixed_groups', None)
+      sub_ep = ep._replace(format=sub_fmt, config=sub_cfg)
+      sub_cols, sub_rows, sub_cnt = load_endpoint_rows(
+          sub_ep,
+          default_project=default_project,
+          dlq_records=dlq_records,
+          warnings=warnings)
+      total_raw_count += sub_cnt
+      rows.extend(sub_rows)
+      for c_name, c_type in sub_cols:
+        if c_name not in seen_col_names:
+          seen_col_names.add(c_name)
+          merged_cols.append((c_name, c_type))
+          col_type_map[c_name] = c_type
+        else:
+          curr_type = col_type_map[c_name]
+          if curr_type != c_type:
+            if {curr_type, c_type} == {'INTEGER', 'REAL'}:
+              col_type_map[c_name] = 'REAL'
+            else:
+              col_type_map[c_name] = 'TEXT'
+
+    final_cols = [(cn, col_type_map[cn]) for cn, _ in merged_cols]
+    return final_cols, rows, total_raw_count
+
   files = _match_source_files(ep.config['path'])
   fmt = ep.format
 
@@ -365,11 +447,20 @@ def load_endpoint_rows(
         allow_dirty=bool(dlq_records is not None),
         null_values=nulls,
         scan_all_for_leading_zeros=('://' not in str(ep.config['path'])))
+    if ep.config.get('fields'):
+      from . import cdc as cdc_mod
+      try:
+        parsed_types = dict(
+            cdc_mod.parse_fields_shorthand(str(ep.config['fields'])))
+        kinds = dlq.apply_type_overrides(
+            kinds, parsed_types, str(ep.raw), allow_new_columns=True)
+      except ValueError as e:
+        raise SqlPipeError(str(e)) from None
     cols = [
         (
             c,
-            'INTEGER' if kinds[c] in ('int', 'bool') else
-            'REAL' if kinds[c] == 'float' else 'TEXT',
+            'INTEGER' if kinds.get(c) in ('int', 'bool') else
+            'REAL' if kinds.get(c) == 'float' else 'TEXT',
         ) for c in header
     ]
     rows = []

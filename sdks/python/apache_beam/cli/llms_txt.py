@@ -59,7 +59,9 @@ def render_llms_txt() -> str:
 - `beam pipe --from [ALIAS=]URI [--join [ALIAS=]URI ...] [--to URI] [flags]`
     Move, convert, filter (`--where`), project (`--select`), run multi-input
     SQL joins & aggregations (`--sql "SELECT ..."` across CSV, Parquet, JSONL,
-    `delta://`, and `iceberg://` in `<100ms` locally or `type: Sql` on Dataflow),
+    mixed-format directory globs like `data/*`, `delta://`, and `iceberg://` in
+    `<100ms` locally or `type: Sql` on Dataflow), apply event-time windowing
+    (`--window fixed:60s`, `sliding:5m,1m`, `session:30m` with `--timestamp-col COL`),
     quarantine dirty rows (`--dlq`), enforce scan budget (`--max-bytes`), verify
     conservation (`--assert-counts`), reconcile output (`--verify`), apply
     cross-engine CDC (`--cdc --primary-key COL`), or register existing Parquet /
@@ -72,11 +74,12 @@ def render_llms_txt() -> str:
     exact CSV/JSONL/Parquet file out, no `--runner`) run in-process in
     ~0.1-0.4 s with the same typing, DLQ records and metrics (`runner:
     "local_fast"`); `BEAM_CLI_NO_FAST_PATH=1` or `--runner` uses a Beam runner.
-- `beam package <FILE.yaml | FILE.py | -> --to <gs://.../spec.json> [flags] [--json]`
+- `beam package <FILE.yaml | FILE.py | -> --to|-o|--output <gs://.../spec.json> [--sdk yaml|python|auto] [flags] [--json]`
     Zero-Docker `<1s` Flex Template packager for Beam YAML (auto-extracts Jinja
     `{{{{ vars }}}}` into `metadata.parameters`) and AST-introspected single-image
     Flex Template bundle generator for Python pipelines (no handwritten
-    `Dockerfile` or `metadata.json`).
+    `Dockerfile` or `metadata.json`). Accepts case-insensitive `--sdk` (`yaml`/`YAML`)
+    and `--to`, `-o`, `--output` destination flags.
 - `beam diff <LEFT_URI> <RIGHT_URI> [--key COL ...] [--columns shared|all|col1,col2] [--limit 100|all] [--to FILE] [--exit-zero] [--rtol F] [--atol F] [--json]`
     In-process (`local_fast` `<= 64 MB`) or distributed O(1)-memory key/multiset
     reconciliation across files, `delta://`, `iceberg://`, and `bigquery://` (`0`
@@ -88,6 +91,7 @@ def render_llms_txt() -> str:
     `value_mismatches`, `duplicate_keys` (`truncated` flag; values are untrusted data).
 - `beam check <FILE.yaml | -> [--plan [--trust-providers]] [--json]`
     Offline SafeLoader YAML validator + deterministic `plan_hash` (`sha256`).
+    Detects untyped Python expressions preceding `WriteToParquet` and warns statically.
     `--plan` falls back to the static check, with a warning, if expansion needs cloud access;
     expansion logs are hidden unless `--verbose`.
 - `beam run <FILE.yaml | -> [--no-jinja] [--wait-timeout DUR] [--json]`

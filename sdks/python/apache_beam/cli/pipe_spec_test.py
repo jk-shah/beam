@@ -108,6 +108,74 @@ class BuildPipeSpecTest(unittest.TestCase):
         with self.assertRaisesRegex(PipeSpecError, message):
           build_pipe_spec(*args, **kwargs)
 
+  def test_parse_window_spec(self):
+    self.assertEqual(
+        pipe_spec.parse_window_spec('fixed:60s'),
+        {'type': 'fixed', 'size': '60s'})
+    self.assertEqual(
+        pipe_spec.parse_window_spec('60s'),
+        {'type': 'fixed', 'size': '60s'})
+    self.assertEqual(
+        pipe_spec.parse_window_spec('sliding:5m,1m'),
+        {'type': 'sliding', 'size': '5m', 'period': '1m'})
+    self.assertEqual(
+        pipe_spec.parse_window_spec('session:30m'),
+        {'type': 'sessions', 'gap': '30m'})
+    self.assertEqual(
+        pipe_spec.parse_window_spec('sessions:5s'),
+        {'type': 'sessions', 'gap': '5s'})
+    self.assertEqual(
+        pipe_spec.parse_window_spec('type=fixed,size=30s'),
+        {'type': 'fixed', 'size': '30s'})
+    self.assertEqual(
+        pipe_spec.parse_window_spec({'type': 'session', 'gap': '10m'}),
+        {'type': 'sessions', 'gap': '10m'})
+    with self.assertRaisesRegex(PipeSpecError, 'cannot be empty'):
+      pipe_spec.parse_window_spec('')
+    with self.assertRaisesRegex(PipeSpecError, 'invalid sliding'):
+      pipe_spec.parse_window_spec('sliding:5m')
+
+  def test_window_and_timestamp_col_chain(self):
+    pipe = build_pipe_spec(
+        'users.csv',
+        'out/users.parquet',
+        window='fixed:60s',
+        timestamp_col='event_time')
+    transforms = pipe.spec['pipeline']['transforms']
+    types = [t['type'] for t in transforms]
+    self.assertIn('AssignTimestamps', types)
+    self.assertIn('WindowInto', types)
+    assign_step = next(t for t in transforms if t['type'] == 'AssignTimestamps')
+    self.assertEqual(assign_step['config']['timestamp'], 'event_time')
+    window_step = next(t for t in transforms if t['type'] == 'WindowInto')
+    self.assertEqual(window_step['config']['windowing'], {'type': 'fixed', 'size': '60s'})
+
+  def test_window_and_timestamp_col_dag(self):
+    pipe = build_pipe_spec(
+        'users.csv',
+        'bigquery://my-proj.analytics.users',
+        dlq_sink='dlq/bad_rows.json',
+        window='sliding:5m,1m',
+        timestamp_col='ts')
+    transforms = pipe.spec['pipeline']['transforms']
+    names = [t['name'] for t in transforms]
+    self.assertIn('AssignTimestamps', names)
+    self.assertIn('WindowInto', names)
+    assign_step = next(t for t in transforms if t['name'] == 'AssignTimestamps')
+    self.assertEqual(assign_step['config']['timestamp'], 'ts')
+    window_step = next(t for t in transforms if t['name'] == 'WindowInto')
+    self.assertEqual(
+        window_step['config']['windowing'],
+        {'type': 'sliding', 'size': '5m', 'period': '1m'})
+
+  def test_zero_copy_rejects_window(self):
+    with self.assertRaisesRegex(PipeSpecError, 'cannot be combined with .* --window'):
+      build_pipe_spec(
+          'data/*.parquet',
+          'iceberg://lake.db.table',
+          zero_copy=True,
+          window='fixed:60s')
+
 
 class ToYamlTest(unittest.TestCase):
   def test_starts_with_the_command_and_round_trips(self):
