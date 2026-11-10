@@ -28,12 +28,12 @@ Use `beam` whenever moving, converting, filtering, joining/aggregating (`--join`
   `beam pipe --from updates.csv --to out/latest.parquet --cdc --primary-key account_id --cdc-seq-col updated_at --assert-counts --json`
 - **Key reconciliation (writes JSON report, optional `--exit-zero` on drift)**:
   `beam diff old.parquet new.jsonl --key item_id --to out/diff.json --exit-zero --json`
-- **When NOT to use `beam`**: statistical modeling, least-squares regression, hypothesis tests, or plotting -> use `numpy`/`scipy`/`pandas`; multi-table warehouse SQL DAGs -> `dbt`/`Dataform`; custom stateful streaming timers -> `apache_beam` Python SDK.
+- **When NOT to use `beam`**: complex ML training, deep neural networks, or plotting -> use `pytorch`/`scikit-learn`/`matplotlib`; for OLS regression & bivariate statistics, ANSI aggregates (`regr_slope`, `regr_intercept`, `regr_r2`, `corr`, `covar_samp`, `var_samp`, `stddev_pop`) are supported natively in `beam pipe --sql`; multi-table warehouse SQL DAGs -> `dbt`/`Dataform`; custom stateful streaming timers -> `apache_beam` Python SDK.
 
 ## Guarantees (Do Not Assume Legacy Caveats)
 
 - **Leading zeros are never silently stripped**: local runs scan *every* CSV row for leading zeros (`00123` stays `"00123"`, not `100`-row guesswork); runner paths send late leading-zero cells in numeric columns to `--dlq` or fail with a `--from-opt fields=col:str` hint.
-- **SQLite window functions, CTEs, percentiles, and `to_utc()` are built in**: `ROW_NUMBER() OVER (...)`, `RANK()`, `LAG()`, `median(x)`, `percentile(x, 90)`, `quantile(x, 0.9)`, `stddev(x)`, and `to_utc(ts)` work out of the box. Check `beam doctor --json` (`outputs.sql_engines.duckdb.available`) if you want `--sql-engine duckdb`.
+- **SQLite window functions, CTEs, percentiles, statistical aggregates, and `to_utc()` are built in**: `ROW_NUMBER() OVER (...)`, `RANK()`, `LAG()`, `median(x)`, `percentile(x, 90)`, `quantile(x, 0.9)`, `stddev(x)`, `variance(x)`, `var_samp(x)`, `stddev_pop(x)`, `covar_samp(x, y)`, `corr(x, y)`, `regr_slope(y, x)`, `regr_intercept(y, x)`, `regr_r2(y, x)`, and `to_utc(ts)` work out of the box. Check `beam doctor --json` (`outputs.sql_engines.duckdb.available`) if you want `--sql-engine duckdb`.
 - **SQL three-valued NULL semantics everywhere**: empty CSV cells are `NULL`; `!=`, `<>`, `NOT IN`, `AND`/`OR` follow SQL NULL rules on both in-process and Beam runner paths.
 - **Exact duplicate CDC rows collapse cleanly (`<250 ms` locally)**: `--cdc` runs in-process on `local_fast` (`<= 64 MB`), auto-detects `lsn`/`ts_ms`/`seq_ts`/`seq`/`updated_at`/`event_ts`/`timestamp`, deduplicates byte-identical events sharing the latest sequence value, and retains data timestamp columns (`updated_at`, `seq_ts`).
 - **Safe atomic `--if-exists replace`**: previous local outputs stay untouched until the new run, `--assert-counts`, and `--verify` all succeed completely.

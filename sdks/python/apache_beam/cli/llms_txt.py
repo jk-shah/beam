@@ -160,7 +160,9 @@ def render_llms_txt() -> str:
 - Local `--sql` is SQLite (inputs named `alias=URI`; unaliased inputs are named after the file, and the primary input
   also binds `FROM source`) plus `to_utc(ts)`
   (normalizes ISO `Z`/offsets/naive and epoch sec/ms to `YYYY-MM-DDTHH:MM:SSZ`), exact `median(x)`,
-  `percentile(x, 95)`, `quantile(x, 0.95)` (linear interpolation, like numpy) and `stddev(x)`; window functions
+  `percentile(x, 95)`, `quantile(x, 0.95)` (linear interpolation, like numpy), `stddev(x)`, `variance(x)`,
+  `var_samp(x)`, `var_pop(x)`, `stddev_pop(x)`, `covar_samp(x, y)`, `covar_pop(x, y)`, `corr(x, y)`,
+  `regr_slope(y, x)`, `regr_intercept(y, x)`, `regr_r2(y, x)`; window functions
   such as `ROW_NUMBER() OVER (PARTITION BY k ORDER BY to_utc(ts) DESC)` work. Schema-evolution append / column
   rename is one query: `SELECT id, name, CAST(NULL AS TEXT) AS tier FROM old UNION ALL SELECT id, full_name AS name, tier FROM batch2`
   (local `--if-exists replace` stages new outputs and keeps previous files intact on any failure).
