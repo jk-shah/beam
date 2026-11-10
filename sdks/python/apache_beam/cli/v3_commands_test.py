@@ -3572,5 +3572,83 @@ class Round11FixesTest(unittest.TestCase):
     self.assertIn('--sql-engine duckdb', env_regr['error']['message'])
 
 
+class Round12FixesTest(unittest.TestCase):
+  """Regression tests for Round 12 findings (M1-M3)."""
+
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp(prefix='beam-cli-r12-')
+
+  def tearDown(self):
+    shutil.rmtree(self.tmp, ignore_errors=True)
+
+  def test_diff_local_fast_matches_fnapi_runner_and_warns_on_truncation(self):
+    """M1 + M2: local_fast diff matches FnApiRunner and warns when differing_keys truncates."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    left_pq = os.path.join(self.tmp, 'left.parquet')
+    right_jsonl = os.path.join(self.tmp, 'right.jsonl')
+    pq.write_table(
+        pa.Table.from_pylist([
+            {'id': 'I1', 'qty': 10, 'loc': None},
+            {'id': 'I2', 'qty': 5, 'loc': 'A'},
+            {'id': 'I3', 'qty': 7, 'loc': 'B'},
+        ]),
+        left_pq)
+    with open(right_jsonl, 'w', encoding='utf-8') as f:
+      f.write(json.dumps({'id': 'I1', 'qty': 10}) + '\n')  # missing loc == None
+      f.write(json.dumps({'id': 'I2', 'qty': 9, 'loc': 'A'}) + '\n')
+      f.write(json.dumps({'id': 'I4', 'qty': 1, 'loc': 'C'}) + '\n')
+
+    rc_fast, env_fast, _ = _run_json(['diff', left_pq, right_jsonl, '--key', 'id'])
+    with mock.patch.dict(os.environ, {'BEAM_CLI_NO_FAST_PATH': '1'}):
+      rc_runner, env_runner, _ = _run_json(
+          ['diff', left_pq, right_jsonl, '--key', 'id'])
+    self.assertEqual(rc_fast, cli.EXIT_DIFF_MISMATCH)
+    self.assertEqual(rc_runner, cli.EXIT_DIFF_MISMATCH)
+    self.assertEqual(env_fast['runner'], 'local_fast')
+    self.assertEqual(env_runner['runner'], 'FnApiRunner')
+    self.assertEqual(env_fast['outputs']['summary'], env_runner['outputs']['summary'])
+    self.assertEqual(
+        env_fast['outputs']['differing_keys'],
+        env_runner['outputs']['differing_keys'])
+
+    # >100 churned keys triggers explicit truncation warning until --limit all
+    big_left = os.path.join(self.tmp, 'big_l.csv')
+    big_right = os.path.join(self.tmp, 'big_r.csv')
+    with open(big_left, 'w', encoding='utf-8') as f:
+      f.write('id,val\n')
+      for i in range(120):
+        f.write(f'ACC-{i:04d},1\n')
+    with open(big_right, 'w', encoding='utf-8') as f:
+      f.write('id,val\n')
+    rc_trunc, env_trunc, _ = _run_json(
+        ['diff', big_left, big_right, '--key', 'id', '--exit-zero'])
+    self.assertEqual(rc_trunc, cli.EXIT_OK)
+    self.assertTrue(env_trunc['outputs']['differing_keys']['truncated'])
+    self.assertTrue(
+        any('--limit all' in w for w in env_trunc['warnings']),
+        msg=env_trunc['warnings'])
+
+    rc_full, env_full, _ = _run_json([
+        'diff', big_left, big_right, '--key', 'id', '--limit', 'all', '--exit-zero'
+    ])
+    self.assertEqual(rc_full, cli.EXIT_OK)
+    self.assertFalse(env_full['outputs']['differing_keys']['truncated'])
+    self.assertEqual(env_full['warnings'], [])
+
+  def test_single_input_sql_accepts_common_table_views(self):
+    """M3: Single-input --sql accepts FROM data / FROM tbl / FROM input."""
+    csv_path = os.path.join(self.tmp, 'items.csv')
+    with open(csv_path, 'w', encoding='utf-8') as f:
+      f.write('sku,qty\nA,2\nB,3\n')
+    for view_name in ('source', 'data', 'tbl', 'input'):
+      rc, env, err = _run_json([
+          'pipe', '--from', csv_path, '--sql', f'SELECT SUM(qty) AS s FROM {view_name}'
+      ])
+      self.assertEqual(rc, cli.EXIT_OK, err)
+      self.assertEqual(env['untrusted_data']['rows'], [{'s': 5}])
+
+
 if __name__ == '__main__':
   unittest.main()

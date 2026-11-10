@@ -272,6 +272,10 @@ def _tail_pubsub(
       if not proj:
         raise TailError(
             f'cannot determine GCP project for topic {topic_path!r}', 2)
+      try:
+        proj = uris.validate_bq_project_id(proj)
+      except uris.UriError as e:
+        raise TailError(str(e), 2) from None
       publisher = pubsub_v1.PublisherClient()
       _gc_stale_peek_subscriptions(subscriber, publisher, topic_path)
       epoch_hex = format(int(time.time()), 'x')
@@ -462,6 +466,7 @@ def _tail_kafka(
       'group.id': f'beam-cli-peek-{uuid.uuid4().hex[:10]}',
       'enable.auto.commit': False,
       'auto.offset.reset': 'latest' if follow else 'earliest',
+      'socket.timeout.ms': 5000,
   })
   rows: list[dict[str, Any]] = []
   scanned_bytes = 0

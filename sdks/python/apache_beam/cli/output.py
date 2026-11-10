@@ -212,6 +212,7 @@ _KV_SECRET_RE = re.compile(
 _KNOWN_TOKEN_RE = re.compile(
     r'\b(?:'
     r'ya29\.[A-Za-z0-9._-]{12,}|'
+    r'eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|'
     r'gh[pousr]_[A-Za-z0-9_]{16,}|'
     r'github_pat_[A-Za-z0-9_]{16,}|'
     r'AKIA[0-9A-Z]{16}|'

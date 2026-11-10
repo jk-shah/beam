@@ -1173,5 +1173,115 @@ class InputValidationAndResourceBoundsPass4Test(unittest.TestCase):
     self.assertIn('statement_timeout=5000', str(captured_kwargs.get('options')))
 
 
+class InputValidationAndResourceBoundsPass5Test(unittest.TestCase):
+  """Tests for Pass 5 input validation, cache isolation, and token redaction."""
+
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp(prefix='beam-cli-p5-')
+
+  def tearDown(self):
+    shutil.rmtree(self.tmp, ignore_errors=True)
+
+  def test_package_enforces_jinja_sandbox_and_transform_key_validation(self):
+    from apache_beam.cli import package
+
+    bad_jinja = os.path.join(self.tmp, 'bad_jinja.yaml')
+    with open(bad_jinja, 'w', encoding='utf-8') as f:
+      f.write(
+          'pipeline:\n'
+          '  type: chain\n'
+          '  transforms:\n'
+          '    - type: ReadFromCsv\n'
+          '      config:\n'
+          '        path: "{{ input_csv.__class__.__mro__ }}"\n')
+    with self.assertRaises(package.PackageError):
+      package.run_package(bad_jinja, dry_run=True)
+
+    bad_keys = os.path.join(self.tmp, 'bad_keys.yaml')
+    with open(bad_keys, 'w', encoding='utf-8') as f:
+      f.write(
+          'pipeline:\n'
+          '  type: chain\n'
+          '  transforms:\n'
+          '    - type: ReadFromCsv\n'
+          '      path: "gs://b/in.csv"\n')
+    with self.assertRaises(package.PackageError):
+      package.run_package(bad_keys, dry_run=True)
+
+    good_yaml = os.path.join(self.tmp, 'good.yaml')
+    with open(good_yaml, 'w', encoding='utf-8') as f:
+      f.write(
+          'pipeline:\n'
+          '  type: chain\n'
+          '  transforms:\n'
+          '    - type: ReadFromCsv\n'
+          '      config:\n'
+          '        path: "{{ input_csv }}"\n')
+    with self.assertRaises(package.PackageError):
+      package.run_package(good_yaml, project='--bad-flag', dry_run=True)
+
+    handler = package._HttpsOnlyRedirectHandler()
+    req = package.urllib.request.Request('https://storage.googleapis.com/x')
+    with self.assertRaises(package.urllib.error.URLError):
+      handler.redirect_request(req, None, 302, 'Found', {}, 'http://example.com/x')
+
+  def test_jobs_tail_sql_and_output_jwt_redaction(self):
+    from apache_beam.cli import jobs
+    from apache_beam.cli import output
+    from apache_beam.cli import sql
+    from apache_beam.cli import tail
+    from apache_beam.cli import uris
+
+    with mock.patch.dict(os.environ, {'BEAM_HOME': self.tmp}):
+      jobs.record_job_submission(
+          'job-p5-1',
+          runner='DataflowRunner',
+          state='JOB_STATE_RUNNING',
+          command='pipe',
+          project='--injected-flag',
+          region='us-central1')
+      with self.assertRaises(jobs.JobError):
+        jobs.wait_for_job('job-p5-1', query_fn=lambda *_: ('DONE', {}))
+      with self.assertRaises(jobs.JobError):
+        jobs.cancel_job('job-p5-1', cancel_fn=lambda *_: True)
+
+    ep = uris.ParsedEndpoint(
+        raw='pubsub://projects/my-proj/topics/t1',
+        scheme='pubsub',
+        kind='pubsub',
+        format='pubsub',
+        yaml_type='ReadFromPubSub',
+        config={'topic': 'short_topic'},
+    )
+    fake_ps = mock.MagicMock()
+    with mock.patch.dict(
+        'sys.modules',
+        {'google.cloud': mock.MagicMock(pubsub_v1=fake_ps), 'google.api_core': mock.MagicMock()}):
+      with self.assertRaises(tail.TailError):
+        tail._tail_pubsub(
+            ep,
+            limit=1,
+            duration_sec=0.1,
+            follow=False,
+            poll_interval=0.1,
+            byte_budget=1024,
+            default_project='--bad-proj',
+            on_record=None)
+
+    ext_dir = os.path.join(self.tmp, 'ext')
+    os.makedirs(ext_dir, exist_ok=True)
+    os.symlink(ext_dir, os.path.join(self.tmp, 'maven-wrapper'))
+    with self.assertRaises(sql.SqlError):
+      sql._ensure_maven_wrapper(self.tmp)
+
+    fake_jwt = (
+        'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.'
+        'eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4ifQ.'
+        'SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c')
+    scrubbed = output.scrub_error_message(f'upstream auth error: {fake_jwt}')
+    self.assertNotIn('eyJhbGciOi', scrubbed)
+    self.assertIn('<redacted-value>', scrubbed)
+
+
 if __name__ == '__main__':
   unittest.main()

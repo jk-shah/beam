@@ -419,12 +419,11 @@ def wait_for_job(
         'metrics': {},
     }
 
-  proj = project or record.get('project')
-  reg = region or record.get('region') or 'us-central1'
-  if not proj:
-    raise JobError(
-        f'cannot poll job {safe_id!r} without a GCP project; pass --project',
-        EXIT_USAGE)
+  proj, reg = _validate_job_project_and_region(
+      safe_id,
+      project or record.get('project'),
+      region or record.get('region') or 'us-central1',
+      verb='poll')
 
   fetch = query_fn or _query_dataflow_job
   deadline = (time.monotonic() + timeout_seconds) if timeout_seconds else None
@@ -503,6 +502,28 @@ def wait_for_job(
     time.sleep(sleep_s)
 
 
+def _validate_job_project_and_region(
+    safe_id: str,
+    raw_proj: Any,
+    raw_reg: Any,
+    *,
+    verb: str,
+) -> tuple[str, str]:
+  from . import uris
+  if not raw_proj:
+    raise JobError(
+        f'cannot {verb} job {safe_id!r} without a GCP project; pass --project',
+        EXIT_USAGE)
+  try:
+    proj = uris.validate_bq_project_id(str(raw_proj))
+  except uris.UriError as e:
+    raise JobError(str(e), EXIT_USAGE) from None
+  reg = str(raw_reg or 'us-central1').strip()
+  if not re.fullmatch(r'[a-z0-9]+(?:-[a-z0-9]+)+', reg):
+    raise JobError(f'invalid GCP region {raw_reg!r}', EXIT_USAGE)
+  return proj, reg
+
+
 def cancel_job(
     job_id: str,
     *,
@@ -520,12 +541,11 @@ def cancel_job(
     if not (project and region):
       raise
 
-  proj = project or record.get('project')
-  reg = region or record.get('region') or 'us-central1'
-  if not proj:
-    raise JobError(
-        f'cannot cancel job {safe_id!r} without a GCP project; pass --project',
-        EXIT_USAGE)
+  proj, reg = _validate_job_project_and_region(
+      safe_id,
+      project or record.get('project'),
+      region or record.get('region') or 'us-central1',
+      verb='cancel')
 
   target_state = 'JOB_STATE_DRAINING' if drain else 'JOB_STATE_CANCELLED'
   if cancel_fn is not None:

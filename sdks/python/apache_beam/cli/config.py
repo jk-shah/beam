@@ -152,35 +152,47 @@ def _cached_option_catalog(
   if cache_key == ':live:':
     return _introspect_pipeline_options()
 
-  try:
-    with open(cache_key, encoding='utf-8') as f:
-      raw = json.load(f)
-    by_dest = {k: _OptionMeta(**v) for k, v in raw['by_dest'].items()}
-    by_flag = {k: (v[0], v[1]) for k, v in raw['by_flag'].items()}
-    return by_dest, by_flag
-  except (OSError, ValueError, KeyError, TypeError):
-    pass
+  if not os.path.islink(cache_key) and os.path.isfile(cache_key):
+    try:
+      from . import output as out_mod
+      raw = json.loads(
+          out_mod.read_bounded_text(
+              cache_key, max_bytes=4 * 1024 * 1024, label=cache_key))
+      by_dest = {k: _OptionMeta(**v) for k, v in raw['by_dest'].items()}
+      by_flag = {k: (v[0], v[1]) for k, v in raw['by_flag'].items()}
+      return by_dest, by_flag
+    except (OSError, ValueError, KeyError, TypeError):
+      pass
 
   by_dest, by_flag = _introspect_pipeline_options()
-  tmp_path = f'{cache_key}.{os.getpid()}.part'
+  import tempfile
+  tmp_path: str | None = None
   try:
-    os.makedirs(os.path.dirname(cache_key), mode=0o700, exist_ok=True)
-    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    payload = {
-        'by_dest': {
-            k: v._asdict()
-            for k, v in by_dest.items()
-        },
-        'by_flag': {
-            k: [v[0], v[1]]
-            for k, v in by_flag.items()
-        },
-    }
-    with os.fdopen(fd, 'w', encoding='utf-8') as f:
-      json.dump(payload, f)
-    os.replace(tmp_path, cache_key)
+    cache_dir = os.path.dirname(cache_key)
+    os.makedirs(cache_dir, mode=0o700, exist_ok=True)
+    if not os.path.islink(cache_dir) and not os.path.islink(cache_key):
+      fd, tmp_path = tempfile.mkstemp(
+          prefix='.tmp_opts_', suffix='.part', dir=cache_dir)
+      try:
+        os.fchmod(fd, 0o600)
+      except (AttributeError, OSError):
+        pass
+      payload = {
+          'by_dest': {
+              k: v._asdict()
+              for k, v in by_dest.items()
+          },
+          'by_flag': {
+              k: [v[0], v[1]]
+              for k, v in by_flag.items()
+          },
+      }
+      with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        json.dump(payload, f)
+      os.replace(tmp_path, cache_key)
+      tmp_path = None
   except OSError:
-    if os.path.exists(tmp_path):
+    if tmp_path and os.path.exists(tmp_path):
       try:
         os.remove(tmp_path)
       except OSError:

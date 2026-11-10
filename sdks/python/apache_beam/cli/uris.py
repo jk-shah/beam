@@ -418,7 +418,7 @@ def _infer_jinja_file_format(location: str) -> str:
   return ''
 
 
-_SAFE_BQ_PROJECT_RE = re.compile(r'^[A-Za-z0-9_.:-]{1,128}$')
+_SAFE_BQ_PROJECT_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$')
 
 
 def validate_bq_project_id(proj: str | None) -> str | None:

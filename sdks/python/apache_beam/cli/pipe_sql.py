@@ -975,7 +975,10 @@ def _run_duckdb(
       used_lower.add(ns.alias.lower())
       first_alias = first_alias or ns.alias
     if first_alias is not None:
-      for view_name in ('PCOLLECTION', 'source'):
+      extra_views = (
+          ('PCOLLECTION', 'source', 'data', 'tbl', 'input')
+          if len(named_sources) == 1 else ('PCOLLECTION', 'source'))
+      for view_name in extra_views:
         if view_name.lower() not in used_lower:
           con.execute(
               f'CREATE VIEW {_quote_ident(view_name)} AS '
@@ -1105,9 +1108,13 @@ def run_in_memory_sql(
       if first_alias is None:
         first_alias = ns.alias
 
-    # Register Beam SQL `PCOLLECTION` and `source` views on the primary input.
+    # Register Beam SQL `PCOLLECTION` and `source` views on the primary input
+    # (plus common single-table aliases `data`, `t`, `tbl`, `input` when unary).
     if first_alias is not None:
-      for view_name in ('PCOLLECTION', 'source'):
+      extra_views = (
+          ('PCOLLECTION', 'source', 'data', 'tbl', 'input')
+          if len(named_sources) == 1 else ('PCOLLECTION', 'source'))
+      for view_name in extra_views:
         if view_name.lower() not in used_lower:
           conn.execute(
               f'CREATE VIEW {_quote_ident(view_name)} AS '

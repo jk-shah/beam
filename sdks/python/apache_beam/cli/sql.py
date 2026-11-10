@@ -109,11 +109,15 @@ def run(
 
   home = beam_home or os.path.expanduser(os.environ.get('BEAM_HOME', '~/.beam'))
   cache_dir = os.path.join(home, 'cache')
-  os.makedirs(cache_dir, exist_ok=True)
+  os.makedirs(cache_dir, mode=0o700, exist_ok=True)
+  if os.path.islink(cache_dir):
+    raise SqlError(
+        f'refusing symlinked Beam SQL cache directory {cache_dir!r}',
+        _EXIT_USAGE)
   jar_path = os.path.join(
       cache_dir, _cache_filename(resolved_version, runner_key, clean_ios))
 
-  if os.path.isfile(jar_path):
+  if os.path.isfile(jar_path) and not os.path.islink(jar_path):
     print(f'Using cached Beam SQL JAR: {jar_path}', file=sys.stderr)
   else:
     mvnw = _ensure_maven_wrapper(home)
@@ -290,18 +294,23 @@ _MAVEN_DISTRIBUTION_URL = (
 def _ensure_maven_wrapper(beam_home):
   """Returns cached `~/.beam/maven-wrapper/mvnw`, downloading it once."""
   wrapper_dir = os.path.join(beam_home, 'maven-wrapper')
+  if os.path.islink(wrapper_dir):
+    raise SqlError(
+        f'refusing symlinked Maven Wrapper directory {wrapper_dir!r}',
+        _EXIT_USAGE)
   mvnw = os.path.join(wrapper_dir, 'mvnw')
   wrapper_jar = os.path.join(
       wrapper_dir, '.mvn', 'wrapper', 'maven-wrapper.jar')
   wrapper_props = os.path.join(
       wrapper_dir, '.mvn', 'wrapper', 'maven-wrapper.properties')
 
-  if (os.path.isfile(mvnw) and os.path.isfile(wrapper_jar) and
+  if (os.path.isfile(mvnw) and not os.path.islink(mvnw) and
+      os.path.isfile(wrapper_jar) and not os.path.islink(wrapper_jar) and
       os.path.isfile(wrapper_props)):
     return mvnw
 
   print(f'Downloading Maven Wrapper into {wrapper_dir}...', file=sys.stderr)
-  os.makedirs(os.path.dirname(wrapper_jar), exist_ok=True)
+  os.makedirs(os.path.dirname(wrapper_jar), mode=0o700, exist_ok=True)
   with open(wrapper_props, 'w', encoding='utf-8') as f:
     f.write(f'distributionUrl={_MAVEN_DISTRIBUTION_URL}\n')
   _download_https(_MAVEN_WRAPPER_SCRIPT_URL, mvnw)
@@ -331,21 +340,34 @@ def _download_https(url, dest_path, max_bytes: int = 32 * 1024 * 1024):
   """Downloads an `https://` URL atomically to `dest_path`."""
   if not url.startswith('https://'):
     raise ValueError(f'expected https:// URL, got {url!r}')
-  tmp_path = dest_path + '.part'
+  dest_dir = os.path.dirname(os.path.abspath(dest_path)) or '.'
+  os.makedirs(dest_dir, mode=0o700, exist_ok=True)
+  fd, tmp_path = tempfile.mkstemp(prefix='.tmp_dl_', suffix='.part', dir=dest_dir)
   try:
     with _https_urlopen(url, timeout=30) as resp:
       data = resp.read(max_bytes + 1)
     if len(data) > max_bytes:
+      os.close(fd)
       raise SqlError(
           f'download from {url} exceeded maximum size ({max_bytes:,} bytes)',
           _EXIT_FAILED)
-    with open(tmp_path, 'wb') as f:
+    with os.fdopen(fd, 'wb') as f:
       f.write(data)
     os.replace(tmp_path, dest_path)
   except (urllib.error.URLError, OSError) as e:
     if os.path.exists(tmp_path):
-      os.remove(tmp_path)
+      try:
+        os.remove(tmp_path)
+      except OSError:
+        pass
     raise SqlError(f'failed to download {url}: {e}', _EXIT_FAILED) from None
+  except Exception:
+    if os.path.exists(tmp_path):
+      try:
+        os.remove(tmp_path)
+      except OSError:
+        pass
+    raise
 
 
 def _validated_dep_version(env_var: str, default: str) -> str:

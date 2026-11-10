@@ -1660,6 +1660,8 @@ def _diff(args, extra_args, *, json_session, t0: float) -> int:
   untrusted = report.pop('untrusted_data', None)
   diff_job_id = report.pop('job_id', None)
   diff_state = report.pop('state', None)
+  diff_runner = report.pop('_runner', None) or diff_runner
+  diff_warnings = report.pop('warnings', None)
   summary = report['summary']
   drift_detected = (rc != EXIT_OK)
   if getattr(args, 'sink', None):
@@ -1691,11 +1693,15 @@ def _diff(args, extra_args, *, json_session, t0: float) -> int:
                 'duplicate_key_mismatches': summary['duplicate_key_mismatches'],
             },
             outputs=report,
+            warnings=diff_warnings,
             error=output.classify_error(
                 'datasets differ', rc, command='diff')[0]
             if eff_rc != EXIT_OK else None,
             untrusted_data=untrusted))
   else:
+    if diff_warnings:
+      for w in diff_warnings:
+        print(f'warning: {w}', file=sys.stderr)
     if not drift_detected:
       print(
           f"MATCH: {summary['matched_rows']} row(s) identical between "
@@ -2942,7 +2948,8 @@ def _run_yaml(
   try:
     with contextlib.ExitStack() as stack:
       skip_xlang_dry_expand = False
-      if dry_run_yaml is not None and '{{' in dry_run_yaml:
+      if (direct_yaml_text is None and dry_run_yaml is not None and
+          '{{' in dry_run_yaml):
         from . import package as pkg_mod
         try:
           pkg_mod._validate_yaml_with_jinja_placeholders(dry_run_yaml)

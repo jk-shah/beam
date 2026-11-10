@@ -78,11 +78,12 @@ def render_llms_txt() -> str:
     Flex Template bundle generator for Python pipelines (no handwritten
     `Dockerfile` or `metadata.json`).
 - `beam diff <LEFT_URI> <RIGHT_URI> [--key COL ...] [--columns shared|all|col1,col2] [--limit 100|all] [--to FILE] [--exit-zero] [--rtol F] [--atol F] [--json]`
-    Distributed O(1)-memory key/multiset reconciliation across files, `delta://`,
-    `iceberg://`, and `bigquery://` (`0` match, `6` drift). Compares shared columns
-    (or `--columns all`, or an explicit subset `--columns qty,price`) and reports
-    added/removed/retyped columns in `outputs.schema_diff`. With
-    `--key`, `outputs.differing_keys` lists up to `--limit` keys (default 100, or
+    In-process (`local_fast` `<= 64 MB`) or distributed O(1)-memory key/multiset
+    reconciliation across files, `delta://`, `iceberg://`, and `bigquery://` (`0`
+    match, `6` drift). Compares shared columns (or `--columns all`, or an explicit
+    subset `--columns qty,price`) and reports added/removed/retyped columns in
+    `outputs.schema_diff`. With `--key`, `outputs.differing_keys` lists up to
+    `--limit` keys (default 100 with an explicit `warnings` entry if truncated, or
     `--limit all` up to 100,000) each for `only_in_left`, `only_in_right`,
     `value_mismatches`, `duplicate_keys` (`truncated` flag; values are untrusted data).
 - `beam check <FILE.yaml | -> [--plan [--trust-providers]] [--json]`

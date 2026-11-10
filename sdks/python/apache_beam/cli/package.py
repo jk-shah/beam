@@ -168,9 +168,27 @@ def _validate_entrypoint_filename(filename: str) -> str:
   return filename
 
 
+_ALLOWED_TRANSFORM_SPEC_KEYS = frozenset({
+    'type',
+    'name',
+    'input',
+    'output',
+    'config',
+    'error_handling',
+    'windowing',
+    'resource_hints',
+    'environment',
+    'annotations',
+})
+
+
 def _validate_yaml_with_jinja_placeholders(yaml_text: str) -> dict[str, Any]:
   """Validates top-level Beam YAML structure even when `{{ vars }}` are present."""
   from . import output as out_mod
+  try:
+    out_mod.validate_safe_jinja_template(yaml_text)
+  except ValueError as e:
+    raise PackageError(str(e), EXIT_USAGE) from None
   scrubbed = _JINJA_EXPR_RE.sub('__BEAM_JINJA_PLACEHOLDER__', yaml_text)
   try:
     doc = out_mod.safe_yaml_load(scrubbed)
@@ -180,6 +198,22 @@ def _validate_yaml_with_jinja_placeholders(yaml_text: str) -> dict[str, Any]:
     raise PackageError(
         "Beam YAML file must be a mapping containing a top-level 'pipeline:' key.",
         EXIT_USAGE)
+  pipe_obj = doc.get('pipeline')
+  if isinstance(pipe_obj, dict):
+    transforms = pipe_obj.get('transforms')
+    if isinstance(transforms, list):
+      for idx, tfm in enumerate(transforms):
+        if not isinstance(tfm, dict) or not tfm.get('type'):
+          raise PackageError(
+              f"pipeline.transforms[{idx}] must be a mapping with a 'type' key.",
+              EXIT_USAGE)
+        bad_keys = sorted(set(tfm.keys()) - _ALLOWED_TRANSFORM_SPEC_KEYS)
+        if bad_keys:
+          raise PackageError(
+              f"pipeline.transforms[{idx}] ({tfm.get('type')!r}) has unexpected "
+              f'top-level key(s) {bad_keys}; connector/transform parameters '
+              "belong nested under 'config:'.",
+              EXIT_USAGE)
   return doc
 
 
@@ -282,6 +316,15 @@ def extract_python_pipeline_parameters(py_source: str) -> list[dict[str, Any]]:
   return params
 
 
+class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
+  """Refuses any redirect from `https://` to a non-`https://` scheme."""
+  def redirect_request(self, req, fp, code, msg, headers, newurl):
+    if not str(newurl).lower().startswith('https://'):
+      raise urllib.error.URLError(
+          f'refusing non-HTTPS redirect target {newurl!r}')
+    return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def resolve_yaml_template_image(
     region: str = DEFAULT_REGION,
     explicit_image: str | None = None,
@@ -294,6 +337,8 @@ def resolve_yaml_template_image(
 
   warnings_out: list[str] = []
   if allow_network:
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(), _HttpsOnlyRedirectHandler())
     for reg in (safe_reg, DEFAULT_REGION):
       url = (
           f'https://storage.googleapis.com/dataflow-templates-{reg}/'
@@ -301,7 +346,7 @@ def resolve_yaml_template_image(
       try:
         req = urllib.request.Request(
             url, headers={'User-Agent': 'apache-beam-cli-package'})
-        with urllib.request.urlopen(req, timeout=5.0) as resp:
+        with opener.open(req, timeout=5.0) as resp:
           spec = json.loads(resp.read(65536).decode('utf-8'))
           img = spec.get('image')
           if isinstance(img, str) and img.strip():
@@ -443,6 +488,22 @@ def _generate_yaml_python_wrapper(
   )
 
 
+def _atomic_write_text(target: Path, content: str) -> None:
+  target.parent.mkdir(parents=True, exist_ok=True)
+  fd, tmp_path = tempfile.mkstemp(
+      prefix=f'.tmp_{target.name}_', dir=str(target.parent))
+  try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+      f.write(content)
+    os.replace(tmp_path, target)
+  finally:
+    if os.path.exists(tmp_path):
+      try:
+        os.unlink(tmp_path)
+      except OSError:
+        pass
+
+
 def _write_text_destination(
     dest: str, content: str, *, project: str | None = None) -> None:
   """Writes UTF-8 text either to `gs://bucket/object` or a local file path."""
@@ -466,9 +527,7 @@ def _write_text_destination(
     blob.upload_from_string(content.encode('utf-8'), content_type='application/json')
     return
 
-  out_path = Path(dest)
-  out_path.parent.mkdir(parents=True, exist_ok=True)
-  out_path.write_text(content, encoding='utf-8')
+  _atomic_write_text(Path(dest), content)
 
 
 def _read_source_text(
@@ -591,6 +650,19 @@ def run_package(
     stdin_text: str | None = None,
 ) -> dict[str, Any]:
   """Packages a `.yaml` or `.py` pipeline into a Dataflow Flex Template."""
+  if project is not None:
+    p_str = str(project).strip()
+    if (not p_str or p_str.startswith('-') or
+        any(ch in p_str for ch in ('\r', '\n', '\x00'))):
+      raise PackageError(f'invalid GCP project identifier {project!r}', EXIT_USAGE)
+    if build_image or not dry_run:
+      from . import uris
+      try:
+        project = uris.validate_bq_project_id(p_str)
+      except uris.UriError as e:
+        raise PackageError(str(e), EXIT_USAGE) from None
+    else:
+      project = p_str
   source_text, source_basename = _read_source_text(
       source, stdin_text=stdin_text, project=project)
 

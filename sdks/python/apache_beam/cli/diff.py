@@ -330,67 +330,8 @@ def run_diff(
   `columns='all'` compares the union of columns (missing = null), and
   `'col1,col2,...'` compares an explicit column subset.
   """
-  import apache_beam as beam
-  from apache_beam.options.pipeline_options import GoogleCloudOptions
-  from apache_beam.options.pipeline_options import PipelineOptions
-  from apache_beam.options.pipeline_options import StandardOptions
-
   eff_key_limit = parse_key_limit(key_limit)
-
   p_args = list(pipeline_args or [])
-  opts = PipelineOptions(p_args)
-  proj = default_project or opts.view_as(GoogleCloudOptions).project
-
-  # Use in-process FnApiRunner when no explicit remote runner was requested so
-  # local/GCS/BQ diffs run deterministically without Prism port/sandbox issues.
-  std_opts = opts.view_as(StandardOptions)
-  if not std_opts.runner or std_opts.runner.lower() in (
-      'direct', 'directrunner'):
-    std_opts.runner = 'FnApiRunner'
-
-  # Ensure FileSystems sees options (`--project`, S3, etc.) before sniffing!
-  from apache_beam.io.filesystems import FileSystems
-  FileSystems.set_options(opts)
-
-  parsed_left_opts = uris.parse_kv_options(left_opts, None, '--left-opt')
-  parsed_right_opts = uris.parse_kv_options(right_opts, None, '--right-opt')
-
-  left_ep = uris.parse_endpoint(
-      left_uri,
-      is_read=True,
-      explicit_format=left_format,
-      options=parsed_left_opts,
-      default_project=proj,
-      allow_sniff=True)
-  right_ep = uris.parse_endpoint(
-      right_uri,
-      is_read=True,
-      explicit_format=right_format,
-      options=parsed_right_opts,
-      default_project=proj,
-      allow_sniff=True)
-
-  for ep_chk in (left_ep, right_ep):
-    if ep_chk.kind == 'file':
-      if not FileSystems.match([ep_chk.config['path']])[0].metadata_list:
-        raise uris.UriError(
-            f'no files matched {ep_chk.raw!r} (checked {ep_chk.config["path"]!r})')
-
-  if max_bytes is not None:
-    limit = cost_guard.parse_byte_size(max_bytes)
-    left_est = cost_guard.estimate_endpoint_bytes(
-        left_ep, default_project=proj, stop_after_bytes=limit)
-    right_est = cost_guard.estimate_endpoint_bytes(
-        right_ep, default_project=proj, stop_after_bytes=limit)
-    combined = (left_est.get('estimated_bytes') or 0) + (
-        right_est.get('estimated_bytes') or 0)
-    if combined > limit:
-      raise cost_guard.CostLimitError(
-          f'combined diff scan is {cost_guard.format_bytes(combined)} '
-          f'({combined:,} bytes), exceeding --max-bytes={max_bytes} '
-          f'({limit:,} bytes)',
-          estimated_bytes=combined,
-          limit_bytes=limit)
 
   key_cols = [k.strip() for k in (keys or ()) if k.strip()]
   explicit_cols: list[str] | None = None
@@ -403,129 +344,12 @@ def run_diff(
       raise uris.UriError(
           "--columns: expected 'shared', 'all', or a comma-separated list "
           'of column names (e.g. --columns qty,location,price)')
-  # Set once both sources are read: the columns retained on each row when
-  # comparing a subset (`explicit_cols` or `columns='shared'`); None means keep
-  # every column on the row.
   shared_cols: list[frozenset[str] | None] = [
       (frozenset(explicit_cols) | frozenset(key_cols))
       if explicit_cols is not None else None
   ]
   sig_digits = (
       max(1, int(-math.log10(rtol))) if (rtol and rtol > 0) else None)
-
-  class _KeySummaryCombineFn(beam.CombineFn):
-    """O(1)-memory per-key summary: count, multiset hash, and single-row."""
-    def create_accumulator(self):
-      return [0, 0, 0, None, None]  # [count, xor_h, sum_h, single_row, key_repr]
-
-    def add_input(self, acc, item):
-      row_dict, key_display = item
-      digest_int = int.from_bytes(
-          _canonical_row_digest(row_dict, sig_digits), 'big')
-      new_count = acc[0] + 1
-      new_xor = acc[1] ^ digest_int
-      new_sum = (acc[2] + digest_int) & ((1 << 256) - 1)
-      single = row_dict if new_count == 1 else None
-      disp = acc[4] if acc[4] is not None else key_display
-      return [new_count, new_xor, new_sum, single, disp]
-
-    def merge_accumulators(self, accumulators):
-      total_c = 0
-      xor_h = 0
-      sum_h = 0
-      single = None
-      disp = None
-      for a in accumulators:
-        if a[0] == 0:
-          continue
-        if total_c == 0 and a[0] == 1:
-          single = a[3]
-        else:
-          single = None
-        total_c += a[0]
-        xor_h ^= a[1]
-        sum_h = (sum_h + a[2]) & ((1 << 256) - 1)
-        if disp is None and a[4] is not None:
-          disp = a[4]
-      if total_c != 1:
-        single = None
-      return [total_c, xor_h, sum_h, single, disp]
-
-    def extract_output(self, acc):
-      return tuple(acc)
-
-  class _GlobalDiffReportCombineFn(beam.CombineFn):
-    """Aggregates per-key reconciliation statuses into one bounded summary."""
-    def create_accumulator(self):
-      return {
-          'left_rows': 0,
-          'right_rows': 0,
-          'matched_rows': 0,
-          'only_in_left': 0,
-          'only_in_right': 0,
-          'value_mismatches': 0,
-          'duplicate_key_mismatches': 0,
-          'column_mismatch_counts': {},
-          'sample_drifts': [],
-          'key_lists': _empty_key_lists(),
-          'key_lists_truncated': False,
-      }
-
-    @staticmethod
-    def _add_key(acc, category, key):
-      bucket = acc['key_lists'][category]
-      if len(bucket) < eff_key_limit:
-        bucket.append(key)
-      else:
-        acc['key_lists_truncated'] = True
-
-    def add_input(self, acc, event: dict[str, Any]):
-      acc['left_rows'] += event['left_rows']
-      acc['right_rows'] += event['right_rows']
-      acc['matched_rows'] += event['matched_rows']
-      acc['only_in_left'] += event['only_in_left']
-      acc['only_in_right'] += event['only_in_right']
-      acc['value_mismatches'] += event['value_mismatches']
-      acc['duplicate_key_mismatches'] += event['duplicate_key_mismatches']
-      for col, cnt in event.get('col_mismatches', {}).items():
-        acc['column_mismatch_counts'][col] = (
-            acc['column_mismatch_counts'].get(col, 0) + cnt)
-      sample = event.get('sample')
-      if sample is not None and len(acc['sample_drifts']) < 10:
-        acc['sample_drifts'].append(sample)
-      if key_cols and sample is not None and 'key' in sample:
-        category = _KEY_CATEGORIES.get(sample.get('kind'))
-        if category:
-          key = sample['key']
-          if len(key_cols) == 1 and isinstance(key, dict):
-            key = key.get(key_cols[0])
-          self._add_key(acc, category, key)
-      return acc
-
-    def merge_accumulators(self, accumulators):
-      merged = self.create_accumulator()
-      for a in accumulators:
-        merged['left_rows'] += a['left_rows']
-        merged['right_rows'] += a['right_rows']
-        merged['matched_rows'] += a['matched_rows']
-        merged['only_in_left'] += a['only_in_left']
-        merged['only_in_right'] += a['only_in_right']
-        merged['value_mismatches'] += a['value_mismatches']
-        merged['duplicate_key_mismatches'] += a['duplicate_key_mismatches']
-        for col, cnt in a['column_mismatch_counts'].items():
-          merged['column_mismatch_counts'][col] = (
-              merged['column_mismatch_counts'].get(col, 0) + cnt)
-        for s in a['sample_drifts']:
-          if len(merged['sample_drifts']) < 10:
-            merged['sample_drifts'].append(s)
-        merged['key_lists_truncated'] |= a.get('key_lists_truncated', False)
-        for category, keys in a.get('key_lists', {}).items():
-          for key in keys:
-            self._add_key(merged, category, key)
-      return merged
-
-    def extract_output(self, acc):
-      return acc
 
   def _key_row(row):
     d = _row_to_plain_dict(row)
@@ -544,6 +368,17 @@ def run_diff(
       k_tuple = ((4, digest), )
       k_disp = d
     return (k_tuple, (d, k_disp))
+
+  def _acc_add_row(acc: list[Any], item: tuple[dict[str, Any], Any]) -> list[Any]:
+    row_dict, key_display = item
+    digest_int = int.from_bytes(
+        _canonical_row_digest(row_dict, sig_digits), 'big')
+    new_count = acc[0] + 1
+    new_xor = acc[1] ^ digest_int
+    new_sum = (acc[2] + digest_int) & ((1 << 256) - 1)
+    single = row_dict if new_count == 1 else None
+    disp = acc[4] if acc[4] is not None else key_display
+    return [new_count, new_xor, new_sum, single, disp]
 
   def _compare_grouped(item):
     _, grouped = item
@@ -669,7 +504,6 @@ def run_diff(
           },
       }
 
-    # Multi-row duplicate key (`l_cnt == r_cnt > 1`): compare O(1) multiset hash!
     if l_xor == r_xor and l_add == r_add:
       return {
           'left_rows': l_cnt,
@@ -698,7 +532,382 @@ def run_diff(
         },
     }
 
+  def _create_global_acc() -> dict[str, Any]:
+    return {
+        'left_rows': 0,
+        'right_rows': 0,
+        'matched_rows': 0,
+        'only_in_left': 0,
+        'only_in_right': 0,
+        'value_mismatches': 0,
+        'duplicate_key_mismatches': 0,
+        'column_mismatch_counts': {},
+        'sample_drifts': [],
+        'key_lists': _empty_key_lists(),
+        'key_lists_truncated': False,
+    }
+
+  def _global_add_key(acc: dict[str, Any], category: str, key: Any) -> None:
+    bucket = acc['key_lists'][category]
+    if len(bucket) < eff_key_limit:
+      bucket.append(key)
+    else:
+      acc['key_lists_truncated'] = True
+
+  def _global_add_event(
+      acc: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
+    acc['left_rows'] += event['left_rows']
+    acc['right_rows'] += event['right_rows']
+    acc['matched_rows'] += event['matched_rows']
+    acc['only_in_left'] += event['only_in_left']
+    acc['only_in_right'] += event['only_in_right']
+    acc['value_mismatches'] += event['value_mismatches']
+    acc['duplicate_key_mismatches'] += event['duplicate_key_mismatches']
+    for col, cnt in event.get('col_mismatches', {}).items():
+      acc['column_mismatch_counts'][col] = (
+          acc['column_mismatch_counts'].get(col, 0) + cnt)
+    sample = event.get('sample')
+    if sample is not None and len(acc['sample_drifts']) < 10:
+      acc['sample_drifts'].append(sample)
+    if key_cols and sample is not None and 'key' in sample:
+      category = _KEY_CATEGORIES.get(sample.get('kind'))
+      if category:
+        key = sample['key']
+        if len(key_cols) == 1 and isinstance(key, dict):
+          key = key.get(key_cols[0])
+        _global_add_key(acc, category, key)
+    return acc
+
+  def _compute_schema_diff(
+      left_schema: dict[str, str] | None,
+      right_schema: dict[str, str] | None) -> dict[str, Any] | None:
+    if left_schema is None or right_schema is None:
+      return None
+    if explicit_cols is not None:
+      avail_union = set(left_schema) | set(right_schema)
+      unknown_cols = [c for c in explicit_cols if c not in avail_union]
+      if unknown_cols:
+        raise uris.UriError(
+            f'--columns: unknown column(s) {unknown_cols}; available: '
+            f'{sorted(avail_union)}')
+    sdiff = {
+        'columns_added': sorted(set(right_schema) - set(left_schema)),
+        'columns_removed': sorted(set(left_schema) - set(right_schema)),
+        'type_changes': {
+            c: {'left': left_schema[c], 'right': right_schema[c]}
+            for c in sorted(set(left_schema) & set(right_schema))
+            if left_schema[c] != right_schema[c]
+        },
+        'compared_columns': (
+            explicit_cols if explicit_cols is not None else columns),
+    }
+    if columns == 'shared':
+      shared_cols[0] = frozenset(left_schema) & frozenset(right_schema)
+    return sdiff
+
+  def _finalize_report(
+      summary: dict[str, Any],
+      schema_diff: dict[str, Any] | None,
+      *,
+      job_id: str | None = None,
+      final_state: str = 'DONE',
+      runner_tag: str | None = None,
+  ) -> tuple[int, dict[str, Any]]:
+    samples = summary.pop('sample_drifts', [])
+    key_lists = summary.pop('key_lists', None) or _empty_key_lists()
+    keys_truncated = bool(summary.pop('key_lists_truncated', False))
+    differing_keys = None
+    warnings_list: list[str] = []
+    if key_cols:
+      differing_keys = {
+          category: sorted(
+              (output.sanitize_untrusted_value(k) for k in keys),
+              key=lambda k: json.dumps(k, sort_keys=True, default=str))
+          for category, keys in key_lists.items()
+      }
+      differing_keys['limit'] = eff_key_limit
+      differing_keys['truncated'] = keys_truncated
+      differing_keys['values_are_untrusted'] = True
+      if keys_truncated:
+        warnings_list.append(
+            f'outputs.differing_keys was capped at {eff_key_limit} keys per '
+            'category; pass --limit all (or --limit N) to list up to 100,000 '
+            'differing keys.')
+    if explicit_cols is not None:
+      req_set = set(explicit_cols)
+      schema_drift = bool(
+          schema_diff and (
+              (req_set & set(schema_diff['columns_added'])) or
+              (req_set & set(schema_diff['columns_removed'])) or
+              (req_set & set(schema_diff['type_changes']))))
+    else:
+      schema_drift = bool(
+          schema_diff and (
+              schema_diff['columns_added'] or schema_diff['columns_removed'] or
+              schema_diff['type_changes']))
+    identical = (
+        summary['only_in_left'] == 0 and summary['only_in_right'] == 0 and
+        summary['value_mismatches'] == 0 and
+        summary['duplicate_key_mismatches'] == 0 and
+        summary['left_rows'] == summary['right_rows'] and not schema_drift)
+    exit_code = EXIT_OK if identical else EXIT_DIFF_MISMATCH
+    report: dict[str, Any] = {
+        'match': identical,
+        'left': left_uri,
+        'right': right_uri,
+        'keys': key_cols,
+        'rtol': rtol,
+        'atol': atol,
+        'summary': summary,
+        'schema_diff': schema_diff,
+        'differing_keys': differing_keys,
+        'job_id': job_id,
+        'state': final_state,
+        'untrusted_data': output.wrap_untrusted_rows(
+            samples, truncated=len(samples) >= 10) if samples else None,
+    }
+    if runner_tag:
+      report['_runner'] = runner_tag
+    if warnings_list:
+      report['warnings'] = warnings_list
+    return exit_code, report
+
+  # Zero-SDK-import `local_fast` path (`<= 64 MiB` local file / Delta / Iceberg
+  # datasets with no explicit `--runner`): ~25-60ms instead of ~1.2s FnApiRunner!
   import os
+  def _arg_val(argv_list: list[str], flag: str) -> str | None:
+    for idx, tok in enumerate(argv_list):
+      if tok == flag and idx + 1 < len(argv_list):
+        return argv_list[idx + 1]
+      if tok.startswith(flag + '='):
+        return tok.split('=', 1)[1]
+    return None
+
+  explicit_runner = _arg_val(p_args, '--runner')
+  fast_proj = default_project or _arg_val(p_args, '--project')
+  _REMOTE_SCHEMES = ('gs://', 's3://', 'azfs://', 'hdfs://')
+  if (not os.environ.get('BEAM_CLI_NO_FAST_PATH') and not explicit_runner and
+      not any(u.lower().startswith(_REMOTE_SCHEMES) for u in (left_uri, right_uri))):
+    parsed_left_opts = uris.parse_kv_options(left_opts, None, '--left-opt')
+    parsed_right_opts = uris.parse_kv_options(right_opts, None, '--right-opt')
+    cand_left = uris.parse_endpoint(
+        left_uri,
+        is_read=True,
+        explicit_format=left_format,
+        options=parsed_left_opts,
+        default_project=fast_proj,
+        allow_sniff=True)
+    cand_right = uris.parse_endpoint(
+        right_uri,
+        is_read=True,
+        explicit_format=right_format,
+        options=parsed_right_opts,
+        default_project=fast_proj,
+        allow_sniff=True)
+    if (cand_left.kind in ('file', 'delta', 'iceberg') and
+        cand_right.kind in ('file', 'delta', 'iceberg')):
+      from . import pipe_sql
+      fast_ok = True
+      for ep_c in (cand_left, cand_right):
+        for cfg_k in ('path', 'table', 'warehouse'):
+          cfg_v = str(ep_c.config.get(cfg_k) or '').lower()
+          if cfg_v.startswith(_REMOTE_SCHEMES):
+            fast_ok = False
+        if ep_c.kind == 'file' and ep_c.format not in (
+            'csv', 'json', 'parquet', 'avro'):
+          fast_ok = False
+      if fast_ok:
+        for ep_c in (cand_left, cand_right):
+          if ep_c.kind == 'file':
+            try:
+              pipe_sql._match_source_files(ep_c.config['path'])
+            except pipe_sql.SqlPipeError:
+              raise uris.UriError(
+                  f'no files matched {ep_c.raw!r} '
+                  f'(checked {ep_c.config["path"]!r})') from None
+        cap_limit = (
+            cost_guard.parse_byte_size(max_bytes)
+            if max_bytes is not None else None)
+        l_est = cost_guard.estimate_endpoint_bytes(
+            cand_left, default_project=fast_proj, stop_after_bytes=cap_limit)
+        r_est = cost_guard.estimate_endpoint_bytes(
+            cand_right, default_project=fast_proj, stop_after_bytes=cap_limit)
+        l_b = l_est.get('estimated_bytes')
+        r_b = r_est.get('estimated_bytes')
+        comb_b = (l_b or 0) + (r_b or 0)
+        if cap_limit is not None and comb_b > cap_limit:
+          raise cost_guard.CostLimitError(
+              f'combined diff scan is {cost_guard.format_bytes(comb_b)} '
+              f'({comb_b:,} bytes), exceeding --max-bytes={max_bytes} '
+              f'({cap_limit:,} bytes)',
+              estimated_bytes=comb_b,
+              limit_bytes=cap_limit)
+        if l_b is not None and r_b is not None and comb_b <= 64 * 1024 * 1024:
+          def _load_fast_rows(ep_obj: uris.ParsedEndpoint) -> list[dict[str, Any]]:
+            if ep_obj.kind == 'file' and ep_obj.format == 'json':
+              out_r: list[dict[str, Any]] = []
+              for fp in pipe_sql._match_source_files(ep_obj.config['path']):
+                with pipe_sql._open_binary(fp) as bf:
+                  for raw_ln in bf:
+                    txt_ln = raw_ln.decode('utf-8-sig', errors='replace').strip()
+                    if txt_ln:
+                      out_r.append(json.loads(txt_ln))
+              return out_r
+            _, loaded_r, _ = pipe_sql.load_endpoint_rows(
+                ep_obj, default_project=fast_proj)
+            return loaded_r
+
+          schema_diff_fast = _compute_schema_diff(
+              _endpoint_schema(left_uri, left_format, left_opts, fast_proj),
+              _endpoint_schema(right_uri, right_format, right_opts, fast_proj))
+          left_rows_fast = _load_fast_rows(cand_left)
+          right_rows_fast = _load_fast_rows(cand_right)
+          left_map: dict[Any, list[Any]] = {}
+          right_map: dict[Any, list[Any]] = {}
+          for r in left_rows_fast:
+            kt, item = _key_row(r)
+            left_map[kt] = _acc_add_row(
+                left_map.get(kt, [0, 0, 0, None, None]), item)
+          for r in right_rows_fast:
+            kt, item = _key_row(r)
+            right_map[kt] = _acc_add_row(
+                right_map.get(kt, [0, 0, 0, None, None]), item)
+          g_acc = _create_global_acc()
+          for kt in (set(left_map) | set(right_map)):
+            ev = _compare_grouped((
+                kt,
+                {
+                    'left': [tuple(left_map[kt])] if kt in left_map else [],
+                    'right': [tuple(right_map[kt])] if kt in right_map else [],
+                }))
+            _global_add_event(g_acc, ev)
+          sanitized_summary = json.loads(
+              json.dumps(output.sanitize_untrusted_value(g_acc), allow_nan=False))
+          return _finalize_report(
+              sanitized_summary, schema_diff_fast, runner_tag='local_fast')
+
+  import apache_beam as beam
+  from apache_beam.options.pipeline_options import GoogleCloudOptions
+  from apache_beam.options.pipeline_options import PipelineOptions
+  from apache_beam.options.pipeline_options import StandardOptions
+
+  opts = PipelineOptions(p_args)
+  proj = default_project or opts.view_as(GoogleCloudOptions).project
+
+  std_opts = opts.view_as(StandardOptions)
+  if not std_opts.runner or std_opts.runner.lower() in (
+      'direct', 'directrunner'):
+    std_opts.runner = 'FnApiRunner'
+
+  from apache_beam.io.filesystems import FileSystems
+  FileSystems.set_options(opts)
+
+  parsed_left_opts = uris.parse_kv_options(left_opts, None, '--left-opt')
+  parsed_right_opts = uris.parse_kv_options(right_opts, None, '--right-opt')
+
+  left_ep = uris.parse_endpoint(
+      left_uri,
+      is_read=True,
+      explicit_format=left_format,
+      options=parsed_left_opts,
+      default_project=proj,
+      allow_sniff=True)
+  right_ep = uris.parse_endpoint(
+      right_uri,
+      is_read=True,
+      explicit_format=right_format,
+      options=parsed_right_opts,
+      default_project=proj,
+      allow_sniff=True)
+
+  for ep_chk in (left_ep, right_ep):
+    if ep_chk.kind == 'file':
+      if not FileSystems.match([ep_chk.config['path']])[0].metadata_list:
+        raise uris.UriError(
+            f'no files matched {ep_chk.raw!r} (checked {ep_chk.config["path"]!r})')
+
+  if max_bytes is not None:
+    limit = cost_guard.parse_byte_size(max_bytes)
+    left_est = cost_guard.estimate_endpoint_bytes(
+        left_ep, default_project=proj, stop_after_bytes=limit)
+    right_est = cost_guard.estimate_endpoint_bytes(
+        right_ep, default_project=proj, stop_after_bytes=limit)
+    combined = (left_est.get('estimated_bytes') or 0) + (
+        right_est.get('estimated_bytes') or 0)
+    if combined > limit:
+      raise cost_guard.CostLimitError(
+          f'combined diff scan is {cost_guard.format_bytes(combined)} '
+          f'({combined:,} bytes), exceeding --max-bytes={max_bytes} '
+          f'({limit:,} bytes)',
+          estimated_bytes=combined,
+          limit_bytes=limit)
+
+  class _KeySummaryCombineFn(beam.CombineFn):
+    """O(1)-memory per-key summary: count, multiset hash, and single-row."""
+    def create_accumulator(self):
+      return [0, 0, 0, None, None]
+
+    def add_input(self, acc, item):
+      return _acc_add_row(acc, item)
+
+    def merge_accumulators(self, accumulators):
+      total_c = 0
+      xor_h = 0
+      sum_h = 0
+      single = None
+      disp = None
+      for a in accumulators:
+        if a[0] == 0:
+          continue
+        if total_c == 0 and a[0] == 1:
+          single = a[3]
+        else:
+          single = None
+        total_c += a[0]
+        xor_h ^= a[1]
+        sum_h = (sum_h + a[2]) & ((1 << 256) - 1)
+        if disp is None and a[4] is not None:
+          disp = a[4]
+      if total_c != 1:
+        single = None
+      return [total_c, xor_h, sum_h, single, disp]
+
+    def extract_output(self, acc):
+      return tuple(acc)
+
+  class _GlobalDiffReportCombineFn(beam.CombineFn):
+    """Aggregates per-key reconciliation statuses into one bounded summary."""
+    def create_accumulator(self):
+      return _create_global_acc()
+
+    def add_input(self, acc, event: dict[str, Any]):
+      return _global_add_event(acc, event)
+
+    def merge_accumulators(self, accumulators):
+      merged = self.create_accumulator()
+      for a in accumulators:
+        merged['left_rows'] += a['left_rows']
+        merged['right_rows'] += a['right_rows']
+        merged['matched_rows'] += a['matched_rows']
+        merged['only_in_left'] += a['only_in_left']
+        merged['only_in_right'] += a['only_in_right']
+        merged['value_mismatches'] += a['value_mismatches']
+        merged['duplicate_key_mismatches'] += a['duplicate_key_mismatches']
+        for col, cnt in a['column_mismatch_counts'].items():
+          merged['column_mismatch_counts'][col] = (
+              merged['column_mismatch_counts'].get(col, 0) + cnt)
+        for s in a['sample_drifts']:
+          if len(merged['sample_drifts']) < 10:
+            merged['sample_drifts'].append(s)
+        merged['key_lists_truncated'] |= a.get('key_lists_truncated', False)
+        for category, keys in a.get('key_lists', {}).items():
+          for key in keys:
+            _global_add_key(merged, category, key)
+      return merged
+
+    def extract_output(self, acc):
+      return acc
+
   import shutil
   import tempfile
   import uuid
@@ -725,29 +934,9 @@ def run_diff(
     pipeline = beam.Pipeline(options=opts)
     left_pcoll = _read_endpoint_pcoll(pipeline, 'ReadLeft', left_ep)
     right_pcoll = _read_endpoint_pcoll(pipeline, 'ReadRight', right_ep)
-    left_schema = _endpoint_schema(left_uri, left_format, left_opts, proj)
-    right_schema = _endpoint_schema(right_uri, right_format, right_opts, proj)
-    if left_schema is not None and right_schema is not None:
-      if explicit_cols is not None:
-        avail_union = set(left_schema) | set(right_schema)
-        unknown_cols = [c for c in explicit_cols if c not in avail_union]
-        if unknown_cols:
-          raise uris.UriError(
-              f'--columns: unknown column(s) {unknown_cols}; available: '
-              f'{sorted(avail_union)}')
-      schema_diff = {
-          'columns_added': sorted(set(right_schema) - set(left_schema)),
-          'columns_removed': sorted(set(left_schema) - set(right_schema)),
-          'type_changes': {
-              c: {'left': left_schema[c], 'right': right_schema[c]}
-              for c in sorted(set(left_schema) & set(right_schema))
-              if left_schema[c] != right_schema[c]
-          },
-          'compared_columns': (
-              explicit_cols if explicit_cols is not None else columns),
-      }
-      if columns == 'shared':
-        shared_cols[0] = frozenset(left_schema) & frozenset(right_schema)
+    schema_diff = _compute_schema_diff(
+        _endpoint_schema(left_uri, left_format, left_opts, proj),
+        _endpoint_schema(right_uri, right_format, right_opts, proj))
 
     left_sum = (
         left_pcoll
@@ -814,52 +1003,5 @@ def run_diff(
     if tmp_dir is not None:
       shutil.rmtree(tmp_dir, ignore_errors=True)
 
-  samples = summary.pop('sample_drifts', [])
-  key_lists = summary.pop('key_lists', None) or _empty_key_lists()
-  keys_truncated = bool(summary.pop('key_lists_truncated', False))
-  differing_keys = None
-  if key_cols:
-    # Key values come from the data: sanitized, capped, and flagged untrusted.
-    differing_keys = {
-        category: sorted(
-            (output.sanitize_untrusted_value(k) for k in keys),
-            key=lambda k: json.dumps(k, sort_keys=True, default=str))
-        for category, keys in key_lists.items()
-    }
-    differing_keys['limit'] = eff_key_limit
-    differing_keys['truncated'] = keys_truncated
-    differing_keys['values_are_untrusted'] = True
-  if explicit_cols is not None:
-    req_set = set(explicit_cols)
-    schema_drift = bool(
-        schema_diff and (
-            (req_set & set(schema_diff['columns_added'])) or
-            (req_set & set(schema_diff['columns_removed'])) or
-            (req_set & set(schema_diff['type_changes']))))
-  else:
-    schema_drift = bool(
-        schema_diff and (
-            schema_diff['columns_added'] or schema_diff['columns_removed'] or
-            schema_diff['type_changes']))
-  identical = (
-      summary['only_in_left'] == 0 and summary['only_in_right'] == 0 and
-      summary['value_mismatches'] == 0 and
-      summary['duplicate_key_mismatches'] == 0 and
-      summary['left_rows'] == summary['right_rows'] and not schema_drift)
-  exit_code = EXIT_OK if identical else EXIT_DIFF_MISMATCH
-  report = {
-      'match': identical,
-      'left': left_uri,
-      'right': right_uri,
-      'keys': key_cols,
-      'rtol': rtol,
-      'atol': atol,
-      'summary': summary,
-      'schema_diff': schema_diff,
-      'differing_keys': differing_keys,
-      'job_id': job_id,
-      'state': final_state,
-      'untrusted_data': output.wrap_untrusted_rows(
-          samples, truncated=len(samples) >= 10) if samples else None,
-  }
-  return exit_code, report
+  return _finalize_report(summary, schema_diff, job_id=job_id, final_state=final_state)
+
