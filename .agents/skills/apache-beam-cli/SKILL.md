@@ -11,8 +11,13 @@ Use `beam` whenever moving, converting, filtering, joining/aggregating (`--join`
 
 - **Clean/filter/project dirty CSV or JSONL with DLQ + row conservation** (`<0.4s` locally):
   `beam pipe --from data.csv --to out/clean.parquet --dlq out/bad.jsonl --where "state != 'CA' AND amount > 0" --select "id, zip, amount" --assert-counts --json` *(override column types if needed: `--from-opt fields=amount:float`)*
-- **Mixed-format directory glob (`.jsonl` + `.csv`, even with reordered CSV headers)**:
+- **Mixed-format directory glob (`.jsonl` + `.csv`, even with reordered CSV headers or in local `--sql`)**:
   `beam pipe --from "data/mixed/*" --to out/unified.parquet --dlq out/bad.jsonl --where "amount > 0" --assert-counts --json`
+  *(or local SQL aggregations over mixed-format directory globs: `beam pipe --from "data/metrics/*" --sql "SELECT type, COUNT(*), AVG(val) FROM PCOLLECTION GROUP BY 1" --to out/metrics.json --json`)*
+- **Windowed event-time pipeline scaffolding (`--window` + `--timestamp-col`) & Flex packaging**:
+  `beam pipe --from stream.parquet --timestamp-col event_ts --window fixed:60s --to out/windowed.parquet --emit-yaml > pipelines/windowed.yaml`
+  `beam check pipelines/windowed.yaml --json`
+  `beam package pipelines/windowed.yaml -o gs://bucket/spec.json --sdk YAML --dry-run --json`
 - **Normalize mixed timestamps (ISO `Z`, `+02:00`/`-05:00`, naive, epoch sec/ms) to UTC & deduplicate**:
   `beam pipe --from e=events.parquet --sql "SELECT event_id, user, ts_utc, amount FROM (SELECT event_id, user, to_utc(ts) AS ts_utc, amount, ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY to_utc(ts) DESC) AS rn FROM e) WHERE rn = 1 ORDER BY event_id" --to out/events_clean.parquet --json`
 - **Schema-evolution append (rename column + fill new column with `NULL`; supports in-place `--if-exists replace`)**:
