@@ -1282,6 +1282,17 @@ class InputValidationAndResourceBoundsPass5Test(unittest.TestCase):
     self.assertNotIn('eyJhbGciOi', scrubbed)
     self.assertIn('<redacted-value>', scrubbed)
 
+    try:
+      from apache_beam_cli_preview import launcher as prev_launcher
+    except ImportError:
+      prev_launcher = None
+    if prev_launcher is not None:
+      sym_cache = os.path.join(self.tmp, 'sym_cache')
+      os.symlink(ext_dir, sym_cache)
+      with mock.patch.dict(os.environ, {'BEAM_CACHE_DIR': sym_cache}):
+        with self.assertRaises(RuntimeError):
+          prev_launcher.ensure_preview_wheel()
+
 
 if __name__ == '__main__':
   unittest.main()

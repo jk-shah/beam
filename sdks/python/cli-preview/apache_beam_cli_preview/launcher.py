@@ -321,13 +321,16 @@ def ensure_preview_wheel() -> str:
     cache_root = Path(os.path.expanduser(beam_home_env)) / 'cache'
   else:
     cache_root = Path.home() / '.beam' / 'cache'
+  if os.path.islink(cache_root):
+    raise RuntimeError(
+        f'refusing symlinked cache directory {str(cache_root)!r}')
   wheel_dir = cache_root / 'wheels' / digest
   wheel_name = f'apache_beam_cli_preview-{__version__}-py3-none-any.whl'
   wheel_path = wheel_dir / wheel_name
-  if wheel_path.is_file():
+  if wheel_path.is_file() and not os.path.islink(wheel_path):
     return str(wheel_path)
   try:
-    wheel_dir.mkdir(parents=True, exist_ok=True)
+    wheel_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
   except OSError:
     if explicit_cache:
       raise

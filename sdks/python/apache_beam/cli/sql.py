@@ -540,13 +540,19 @@ def _build_shaded_jar(
 
     # Atomic replace inside the cache directory so Ctrl-C never leaves a
     # truncated JAR that a later run would mistake for a valid cache hit.
-    tmp_jar = f'{jar_path}.{os.getpid()}.part'
+    jar_dir = os.path.dirname(os.path.abspath(jar_path)) or '.'
+    os.makedirs(jar_dir, mode=0o700, exist_ok=True)
+    fd, tmp_jar = tempfile.mkstemp(prefix='.tmp_jar_', suffix='.part', dir=jar_dir)
+    os.close(fd)
     try:
       shutil.copyfile(built_jar, tmp_jar)
       os.replace(tmp_jar, jar_path)
     finally:
       if os.path.exists(tmp_jar):
-        os.remove(tmp_jar)
+        try:
+          os.remove(tmp_jar)
+        except OSError:
+          pass
 
   print(f'Cached Beam SQL JAR at {jar_path}', file=sys.stderr)
 
