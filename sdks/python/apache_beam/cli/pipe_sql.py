@@ -788,7 +788,10 @@ class _Stddev:
 
   def step(self, value):
     if value is not None:
-      self._values.append(float(value))
+      try:
+        self._values.append(float(value))
+      except (ValueError, TypeError):
+        pass
 
   def finalize(self):
     if len(self._values) < 2:
@@ -796,6 +799,174 @@ class _Stddev:
     mean = sum(self._values) / len(self._values)
     return math.sqrt(
         sum((v - mean)**2 for v in self._values) / (len(self._values) - 1))
+
+
+class _StddevPop:
+  """Population standard deviation (STDDEV_POP)."""
+  def __init__(self):
+    self._values: list[float] = []
+
+  def step(self, value):
+    if value is not None:
+      try:
+        self._values.append(float(value))
+      except (ValueError, TypeError):
+        pass
+
+  def finalize(self):
+    if not self._values:
+      return None
+    mean = sum(self._values) / len(self._values)
+    return math.sqrt(sum((v - mean)**2 for v in self._values) / len(self._values))
+
+
+class _VarianceSamp:
+  """Sample variance (VARIANCE / VAR_SAMP)."""
+  def __init__(self):
+    self._values: list[float] = []
+
+  def step(self, value):
+    if value is not None:
+      try:
+        self._values.append(float(value))
+      except (ValueError, TypeError):
+        pass
+
+  def finalize(self):
+    if len(self._values) < 2:
+      return None
+    mean = sum(self._values) / len(self._values)
+    return sum((v - mean)**2 for v in self._values) / (len(self._values) - 1)
+
+
+class _VariancePop:
+  """Population variance (VAR_POP)."""
+  def __init__(self):
+    self._values: list[float] = []
+
+  def step(self, value):
+    if value is not None:
+      try:
+        self._values.append(float(value))
+      except (ValueError, TypeError):
+        pass
+
+  def finalize(self):
+    if not self._values:
+      return None
+    mean = sum(self._values) / len(self._values)
+    return sum((v - mean)**2 for v in self._values) / len(self._values)
+
+
+class _RegrAccumulator:
+  """Numerically stable two-variable accumulator for linear regression (OLS).
+
+  Maintains Welford running sums for (y, x) pairs where neither y nor x is null:
+    n: count of pairs
+    mean_x, mean_y: running sample means
+    m2_x: sum of squared deviations for x
+    m2_y: sum of squared deviations for y
+    c_xy: sum of cross-products of deviations
+  """
+  def __init__(self):
+    self.n = 0
+    self.mean_x = 0.0
+    self.mean_y = 0.0
+    self.m2_x = 0.0
+    self.m2_y = 0.0
+    self.c_xy = 0.0
+
+  def step(self, y, x):
+    if y is None or x is None:
+      return
+    try:
+      yf = float(y)
+      xf = float(x)
+    except (ValueError, TypeError):
+      return
+    self.n += 1
+    dx = xf - self.mean_x
+    self.mean_x += dx / self.n
+    dy = yf - self.mean_y
+    self.mean_y += dy / self.n
+    self.m2_x += dx * (xf - self.mean_x)
+    self.m2_y += dy * (yf - self.mean_y)
+    self.c_xy += dx * (yf - self.mean_y)
+
+
+class _RegrSlope(_RegrAccumulator):
+  def finalize(self):
+    if self.n < 2 or self.m2_x <= 0:
+      return None
+    return self.c_xy / self.m2_x
+
+
+class _RegrIntercept(_RegrAccumulator):
+  def finalize(self):
+    if self.n < 2 or self.m2_x <= 0:
+      return None
+    slope = self.c_xy / self.m2_x
+    return self.mean_y - slope * self.mean_x
+
+
+class _RegrR2(_RegrAccumulator):
+  def finalize(self):
+    if self.n < 2 or self.m2_x <= 0 or self.m2_y <= 0:
+      return None
+    r = self.c_xy / math.sqrt(self.m2_x * self.m2_y)
+    return r * r
+
+
+class _Corr(_RegrAccumulator):
+  def finalize(self):
+    if self.n < 2 or self.m2_x <= 0 or self.m2_y <= 0:
+      return None
+    val = self.c_xy / math.sqrt(self.m2_x * self.m2_y)
+    return max(-1.0, min(1.0, val))
+
+
+class _CovarPop(_RegrAccumulator):
+  def finalize(self):
+    if self.n < 1:
+      return None
+    return self.c_xy / self.n
+
+
+class _CovarSamp(_RegrAccumulator):
+  def finalize(self):
+    if self.n < 2:
+      return None
+    return self.c_xy / (self.n - 1)
+
+
+class _RegrCount(_RegrAccumulator):
+  def finalize(self):
+    return self.n
+
+
+class _RegrAvgX(_RegrAccumulator):
+  def finalize(self):
+    return self.mean_x if self.n > 0 else None
+
+
+class _RegrAvgY(_RegrAccumulator):
+  def finalize(self):
+    return self.mean_y if self.n > 0 else None
+
+
+class _RegrSXX(_RegrAccumulator):
+  def finalize(self):
+    return self.m2_x if self.n >= 2 else None
+
+
+class _RegrSYY(_RegrAccumulator):
+  def finalize(self):
+    return self.m2_y if self.n >= 2 else None
+
+
+class _RegrSXY(_RegrAccumulator):
+  def finalize(self):
+    return self.c_xy if self.n >= 2 else None
 
 
 def _register_aggregate_functions(conn: sqlite3.Connection) -> None:
@@ -810,6 +981,22 @@ def _register_aggregate_functions(conn: sqlite3.Connection) -> None:
   conn.create_aggregate('QUANTILE_CONT', 2, _Quantile)
   conn.create_aggregate('STDDEV', 1, _Stddev)
   conn.create_aggregate('STDDEV_SAMP', 1, _Stddev)
+  conn.create_aggregate('STDDEV_POP', 1, _StddevPop)
+  conn.create_aggregate('VARIANCE', 1, _VarianceSamp)
+  conn.create_aggregate('VAR_SAMP', 1, _VarianceSamp)
+  conn.create_aggregate('VAR_POP', 1, _VariancePop)
+  conn.create_aggregate('REGR_SLOPE', 2, _RegrSlope)
+  conn.create_aggregate('REGR_INTERCEPT', 2, _RegrIntercept)
+  conn.create_aggregate('REGR_R2', 2, _RegrR2)
+  conn.create_aggregate('CORR', 2, _Corr)
+  conn.create_aggregate('COVAR_POP', 2, _CovarPop)
+  conn.create_aggregate('COVAR_SAMP', 2, _CovarSamp)
+  conn.create_aggregate('REGR_COUNT', 2, _RegrCount)
+  conn.create_aggregate('REGR_AVGX', 2, _RegrAvgX)
+  conn.create_aggregate('REGR_AVGY', 2, _RegrAvgY)
+  conn.create_aggregate('REGR_SXX', 2, _RegrSXX)
+  conn.create_aggregate('REGR_SYY', 2, _RegrSYY)
+  conn.create_aggregate('REGR_SXY', 2, _RegrSXY)
 
 
 # Functions and syntax from other dialects mapped to what local SQL supports.
@@ -828,11 +1015,10 @@ _SQL_DIALECT_HINTS = (
                 re.I),
      "use strftime(), e.g. strftime('%Y-%m', ts)"),
     (re.compile(
-        r'no such function: (regr_\w+|corr|covar_\w+|arg_max|arg_min|'
+        r'no such function: (arg_max|arg_min|'
         r'max_by|min_by|mode|bool_and|bool_or|string_agg|array_agg)',
         re.I),
-     'statistical and ANSI warehouse aggregates require --sql-engine duckdb '
-     '(or Python numpy/scipy for linear regression)'),
+     'advanced warehouse aggregates require --sql-engine duckdb'),
     (re.compile(r'no such table|table .* does not exist|replacement scan', re.I),
      'name each input with --from ALIAS=PATH / --join ALIAS=PATH (inputs are '
      'pre-loaded as tables, never file paths; without an alias use the file '

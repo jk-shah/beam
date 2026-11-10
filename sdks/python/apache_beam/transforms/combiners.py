@@ -22,10 +22,12 @@
 import copy
 import heapq
 import itertools
+import math
 import operator
 import random
 from collections.abc import Iterable
 from typing import Any
+from typing import NamedTuple
 from typing import TypeVar
 from typing import Union
 
@@ -52,6 +54,11 @@ __all__ = [
     'ToList',
     'ToSet',
     'Latest',
+    'Variance',
+    'StandardDeviation',
+    'Covariance',
+    'LinearRegression',
+    'RegressionResult',
     'CountCombineFn',
     'MeanCombineFn',
     'SampleCombineFn',
@@ -60,6 +67,10 @@ __all__ = [
     'ToListCombineFn',
     'ToSetCombineFn',
     'LatestCombineFn',
+    'VarianceCombineFn',
+    'StandardDeviationCombineFn',
+    'CovarianceCombineFn',
+    'LinearRegressionCombineFn',
 ]
 
 # Type variables
@@ -129,6 +140,348 @@ class MeanCombineFn(core.CombineFn):
     elif input_type is float:
       return cy_combiners.MeanFloatFn()
     return self
+
+
+class Variance(object):
+  """Combiners for computing sample or population variance of elements."""
+  class Globally(CombinerWithoutDefaults):
+    """combiners.Variance.Globally computes the variance of elements."""
+    def __init__(self, sample=True, has_defaults=True):
+      super().__init__(has_defaults=has_defaults)
+      self._sample = sample
+
+    def expand(self, pcoll):
+      combine_fn = VarianceCombineFn(sample=self._sample)
+      if self.has_defaults:
+        return pcoll | core.CombineGlobally(combine_fn)
+      else:
+        return pcoll | core.CombineGlobally(combine_fn).without_defaults()
+
+  class PerKey(ptransform.PTransform):
+    """combiners.Variance.PerKey finds the variance of elements for each key."""
+    def __init__(self, sample=True):
+      super().__init__()
+      self._sample = sample
+
+    def expand(self, pcoll):
+      return pcoll | core.CombinePerKey(VarianceCombineFn(sample=self._sample))
+
+
+@with_input_types(Union[float, int, np.int64, np.float64])
+@with_output_types(float)
+class VarianceCombineFn(core.CombineFn):
+  """CombineFn for computing variance using Chan's parallel algorithm.
+
+  Args:
+    sample: If True (default), computes sample variance (divided by n - 1).
+      If False, computes population variance (divided by n).
+  """
+  def __init__(self, sample=True):
+    self._sample = sample
+
+  def create_accumulator(self):
+    return (0, 0.0, 0.0)
+
+  def add_input(self, accumulator, element):
+    count, mean, m2 = accumulator
+    if element is None:
+      return accumulator
+    count += 1
+    delta = element - mean
+    mean += delta / count
+    m2 += delta * (element - mean)
+    return (count, mean, m2)
+
+  def merge_accumulators(self, accumulators):
+    count = 0
+    mean = 0.0
+    m2 = 0.0
+    for c, m, m_2 in accumulators:
+      if c == 0:
+        continue
+      if count == 0:
+        count, mean, m2 = c, m, m_2
+      else:
+        new_count = count + c
+        delta = m - mean
+        mean += delta * c / new_count
+        m2 += m_2 + delta * delta * count * c / new_count
+        count = new_count
+    return (count, mean, m2)
+
+  def extract_output(self, accumulator):
+    count, _, m2 = accumulator
+    if self._sample:
+      if count < 2:
+        return float('nan')
+      return m2 / (count - 1)
+    else:
+      if count < 1:
+        return float('nan')
+      return m2 / count
+
+
+class StandardDeviation(object):
+  """Combiners for computing sample or population standard deviation."""
+  class Globally(CombinerWithoutDefaults):
+    """combiners.StandardDeviation.Globally computes standard deviation of elements."""
+    def __init__(self, sample=True, has_defaults=True):
+      super().__init__(has_defaults=has_defaults)
+      self._sample = sample
+
+    def expand(self, pcoll):
+      combine_fn = StandardDeviationCombineFn(sample=self._sample)
+      if self.has_defaults:
+        return pcoll | core.CombineGlobally(combine_fn)
+      else:
+        return pcoll | core.CombineGlobally(combine_fn).without_defaults()
+
+  class PerKey(ptransform.PTransform):
+    """combiners.StandardDeviation.PerKey computes standard deviation per key."""
+    def __init__(self, sample=True):
+      super().__init__()
+      self._sample = sample
+
+    def expand(self, pcoll):
+      return pcoll | core.CombinePerKey(
+          StandardDeviationCombineFn(sample=self._sample))
+
+
+@with_input_types(Union[float, int, np.int64, np.float64])
+@with_output_types(float)
+class StandardDeviationCombineFn(VarianceCombineFn):
+  """CombineFn for computing standard deviation."""
+  def extract_output(self, accumulator):
+    var = super().extract_output(accumulator)
+    if math.isnan(var):
+      return float('nan')
+    return math.sqrt(var)
+
+
+class Covariance(object):
+  """Combiners for computing sample or population covariance of (x, y) pairs."""
+  class Globally(CombinerWithoutDefaults):
+    """combiners.Covariance.Globally computes covariance across elements."""
+    def __init__(self, sample=True, x=None, y=None, has_defaults=True):
+      super().__init__(has_defaults=has_defaults)
+      self._sample = sample
+      self._x = x
+      self._y = y
+
+    def expand(self, pcoll):
+      combine_fn = CovarianceCombineFn(
+          sample=self._sample, x=self._x, y=self._y)
+      if self.has_defaults:
+        return pcoll | core.CombineGlobally(combine_fn)
+      else:
+        return pcoll | core.CombineGlobally(combine_fn).without_defaults()
+
+  class PerKey(ptransform.PTransform):
+    """combiners.Covariance.PerKey computes covariance per key."""
+    def __init__(self, sample=True, x=None, y=None):
+      super().__init__()
+      self._sample = sample
+      self._x = x
+      self._y = y
+
+    def expand(self, pcoll):
+      return pcoll | core.CombinePerKey(
+          CovarianceCombineFn(sample=self._sample, x=self._x, y=self._y))
+
+
+@with_input_types(Any)
+@with_output_types(float)
+class CovarianceCombineFn(core.CombineFn):
+  """CombineFn for computing covariance between two variables.
+
+  Accepts (x, y) 2-tuples/sequences or dict/Row objects when x and y keys are specified.
+  """
+  def __init__(self, sample=True, x=None, y=None):
+    self._sample = sample
+    self._x = x
+    self._y = y
+
+  def create_accumulator(self):
+    return (0, 0.0, 0.0, 0.0)
+
+  def add_input(self, accumulator, element):
+    count, mx, my, cxy = accumulator
+    if element is None:
+      return accumulator
+    if self._x is not None and self._y is not None:
+      xv = element[self._x]
+      yv = element[self._y]
+    else:
+      xv, yv = element[0], element[1]
+    if xv is None or yv is None:
+      return accumulator
+    count += 1
+    dx = xv - mx
+    mx += dx / count
+    dy = yv - my
+    my += dy / count
+    cxy += dx * (yv - my)
+    return (count, mx, my, cxy)
+
+  def merge_accumulators(self, accumulators):
+    count = 0
+    mx = 0.0
+    my = 0.0
+    cxy = 0.0
+    for c, _mx, _my, _cxy in accumulators:
+      if c == 0:
+        continue
+      if count == 0:
+        count, mx, my, cxy = c, _mx, _my, _cxy
+      else:
+        new_count = count + c
+        dx = _mx - mx
+        dy = _my - my
+        mx += dx * c / new_count
+        my += dy * c / new_count
+        cxy += _cxy + dx * dy * count * c / new_count
+        count = new_count
+    return (count, mx, my, cxy)
+
+  def extract_output(self, accumulator):
+    count, _, _, cxy = accumulator
+    if self._sample:
+      if count < 2:
+        return float('nan')
+      return cxy / (count - 1)
+    else:
+      if count < 1:
+        return float('nan')
+      return cxy / count
+
+
+class RegressionResult(NamedTuple):
+  """Result of an ordinary least squares regression fit."""
+  count: int
+  slope: float
+  intercept: float
+  r: float
+  r2: float
+  mean_x: float
+  mean_y: float
+
+
+class LinearRegression(object):
+  """Combiners for fitting ordinary least squares linear regression y = slope * x + intercept."""
+  class Globally(CombinerWithoutDefaults):
+    """combiners.LinearRegression.Globally fits linear regression across elements."""
+    def __init__(self, x=None, y=None, has_defaults=True):
+      super().__init__(has_defaults=has_defaults)
+      self._x = x
+      self._y = y
+
+    def expand(self, pcoll):
+      combine_fn = LinearRegressionCombineFn(x=self._x, y=self._y)
+      if self.has_defaults:
+        return pcoll | core.CombineGlobally(combine_fn)
+      else:
+        return pcoll | core.CombineGlobally(combine_fn).without_defaults()
+
+  class PerKey(ptransform.PTransform):
+    """combiners.LinearRegression.PerKey fits linear regression per key."""
+    def __init__(self, x=None, y=None):
+      super().__init__()
+      self._x = x
+      self._y = y
+
+    def expand(self, pcoll):
+      return pcoll | core.CombinePerKey(
+          LinearRegressionCombineFn(x=self._x, y=self._y))
+
+
+@with_input_types(Any)
+@with_output_types(RegressionResult)
+class LinearRegressionCombineFn(core.CombineFn):
+  """CombineFn for computing ordinary least squares linear regression.
+
+  Returns a RegressionResult(count, slope, intercept, r, r2, mean_x, mean_y).
+  Accepts (x, y) pairs, or dict/Row objects when x and y keys are specified.
+  """
+  def __init__(self, x=None, y=None):
+    self._x = x
+    self._y = y
+
+  def create_accumulator(self):
+    return (0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+  def add_input(self, accumulator, element):
+    n, mx, my, cxx, cxy, cyy = accumulator
+    if element is None:
+      return accumulator
+    if self._x is not None and self._y is not None:
+      xv = element[self._x]
+      yv = element[self._y]
+    else:
+      xv, yv = element[0], element[1]
+    if xv is None or yv is None:
+      return accumulator
+    n += 1
+    dx = xv - mx
+    mx += dx / n
+    dy = yv - my
+    my += dy / n
+    cxx += dx * (xv - mx)
+    cyy += dy * (yv - my)
+    cxy += dx * (yv - my)
+    return (n, mx, my, cxx, cxy, cyy)
+
+  def merge_accumulators(self, accumulators):
+    n = 0
+    mx = 0.0
+    my = 0.0
+    cxx = 0.0
+    cxy = 0.0
+    cyy = 0.0
+    for c, _mx, _my, _cxx, _cxy, _cyy in accumulators:
+      if c == 0:
+        continue
+      if n == 0:
+        n, mx, my, cxx, cxy, cyy = c, _mx, _my, _cxx, _cxy, _cyy
+      else:
+        new_n = n + c
+        dx = _mx - mx
+        dy = _my - my
+        mx += dx * c / new_n
+        my += dy * c / new_n
+        cxx += _cxx + dx * dx * n * c / new_n
+        cyy += _cyy + dy * dy * n * c / new_n
+        cxy += _cxy + dx * dy * n * c / new_n
+        n = new_n
+    return (n, mx, my, cxx, cxy, cyy)
+
+  def extract_output(self, accumulator):
+    n, mx, my, cxx, cxy, cyy = accumulator
+    if n < 2 or cxx == 0.0:
+      return RegressionResult(
+          count=n,
+          slope=float('nan'),
+          intercept=float('nan'),
+          r=float('nan'),
+          r2=float('nan'),
+          mean_x=mx if n > 0 else float('nan'),
+          mean_y=my if n > 0 else float('nan'))
+    slope = cxy / cxx
+    intercept = my - slope * mx
+    denom = cxx * cyy
+    if denom <= 0.0:
+      r = 0.0
+      r2 = 0.0
+    else:
+      r = cxy / math.sqrt(denom)
+      r2 = min(1.0, max(0.0, (cxy * cxy) / denom))
+    return RegressionResult(
+        count=n,
+        slope=slope,
+        intercept=intercept,
+        r=r,
+        r2=r2,
+        mean_x=mx,
+        mean_y=my)
 
 
 class Count(object):

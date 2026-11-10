@@ -434,6 +434,50 @@ class LocalSqlDialectTest(unittest.TestCase):
     self.assertAlmostEqual(row['q25'], 20.0)
     self.assertAlmostEqual(row['sd'], 35.355339, places=5)
 
+  def test_regression_and_bivariate_aggregates(self):
+    pts_file = os.path.join(self.tmp, 'ad_spend.csv')
+    with open(pts_file, 'w', encoding='utf-8') as f:
+      f.write('ad_spend,revenue\n')
+      f.write('10,25.0\n20,41.0\n30,62.0\n40,79.0\n50,98.0\n'
+              '60,122.0\n70,139.0\n80,160.0\n90,175.0\n100,201.0\n')
+
+    # Test on default SQLite engine
+    rc, env, err = _run_json([
+        'pipe', '--from', f'a={pts_file}', '--sql',
+        'SELECT '
+        'regr_slope(revenue, ad_spend) AS slope, '
+        'regr_intercept(revenue, ad_spend) AS intercept, '
+        'regr_r2(revenue, ad_spend) AS r2, '
+        'corr(revenue, ad_spend) AS r, '
+        'covar_pop(revenue, ad_spend) AS covar_p, '
+        'regr_slope(revenue, ad_spend) * 150 + regr_intercept(revenue, ad_spend) AS pred '
+        'FROM a'
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    row = env['untrusted_data']['rows'][0]
+    self.assertAlmostEqual(row['slope'], 1.9490909, places=5)
+    self.assertAlmostEqual(row['intercept'], 3.0, places=5)
+    self.assertAlmostEqual(row['r2'], 0.9985911, places=5)
+    self.assertAlmostEqual(row['r'], 0.9992953, places=5)
+    self.assertAlmostEqual(row['pred'], 295.363636, places=4)
+
+    # Test on DuckDB engine
+    rc_duck, env_duck, err_duck = _run_json([
+        'pipe', '--from', f'a={pts_file}', '--sql-engine', 'duckdb', '--sql',
+        'SELECT '
+        'regr_slope(revenue, ad_spend) AS slope, '
+        'regr_intercept(revenue, ad_spend) AS intercept, '
+        'regr_r2(revenue, ad_spend) AS r2, '
+        'corr(revenue, ad_spend) AS r '
+        'FROM a'
+    ])
+    self.assertEqual(rc_duck, cli.EXIT_OK, err_duck)
+    row_duck = env_duck['untrusted_data']['rows'][0]
+    self.assertAlmostEqual(row_duck['slope'], 1.9490909, places=5)
+    self.assertAlmostEqual(row_duck['intercept'], 3.0, places=5)
+    self.assertAlmostEqual(row_duck['r2'], 0.9985911, places=5)
+    self.assertAlmostEqual(row_duck['r'], 0.9992953, places=5)
+
   def test_other_dialect_percentiles_get_a_hint(self):
     for query in (
         'SELECT PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY ms) FROM l',
@@ -3565,11 +3609,18 @@ class Round11FixesTest(unittest.TestCase):
     self.assertEqual(len(env_all['outputs']['differing_keys']['only_in_left']), 135)
     self.assertFalse(env_all['outputs']['differing_keys']['truncated'])
 
-    rc_regr, env_regr, _ = _run_json([
+    # regr_slope is now natively supported on default SQLite:
+    rc_regr, env_regr, err_regr = _run_json([
         'pipe', '--from', left_csv, '--sql', 'SELECT regr_slope(v, v) FROM source'
     ])
-    self.assertEqual(rc_regr, cli.EXIT_USAGE)
-    self.assertIn('--sql-engine duckdb', env_regr['error']['message'])
+    self.assertEqual(rc_regr, cli.EXIT_OK, err_regr)
+
+    # Advanced warehouse aggregates like arg_max still hint DuckDB:
+    rc_argmax, env_argmax, _ = _run_json([
+        'pipe', '--from', left_csv, '--sql', 'SELECT arg_max(v, v) FROM source'
+    ])
+    self.assertEqual(rc_argmax, cli.EXIT_USAGE)
+    self.assertIn('--sql-engine duckdb', env_argmax['error']['message'])
 
 
 class Round12FixesTest(unittest.TestCase):

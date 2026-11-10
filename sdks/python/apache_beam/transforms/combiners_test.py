@@ -27,7 +27,10 @@ import time
 import unittest
 from pathlib import Path
 
-import hamcrest as hc
+try:
+  import hamcrest as hc
+except ImportError:
+  hc = None
 import pytest
 
 import apache_beam as beam
@@ -49,7 +52,10 @@ from apache_beam.transforms.core import CombineGlobally
 from apache_beam.transforms.core import Create
 from apache_beam.transforms.core import Map
 from apache_beam.transforms.display import DisplayData
-from apache_beam.transforms.display_test import DisplayDataItemMatcher
+try:
+  from apache_beam.transforms.display_test import DisplayDataItemMatcher
+except ImportError:
+  DisplayDataItemMatcher = None
 from apache_beam.transforms.periodicsequence import PeriodicImpulse
 from apache_beam.transforms.ptransform import PTransform
 from apache_beam.transforms.trigger import AfterAll
@@ -135,6 +141,79 @@ class CombineTest(unittest.TestCase):
       result_key_count = pcoll | 'count-perkey' >> combine.Count.PerKey()
       assert_that(result_key_mean, equal_to([('a', mean)]), label='key:mean')
       assert_that(result_key_count, equal_to([('a', size)]), label='key:size')
+
+  def test_variance(self):
+    vals = [10.0, 20.0, 30.0, 40.0, 100.0]
+    with TestPipeline() as pipeline:
+      pcoll = pipeline | 'start' >> Create(vals)
+      s_var = pcoll | 'sample_var' >> combine.Variance.Globally()
+      p_var = pcoll | 'pop_var' >> combine.Variance.Globally(sample=False)
+      p_sd = (
+          pcoll
+          | 'pop_sd' >> combine.StandardDeviation.Globally(sample=False)
+          | 'round_sd' >> beam.Map(lambda v: round(v, 4)))
+
+      assert_that(s_var, equal_to([1250.0]), label='assert:s_var')
+      assert_that(p_var, equal_to([1000.0]), label='assert:p_var')
+      assert_that(p_sd, equal_to([31.6228]), label='assert:p_sd')
+
+      pk_coll = pipeline | 'start-pk' >> Create([('k', v) for v in vals])
+      pk_var = pk_coll | 'pk_var' >> combine.Variance.PerKey()
+      assert_that(pk_var, equal_to([('k', 1250.0)]), label='assert:pk_var')
+
+  def test_covariance(self):
+    pts = [(10.0, 2.0), (20.0, 5.0), (30.0, 7.0), (40.0, 8.0), (50.0, 11.0)]
+    with TestPipeline() as pipeline:
+      pcoll = pipeline | 'start' >> Create(pts)
+      s_cov = pcoll | 'sample_cov' >> combine.Covariance.Globally()
+      p_cov = pcoll | 'pop_cov' >> combine.Covariance.Globally(sample=False)
+
+      assert_that(s_cov, equal_to([52.5]), label='assert:s_cov')
+      assert_that(p_cov, equal_to([42.0]), label='assert:p_cov')
+
+      dict_coll = (
+          pipeline
+          | 'start-dict' >> Create([{'x': x, 'y': y} for x, y in pts]))
+      s_cov_dict = (
+          dict_coll
+          | 's_cov_dict' >> combine.Covariance.Globally(x='x', y='y'))
+      assert_that(s_cov_dict, equal_to([52.5]), label='assert:s_cov_dict')
+
+      pk_coll = pipeline | 'start-pk' >> Create([('k', pt) for pt in pts])
+      pk_cov = pk_coll | 'pk_cov' >> combine.Covariance.PerKey()
+      assert_that(pk_cov, equal_to([('k', 52.5)]), label='assert:pk_cov')
+
+  def test_linear_regression(self):
+    pts = [(10, 25.0), (20, 41.0), (30, 62.0), (40, 79.0), (50, 98.0),
+           (60, 122.0), (70, 139.0), (80, 160.0), (90, 175.0), (100, 201.0)]
+    with TestPipeline() as pipeline:
+      pcoll = pipeline | 'start' >> Create(pts)
+      reg = (
+          pcoll
+          | 'regr' >> combine.LinearRegression.Globally()
+          | 'extract' >> beam.Map(
+              lambda r: (r.count, round(r.slope, 4), round(r.intercept, 4))))
+
+      assert_that(reg, equal_to([(10, 1.9491, 3.0)]), label='assert:regr')
+
+      dict_coll = (
+          pipeline
+          | 'start-dict' >> Create([{'indep': x, 'dep': y} for x, y in pts]))
+      reg_dict = (
+          dict_coll
+          | 'regr_dict' >> combine.LinearRegression.Globally(x='indep', y='dep')
+          | 'extract_dict' >> beam.Map(
+              lambda r: (r.count, round(r.slope, 4), round(r.intercept, 4))))
+      assert_that(
+          reg_dict, equal_to([(10, 1.9491, 3.0)]), label='assert:regr_dict')
+
+      pk_coll = pipeline | 'start-pk' >> Create([('grp', pt) for pt in pts])
+      pk_reg = (
+          pk_coll
+          | 'pk_regr' >> combine.LinearRegression.PerKey()
+          | 'pk_extract' >> beam.Map(
+              lambda kv: (kv[0], kv[1].count, round(kv[1].slope, 4))))
+      assert_that(pk_reg, equal_to([('grp', 10, 1.9491)]), label='assert:pk_regr')
 
   def test_top(self):
     with TestPipeline() as pipeline:
