@@ -335,27 +335,59 @@ def check_assert_counts(counters: dict[str, int]) -> str | None:
   return None
 
 
-def _query_dataflow_job(
-    job_id: str, project: str, region: str) -> tuple[str, dict[str, int]]:
-  """Queries Dataflow REST API for current job state and `beam_cli` counters."""
-  from apache_beam.options.pipeline_options import PipelineOptions
-  from apache_beam.runners.dataflow.internal import apiclient
+def dataflow_console_url(
+    job_id: str | None,
+    project: str | None,
+    region: str | None = 'us-central1',
+) -> str | None:
+  """Returns the Cloud Console URL for a Dataflow job when ID and project exist."""
+  if not job_id or not project:
+    return None
+  reg = (region or 'us-central1').strip()
+  return (
+      f'https://console.cloud.google.com/dataflow/jobs/{reg}/{job_id}'
+      f'?project={project}')
 
-  opts = PipelineOptions([
-      f'--project={project}',
-      f'--region={region}',
-  ])
-  client = apiclient.DataflowApplicationClient(opts)
-  job_proto = client.get_job(job_id)
-  raw_state = getattr(job_proto, 'current_state', None)
-  if raw_state is None:
-    raw_state = getattr(job_proto, 'currentState', 'JOB_STATE_UNKNOWN')
-  state_str = str(getattr(raw_state, 'name', None) or raw_state)
 
+class _NoRedirectHandler(object):
+  """Lazy factory wrapper around `urllib.request.HTTPRedirectHandler`."""
+
+  @staticmethod
+  def build_opener():
+    import urllib.request
+
+    class _BlockRedirect(urllib.request.HTTPRedirectHandler):
+      def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url, code, 'redirects disallowed for auth requests',
+            headers, fp)
+
+    return urllib.request.build_opener(_BlockRedirect())
+
+
+def _extract_raw_counters_from_metrics_list(
+    metrics_items: Any) -> dict[str, int]:
+  """Extracts `beam_cli` counters from either REST dicts or apiclient protos."""
   raw_counters: dict[str, int] = {}
-  try:
-    metrics_proto = client.get_job_metrics(job_id)
-    for m in getattr(metrics_proto, 'metrics', ()) or ():
+  for m in metrics_items or ():
+    if isinstance(m, dict):
+      m_name = m.get('name') or {}
+      origin = str(m_name.get('origin') or '')
+      name_str = str(m_name.get('name') or '')
+      ctx_raw = m_name.get('context') or {}
+      context_entries = (
+          {str(k): str(v) for k, v in ctx_raw.items()}
+          if isinstance(ctx_raw, dict) else {})
+      scalar = m.get('scalar')
+      if isinstance(scalar, dict):
+        val = scalar.get(
+            'integerValue',
+            scalar.get(
+                'integer_value',
+                scalar.get('doubleValue', scalar.get('double_value'))))
+      else:
+        val = scalar
+    else:
       m_name = getattr(m, 'name', None)
       if m_name is None:
         continue
@@ -370,24 +402,164 @@ def _query_dataflow_job(
         }
       else:
         context_entries = {}
-      if 'user' in origin.lower() and context_entries.get(
-          'namespace') == 'beam_cli' and not name_str.endswith(
-              ('_MIN', '_MAX', '_MEAN', '_COUNT')):
-        scalar = getattr(m, 'scalar', None)
-        if isinstance(scalar, (int, float)):
-          val: int | float | None = scalar
-        elif scalar is not None:
-          val = getattr(scalar, 'integer_value', None)
-          if val is None:
-            val = getattr(scalar, 'double_value', None)
-        else:
-          val = None
-        if val is not None and context_entries.get('tentative') != 'true':
-          raw_counters[name_str] = raw_counters.get(name_str, 0) + int(val)
-  except Exception:  # pylint: disable=broad-except
-    pass
+      scalar = getattr(m, 'scalar', None)
+      if isinstance(scalar, (int, float)):
+        val = scalar
+      elif scalar is not None:
+        val = getattr(scalar, 'integer_value', None)
+        if val is None:
+          val = getattr(scalar, 'double_value', None)
+      else:
+        val = None
 
-  return state_str, finalize_cli_row_metrics(raw_counters)
+    if 'user' in origin.lower() and context_entries.get(
+        'namespace') == 'beam_cli' and not name_str.endswith(
+            ('_MIN', '_MAX', '_MEAN', '_COUNT')):
+      if val is not None and context_entries.get('tentative') != 'true':
+        try:
+          raw_counters[name_str] = raw_counters.get(name_str, 0) + int(
+              float(val))
+        except (TypeError, ValueError):
+          pass
+  return raw_counters
+
+
+class _DataflowPoller:
+  """Caches credentials/client across polls so `beam wait` never forks per poll."""
+  def __init__(self, project: str, region: str):
+    self._project = project
+    self._region = region
+    self._creds = None
+    self._auth_req = None
+    self._opener = None
+    self._apiclient = None
+
+  def _ensure_rest_creds(self) -> str | None:
+    try:
+      if self._creds is None:
+        import google.auth
+        creds, _ = google.auth.default(
+            scopes=['https://www.googleapis.com/auth/cloud-platform'])
+        self._creds = creds
+      if not self._creds.valid or getattr(self._creds, 'expired', False):
+        if self._auth_req is None:
+          try:
+            import google.auth.transport.requests as ga_requests
+            self._auth_req = ga_requests.Request()
+          except ImportError:
+            import google.auth.transport._http_client as ga_http
+            self._auth_req = ga_http.Request()
+        self._creds.refresh(self._auth_req)
+      token = getattr(self._creds, 'token', None)
+      if isinstance(token, str) and token:
+        if self._opener is None:
+          self._opener = _NoRedirectHandler.build_opener()
+        return token
+    except Exception:  # pylint: disable=broad-except
+      return None
+    return None
+
+  def _rest_json(
+      self,
+      url: str,
+      token: str,
+      *,
+      method: str = 'GET',
+      body: dict[str, Any] | None = None,
+  ) -> dict[str, Any]:
+    import urllib.parse
+    import urllib.request
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != 'https' or parsed.hostname != 'dataflow.googleapis.com':
+      raise JobError(f'refusing Dataflow API request to {url!r}', EXIT_USAGE)
+    payload = (
+        json.dumps(body).encode('utf-8') if body is not None else None)
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Accept': 'application/json',
+    }
+    if payload is not None:
+      headers['Content-Type'] = 'application/json'
+    req = urllib.request.Request(url, data=payload, headers=headers, method=method)
+    with self._opener.open(req, timeout=20) as resp:
+      raw = resp.read(16 * 1024 * 1024)
+    return json.loads(raw.decode('utf-8')) if raw else {}
+
+  def query(self, job_id: str, project: str, region: str) -> tuple[str, dict[str, int]]:
+    import urllib.parse
+    token = self._ensure_rest_creds()
+    if token is not None:
+      q_proj = urllib.parse.quote(project, safe='')
+      q_reg = urllib.parse.quote(region, safe='')
+      q_job = urllib.parse.quote(job_id, safe='')
+      base = (
+          f'https://dataflow.googleapis.com/v1b3/projects/{q_proj}'
+          f'/locations/{q_reg}/jobs/{q_job}')
+      job_doc = self._rest_json(base, token)
+      state_str = str(job_doc.get('currentState') or 'JOB_STATE_UNKNOWN')
+      raw_counters: dict[str, int] = {}
+      try:
+        m_doc = self._rest_json(f'{base}/metrics', token)
+        raw_counters = _extract_raw_counters_from_metrics_list(
+            m_doc.get('metrics'))
+      except Exception:  # pylint: disable=broad-except
+        pass
+      return state_str, finalize_cli_row_metrics(raw_counters)
+
+    # Fallback: instantiate `DataflowApplicationClient` ONCE and reuse it.
+    if self._apiclient is None:
+      os.environ.setdefault('GRPC_VERBOSITY', 'ERROR')
+      os.environ.setdefault('GRPC_ENABLE_FORK_SUPPORT', '0')
+      from apache_beam.options.pipeline_options import PipelineOptions
+      from apache_beam.runners.dataflow.internal import apiclient
+      opts = PipelineOptions([f'--project={project}', f'--region={region}'])
+      self._apiclient = apiclient.DataflowApplicationClient(opts)
+    job_proto = self._apiclient.get_job(job_id)
+    raw_state = getattr(job_proto, 'current_state', None)
+    if raw_state is None:
+      raw_state = getattr(job_proto, 'currentState', 'JOB_STATE_UNKNOWN')
+    state_str = str(getattr(raw_state, 'name', None) or raw_state)
+    raw_counters = {}
+    try:
+      metrics_proto = self._apiclient.get_job_metrics(job_id)
+      raw_counters = _extract_raw_counters_from_metrics_list(
+          getattr(metrics_proto, 'metrics', None))
+    except Exception:  # pylint: disable=broad-except
+      pass
+    return state_str, finalize_cli_row_metrics(raw_counters)
+
+  def modify_state(self, job_id: str, target_state: str) -> bool:
+    import urllib.parse
+    token = self._ensure_rest_creds()
+    if token is not None:
+      q_proj = urllib.parse.quote(self._project, safe='')
+      q_reg = urllib.parse.quote(self._region, safe='')
+      q_job = urllib.parse.quote(job_id, safe='')
+      url = (
+          f'https://dataflow.googleapis.com/v1b3/projects/{q_proj}'
+          f'/locations/{q_reg}/jobs/{q_job}')
+      try:
+        self._rest_json(
+            url, token, method='PUT', body={'requestedState': target_state})
+        return True
+      except Exception:  # pylint: disable=broad-except
+        return False
+    if self._apiclient is None:
+      os.environ.setdefault('GRPC_VERBOSITY', 'ERROR')
+      os.environ.setdefault('GRPC_ENABLE_FORK_SUPPORT', '0')
+      from apache_beam.options.pipeline_options import PipelineOptions
+      from apache_beam.runners.dataflow.internal import apiclient
+      opts = PipelineOptions([
+          f'--project={self._project}', f'--region={self._region}'
+      ])
+      self._apiclient = apiclient.DataflowApplicationClient(opts)
+    return bool(self._apiclient.modify_job_state(job_id, target_state))
+
+
+def _query_dataflow_job(
+    job_id: str, project: str, region: str) -> tuple[str, dict[str, int]]:
+  """Single-shot helper retained for callers querying Dataflow state once."""
+  return _DataflowPoller(project, region).query(job_id, project, region)
 
 
 def wait_for_job(
@@ -398,8 +570,10 @@ def wait_for_job(
     project: str | None = None,
     region: str | None = None,
     query_fn=None,
+    show_progress: bool = False,
 ) -> tuple[int, dict[str, Any]]:
   """Polls a remote job until terminal state or `timeout_seconds` (`EXIT_TIMEOUT=7`)."""
+  import sys
   safe_id = validate_job_id(job_id)
   record: dict[str, Any]
   try:
@@ -425,8 +599,21 @@ def wait_for_job(
       region or record.get('region') or 'us-central1',
       verb='poll')
 
-  fetch = query_fn or _query_dataflow_job
-  deadline = (time.monotonic() + timeout_seconds) if timeout_seconds else None
+  poller = _DataflowPoller(proj, reg) if query_fn is None else None
+  fetch = query_fn or poller.query
+  t_start = time.monotonic()
+  deadline = (t_start + timeout_seconds) if timeout_seconds else None
+  last_logged_state: str | None = None
+  last_logged_at = 0.0
+
+  console_url = dataflow_console_url(safe_id, proj, reg)
+  if console_url:
+    existing_out = dict(record.get('outputs') or {})
+    existing_out.setdefault('console_url', console_url)
+    record['outputs'] = existing_out
+
+  if show_progress and console_url:
+    print(f'[beam] Job console: {console_url}', file=sys.stderr, flush=True)
 
   while True:
     state_str, counters = fetch(safe_id, proj, reg)
@@ -436,6 +623,18 @@ def wait_for_job(
       record['metrics'] = counters
     _atomic_write_json(_jobs_dir() / f'{safe_id}.json', record)
 
+    now_m = time.monotonic()
+    elapsed_s = int(now_m - t_start)
+    if show_progress and (
+        state_str != last_logged_state or (now_m - last_logged_at) >= 10.0):
+      print(
+          f'[beam] Waiting for job {safe_id} '
+          f'(state={state_str}, elapsed={elapsed_s}s)...',
+          file=sys.stderr,
+          flush=True)
+      last_logged_state = state_str
+      last_logged_at = now_m
+
     upper = state_str.upper()
     if upper in _TERMINAL_SUCCESS_STATES:
       outputs_obj = dict(record.get('outputs') or {})
@@ -443,6 +642,8 @@ def wait_for_job(
       dlq_pfx = outputs_obj.get('dlq_prefix')
       if out_pfx or dlq_pfx:
         try:
+          os.environ.setdefault('GRPC_VERBOSITY', 'ERROR')
+          os.environ.setdefault('GRPC_ENABLE_FORK_SUPPORT', '0')
           from apache_beam.io.filesystems import FileSystems
           from apache_beam.options.pipeline_options import PipelineOptions
           FileSystems.set_options(PipelineOptions([f'--project={proj}']))
@@ -551,11 +752,7 @@ def cancel_job(
   if cancel_fn is not None:
     ok = bool(cancel_fn(safe_id, proj, reg, target_state))
   else:
-    from apache_beam.options.pipeline_options import PipelineOptions
-    from apache_beam.runners.dataflow.internal import apiclient
-    opts = PipelineOptions([f'--project={proj}', f'--region={reg}'])
-    client = apiclient.DataflowApplicationClient(opts)
-    ok = bool(client.modify_job_state(safe_id, target_state))
+    ok = _DataflowPoller(proj, reg).modify_state(safe_id, target_state)
 
   if not ok:
     raise JobError(

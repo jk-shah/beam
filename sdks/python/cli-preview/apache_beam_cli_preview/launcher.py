@@ -425,6 +425,8 @@ def maybe_inject_dataflow_worker_args(pipeline_args: list[str]) -> list[str]:
 
 
 def main(argv=None) -> int:
+  os.environ.setdefault('GRPC_VERBOSITY', 'ERROR')
+  os.environ.setdefault('GRPC_ENABLE_FORK_SUPPORT', '0')
   cli_dir = install_runtime_hooks()
   if 'apache_beam' not in sys.modules and _FAST_PKG not in sys.modules:
     spec = importlib.util.spec_from_file_location(

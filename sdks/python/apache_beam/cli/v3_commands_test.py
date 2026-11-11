@@ -2050,10 +2050,28 @@ class InspectCheckIoDoctorTailJobsTest(unittest.TestCase):
         {'tier': 'SILVER', 'order_count': 1, 'total_revenue': 40.0},
         {'tier': 'UNMAPPED', 'order_count': 1, 'total_revenue': 25.5},
     ]
-    self.assertEqual(env['untrusted_data']['rows'], expected_agg)
+    self.assertIsNone(env.get('untrusted_data'))
     with open(out_json, encoding='utf-8') as f:
       written_rows = [json.loads(line) for line in f if line.strip()]
     self.assertEqual(written_rows, expected_agg)
+
+    # Repeatable `--from` (without `--join`) + `--preview` emits inline preview!
+    rc_p, env_p, err_p = _run_json([
+        'pipe',
+        '--from',
+        f'o={orders_pq}',
+        '--from',
+        f'c={customers_csv}',
+        '--to',
+        out_json,
+        '--if-exists',
+        'replace',
+        '--preview',
+        '--sql',
+        sql_q,
+    ])
+    self.assertEqual(rc_p, cli.EXIT_OK, err_p)
+    self.assertEqual(env_p['untrusted_data']['rows'], expected_agg)
 
     # Query-only mode (`--sql` without `--to`) returns rows directly in JSON!
     rc_q, env_q, err_q = _run_json([
@@ -3807,6 +3825,131 @@ class Round12FixesTest(unittest.TestCase):
         'package', p_path, '--sdk', 'auto', '--output', 'gs://bucket/spec.json', '--dry-run'
     ])
     self.assertEqual(rc3, cli.EXIT_OK, err3)
+
+  def test_scrub_error_message_preserves_dataflow_job_id(self):
+    from apache_beam.cli import output as out_mod
+    df_id = '2026-11-10_14_34_36-14034864922449419400'
+    msg = (
+        f"pipeline still running after --wait-timeout (5.0s); "
+        f"detached remote job '{df_id}' with token "
+        f"'super_secret_long_random_credential_string_xyz'")
+    scrubbed = out_mod.scrub_error_message(msg)
+    self.assertIn(df_id, scrubbed)
+    self.assertNotIn('super_secret_long_random_credential_string_xyz', scrubbed)
+    self.assertIn('<redacted-value>', scrubbed)
+
+  def test_dataflow_rest_poller_console_url_and_wait_progress(self):
+    from unittest import mock
+    from apache_beam.cli import jobs as jobs_mod
+
+    df_id = '2026-11-10_14_34_36-14034864922449419400'
+    url = jobs_mod.dataflow_console_url(df_id, 'my-proj', 'us-central1')
+    self.assertEqual(
+        url,
+        f'https://console.cloud.google.com/dataflow/jobs/us-central1/{df_id}'
+        '?project=my-proj')
+
+    poller = jobs_mod._DataflowPoller('my-proj', 'us-central1')
+    responses = [
+        {'currentState': 'JOB_STATE_RUNNING'},
+        {
+            'metrics': [{
+                'name': {
+                    'origin': 'user',
+                    'name': 'rows_read',
+                    'context': {'namespace': 'beam_cli'},
+                },
+                'scalar': {'integerValue': '42'},
+            }]
+        },
+        {'currentState': 'JOB_STATE_DONE'},
+        {
+            'metrics': [
+                {
+                    'name': {
+                        'origin': 'user',
+                        'name': 'rows_read',
+                        'context': {'namespace': 'beam_cli'},
+                    },
+                    'scalar': {'integerValue': '100'},
+                },
+                {
+                    'name': {
+                        'origin': 'user',
+                        'name': 'pre_sink_rows',
+                        'context': {'namespace': 'beam_cli'},
+                    },
+                    'scalar': {'integerValue': '95'},
+                },
+            ]
+        },
+    ]
+    with mock.patch.object(
+        poller, '_ensure_rest_creds', return_value='fake-tok'), mock.patch.object(
+            poller, '_rest_json', side_effect=responses):
+      st1, m1 = poller.query(df_id, 'my-proj', 'us-central1')
+      self.assertEqual(st1, 'JOB_STATE_RUNNING')
+      self.assertEqual(m1['rows_read'], 42)
+      st2, m2 = poller.query(df_id, 'my-proj', 'us-central1')
+      self.assertEqual(st2, 'JOB_STATE_DONE')
+      self.assertEqual(m2['rows_read'], 100)
+      self.assertEqual(m2['rows_written'], 95)
+
+    # Verify `wait_for_job(..., show_progress=True)` emits console_url and stderr heartbeats.
+    with mock.patch.dict(
+        os.environ, {'BEAM_HOME': os.path.join(self.tmp, 'beam_home')}):
+      jobs_mod.record_job_submission(
+          df_id,
+          runner='DataflowRunner',
+          state='JOB_STATE_RUNNING',
+          command='pipe',
+          project='my-proj',
+          region='us-central1',
+          outputs={'destination': 'bigquery://my-proj.ds.tbl'})
+      poll_states = iter([
+          (
+              'JOB_STATE_RUNNING',
+              {
+                  'rows_read': 10,
+                  'rows_written': 0,
+                  'rows_filtered_out': 0,
+                  'dlq_rows': 0,
+              },
+          ),
+          (
+              'JOB_STATE_DONE',
+              {
+                  'rows_read': 10,
+                  'rows_written': 10,
+                  'rows_filtered_out': 0,
+                  'dlq_rows': 0,
+              },
+          ),
+      ])
+      err_buf = io.StringIO()
+      with contextlib.redirect_stderr(err_buf):
+        rc, rec = jobs_mod.wait_for_job(
+            df_id,
+            poll_interval=0.01,
+            query_fn=lambda *_a: next(poll_states),
+            show_progress=True)
+    self.assertEqual(rc, cli.EXIT_OK)
+    self.assertEqual(rec['outputs']['destination'], 'bigquery://my-proj.ds.tbl')
+    self.assertIn('console.cloud.google.com/dataflow/jobs', rec['outputs']['console_url'])
+    self.assertIn('[beam] Job console:', err_buf.getvalue())
+    self.assertIn('JOB_STATE_DONE', err_buf.getvalue())
+
+  def test_io_describe_text_and_json_key_option(self):
+    rc_t, env_t, err_t = _run_json(['io', 'describe', 'text'])
+    self.assertEqual(rc_t, cli.EXIT_OK, err_t)
+    conn_t = env_t['outputs']['connector']
+    self.assertEqual(conn_t['read_transform'], 'ReadFromText')
+    self.assertEqual(conn_t['write_transform'], 'WriteToText')
+
+    rc_j, env_j, err_j = _run_json(['io', 'describe', 'json'])
+    self.assertEqual(rc_j, cli.EXIT_OK, err_j)
+    conn_j = env_j['outputs']['connector']
+    self.assertIn('key', conn_j['options'])
 
 
 if __name__ == '__main__':

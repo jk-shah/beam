@@ -29,8 +29,17 @@ _CATALOG: list[dict[str, Any]] = [
         'write_transform': 'WriteToCsv',
         'runtime': 'python',
         'supports_dlq': True,
-        'options': ['path', 'delimiter', 'comment', 'filename_column'],
-        'description': 'RFC-4180 CSV files on local or cloud filesystems.',
+        'options': [
+            'path',
+            'delimiter',
+            'null_values',
+            'fields',
+            'comment',
+            'filename_column',
+        ],
+        'description': (
+            'RFC-4180 CSV files on local or cloud filesystems '
+            '(--from-opt fields=col:type overrides inferred column types).'),
     },
     {
         'name': 'json',
@@ -39,8 +48,30 @@ _CATALOG: list[dict[str, Any]] = [
         'write_transform': 'WriteToJson',
         'runtime': 'python',
         'supports_dlq': True,
+        'options': [
+            'path',
+            'sample_rows',
+            'fields',
+            'on_unknown_fields',
+            'key',
+        ],
+        'description': (
+            'Newline-delimited JSON objects (JSONL) by default; pass '
+            '--to-opt key=<col> on local runs to write a single JSON object '
+            'indexed by <col>.'),
+    },
+    {
+        'name': 'text',
+        'uri_example': 'data/logs.txt  or  gs://bucket/logs/*.txt',
+        'read_transform': 'ReadFromText',
+        'write_transform': 'WriteToText',
+        'runtime': 'python',
+        'supports_dlq': False,
         'options': ['path'],
-        'description': 'Newline-delimited JSON objects (JSONL).',
+        'description': (
+            'Line-delimited plain text files emitting Row(line: str); pair '
+            'with --select or --sql to project structured columns into '
+            'BigQuery or Parquet.'),
     },
     {
         'name': 'parquet',

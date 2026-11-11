@@ -26,6 +26,7 @@ executes a Beam pipeline.
 
 import importlib
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -34,6 +35,8 @@ _FAST_PACKAGE = '_apache_beam_cli_pkg'
 
 def main(argv=None):
   """Runs `apache_beam/cli/main.py` without eagerly importing `apache_beam`."""
+  os.environ.setdefault('GRPC_VERBOSITY', 'ERROR')
+  os.environ.setdefault('GRPC_ENABLE_FORK_SUPPORT', '0')
   if 'apache_beam' not in sys.modules and _FAST_PACKAGE not in sys.modules:
     cli_dir = Path(__file__).resolve().with_name('apache_beam') / 'cli'
     init_py = cli_dir / '__init__.py'

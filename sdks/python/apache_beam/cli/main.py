@@ -84,15 +84,17 @@ Every other --flag is passed to the pipeline as a Beam pipeline option.
 _PIPE_EPILOG = """\
 examples:
   beam pipe --from users.csv --to out/users.parquet
+  beam pipe --from gs://raw/logs/*.txt --select "line, len(line) AS chars" \\
+      --to bigquery://proj.ds.log_lines --runner=DataflowRunner --project=proj
   beam pipe --from gs://raw/orders.csv --to bigquery://proj.ds.orders \\
       --where "amount > 0" --dlq gs://raw/dlq/orders.json --assert-counts --json
-  beam pipe --from orders=out/orders.parquet --join tiers=data/vip_tiers.csv \\
+  beam pipe --from orders=out/orders.parquet --from tiers=data/vip_tiers.csv \\
       --sql "SELECT COALESCE(tiers.tier, 'STANDARD') AS tier, COUNT(*) AS order_count, ROUND(SUM(orders.amount), 2) AS total_amount FROM orders LEFT JOIN tiers USING (email) GROUP BY 1 ORDER BY 1" \\
-      --to out/tier_spend.json --json
+      --to out/tier_spend.json --to-opt key=tier --json
   beam pipe --from users.csv --to out/users.parquet --dry-run > pipeline.yaml
 
-Formats: csv, json, parquet, avro, delta://, iceberg://, bigquery://,
-postgres://, mysql://, spanner://, pubsub://, kafka://.
+Formats: csv, json, text (.txt -> Row(line)), parquet, avro, delta://,
+iceberg://, bigquery://, postgres://, mysql://, spanner://, pubsub://, kafka://.
 Every other --flag is passed as a Beam pipeline option.
 """ + _EXIT_CODES
 
@@ -158,6 +160,7 @@ _CLI_ZERO_FLAGS = {
         '--zero-copy',
         '--assert-counts',
         '--verify',
+        '--preview',
         '--verbose',
         '--no-config',
         '--help',
@@ -189,6 +192,9 @@ _CLI_ONE_FLAGS = {
         '--join',
         '--to',
         '--sql',
+        '--window',
+        '--timestamp-col',
+        '--timestamp_col',
         '--format',
         '--from-format',
         '--to-format',
@@ -338,6 +344,8 @@ def _normalize_cli_argv(argv: list[str]) -> list[str]:
 
 def main(argv=None) -> int:
   """Runs the `beam` command and returns its exit code."""
+  os.environ.setdefault('GRPC_VERBOSITY', 'ERROR')
+  os.environ.setdefault('GRPC_ENABLE_FORK_SUPPORT', '0')
   t0 = time.monotonic()
   raw_argv = list(sys.argv[1:] if argv is None else argv)
   output.DLQ_REQUESTED = any(
@@ -609,14 +617,15 @@ def _build_parser():
       metavar='[ALIAS=]SOURCE',
       help=(
           'source path, glob, or URI (gs://, bigquery://, delta://, '
-          'iceberg://, ...); repeatable with --sql'))
+          'iceberg://, ...); repeat --from alias=URI to bind multiple '
+          'named sources for --sql'))
   pipe.add_argument(
       '--join',
       dest='joins',
       action='append',
       default=[],
       metavar='[ALIAS=]SOURCE',
-      help='additional source URI to join in --sql (repeatable)')
+      help='alias for repeating --from [ALIAS=]SOURCE in multi-source --sql queries')
   pipe.add_argument(
       '--to',
       dest='sink',
@@ -631,11 +640,11 @@ def _build_parser():
   pipe.add_argument(
       '--from-format',
       metavar='FMT',
-      help='source format (csv, json, parquet, avro)')
+      help='source format (csv, json, text, parquet, avro)')
   pipe.add_argument(
       '--to-format',
       metavar='FMT',
-      help='sink format (csv, json, parquet, avro)')
+      help='sink format (csv, json, text, parquet, avro)')
   pipe.add_argument(
       '--where',
       metavar='EXPR',
@@ -666,8 +675,8 @@ def _build_parser():
       default=None,
       metavar='QUERY',
       help=(
-          'read-only SQL SELECT/JOIN/GROUP BY query across --from and --join '
-          'sources'))
+          'read-only SQL SELECT/JOIN/GROUP BY query across one or more '
+          '--from [ALIAS=]SOURCE inputs'))
   pipe.add_argument(
       '--dlq',
       metavar='SINK',
@@ -699,14 +708,18 @@ def _build_parser():
       action='append',
       default=[],
       metavar='KEY=VAL',
-      help='additional source connector option (repeatable)')
+      help=(
+          'additional source connector option (repeatable; e.g. '
+          'fields=col:type, sample_rows=100)'))
   pipe.add_argument(
       '--to-opt',
       dest='to_opts',
       action='append',
       default=[],
       metavar='KEY=VAL',
-      help='additional sink connector option (repeatable)')
+      help=(
+          'additional sink connector option (repeatable; e.g. key=COL '
+          'writes one JSON object indexed by COL instead of JSONL)'))
   pipe.add_argument(
       '--from-opt-file',
       metavar='FILE',
@@ -762,6 +775,10 @@ def _build_parser():
       '--zero-copy',
       action='store_true',
       help='register existing Parquet or delta:// files into iceberg:// without copying data')
+  pipe.add_argument(
+      '--preview',
+      action='store_true',
+      help='include sampled output rows in --json even when --to writes to a destination')
   pipe.add_argument(
       '--dry-run',
       '--dry_run',
@@ -1744,7 +1761,8 @@ def _wait(args, extra_args, *, json_session, t0: float) -> int:
         timeout_seconds=timeout_sec,
         poll_interval=args.poll_interval,
         project=args.project,
-        region=args.region)
+        region=args.region,
+        show_progress=True)
   except (jobs.JobError, ValueError) as e:
     raise _CliError(str(e), getattr(e, 'exit_code', EXIT_USAGE)) from None
   except Exception as e:  # pylint: disable=broad-except
@@ -2278,6 +2296,7 @@ def _pipe(
             dry_run_yaml=pipe_spec.to_yaml(sql_spec, pipe_argv)
             if args.dry_run else None,
             output_prefix=sql_stage_prefix or orig_sql_out,
+            destination=args.sink,
             replace_commit_target=orig_sql_out if sql_stage_prefix else None,
             if_exists=args.if_exists,
             dlq_prefix=sql_dlq_stage or orig_sql_dlq,
@@ -2400,6 +2419,7 @@ def _pipe(
 
     if json_session.enabled:
       preview_limit = 500
+      include_rows = bool(not written_sql or getattr(args, 'preview', False))
       json_session.emit(
           output.build_envelope(
               ok=True,
@@ -2413,7 +2433,8 @@ def _pipe(
               warnings=sql_warnings,
               untrusted_data=output.wrap_untrusted_rows(
                   out_rows[:preview_limit],
-                  truncated=len(out_rows) > preview_limit)))
+                  truncated=len(out_rows) > preview_limit)
+              if include_rows else None))
     else:
       for warning in sql_warnings:
         print(f'warning: {warning}', file=sys.stderr)
@@ -2698,6 +2719,7 @@ def _pipe(
         dry_run_yaml=pipe_spec.to_yaml(pipe.spec, pipe_argv)
         if args.dry_run else None,
         output_prefix=sink_stage_prefix or orig_out_prefix,
+        destination=args.sink,
         replace_commit_target=orig_out_prefix if sink_stage_prefix else None,
         if_exists=args.if_exists,
         dlq_prefix=dlq_stage_prefix or orig_dlq_prefix,
@@ -2916,6 +2938,7 @@ def _run_yaml(
     local_paths=(),
     dry_run_yaml: str | None = None,
     output_prefix: str | None = None,
+    destination: str | None = None,
     replace_commit_target: str | None = None,
     if_exists: str = 'fail',
     dlq_prefix: str | None = None,
@@ -2964,6 +2987,10 @@ def _run_yaml(
   warnings_list: list[str] = list(extra_warnings or ())
   orig_runner_raw = None
   switched_to_fnapi = False
+  explicit_runner_hint = _extract_runner_from_args(yaml_or_pipeline_argv)
+  is_remote_hint = bool(
+      dry_run_yaml is None and explicit_runner_hint and
+      _runner_name(explicit_runner_hint) not in _LOCAL_RUNNERS)
   try:
     with contextlib.ExitStack() as stack:
       skip_xlang_dry_expand = False
@@ -2986,6 +3013,11 @@ def _run_yaml(
       if skip_xlang_dry_expand:
         options = PipelineOptions(yaml_or_pipeline_argv)
       else:
+        if is_remote_hint:
+          print(
+              '[beam] Building pipeline & resolving connectors...',
+              file=sys.stderr,
+              flush=True)
         try:
           if direct_yaml_text is not None:
             # Safe direct YAML compile: bypasses `expand_jinja()` completely so
@@ -3136,6 +3168,12 @@ def _run_yaml(
       prev_subproc_level = subproc_logger.level
       if suppress_prism_log:
         subproc_logger.setLevel(logging.CRITICAL)
+      if not is_local:
+        print(
+            f'[beam] Submitting job to {runner_raw or "remote runner"} '
+            '(staging SDK & packages)...',
+            file=sys.stderr,
+            flush=True)
       try:
         try:
           result = _execute_with_optional_timeout(
@@ -3179,6 +3217,18 @@ def _run_yaml(
     # Persist remote job record when a remote job ID exists!
     job_id = _extract_job_id(result)
     gcp_opts = options.view_as(GoogleCloudOptions)
+    console_url = (
+        jobs.dataflow_console_url(job_id, gcp_opts.project, gcp_opts.region)
+        if (not is_local and job_id and _runner_name(runner_raw) == 'dataflow')
+        else None)
+    remote_outputs: dict[str, Any] = {
+        'output_prefix': output_prefix,
+        'dlq_prefix': dlq_prefix,
+    }
+    if destination:
+      remote_outputs['destination'] = destination
+    if console_url:
+      remote_outputs['console_url'] = console_url
     if not is_local and job_id:
       try:
         jobs.record_job_submission(
@@ -3190,7 +3240,7 @@ def _run_yaml(
             region=gcp_opts.region,
             idem_key=idem_key,
             post_checks=post_checks,
-            outputs={'output_prefix': output_prefix, 'dlq_prefix': dlq_prefix})
+            outputs=remote_outputs)
       except jobs.JobError:
         pass
 
@@ -3205,20 +3255,31 @@ def _run_yaml(
           'description': 'Poll the detached remote job until completion.',
           'requires_human': False,
       }] if job_id else []
+      clean_remote_out = {
+          k: v for k, v in remote_outputs.items() if v is not None
+      }
+      extra_detached: dict[str, Any] = {
+          'detached': True,
+          'job_id': job_id,
+          'runner': str(runner_raw),
+          'state': str(getattr(result, 'state', 'RUNNING')),
+      }
+      if clean_remote_out:
+        extra_detached['outputs'] = clean_remote_out
       raise _CliError(
           f'pipeline still running after --wait-timeout ({wait_timeout_sec}s); '
           f'detached remote job {job_id!r}',
           EXIT_TIMEOUT,
-          extra={
-              'detached': True,
-              'job_id': job_id,
-              'runner': str(runner_raw),
-              'state': str(getattr(result, 'state', 'RUNNING')),
-          },
+          extra=extra_detached,
           next_actions=next_acts)
 
     if no_wait:
       state_s = str(getattr(result, 'state', 'RUNNING'))
+      nw_outputs: dict[str, Any] = {'submitted': True}
+      if destination:
+        nw_outputs['destination'] = destination
+      if console_url:
+        nw_outputs['console_url'] = console_url
       if json_session is not None and json_session.enabled:
         json_session.emit(
             output.build_envelope(
@@ -3230,7 +3291,7 @@ def _run_yaml(
                 state=state_s,
                 duration_ms=int((time.monotonic() - t0) * 1000),
                 warnings=warnings_list,
-                outputs={'submitted': True}))
+                outputs=nw_outputs))
       else:
         print(
             f'Submitted {_describe_runner(options, result)} '
@@ -3256,6 +3317,10 @@ def _run_yaml(
         raise _CliError(err_msg, EXIT_PIPELINE_FAILED)
 
     outputs_dict: dict[str, Any] = {}
+    if destination and (not is_local or output_prefix is None):
+      outputs_dict['destination'] = destination
+    if console_url:
+      outputs_dict['console_url'] = console_url
     written: list[str] = []
     dlq_files: list[str] = []
     allow_materialize = bool(
@@ -3353,6 +3418,38 @@ def _run_yaml(
     del threading
 
 
+def _log_remote_submission(
+    res: Any,
+    options: Any,
+    *,
+    no_wait: bool,
+    wait_timeout_sec: float | None,
+) -> tuple[str | None, str | None]:
+  """Emits immediate stderr feedback once a remote job has been created."""
+  jid = _extract_job_id(res)
+  url = None
+  if jid and options is not None:
+    try:
+      from . import jobs
+      from apache_beam.options.pipeline_options import GoogleCloudOptions
+      from apache_beam.options.pipeline_options import StandardOptions
+      if _runner_name(options.view_as(StandardOptions).runner) == 'dataflow':
+        gcp = options.view_as(GoogleCloudOptions)
+        url = jobs.dataflow_console_url(jid, gcp.project, gcp.region)
+    except Exception:  # pylint: disable=broad-except
+      url = None
+  if jid:
+    loc = f' ({url})' if url else ''
+    if no_wait:
+      suffix = ' [detached; --no_wait_until_finish]'
+    elif wait_timeout_sec is not None:
+      suffix = f'; waiting up to {wait_timeout_sec:g}s before detaching...'
+    else:
+      suffix = '; waiting for completion...'
+    print(f'[beam] Submitted job {jid}{loc}{suffix}', file=sys.stderr, flush=True)
+  return jid, url
+
+
 def _execute_with_optional_timeout(
     pipeline,
     *,
@@ -3361,25 +3458,55 @@ def _execute_with_optional_timeout(
     wait_timeout_sec: float | None,
     is_local: bool,
 ):
-  del options
+  import threading
   if no_wait:
     res = pipeline.run()
+    if not is_local:
+      _log_remote_submission(res, options, no_wait=True, wait_timeout_sec=None)
     return res, None, False
+
+  def _start_remote_heartbeat(jid: str | None) -> tuple[threading.Event, threading.Thread | None]:
+    stop_ev = threading.Event()
+    if is_local or not jid:
+      return stop_ev, None
+    t_start = time.monotonic()
+
+    def _beat():
+      while not stop_ev.wait(15.0):
+        elapsed = int(time.monotonic() - t_start)
+        print(
+            f'[beam] Job {jid} still running ({elapsed}s elapsed)...',
+            file=sys.stderr,
+            flush=True)
+
+    hb = threading.Thread(target=_beat, daemon=True)
+    hb.start()
+    return stop_ev, hb
+
   if wait_timeout_sec is None:
     res = pipeline.run()
+    jid = None
+    if not is_local:
+      jid, _ = _log_remote_submission(
+          res, options, no_wait=False, wait_timeout_sec=None)
+    stop_ev, _ = _start_remote_heartbeat(jid)
     try:
       st = res.wait_until_finish()
       return res, st, False
     except KeyboardInterrupt:
       _cancel(res)
       raise
+    finally:
+      stop_ev.set()
 
-  import threading
   if not is_local:
     # Remote runners (e.g. DataflowRunner) stage artifacts and create the remote
     # job inside `pipeline.run()`; complete submission first so `job_id` is
     # always captured and persisted before bounding `wait_until_finish()`.
     res = pipeline.run()
+    jid, _ = _log_remote_submission(
+        res, options, no_wait=False, wait_timeout_sec=wait_timeout_sec)
+    stop_ev, _ = _start_remote_heartbeat(jid)
     box_remote: dict[str, Any] = {'state': None, 'exc': None}
 
     def _wait_remote():
@@ -3388,14 +3515,17 @@ def _execute_with_optional_timeout(
       except BaseException as exc:  # pylint: disable=broad-except
         box_remote['exc'] = exc
 
-    t_rem = threading.Thread(target=_wait_remote, daemon=True)
-    t_rem.start()
-    t_rem.join(timeout=wait_timeout_sec)
-    if t_rem.is_alive():
-      return res, getattr(res, 'state', 'RUNNING'), True
-    if box_remote['exc'] is not None:
-      raise box_remote['exc']
-    return res, box_remote['state'], False
+    try:
+      t_rem = threading.Thread(target=_wait_remote, daemon=True)
+      t_rem.start()
+      t_rem.join(timeout=wait_timeout_sec)
+      if t_rem.is_alive():
+        return res, getattr(res, 'state', 'RUNNING'), True
+      if box_remote['exc'] is not None:
+        raise box_remote['exc']
+      return res, box_remote['state'], False
+    finally:
+      stop_ev.set()
 
   box: dict[str, Any] = {'res': None, 'state': None, 'exc': None}
 

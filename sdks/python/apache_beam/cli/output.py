@@ -178,6 +178,8 @@ def _keep_quoted(literal: str) -> bool:
   where an error happened; they aren't secrets.
   """
   import os
+  if re.fullmatch(r'\d{4}-\d{2}-\d{2}_\d{2}_\d{2}_\d{2}-\d+', literal):
+    return True  # Dataflow job ID (e.g. 2026-11-10_14_34_36-14034864922449419400)
   if re.fullmatch(r'[A-Za-z0-9_.:/()\[\]-]+', literal) and (
       '/' in literal and not literal.startswith('/') and
       not re.search(r'[A-Za-z0-9+/]{40,}', literal)):
