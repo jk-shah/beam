@@ -1387,7 +1387,29 @@ def commit_iceberg_snapshot(
         'timestamp-ms': int(old_meta.get('last-updated-ms') or now_ms),
         'metadata-file': _to_iceberg_uri(existing['metadata_path']),
     })
-    cur_schema = existing['current_schema']
+    cur_schema = dict(existing['current_schema'])
+    cur_fields = list(cur_schema.get('fields') or [])
+    cur_schema['fields'] = cur_fields
+    last_col_id = max((int(f.get('id', 0)) for f in cur_fields), default=0)
+    if old_meta.get('last-column-id'):
+      last_col_id = max(last_col_id, int(old_meta['last-column-id']))
+
+    existing_names = {str(f['name']).lower() for f in cur_fields}
+    evolved = False
+    for f in iceberg_fields:
+      f_name = str(f['name'])
+      if f_name.lower() not in existing_names:
+        last_col_id += 1
+        cur_fields.append({
+            'id': last_col_id,
+            'name': f_name,
+            'required': False,
+            'type': f['type'],
+        })
+        existing_names.add(f_name.lower())
+        evolved = True
+    if evolved:
+      cur_schema['schema-id'] = int(cur_schema.get('schema-id', 0)) + 1
   else:
     meta_ver = 1
     table_uuid = str(uuid.uuid4())
@@ -1577,6 +1599,13 @@ def commit_iceberg_snapshot(
     snap_obj['parent-snapshot-id'] = parent_snap_id
 
   last_col_id = max((int(f['id']) for f in cur_schema['fields']), default=0)
+  if existing is not None and old_meta.get('schemas'):
+    all_schemas = [
+        s for s in old_meta['schemas']
+        if s.get('schema-id') != cur_schema.get('schema-id')
+    ] + [cur_schema]
+  else:
+    all_schemas = [cur_schema]
   meta_json_obj = {
       'format-version': 2,
       'table-uuid': table_uuid,
@@ -1585,7 +1614,7 @@ def commit_iceberg_snapshot(
       'last-updated-ms': now_ms,
       'last-column-id': last_col_id,
       'current-schema-id': cur_schema.get('schema-id', 0),
-      'schemas': [cur_schema],
+      'schemas': all_schemas,
       'default-spec-id': 0,
       'partition-specs': [part_spec],
       'last-partition-id': 999,
@@ -1722,20 +1751,25 @@ def register_zero_copy_to_iceberg(
     except FileNotFoundError:
       pass
 
-  iceberg_fields: list[dict[str, Any]] = []
+  seen_fields: dict[str, dict[str, Any]] = {}
+  file_field_presence: dict[str, int] = {}
   data_entries: list[dict[str, Any]] = []
   total_rows = 0
+  num_files = len(parquet_files)
   for fpath, fsize in parquet_files:
     with _fs_open_read(fpath) as fobj:
       pf = pq.ParquetFile(fobj)
-      if not iceberg_fields:
-        for idx, field in enumerate(pf.schema_arrow, start=1):
-          iceberg_fields.append({
-              'id': idx,
-              'name': field.name,
+      for field in pf.schema_arrow:
+        fname = field.name
+        file_field_presence[fname] = file_field_presence.get(fname, 0) + 1
+        if fname not in seen_fields:
+          seen_fields[fname] = {
+              'name': fname,
               'type': _arrow_type_to_iceberg_type(field.type),
               'nullable': bool(field.nullable),
-          })
+          }
+        elif field.nullable:
+          seen_fields[fname]['nullable'] = True
       nrows = int(pf.metadata.num_rows)
       total_rows += nrows
       data_entries.append({
@@ -1743,6 +1777,16 @@ def register_zero_copy_to_iceberg(
           'record_count': nrows,
           'file_size_in_bytes': fsize,
       })
+
+  iceberg_fields: list[dict[str, Any]] = []
+  for idx, (fname, fdict) in enumerate(seen_fields.items(), start=1):
+    is_nullable = fdict['nullable'] or (file_field_presence.get(fname, 0) < num_files)
+    iceberg_fields.append({
+        'id': idx,
+        'name': fname,
+        'type': fdict['type'],
+        'nullable': is_nullable,
+    })
 
   commit_res = commit_iceberg_snapshot(
       table_dir,

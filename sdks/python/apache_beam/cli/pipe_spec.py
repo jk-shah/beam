@@ -26,6 +26,7 @@ Supports:
 - Fusion-safe `beam_cli` row counters (`rows_read`, `pre_sink_rows`, `dlq_rows`)
 """
 
+import re
 import shlex
 from typing import Any
 from typing import Iterable
@@ -68,6 +69,65 @@ def _materialize_cdc_config(pks, seq_col):
   return cfg
 
 
+_AGG_CALL_RE = re.compile(
+    r'^(?:(?P<alias>[A-Za-z0-9_]+)\s*=\s*)?(?P<fn>[A-Za-z0-9_]+)\s*\(\s*(?P<val>[A-Za-z0-9_*]*)\s*\)$'
+)
+
+
+def _split_window_tokens(s: str) -> list[str]:
+  tokens: list[str] = []
+  cur: list[str] = []
+  depth = 0
+  for ch in s:
+    if ch in '([{':
+      depth += 1
+      cur.append(ch)
+    elif ch in ')]}':
+      if depth > 0:
+        depth -= 1
+      cur.append(ch)
+    elif ch == ',' and depth == 0:
+      tok = ''.join(cur).strip()
+      if tok:
+        tokens.append(tok)
+      cur = []
+    else:
+      cur.append(ch)
+  if cur:
+    tok = ''.join(cur).strip()
+    if tok:
+      tokens.append(tok)
+  return tokens
+
+
+def _parse_inline_aggregations(
+    tokens: list[str]
+) -> tuple[dict[str, Any], list[str], list[str]]:
+  combines: dict[str, Any] = {}
+  group_by: list[str] = []
+  remaining: list[str] = []
+  for t in tokens:
+    if t.startswith(('group_by=', 'by=')):
+      val = t.split('=', 1)[1]
+      cols = [c.strip("[] '\"") for c in val.split(',') if c.strip("[] '\"")]
+      group_by.extend(cols)
+      continue
+    m = _AGG_CALL_RE.match(t)
+    if m:
+      fn = m.group('fn').lower()
+      fn_clean = 'mean' if fn == 'avg' else fn
+      val = m.group('val').strip()
+      alias = m.group('alias')
+      if not alias:
+        alias = val if val and val != '*' else (fn if fn != 'mean' else 'avg')
+      if not val or val == '*':
+        val = alias if alias != fn_clean else '1'
+      combines[alias] = {'value': val, 'fn': fn_clean}
+      continue
+    remaining.append(t)
+  return combines, group_by, remaining
+
+
 def parse_window_spec(spec: str | dict[str, Any]) -> dict[str, Any]:
   """Parses a `--window` string into a Beam YAML windowing dict."""
   if isinstance(spec, dict):
@@ -89,7 +149,7 @@ def parse_window_spec(spec: str | dict[str, Any]) -> dict[str, Any]:
     except Exception as e:
       raise PipeSpecError(f'malformed JSON in --window: {e}') from None
 
-  if '=' in s and ':' not in s.split('=', 1)[0]:
+  if '=' in s and ':' not in s.split('=', 1)[0] and not _AGG_CALL_RE.search(s):
     parts = [p.strip() for p in s.split(',') if p.strip()]
     kv: dict[str, Any] = {}
     for p in parts:
@@ -109,42 +169,41 @@ def parse_window_spec(spec: str | dict[str, Any]) -> dict[str, Any]:
       prefix = cand_prefix.lower()
       rest = cand_rest.strip()
 
+  tokens = _split_window_tokens(rest)
+  combines, group_by, rem_tokens = _parse_inline_aggregations(tokens)
+
   if not prefix:
     prefix = 'fixed'
 
   if prefix == 'fixed':
-    parts = [p.strip() for p in rest.split(',') if p.strip()]
-    if not parts:
+    if not rem_tokens:
       raise PipeSpecError(
           f"invalid fixed window specification {s!r}; expected fixed:DURATION (e.g. 'fixed:60s')")
-    out: dict[str, Any] = {'type': 'fixed', 'size': parts[0]}
-    if len(parts) > 1:
-      out['offset'] = parts[1]
-    return out
-
+    out: dict[str, Any] = {'type': 'fixed', 'size': rem_tokens[0]}
+    if len(rem_tokens) > 1:
+      out['offset'] = rem_tokens[1]
   elif prefix == 'sliding':
-    parts = [p.strip() for p in rest.split(',') if p.strip()]
-    if len(parts) < 2:
+    if len(rem_tokens) < 2:
       raise PipeSpecError(
           f"invalid sliding window specification {s!r}; expected sliding:SIZE,PERIOD (e.g. 'sliding:5m,1m')")
-    out = {'type': 'sliding', 'size': parts[0], 'period': parts[1]}
-    if len(parts) > 2:
-      out['offset'] = parts[2]
-    return out
-
+    out = {'type': 'sliding', 'size': rem_tokens[0], 'period': rem_tokens[1]}
+    if len(rem_tokens) > 2:
+      out['offset'] = rem_tokens[2]
   elif prefix in ('session', 'sessions'):
-    parts = [p.strip() for p in rest.split(',') if p.strip()]
-    if not parts:
+    if not rem_tokens:
       raise PipeSpecError(
           f"invalid session window specification {s!r}; expected session:GAP (e.g. 'session:30m')")
-    return {'type': 'sessions', 'gap': parts[0]}
-
+    out = {'type': 'sessions', 'gap': rem_tokens[0]}
   elif prefix == 'global':
-    return {'type': 'global'}
+    out = {'type': 'global'}
+  else:
+    raise PipeSpecError(
+        f"unknown window type in --window {s!r}; expected fixed:DURATION, "
+        "sliding:SIZE,PERIOD, or session:GAP")
 
-  raise PipeSpecError(
-      f"unknown window type in --window {s!r}; expected fixed:DURATION, "
-      "sliding:SIZE,PERIOD, or session:GAP")
+  if combines:
+    out['aggregations'] = {'group_by': group_by, 'combine': combines}
+  return out
 
 
 def build_pipe_spec(
@@ -344,6 +403,7 @@ def build_pipe_spec(
         'immutable shards (use a new prefix or --if-exists=replace)')
 
   window_spec = parse_window_spec(window) if window else None
+  window_aggs = window_spec.pop('aggregations', None) if window_spec else None
   clean_timestamp_col = str(timestamp_col).strip() if timestamp_col else None
   if clean_timestamp_col == '':
     raise PipeSpecError('--timestamp-col cannot be empty')
@@ -661,6 +721,14 @@ def build_pipe_spec(
               'windowing': window_spec
           },
       })
+      if window_aggs:
+        chain_steps.append({
+            'type': 'Combine',
+            'config': {
+                'group_by': window_aggs.get('group_by', []),
+                'combine': window_aggs.get('combine', {}),
+            },
+        })
     if cdc_norm_cfg is not None:
       chain_steps.append({
           'type': 'CliNormalizeCdc',
@@ -803,6 +871,17 @@ def build_pipe_spec(
         },
     })
     current_ref = 'WindowInto'
+    if window_aggs:
+      dag_transforms.append({
+          'name': 'WindowCombine',
+          'type': 'Combine',
+          'input': current_ref,
+          'config': {
+              'group_by': window_aggs.get('group_by', []),
+              'combine': window_aggs.get('combine', {}),
+          },
+      })
+      current_ref = 'WindowCombine'
 
   if cdc_norm_cfg is not None:
     norm_cdc = dict(cdc_norm_cfg)

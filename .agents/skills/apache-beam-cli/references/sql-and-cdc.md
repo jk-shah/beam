@@ -28,6 +28,15 @@ beam pipe --from o=orders.parquet \
 ```
 *(Pass `--portable` / `--strict-beam` or inspect `outputs.portable_to_runner` to verify that a local `--sql` query uses strictly ANSI/Calcite constructs supported on distributed Beam runners such as `DataflowRunner`.)*
 
+### Direct `--select` Shorthand
+You can project columns directly without handwriting `--sql "SELECT ..."` boilerplate:
+```bash
+# Project columns directly to destination or omit --to to print/preview instantly
+beam pipe --from src=data/events.parquet \
+          --select "event_id, lower(email) AS email, amount" \
+          --to out/clean.parquet --json
+```
+
 ---
 
 ## 2. Built-in SQL Functions & Engines
@@ -83,28 +92,29 @@ Supported window formats:
 - **Tumbling**: `--window fixed:60s` (or plain `60s`)
 - **Sliding**: `--window sliding:5m,1m` (window size, slide period)
 - **Session**: `--window session:30m` (inactivity gap)
+- **Inline Aggregations**: `--window "fixed:60s,sum(metric)"` or `--window "fixed:60s,by=user,count(),avg(latency)"` (automatically pairs `WindowInto` with `Combine`)
 
 ```bash
 # Apply 60-second tumbling windows by event_ts and emit Beam YAML
 beam pipe --from src=events.jsonl \
           --timestamp-col event_ts \
-          --window fixed:60s \
+          --window "fixed:60s,total_bytes=sum(bytes)" \
           --to out/windowed.parquet \
           --emit-yaml
 ```
 
-When `--emit-yaml` is passed, `beam` generates idiomatic `AssignTimestamps` and `WindowInto` YAML steps compatible with Dataflow and Beam runners.
+When `--emit-yaml` is passed, `beam` generates idiomatic `AssignTimestamps`, `WindowInto`, and optional `Combine` YAML steps compatible with Dataflow and Beam runners.
 
 ---
 
 ## 5. Cross-Engine CDC Replication & Zero-Gap Full Sync
 
-Replicate CDC streams or snapshots with state deduplication, retaining the latest record per primary key:
+Replicate CDC streams or snapshots with state deduplication, retaining the latest record per primary key (`--primary-key`, `--key`, `--cdc-pk`, and `--pk` are aliases; passing any key flag automatically activates `--cdc`):
 ```bash
 # Replicate from stream/file and keep latest state per primary key
 beam pipe --from src=cdc_updates.parquet \
           --to out/current_state.parquet \
-          --cdc --primary-key account_id \
+          --key account_id \
           --cdc-seq-col updated_at \
           --assert-counts --json
 ```

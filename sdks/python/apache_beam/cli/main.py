@@ -214,6 +214,10 @@ _CLI_ONE_FLAGS = {
         '--max-bytes',
         '--verify-key',
         '--primary-key',
+        '--key',
+        '--pk',
+        '--cdc-pk',
+        '--portable',
         '--cdc-format',
         '--cdc-op-col',
         '--cdc-seq-col',
@@ -222,6 +226,9 @@ _CLI_ONE_FLAGS = {
     ]),
     'diff': frozenset([
         '--key',
+        '--primary-key',
+        '--pk',
+        '--cdc-pk',
         '--left-format',
         '--right-format',
         '--left-opt',
@@ -233,7 +240,7 @@ _CLI_ONE_FLAGS = {
         '--max-bytes',
         '--profile',
     ]),
-    'check': frozenset(['--jinja-variables', '--profile']),
+    'check': frozenset(['--jinja-variables', '--profile', '--portable']),
     'tail': frozenset([
         '-n',
         '--limit',
@@ -755,6 +762,9 @@ def _build_parser():
       help='enable cross-engine Change Data Capture (UPSERT + DELETE propagation)')
   pipe.add_argument(
       '--primary-key',
+      '--key',
+      '--cdc-pk',
+      '--pk',
       dest='primary_keys',
       action='append',
       default=[],
@@ -815,6 +825,9 @@ def _build_parser():
       'right', metavar='RIGHT_URI', help='right dataset URI/path')
   diff_p.add_argument(
       '--key',
+      '--primary-key',
+      '--cdc-pk',
+      '--pk',
       dest='keys',
       action='append',
       default=[],
@@ -933,6 +946,14 @@ def _build_parser():
       '--jinja-variables',
       metavar='JSON',
       help='JSON mapping of Jinja variables when explicitly expanding templates')
+  chk.add_argument(
+      '--portable',
+      '--strict-beam',
+      dest='portable',
+      action='store_true',
+      help=(
+          'validate that pipeline uses only cross-runner portable transforms '
+          'and portable SQL dialect'))
   _add_config_selection_args(chk)
 
   # 6. `beam io`
@@ -1632,6 +1653,7 @@ def _check(args, extra_args, *, json_session, t0: float) -> int:
         trust_providers=args.trust_providers,
         jinja_variables_json=args.jinja_variables,
         pipeline_args=resolved,
+        portable=bool(getattr(args, 'portable', False)),
         verbose=bool(getattr(args, 'verbose', False)))
   except check_cmd.CheckError as e:
     acts = None
@@ -2171,8 +2193,28 @@ def _pipe(
   explicit_runner = _extract_runner_from_args(resolved_args)
   is_local_runner = _runner_name(explicit_runner) in _LOCAL_RUNNERS
 
+  if getattr(args, 'primary_keys', None) and not args.cdc:
+    args.cdc = True
+
   raw_sources = list(args.sources or [])
   raw_joins = list(args.joins or [])
+  if args.sink is None and args.sql is None and getattr(args, 'select', None) and not (
+      args.cdc or args.zero_copy or args.window or args.timestamp_col or args.dlq):
+    from . import pipe_sql as _ps_mod
+    first_src = raw_sources[0] if raw_sources else ''
+    m_alias = _ps_mod._ALIAS_PREFIX_RE.match(first_src)
+    if m_alias and not os.path.exists(first_src):
+      alias = m_alias.group('alias')
+    else:
+      alias = _ps_mod._derive_alias_from_uri(first_src, set())
+      if first_src and '=' not in first_src:
+        args.sources = [f'{alias}={first_src}'] + raw_sources[1:]
+        raw_sources = list(args.sources)
+    where_part = f' WHERE {args.where}' if getattr(args, 'where', None) else ''
+    args.sql = f'SELECT {args.select} FROM {alias}{where_part}'
+    args.where = None
+    args.select = None
+
   is_sql_mode = bool(args.sql is not None or raw_joins or len(raw_sources) > 1)
   allow_jinja = bool(args.dry_run)
 

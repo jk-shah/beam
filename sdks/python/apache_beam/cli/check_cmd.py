@@ -47,6 +47,7 @@ def run_check(
     trust_providers: bool = False,
     jinja_variables_json: str | None = None,
     pipeline_args: list[str] | None = None,
+    portable: bool = False,
     verbose: bool = False,
 ) -> dict[str, Any]:
   """Validates a Beam YAML pipeline and returns a structured validation report."""
@@ -192,6 +193,16 @@ def run_check(
           f'{str(e).splitlines()[0][:300]}')
 
   check_warnings: list[str] = _check_parquet_untyped_python_expressions(pipeline_block)
+  non_portable: list[str] = _check_portability(pipeline_block)
+  if portable and non_portable:
+    raise CheckError(
+        f'{source_label}: --portable rejected non-portable construct(s): ' +
+        ', '.join(non_portable) +
+        ' (these constructs run on local engines but fail on distributed '
+        'runners Dataflow/Flink/Spark)')
+  if non_portable and not portable:
+    check_warnings.extend(
+        [f'non-portable construct: {np}' for np in non_portable])
 
   result = {
       'valid': True,
@@ -203,12 +214,50 @@ def run_check(
       'transforms': stages,
       'has_custom_providers': has_custom_providers,
       'expanded_top_level_transforms': expanded_transforms,
+      'portable_to_runner': len(non_portable) == 0,
+      'non_portable_constructs': non_portable,
       'warnings': check_warnings,
   }
   if plan_skipped_reason:
     result['plan_skipped_reason'] = plan_skipped_reason
     result['plan_skipped_detail'] = plan_skipped_detail
   return result
+
+
+def _check_portability(pipeline_block: dict[str, Any]) -> list[str]:
+  """Recursively checks for SQL dialect or provider constructs non-portable to remote Beam runners."""
+  issues: list[str] = []
+  from . import pipe_sql
+
+  def _scan_transforms(t_list):
+    for t in (t_list or []):
+      if not isinstance(t, dict):
+        continue
+      t_type = str(t.get('type') or '')
+      cfg = t.get('config') or {}
+
+      if t_type.lower() in ('sql', 'sqltransform') or 'query' in cfg:
+        q = str(cfg.get('query') or '')
+        if q:
+          non_port = pipe_sql.analyze_sql_portability(q)
+          for item in non_port:
+            issues.append(f'SQL query uses {item}')
+
+      if 'key' in cfg and t_type.lower() in ('writeasjson', 'writetojson'):
+        issues.append('keyed JSON output (key=)')
+
+      if isinstance(t.get('transforms'), list):
+        _scan_transforms(t['transforms'])
+      for extra in ('source', 'sink', 'extra_transforms'):
+        if extra in t:
+          b = t[extra]
+          _scan_transforms(b if isinstance(b, list) else [b])
+
+  for extra in ('source', 'sink', 'extra_transforms', 'transforms'):
+    if extra in pipeline_block:
+      b = pipeline_block[extra]
+      _scan_transforms(b if isinstance(b, list) else [b])
+  return sorted(set(issues))
 
 
 # Keys Beam YAML accepts on a transform (pipeline.schema.yaml). Anything else,
