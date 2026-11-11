@@ -30,6 +30,8 @@ envelopes for autonomous AI agents across:
 - `beam io` / `beam doctor` / `beam config` / `beam sql` / `beam --llms-txt`
 """
 
+from __future__ import annotations
+
 import argparse
 import copy
 import glob
@@ -2141,7 +2143,7 @@ def _catalog(
     args: argparse.Namespace,
     extra_args: list[str],
     *,
-    json_session: output.JsonEnvelopeSession,
+    json_session: output.JsonOutputSession,
     t0: float,
 ) -> int:
   """Handles `beam catalog sync` execution with deterministic JSON envelopes or terminal summary.

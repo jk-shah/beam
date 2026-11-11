@@ -599,3 +599,6 @@ class JsonOutputSession:
     elif self._prev_stdout is not None:
       sys.stdout = self._prev_stdout
     return False
+
+
+JsonEnvelopeSession = JsonOutputSession
