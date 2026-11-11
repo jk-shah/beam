@@ -26,7 +26,6 @@ beam pipe --from o=orders.parquet \
           --sql "SELECT o.order_id, c.customer_name, p.product_name, o.amount FROM o JOIN c ON o.customer_id = c.customer_id JOIN p ON o.product_id = p.product_id" \
           --portable --json
 ```
-*(Pass `--portable` / `--strict-beam` or inspect `outputs.portable_to_runner` to verify that a local `--sql` query uses strictly ANSI/Calcite constructs supported on distributed Beam runners such as `DataflowRunner`.)*
 
 ### Direct `--select` Shorthand
 You can project columns directly without handwriting `--sql "SELECT ..."` boilerplate:
@@ -70,6 +69,19 @@ beam pipe --from tx=transactions.parquet \
           --json
 ```
 
+### Local SQL Engine vs. Remote Beam Calcite SQL Portability Cliff
+Be aware of dialect boundaries when graduating from local testing to distributed cloud runners:
+| Construct / Function | Local In-Process Engine | Beam Calcite SQL (Dataflow/Flink/Spark) | Portability Guidance |
+| :--- | :--- | :--- | :--- |
+| `COUNT`, `SUM`, `AVG`, `MIN`, `MAX` | Supported | Supported | Fully portable ANSI standard |
+| `ROW_NUMBER() OVER (...)` | Supported | Supported | Fully portable standard windowing |
+| `to_utc(ts)` | Supported (Built-in) | Unsupported | Use standard timestamp casting or formatting |
+| `median(x)`, `quantile(x, p)` | Supported (Built-in) | Unsupported | Compute via standard quantiles transform in Beam YAML |
+| `regr_slope(y, x)`, `corr(x, y)` | Supported (Built-in) | Unsupported | Pre-calculate in Python transform or Beam Combiner |
+| `strftime(...)` | Supported (SQLite syntax) | Unsupported | Use Calcite `EXTRACT(...)` or standard date functions |
+
+*(Pass `--portable` / `--strict-beam` or check `outputs.portable_to_runner` on `beam pipe` / `beam check` to verify Calcite compatibility before submitting to Dataflow.)*
+
 ---
 
 ## 3. Mixed-Format Local Directory Globs
@@ -107,7 +119,7 @@ When `--emit-yaml` is passed, `beam` generates idiomatic `AssignTimestamps`, `Wi
 
 ---
 
-## 5. Cross-Engine CDC Replication & Zero-Gap Full Sync
+## 5. Cross-Engine CDC Replication & Lakehouse Bridging
 
 Replicate CDC streams or snapshots with state deduplication, retaining the latest record per primary key (`--primary-key`, `--key`, `--cdc-pk`, and `--pk` are aliases; passing any key flag automatically activates `--cdc`):
 ```bash
@@ -120,6 +132,12 @@ beam pipe --from src=cdc_updates.parquet \
 ```
 - Deduplication sorts by `lsn`, `ts_ms`, `seq_ts`, `seq`, `updated_at`, `event_ts`, `timestamp`, or an explicit `--cdc-seq-col`.
 - Rows marked as deleted (`op = 'd'` or `_change_type = 'delete'`) are pruned automatically.
+
+### Lakehouse Bridging Limits & Requirements
+1. **Zero-Copy Lakehouse Invariants**: `--zero-copy` translates Delta transaction logs (`_delta_log/*.json`) directly to Iceberg Avro manifests without duplicating underlying Parquet files (`bytes_copied: 0`).
+   - Requires **unpartitioned Delta tables**. If a table is partitioned, physical data rewrite is required (`--if-exists append` or standard copy).
+   - Requires source and target to reside in the **same cloud storage bucket**.
+2. **Delta Deletion Vectors & Column Mapping**: Delta tables using deletion vectors or column mapping require the optional `deltalake` Python package. If missing, `beam` halts with exit code 4 (`EXIT_MISSING_PACKAGE`).
 
 ### Zero-Gap Full Sync + Incremental CDC (Never Miss Intermediate Commits)
 
@@ -142,7 +160,7 @@ To avoid losing writes that land **while** the initial full backfill is running,
              --to "iceberg://lake.orders?warehouse=gs://my-bkt/wh" \
              --cdc --primary-key id --if-exists append --json
 
-   # 4. Reconcile exact parity at V1, then advance V0=$V1 for next run
+   # 4. Reconcile exact parity at V1 (exits 0 if identical, exits 6 if mismatch)
    beam diff "delta://gs://my-bkt/delta/orders?version=${V1}" \
              "iceberg://lake.orders?warehouse=gs://my-bkt/wh" --key id --json
    ```

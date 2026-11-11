@@ -1,6 +1,6 @@
-# Apache Beam CLI — Cloud, Flex Templates, and Validation Reference
+# Apache Beam CLI — Cloud, Flex Templates, Streams, and Production Boundaries
 
-This guide covers Zero-Docker Dataflow Flex Template packaging, offline validation, cloud execution, and stream monitoring with `beam`.
+This guide covers Zero-Docker Dataflow Flex Template packaging, offline validation, cloud execution, bounded stream tailing, and production scheduling boundaries with `beam`.
 
 ---
 
@@ -46,7 +46,7 @@ beam package main.py \
 Validate Beam YAML pipeline structure, transform types, schemas, and provider dependencies offline before submission:
 ```bash
 # Validate YAML syntax and transform schema offline
-beam check pipeline.yaml --json
+beam check pipeline.yaml --portable --json
 ```
 
 ### Static Warning for Untyped Python Expressions
@@ -108,8 +108,48 @@ beam tail pubsub://projects/my-project/subscriptions/events-sub \
           -n 10 --duration 5s --json
 ```
 
-### Live Following (`-f`)
-For interactive terminal monitoring of live streams or lakehouse commit logs:
+### Kafka Stream Tailing (`beam tail kafka://...`)
+`beam tail` connects to Apache Kafka topics with built-in guardrails designed specifically for operational debugging and agents:
+- **Ephemeral Non-Committing Consumer Groups**: `beam tail` connects with an ephemeral consumer group (`beam-tail-<uuid>`) and explicitly sets `enable.auto.commit=false`. It reads messages without committing offsets, preventing any disruption to production consumer groups or consumer lag metrics.
+- **Payload Decoding**: Automatically decodes UTF-8 text and JSON lines. When working with Kafka Schema Registry (Avro or Protobuf payloads), pass the registry URL via `--from-opt schema_registry_url=http://registry:8081` or ingest pre-decoded topics.
+- **Authentication**: Supports standard Kafka client security properties:
+  - `--from-opt security_protocol=SASL_SSL`
+  - `--from-opt sasl_mechanism=PLAIN` (or `SCRAM-SHA-512`)
+  - Standard environment variables: `BEAM_KAFKA_BOOTSTRAP_SERVERS`, `BEAM_KAFKA_SASL_USERNAME`, `BEAM_KAFKA_SASL_PASSWORD`
+  - *Never pass credentials in the URI string (rejected with exit code 2).*
+
 ```bash
-beam tail -f delta://gs://my-bucket/delta/orders -n 20 --json
+# Bounded tail of a secure Kafka topic
+beam tail "kafka://broker.example.com:9092/user-activity" \
+          -n 5 --duration 5s \
+          --from-opt security_protocol=SASL_SSL \
+          --from-opt sasl_mechanism=SCRAM-SHA-512 \
+          --json
 ```
+
+---
+
+## 5. Production Scheduling & Operational Boundaries
+
+`beam` is a single-pipeline execution CLI and driver; it is **not** an orchestrator, daemon, or background scheduler.
+
+### Orchestrating Recurring Pipelines
+`beam` does not include an internal cron daemon or workflow scheduler. For production recurring schedules, multi-stage DAGs, or SLA alerting:
+1. **Package Declarative Pipelines**: Package your pipeline with `beam package pipeline.yaml --to gs://my-bucket/templates/pipeline.json --json`.
+2. **Trigger via Orchestrator**: Schedule executions using **Google Cloud Composer (Apache Airflow)**, **Cloud Scheduler + Cloud Functions / Cloud Run**, or **dbt** for warehouse transformations.
+3. **Programmatic Submission**: Trigger template runs via `gcloud dataflow flex-template run <JOB_NAME> --template-file-gcs-location=gs://.../pipeline.json`.
+
+### Progress Markers & Streaming Checkpointing
+`beam` maintains no local state or checkpoint databases on the CLI client. 
+- In streaming pipelines, progress markers, committed offsets, and watermarks are managed entirely within the target runner (e.g. Google Cloud Dataflow managed state backend or Kafka broker consumer groups when run on Dataflow).
+- In batch incremental loads and CDC backfills, state tracking is achieved deterministically through version-pinned watermarks (`?version=V0`, `?start_version=...`) as detailed in [references/sql-and-cdc.md](sql-and-cdc.md).
+
+---
+
+## 6. Guardrails & Confirmation for Autonomous Agents
+
+Autonomous agents interacting with `beam` must uphold strict operational guardrails:
+1. **Confirm Paid Cloud Compute**: Always prompt the user for confirmation before submitting jobs with `--runner=DataflowRunner`, as this provisions paid Google Cloud Compute Engine worker VMs.
+2. **Confirm Destructive Overwrites**: Always obtain user confirmation before specifying `--if-exists replace` or running operations that overwrite existing tables or storage paths.
+3. **Confirm Job Termination**: Always confirm before canceling or draining active production jobs via `beam cancel <JOB_ID>`.
+4. **Pre-Flight Cost Guard**: When running large ad-hoc scans on cloud storage or BigQuery, always include `--max-bytes <BUDGET>` (e.g., `--max-bytes 10GB`) to halt execution before incurring unexpected scan costs (exits with code 8 `EXIT_COST_LIMIT`).
