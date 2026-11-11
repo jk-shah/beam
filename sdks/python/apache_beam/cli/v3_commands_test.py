@@ -4210,6 +4210,233 @@ class Round12FixesTest(unittest.TestCase):
       self.assertEqual(
           launcher.maybe_inject_dataflow_worker_args(base_args), base_args)
 
+  def test_delta_to_iceberg_zero_gap_full_sync_plus_incremental_cdc(self):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    delta_dir = os.path.join(self.tmp, 'delta_orders')
+    log_dir = os.path.join(delta_dir, '_delta_log')
+    os.makedirs(log_dir, exist_ok=True)
+    wh_dir = os.path.join(self.tmp, 'ice_wh')
+    ice_uri = f'iceberg://shop.orders?warehouse={wh_dir}'
+
+    schema_json = json.dumps({
+        'type': 'struct',
+        'fields': [
+            {'name': 'id', 'type': 'long', 'nullable': False, 'metadata': {}},
+            {'name': 'item', 'type': 'string', 'nullable': True, 'metadata': {}},
+            {'name': 'qty', 'type': 'long', 'nullable': True, 'metadata': {}},
+        ],
+    })
+
+    # Commit v0: 3 initial orders (1=apple:2, 2=pear:5, 3=plum:2).
+    f0 = os.path.join(delta_dir, 'part-v0.parquet')
+    pq.write_table(
+        pa.Table.from_pylist([
+            {'id': 1, 'item': 'apple', 'qty': 2},
+            {'id': 2, 'item': 'pear', 'qty': 5},
+            {'id': 3, 'item': 'plum', 'qty': 2},
+        ]),
+        f0)
+    with open(
+        os.path.join(log_dir, '00000000000000000000.json'),
+        'w',
+        encoding='utf-8') as f:
+      f.write(
+          json.dumps({'protocol': {'minReaderVersion': 1, 'minWriterVersion': 2}})
+          + '\n')
+      f.write(
+          json.dumps({
+              'metaData': {
+                  'id': 'tbl-orders',
+                  'schemaString': schema_json,
+                  'partitionColumns': [],
+                  'configuration': {'delta.enableChangeDataFeed': 'true'},
+              }
+          }) + '\n')
+      f.write(
+          json.dumps({
+              'add': {
+                  'path': 'part-v0.parquet',
+                  'size': os.path.getsize(f0),
+                  'modificationTime': 1700000000000,
+                  'dataChange': True,
+              }
+          }) + '\n')
+
+    # Step 1: Pin V0 via `beam inspect`.
+    rc_i0, env_i0, err_i0 = _run_json([
+        'inspect', f'delta://{delta_dir}', '--sample', '0'
+    ])
+    self.assertEqual(rc_i0, cli.EXIT_OK, err_i0)
+    v0 = env_i0['outputs']['snapshot_version']
+    self.assertEqual(v0, 0)
+
+    # Simulate concurrent intermediate commits v1 and v2 landing on Delta
+    # BEFORE/DURING the initial snapshot backfill!
+    # Commit v1 (Copy-on-Write with `add` listed BEFORE `remove` in commit JSON!):
+    #   updates id=1 qty 2->4, deletes id=2, keeps id=3.
+    f1 = os.path.join(delta_dir, 'part-v1.parquet')
+    pq.write_table(
+        pa.Table.from_pylist([
+            {'id': 1, 'item': 'apple', 'qty': 4},
+            {'id': 3, 'item': 'plum', 'qty': 2},
+        ]),
+        f1)
+    with open(
+        os.path.join(log_dir, '00000000000000000001.json'),
+        'w',
+        encoding='utf-8') as f:
+      f.write(
+          json.dumps({
+              'add': {
+                  'path': 'part-v1.parquet',
+                  'size': os.path.getsize(f1),
+                  'modificationTime': 1700000001000,
+                  'dataChange': True,
+              }
+          }) + '\n')
+      f.write(
+          json.dumps({
+              'remove': {
+                  'path': 'part-v0.parquet',
+                  'deletionTimestamp': 1700000001000,
+                  'dataChange': True,
+              }
+          }) + '\n')
+
+    # Commit v2 (explicit `_change_data` CDF file): inserts id=4 kiwi:1 and updates id=3 qty 2->7.
+    os.makedirs(os.path.join(delta_dir, '_change_data'), exist_ok=True)
+    f2 = os.path.join(delta_dir, 'part-v2.parquet')
+    pq.write_table(
+        pa.Table.from_pylist([
+            {'id': 1, 'item': 'apple', 'qty': 4},
+            {'id': 3, 'item': 'plum', 'qty': 7},
+            {'id': 4, 'item': 'kiwi', 'qty': 1},
+        ]),
+        f2)
+    cdc2 = os.path.join(delta_dir, '_change_data', 'cdc-v2.parquet')
+    pq.write_table(
+        pa.Table.from_pylist([
+            {
+                'id': 3,
+                'item': 'plum',
+                'qty': 2,
+                '_change_type': 'update_preimage',
+                '_commit_version': 2,
+            },
+            {
+                'id': 3,
+                'item': 'plum',
+                'qty': 7,
+                '_change_type': 'update_postimage',
+                '_commit_version': 2,
+            },
+            {
+                'id': 4,
+                'item': 'kiwi',
+                'qty': 1,
+                '_change_type': 'insert',
+                '_commit_version': 2,
+            },
+        ]),
+        cdc2)
+    with open(
+        os.path.join(log_dir, '00000000000000000002.json'),
+        'w',
+        encoding='utf-8') as f:
+      f.write(
+          json.dumps({
+              'remove': {
+                  'path': 'part-v1.parquet',
+                  'deletionTimestamp': 1700000002000,
+                  'dataChange': True,
+              }
+          }) + '\n')
+      f.write(
+          json.dumps({
+              'add': {
+                  'path': 'part-v2.parquet',
+                  'size': os.path.getsize(f2),
+                  'modificationTime': 1700000002000,
+                  'dataChange': True,
+              }
+          }) + '\n')
+      f.write(
+          json.dumps({
+              'cdc': {
+                  'path': '_change_data/cdc-v2.parquet',
+                  'size': os.path.getsize(cdc2),
+                  'partitionValues': {},
+              }
+          }) + '\n')
+
+    # Step 2: Run full sync pinned strictly at `?version=0` (even though v1 & v2 already exist!).
+    rc_sync, _, err_sync = _run_json([
+        'pipe',
+        '--from',
+        f'delta://{delta_dir}?version={v0}',
+        '--to',
+        ice_uri,
+        '--zero-copy',
+    ])
+    self.assertEqual(rc_sync, cli.EXIT_OK, err_sync)
+
+    # Step 3: Pin V1=2 and apply incremental CDC `[V0+1 .. V1]` into Iceberg MoR.
+    rc_i1, env_i1, _ = _run_json([
+        'inspect', f'delta://{delta_dir}', '--sample', '0'
+    ])
+    self.assertEqual(rc_i1, cli.EXIT_OK)
+    v1 = env_i1['outputs']['snapshot_version']
+    self.assertEqual(v1, 2)
+
+    rc_cdc, _, err_cdc = _run_json([
+        'pipe',
+        '--from',
+        f'delta://{delta_dir}?start_version={v0 + 1}&end_version={v1}',
+        '--to',
+        ice_uri,
+        '--cdc',
+        '--primary-key',
+        'id',
+        '--if-exists',
+        'append',
+    ])
+    self.assertEqual(rc_cdc, cli.EXIT_OK, err_cdc)
+
+    # Step 4: Verify 0-row drift between Delta v2 and Iceberg v2!
+    rc_diff, env_diff, err_diff = _run_json([
+        'diff',
+        f'delta://{delta_dir}?version={v1}',
+        ice_uri,
+        '--key',
+        'id',
+    ])
+    self.assertEqual(rc_diff, cli.EXIT_OK, err_diff)
+    self.assertTrue(env_diff['outputs']['match'])
+    self.assertEqual(env_diff['outputs']['summary']['left_rows'], 3)
+    self.assertEqual(env_diff['outputs']['summary']['right_rows'], 3)
+
+    # Step 5: Verify `--emit-yaml` emits core-Beam 2.77+ `ReadFromDeltaCDC` + `WriteToIceberg` config!
+    rc_y, env_y, err_y = _run_json([
+        'pipe',
+        '--from',
+        f'delta://{delta_dir}?start_version=1&end_version=2',
+        '--to',
+        ice_uri,
+        '--cdc',
+        '--primary-key',
+        'id',
+        '--emit-yaml',
+    ])
+    self.assertEqual(rc_y, cli.EXIT_OK, err_y)
+    yaml_out = env_y['outputs']['yaml']
+    self.assertIn('ReadFromDeltaCDC', yaml_out)
+    self.assertIn('include_metadata_columns', yaml_out)
+    self.assertIn('WriteToIceberg', yaml_out)
+    self.assertIn('change_type_map', yaml_out)
+    self.assertIn('update_postimage: UPDATE_AFTER', yaml_out)
+
 
 if __name__ == '__main__':
   unittest.main()

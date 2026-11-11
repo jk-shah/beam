@@ -97,7 +97,7 @@ When `--emit-yaml` is passed, `beam` generates idiomatic `AssignTimestamps` and 
 
 ---
 
-## 5. Cross-Engine CDC Replication
+## 5. Cross-Engine CDC Replication & Zero-Gap Full Sync
 
 Replicate CDC streams or snapshots with state deduplication, retaining the latest record per primary key:
 ```bash
@@ -109,7 +109,37 @@ beam pipe --from src=cdc_updates.parquet \
           --assert-counts --json
 ```
 - Deduplication sorts by `lsn`, `ts_ms`, `seq_ts`, `seq`, `updated_at`, `event_ts`, `timestamp`, or an explicit `--cdc-seq-col`.
-- Rows marked as deleted (`op = 'd'` or `is_deleted = true`) are pruned automatically.
+- Rows marked as deleted (`op = 'd'` or `_change_type = 'delete'`) are pruned automatically.
+
+### Zero-Gap Full Sync + Incremental CDC (Never Miss Intermediate Commits)
+
+To avoid losing writes that land **while** the initial full backfill is running, always pin or overlap the CDC watermark before reading the snapshot:
+
+1. **Delta Lake -> Apache Iceberg (Version-Pinned Watermark Handoff)**
+   *(Native Java Managed `ReadFromDelta` + `ReadFromDeltaCDC` + `WriteToIceberg(mode="merge-on-read")` in Beam `2.77+`; built-in Python Iceberg v2 / Delta bridge on Beam `2.71–2.76`. Enable `delta.enableChangeDataFeed = true` on Delta before pinning `V0`.)*
+   ```bash
+   # 1. Pin snapshot version V0 BEFORE initial backfill
+   V0=$(beam inspect delta://gs://my-bkt/delta/orders --sample 0 --json | jq -r '.outputs.snapshot_version')
+
+   # 2. Full load at pinned ?version=$V0 (add --zero-copy if unpartitioned on same bucket)
+   beam pipe --from "delta://gs://my-bkt/delta/orders?version=${V0}" \
+             --to "iceberg://lake.orders?warehouse=gs://my-bkt/wh" \
+             --assert-counts --json
+
+   # 3. Pin upper bound V1 and apply [V0+1 .. V1] via Iceberg v2 Merge-on-Read CDC
+   V1=$(beam inspect delta://gs://my-bkt/delta/orders --sample 0 --json | jq -r '.outputs.snapshot_version')
+   beam pipe --from "delta://gs://my-bkt/delta/orders?start_version=$((V0 + 1))&end_version=${V1}" \
+             --to "iceberg://lake.orders?warehouse=gs://my-bkt/wh" \
+             --cdc --primary-key id --if-exists append --json
+
+   # 4. Reconcile exact parity at V1, then advance V0=$V1 for next run
+   beam diff "delta://gs://my-bkt/delta/orders?version=${V1}" \
+             "iceberg://lake.orders?warehouse=gs://my-bkt/wh" --key id --json
+   ```
+
+2. **PostgreSQL / MySQL + Debezium -> BigQuery or Iceberg (All Core Beam `2.71+`)**
+   - **Single-pipeline (`ReadFromDebezium`)**: `beam pipe --from "postgres://host:5432/db?table=public.orders" --from-opt-file pg.yaml --to bigquery://proj.ds.orders --cdc --primary-key id --runner=DataflowRunner ...` performs a consistent `snapshot.mode=initial` read (`op='r'`) at WAL LSN $L_0$ and transitions directly to WAL streaming (`op='c'|'u'|'d'`) with zero gap.
+   - **Pub/Sub or Kafka Buffered Debezium**: Start the subscription/topic capture **before** taking the initial snapshot, run the snapshot load, then run `beam pipe --from pubsub://... --to bigquery://... --cdc --primary-key id`. Monotonic `source.lsn` -> `_CHANGE_SEQUENCE_NUMBER` ordering makes overlapping events idempotent.
 
 ---
 

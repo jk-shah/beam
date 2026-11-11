@@ -191,10 +191,15 @@ beam pipe --from gs://my-bucket/raw/orders.csv \\
           --where "amount > 0 AND status = 'PAID' AND order_id IS NOT NULL" \\
           --max-bytes 10GB --assert-counts --json
 
-# 2. Zero-copy Delta Lake -> Iceberg v2 registration (0 bytes copied) + diff
-beam pipe --from delta://gs://my-bucket/delta/orders \\
+# 2. Zero-gap Delta Lake -> Iceberg v2 full sync + incremental CDC (never misses intermediate commits)
+V0=$(beam inspect delta://gs://my-bucket/delta/orders --sample 0 --json | jq -r '.outputs.snapshot_version')
+beam pipe --from "delta://gs://my-bucket/delta/orders?version=${{V0}}" \\
           --to "iceberg://lake.orders?warehouse=gs://my-bucket/iceberg" \\
           --zero-copy --verify --verify-key order_id --json
+V1=$(beam inspect delta://gs://my-bucket/delta/orders --sample 0 --json | jq -r '.outputs.snapshot_version')
+beam pipe --from "delta://gs://my-bucket/delta/orders?start_version=$((V0 + 1))&end_version=${{V1}}" \\
+          --to "iceberg://lake.orders?warehouse=gs://my-bucket/iceberg" \\
+          --cdc --primary-key order_id --if-exists append --json
 
 # 3. Multi-input SQL join + aggregation across Parquet / CSV / Iceberg (repeatable --from)
 beam pipe --from o=out/clean_orders.parquet \\
@@ -203,7 +208,7 @@ beam pipe --from o=out/clean_orders.parquet \\
           --sql "SELECT COALESCE(c.tier, 'UNMAPPED') AS tier, COUNT(*) AS orders, ROUND(SUM(o.amount), 2) AS revenue FROM o LEFT JOIN c ON o.customer_id = c.customer_id GROUP BY 1 ORDER BY revenue DESC" \\
           --json
 
-# 4. Cross-engine CDC (Debezium / Delta CDF -> BigQuery UPSERT/DELETE or Iceberg MoR)
+# 4. OLTP Database + Debezium -> BigQuery UPSERT/DELETE (ReadFromDebezium or buffered Pub/Sub LSN stream)
 beam pipe --from pubsub://projects/my-proj/subscriptions/orders-cdc \\
           --to bigquery://my-proj.analytics.orders_live \\
           --cdc --primary-key order_id --dlq gs://my-bucket/dlq/cdc_bad.json \\

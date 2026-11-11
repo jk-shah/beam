@@ -573,6 +573,11 @@ def build_pipe_spec(
       needs_cli_provider = True
   else:
     # Portable Beam YAML export (`--emit-yaml` / `--dry-run`)
+    if src_ep.kind == 'delta' and cdc:
+      if 'start_version' not in src_cfg and 'start_timestamp' not in src_cfg:
+        src_cfg['start_version'] = 0
+      src_cfg.setdefault(
+          'include_metadata_columns', ['_change_type', '_commit_version'])
     if dst_ep.kind == 'iceberg' and cdc:
       sink_cfg.setdefault('mode', 'merge-on-read')
       sink_cfg.setdefault('equality_columns', pks)
@@ -580,6 +585,14 @@ def build_pipe_spec(
           'change_type_column',
           cdc_op_col or (
               '_change_type' if src_ep.kind in ('delta', 'iceberg') else 'op'))
+      if src_ep.kind == 'delta' and not cdc_op_col:
+        sink_cfg.setdefault(
+            'change_type_map', {
+                'insert': 'INSERT',
+                'update_preimage': 'UPDATE_BEFORE',
+                'update_postimage': 'UPDATE_AFTER',
+                'delete': 'DELETE',
+            })
       sink_cfg.setdefault(
           'sequence_number_column',
           cdc_seq_col or (

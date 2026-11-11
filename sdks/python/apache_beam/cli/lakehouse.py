@@ -625,6 +625,17 @@ def list_delta_cdc_actions(
               'version': ver,
           })
     else:
+      # Emit `remove` actions before `add` actions within the same commit so
+      # Copy-on-Write updates remove the old row first and apply the new row.
+      for obj in ver_objs:
+        rem = obj.get('remove')
+        if rem and rem.get('path') and rem.get('dataChange', True):
+          actions.append({
+              'kind': 'removed_file',
+              'path': _resolve_delta_child_path(root, rem['path']),
+              'partition_values': dict(rem.get('partitionValues') or {}),
+              'version': ver,
+          })
       for obj in ver_objs:
         add = obj.get('add')
         if add and add.get('path') and add.get('dataChange', True):
@@ -632,14 +643,6 @@ def list_delta_cdc_actions(
               'kind': 'added_file',
               'path': _resolve_delta_child_path(root, add['path']),
               'partition_values': dict(add.get('partitionValues') or {}),
-              'version': ver,
-          })
-        rem = obj.get('remove')
-        if rem and rem.get('path') and rem.get('dataChange', True):
-          actions.append({
-              'kind': 'removed_file',
-              'path': _resolve_delta_child_path(root, rem['path']),
-              'partition_values': dict(rem.get('partitionValues') or {}),
               'version': ver,
           })
   return schema_fields, actions
@@ -1854,12 +1857,16 @@ def cli_read_from_delta_cdc(
             }
             if act['kind'] == 'cdc_file':
               raw_op = str(raw_r.get('_change_type', 'insert'))
+              commit_v = int(raw_r.get('_commit_version', ver))
+              seq_num = commit_v * 2 + 1
             elif act['kind'] == 'removed_file':
               raw_op = 'DELETE'
+              seq_num = ver * 2
             else:
               raw_op = 'INSERT'
+              seq_num = ver * 2 + 1
             rec['beam_cdc_op'] = raw_op
-            rec['beam_cdc_seq'] = int(raw_r.get('_commit_version', ver))
+            rec['beam_cdc_seq'] = seq_num
             yield beam.Row(**rec)
 
   class _ReadDeltaCdcTransform(beam.PTransform):

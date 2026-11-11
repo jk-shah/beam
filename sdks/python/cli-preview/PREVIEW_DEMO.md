@@ -225,6 +225,66 @@ beam pipe \
   --json
 ```
 
+### Zero-Gap Full Sync + Incremental CDC Runbooks (Never Miss Intermediate Data)
+
+When writers are actively committing to a source table during your initial backfill, reading an **unpinned** snapshot and starting CDC "from latest" afterwards drops every row committed during the backfill window. Use one of the two zero-gap handoff patterns below depending on your source engine and Apache Beam version:
+
+#### Pattern A: Delta Lake -> Apache Iceberg (Version-Pinned Snapshot + Bounded CDF Windows)
+> **Core Beam compatibility**: Native Java Managed I/O (`ReadFromDelta`, `ReadFromDeltaCDC`, and `WriteToIceberg(mode="merge-on-read")`) lands in **Apache Beam 2.77+** (exported via `--emit-yaml`). On released PyPI Beam `2.71–2.76`, `apache-beam-cli-preview` executes the exact same URI workflow via its built-in Python Iceberg v2 / Delta bridge (`deltalake` extra required only if Delta v3+ Deletion Vectors or Column Mapping are enabled).
+>
+> **Prerequisite on Delta writer**: Enable Change Data Feed **before** pinning `V0` (`ALTER TABLE orders SET TBLPROPERTIES (delta.enableChangeDataFeed = true)`) so future `UPDATE`/`DELETE` commits emit `_change_data` files.
+
+```bash
+# Step 1: Pin exact snapshot watermark V0 BEFORE running the initial load
+#         (commits V0+1, V0+2, ... may land while Step 2 runs — none will be lost!)
+V0=$(beam inspect "delta://gs://<BUCKET>/delta/orders" --sample 0 --json \
+     | python3 -c "import json,sys; print(json.load(sys.stdin)['outputs']['snapshot_version'])")
+
+# Step 2: Initial full sync pinned strictly at ?version=${V0} into Iceberg v2
+#         (Use --zero-copy if unpartitioned on the same bucket, or omit --zero-copy to rewrite Parquet)
+beam pipe \
+  --from "delta://gs://<BUCKET>/delta/orders?version=${V0}" \
+  --to "iceberg://lake.orders?warehouse=gs://<BUCKET>/iceberg_wh" \
+  --assert-counts --json
+
+# Step 3: Pin upper bound V1 for your incremental CDC run so the watermark advances deterministically
+V1=$(beam inspect "delta://gs://<BUCKET>/delta/orders" --sample 0 --json \
+     | python3 -c "import json,sys; print(json.load(sys.stdin)['outputs']['snapshot_version'])")
+
+# Step 4: Apply every intermediate change in [V0 + 1 .. V1] via Iceberg v2 Merge-on-Read equality deletes
+if [ "${V1}" -gt "${V0}" ]; then
+  beam pipe \
+    --from "delta://gs://<BUCKET>/delta/orders?start_version=$((V0 + 1))&end_version=${V1}" \
+    --to "iceberg://lake.orders?warehouse=gs://<BUCKET>/iceberg_wh" \
+    --cdc --primary-key id --if-exists append --json
+fi
+
+# Step 5: Prove 0-row drift at watermark V1, then advance V0=${V1} for the next scheduled run!
+beam diff \
+  "delta://gs://<BUCKET>/delta/orders?version=${V1}" \
+  "iceberg://lake.orders?warehouse=gs://<BUCKET>/iceberg_wh" \
+  --key id --json
+```
+
+#### Pattern B: PostgreSQL / MySQL + Debezium -> BigQuery or Iceberg (Works on All Core Beam `2.71+`)
+When replicating an OLTP database where writers never pause, core Apache Beam (`2.71+`) supports two zero-gap Debezium architectures:
+1. **Direct Core Beam `ReadFromDebezium` -> `WriteToBigQueryCDC` / `WriteToIceberg`**:
+   `ReadFromDebezium` (`snapshot.mode=initial`, the default) acquires a repeatable-read snapshot lock, records exact WAL LSN $L_0$, emits existing rows as `op="r"`, and transitions seamlessly to PostgreSQL `pgoutput` WAL streaming from $L_0$:
+   ```bash
+   # Credentials stay in a 0600 file or env vars — never on the command line:
+   beam pipe \
+     --from "postgres://db.internal:5432/shop?table=public.orders" \
+     --from-opt-file ./pg_creds.yaml \
+     --to "bigquery://<PROJECT>.<DATASET>.orders_live" \
+     --cdc --primary-key id \
+     --runner=DataflowRunner --project=<PROJECT> --region=us-central1 \
+     --temp_location="gs://<BUCKET>/tmp" --json
+   ```
+2. **Decoupled Debezium -> Pub/Sub or Kafka (Overlapping LSN Watermark — Zero Lock Window)**:
+   - **Step 1**: Create your Pub/Sub subscription / Kafka consumer group and start Debezium WAL capture **first** so changes begin buffering immediately with `source.lsn`.
+   - **Step 2**: Run the initial batch table load (`beam pipe --from postgres://... --to bigquery://...`).
+   - **Step 3**: Start the streaming CDC pipeline (`beam pipe --from pubsub://... --to bigquery://... --cdc --primary-key id`). Because `beam --cdc` maps `source.lsn` / `source.ts_us` to BigQuery's monotonic `_CHANGE_SEQUENCE_NUMBER` (and Iceberg's `sequence_number_column`), any overlapping events buffered during Step 2 apply **idempotently** without overwriting newer updates or reviving deleted rows.
+
 ---
 
 ## 9. Universal URIs, Safe Expressions & Exit Code Contract
