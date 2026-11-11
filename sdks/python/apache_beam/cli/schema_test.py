@@ -267,6 +267,40 @@ class SchemaDiffTest(unittest.TestCase):
     data = json.loads(buf.getvalue())
     self.assertTrue(data['ok'])
 
+  def test_cli_pipe_check_schema_incompatible_halts_fast(self):
+    from apache_beam.cli import main
+    import io
+    import json
+    from unittest import mock
+
+    p_src = os.path.join(self.tmp, 'pipe_bad_src.parquet')
+    pq.write_table(pa.Table.from_pylist([{'id': 'str_val'}]), p_src)
+    p_tgt = os.path.join(self.tmp, 'pipe_bad_tgt.parquet')
+    pq.write_table(pa.Table.from_pylist([{'id': 100}]), p_tgt)
+
+    buf = io.StringIO()
+    with mock.patch('sys.stdout', buf):
+      rc = main.main(['pipe', '--from', p_src, '--to', p_tgt, '--check-schema', '--json'])
+    self.assertEqual(rc, 2)
+    data = json.loads(buf.getvalue())
+    self.assertFalse(data['ok'])
+    self.assertIn('Pre-flight schema contract check failed', data['error']['message'])
+    self.assertTrue(len(data['next_actions']) > 0)
+
+  def test_cli_pipe_check_schema_compatible_succeeds(self):
+    from apache_beam.cli import main
+    import io
+    from unittest import mock
+
+    p_src = os.path.join(self.tmp, 'pipe_ok_src.parquet')
+    pq.write_table(pa.Table.from_pylist([{'id': 1}]), p_src)
+    p_out = os.path.join(self.tmp, 'pipe_ok_out.parquet')
+
+    buf = io.StringIO()
+    with mock.patch('sys.stdout', buf):
+      rc = main.main(['pipe', '--from', p_src, '--to', p_out, '--check-schema', '--json'])
+    self.assertEqual(rc, 0)
+
 
 if __name__ == '__main__':
   unittest.main()

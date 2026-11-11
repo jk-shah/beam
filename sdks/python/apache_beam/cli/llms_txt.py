@@ -62,8 +62,10 @@ def render_llms_txt() -> str:
     text `.txt` (`Row(line: str)`), mixed-format directory globs like `data/*`,
     `delta://`, and `iceberg://` in `<100ms` locally or `type: Sql` on Dataflow;
     `--join` is accepted as an alias for repeating `--from`), apply event-time windowing
-    (`--window fixed:60s`, `sliding:5m,1m`, `session:30m` with `--timestamp-col COL`),
-    quarantine dirty rows (`--dlq`), enforce scan budget (`--max-bytes`), verify
+    (`--window fixed:60s`, `sliding:5m,1m`, `session:30m` with `--timestamp-col COL`; `--window-size` is accepted),
+    enforce data quality rules (`--expect "rule: expr -> dlq|drop|fail"`), run pre-flight
+    schema contract comparison (`--check-schema`), quarantine dirty rows (`--dlq` or `--dead-letter-target`),
+    drop invalid rows (`--drop-bad` / `--skip-errors`), enforce scan budget (`--max-bytes`), verify
     conservation (`--assert-counts`), reconcile output (`--verify`), apply
     cross-engine CDC (`--cdc --primary-key COL`), or register existing Parquet /
     `delta://` files into `iceberg://` in `<100ms` with `0` bytes copied
@@ -78,6 +80,16 @@ def render_llms_txt() -> str:
     exact CSV/JSONL/Parquet/Text file out, no `--runner`) run in-process in
     ~0.1-0.4 s with the same typing, DLQ records and metrics (`runner:
     "local_fast"`); `BEAM_CLI_NO_FAST_PATH=1`, `--portable`, or `--runner` uses a Beam runner.
+- `beam schema diff <SRC> <TGT> [--mode backward|forward|full] [--strict] [--json]`
+    Pre-flight schema contract and compatibility guard (<100ms, zero-runner).
+    Detects dropped required columns, type narrowing (FLOAT64 -> INT32), and
+    nullability mismatches between source and target datasets before launching compute,
+    emitting actionable SQL remediation hints (`next_actions`) with `CAST(...)` syntax.
+    `beam schema check` is an alias.
+- `beam export-schedule <FILE.yaml> --orchestrator composer|scheduler [--schedule CRON] [--json]`
+    Export a validated declarative pipeline to a production-grade orchestrator:
+    generates Google Cloud Composer (Airflow) DAGs using `DataflowStartFlexTemplateOperator`
+    or serverless Cloud Scheduler HTTP triggers invoking `flexTemplates:launch`.
 - `beam package <FILE.yaml | FILE.py | -> --to|-o|--output <gs://.../spec.json> [--sdk yaml|python|auto] [flags] [--json]`
     Zero-Docker `<1s` Flex Template packager for Beam YAML (auto-extracts Jinja
     `{{{{ vars }}}}` into `metadata.parameters`) and AST-introspected single-image

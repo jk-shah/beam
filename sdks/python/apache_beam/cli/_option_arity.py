@@ -206,7 +206,6 @@ PIPELINE_ONE_ARG_FLAGS = frozenset([
     '--worker_machine_type',
     '--worker_region',
     '--worker_zone',
-    '--yaml_experimental_features',
     '--zone',
 ])
 

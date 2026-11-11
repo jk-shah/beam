@@ -105,10 +105,13 @@ Always pass `--json`. Every command outputs **one** deterministic RFC-8259 JSON 
 ## Canonical 5-Step Workflow
 
 ### 1. Inspect & Guard
-Inspect unfamiliar schemas and byte estimates before processing:
+Inspect unfamiliar schemas, byte estimates, and verify schema contracts before processing:
 ```bash
 beam inspect gs://my-bucket/raw/orders.csv --stats --json
 beam tail pubsub://projects/my-proj/subscriptions/clicks-sub -n 5 --duration 3s --json
+
+# Pre-flight schema contract guard (<100ms, zero-runner; checks backward/forward compatibility)
+beam schema diff gs://my-bucket/raw/orders.csv bigquery://my-proj.ds.orders --mode BACKWARD --json
 ```
 
 ### 2. Cost-Guard Scans
@@ -120,9 +123,10 @@ beam pipe --from src=gs://my-bucket/orders.csv --to out/clean.parquet --max-byte
 ### 3. Pipe, Clean, Join, & Replicate
 Transform data with DLQ, row conservation, and standard `--to` destinations. Repeat `--from <alias>=<URI>` to join multiple inputs in `--sql`:
 ```bash
-# Clean, filter, project, and quarantine dirty rows
+# Clean, filter, project, verify schema contract, and quarantine dirty rows
 beam pipe --from src=gs://my-bucket/orders.csv \
           --to out/clean.parquet \
+          --check-schema \
           --where "amount > 0 AND status = 'PAID'" \
           --select "order_id, lower(email) AS email, amount" \
           --dlq out/bad.jsonl --assert-counts --json

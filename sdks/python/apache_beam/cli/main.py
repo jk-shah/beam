@@ -165,6 +165,11 @@ _CLI_ZERO_FLAGS = {
         '--preview',
         '--portable',
         '--strict-beam',
+        '--drop-bad',
+        '--skip-errors',
+        '--ignore-errors',
+        '--check-schema',
+        '--schema-check',
         '--verbose',
         '--no-config',
         '--help',
@@ -204,6 +209,8 @@ _CLI_ONE_FLAGS = {
         '--to',
         '--sql',
         '--window',
+        '--window-size',
+        '--window_size',
         '--timestamp-col',
         '--timestamp_col',
         '--format',
@@ -211,7 +218,12 @@ _CLI_ONE_FLAGS = {
         '--to-format',
         '--where',
         '--select',
+        '--columns',
+        '--cols',
         '--dlq',
+        '--dead-letter',
+        '--dead-letter-target',
+        '--dead_letter_target',
         '--dlq-format',
         '--null-values',
         '--sql-engine',
@@ -402,7 +414,9 @@ def main(argv=None) -> int:
   t0 = time.monotonic()
   raw_argv = list(sys.argv[1:] if argv is None else argv)
   output.DLQ_REQUESTED = any(
-      a == '--dlq' or a.startswith('--dlq=') for a in raw_argv)
+      a in ('--dlq', '--dead-letter', '--dead-letter-target', '--dead_letter_target') or
+      a.startswith(('--dlq=', '--dead-letter=', '--dead-letter-target=', '--dead_letter_target='))
+      for a in raw_argv)
   stripped_argv, json_mode, top_version, llms_txt = _extract_global_flags(
       raw_argv)
 
@@ -708,6 +722,9 @@ def _build_parser():
       help='safe SQL/Python row filter (e.g. "amount > 0 AND status = \'OK\'")')
   pipe.add_argument(
       '--select',
+      '--columns',
+      '--cols',
+      dest='select',
       metavar='EXPR',
       help=(
           'projection / scalar expressions (e.g. '
@@ -725,7 +742,23 @@ def _build_parser():
       default='dlq',
       help='default action when an --expect rule is violated (default: dlq)')
   pipe.add_argument(
+      '--drop-bad',
+      '--skip-errors',
+      '--ignore-errors',
+      dest='drop_bad',
+      action='store_true',
+      help='drop corrupt or violating records instead of failing the pipeline')
+  pipe.add_argument(
+      '--check-schema',
+      '--schema-check',
+      dest='check_schema',
+      action='store_true',
+      help='run pre-flight schema contract check (beam schema diff) before executing pipeline')
+  pipe.add_argument(
       '--window',
+      '--window-size',
+      '--window_size',
+      dest='window',
       metavar='SPEC',
       help=(
           'windowing specification for event-time processing: '
@@ -748,6 +781,10 @@ def _build_parser():
           '--from [ALIAS=]SOURCE inputs'))
   pipe.add_argument(
       '--dlq',
+      '--dead-letter',
+      '--dead-letter-target',
+      '--dead_letter_target',
+      dest='dlq',
       metavar='SINK',
       help='dead-letter destination URI/path for corrupt or failing records')
   pipe.add_argument(
@@ -2537,6 +2574,32 @@ def _pipe(
 
   if getattr(args, 'primary_keys', None) and not args.cdc:
     args.cdc = True
+
+  if getattr(args, 'drop_bad', False):
+    if getattr(args, 'on_violation', 'dlq') == 'dlq' and not getattr(args, 'dlq', None):
+      args.on_violation = 'drop'
+
+  if getattr(args, 'check_schema', False) and (args.sources or []) and args.sink:
+    from . import schema as schema_mod
+    first_src = (args.sources or [])[0]
+    if '=' in first_src and not os.path.exists(first_src):
+      first_src = first_src.split('=', 1)[1]
+    try:
+      sch_diff = schema_mod.run_schema_diff(
+          first_src,
+          args.sink,
+          mode='BACKWARD',
+          default_project=default_proj)
+      if not sch_diff['compatible']:
+        err_msg = (
+            f"Pre-flight schema contract check failed with {sch_diff['violation_count']} violation(s):\n"
+            + "\n".join(f"  * {v['field']}: {v['issue']} - {v['description']}" for v in sch_diff['violations'])
+        )
+        raise _CliError(err_msg, EXIT_USAGE, next_actions=sch_diff.get('next_actions'))
+    except Exception as e:
+      if isinstance(e, _CliError):
+        raise
+      logging.getLogger('apache_beam.cli').warning('Could not execute pre-flight schema check: %s', e)
 
   raw_sources = list(args.sources or [])
   raw_joins = list(args.joins or [])
