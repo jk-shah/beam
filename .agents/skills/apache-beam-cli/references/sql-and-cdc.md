@@ -16,15 +16,17 @@ beam pipe --from src=data/events.parquet \
           --json
 ```
 
-### Multi-Input SQL Joins
+### Multi-Input SQL Joins (Repeatable `--from`)
+Repeat `--from <alias>=<URI>` for each table (`--join` is also accepted as an alias). When `--to` writes to a file, `untrusted_data.rows` is omitted by default to keep JSON envelopes compact; add `--preview` to include sampled output rows alongside the file write.
 ```bash
 beam pipe --from o=orders.parquet \
-          --join c=customers.csv \
-          --join p=products.jsonl \
+          --from c=customers.csv \
+          --from p=products.jsonl \
           --to out/enriched_orders.parquet \
           --sql "SELECT o.order_id, c.customer_name, p.product_name, o.amount FROM o JOIN c ON o.customer_id = c.customer_id JOIN p ON o.product_id = p.product_id" \
-          --json
+          --portable --json
 ```
+*(Pass `--portable` / `--strict-beam` or inspect `outputs.portable_to_runner` to verify that a local `--sql` query uses strictly ANSI/Calcite constructs supported on distributed Beam runners such as `DataflowRunner`.)*
 
 ---
 

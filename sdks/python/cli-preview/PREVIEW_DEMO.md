@@ -67,16 +67,16 @@ Give your agent either:
 | Command | Purpose | Cold Start |
 | :--- | :--- | :--- |
 | `beam --llms-txt` | Self-documenting Markdown manual + fast recipe index + exit codes + URI syntax for AI agents | `<60 ms` |
-| `beam doctor` | Checks Python extras, SQLite/DuckDB `--sql` engines, Java runtime, JAR cache, and GCP ADC credentials | `<90 ms` |
-| `beam io list` / `describe` | Lists & describes Universal URI connectors (`csv`, `json`, `parquet`, `avro`, `delta`, `iceberg`, `bigquery`, `postgres`, `mysql`, `spanner`, `pubsub`, `kafka`) | `<60 ms` |
+| `beam doctor` | Checks Python extras (`yaml`, `pyarrow`, `duckdb`, `deltalake`, `pyiceberg`), `PATH` binary collisions, Java runtime, and GCP ADC | `<90 ms` |
+| `beam io list` / `describe` | Lists & describes Universal URI connectors (`csv`, `json`, `text`, `parquet`, `avro`, `delta`, `iceberg`, `bigquery`, `postgres`, `mysql`, `spanner`, `pubsub`, `kafka`) | `<60 ms` |
 | `beam inspect <URI>` | Schema, size, row count, column `--stats`, `--search`, `delta://`/`iceberg://` snapshots, and sanitized samples | `<90 ms` (local) |
 | `beam check <FILE\|->` | Fast static YAML, sandboxed `--jinja-variables`, and provider trust check (`--plan` for full Beam graph expansion) | `<80 ms` (static) |
-| `beam pipe --from <A> --to <B>` | Zero-code ETL, `--where`, `--select`, `--sql`, `--join`, `--dlq`, `--max-bytes`, `--assert-counts`, `--verify`, `--zero-copy`, and `--cdc --primary-key` | `<80 ms` (local) or Cloud |
+| `beam pipe --from <A> [--to <B>]` | Zero-code ETL, `--where`, `--select`, `--sql` (repeatable `--from`), `--portable`, `--preview`, `--dlq`, `--max-bytes`, `--assert-counts`, `--verify`, `--zero-copy`, and `--cdc` | `<80 ms` (local) or Cloud |
 | `beam diff <LEFT> <RIGHT>` | Distributed $O(1)$-memory key/hash reconciliation (`--columns shared\|all\|c1,c2`, `--to FILE`, `--exit-zero`, `EXIT_DIFF_MISMATCH = 6`) | Local or Cloud |
 | `beam tail [-f] <URI>` | Bounded stream peek OR live `tail -f` follow (`pubsub://`, `kafka://`, `delta://`, `iceberg://`, `gs://`/local shards) | `<65 ms` |
 | `beam package <FILE\|->` | Zero-Docker YAML Flex Templates (`<2 s`) & zero-boilerplate Python AST Flex bundles | `<65 ms` |
 | `beam run <FILE\|->` | Runs Beam YAML pipelines (`--no-jinja` default on stdin; sandboxed Jinja2 rendering) | Local or Cloud |
-| `beam wait <JOB_ID>` | Polls detached remote jobs and runs deferred `--assert-counts` / `--verify` checks | `<90 ms` |
+| `beam wait <JOB_ID>` | Polls detached remote jobs via cached REST v1b3 with Cloud Console URLs and deferred post-checks | `<90 ms` |
 | `beam cancel <JOB_ID>` | Cancels or `--drain`s running remote pipelines | `<90 ms` |
 | `beam sql` | Beam Calcite SQL shell & one-shot queries (`-e` / `-f`, `--io delta,iceberg,...`) | JVM |
 | `beam config` | Persistent `PipelineOptions` profiles (`~/.beam/config.yaml`) | `<60 ms` |
@@ -95,23 +95,24 @@ Give your agent either:
    - **JSONL Schema-Drift Protection**: Local JSONL inputs `<= 64 MB` are automatically scanned end-to-end so sparse fields appearing after row 100 are included automatically. On larger or remote JSONL inputs, any unseen field appearing after schema sampling triggers `SchemaDriftError` (or quarantines the full record to `--dlq` with an explicit warning in `warnings`—never silently dropping fields). Override anytime with `--from-opt sample_rows=all|<N>`, `--from-opt fields="col:type,..."`, or `--from-opt on_unknown_fields=ignore`.
    - **Leading-Zero & Explicit Column Typing**: Local CSVs automatically scan all rows so late leading-zero strings (`00123` at row 120) stay `str` instead of silently truncating to `int`; declare explicit types anytime via `--from-opt fields="zip:str,amount:float"` and custom null sentinels via `--null-values "NA,N/A,-"`.
 4. **Prompt-Injection Quarantine (`untrusted_data`) & Cost Guardrails**:
-   - Sampled rows from `inspect`, `tail`, `--sql` stdout, and `diff` live strictly inside `untrusted_data.rows` with ANSI/OSC escapes, C0/C1 control codes, Unicode BiDi overrides, and Unicode Tag characters stripped.
+   - Sampled rows from `inspect`, `tail`, `--sql` stdout (or `--preview` when `--to` is passed), and `diff` live strictly inside `untrusted_data.rows` with ANSI/OSC escapes, C0/C1 control codes, Unicode BiDi overrides, and Unicode Tag characters stripped.
    - `--max-bytes 10GB` fails closed with exit code `8` (`EXIT_COST_LIMIT`) *before* launching any job (`$0` `tables.get` metadata fast path + `$0` `dryRun` fallback for BigQuery `VIEW`s and `EXTERNAL` tables).
-5. **Row Conservation & Distributed Verification**:
+5. **Row Conservation, Runner Graduation (`--portable`) & Distributed Verification**:
    - `--assert-counts` proves `rows_read == rows_written + rows_filtered_out + dlq_rows + cdc_superseded_rows`.
+   - `--portable` (`--strict-beam`) and `outputs.portable_to_runner` verify before cloud deployment that local SQL queries and options graduate cleanly to Beam Calcite SQL on Dataflow/Flink/Spark.
    - `beam diff` reconciles arbitrarily large sharded CSV, JSON, Parquet, Avro, Delta Lake, Apache Iceberg v2, and BigQuery datasets in $O(1)$ worker memory (`--columns shared|all|col1,col2`, `--rtol`/`--atol`, `--to report.json`, `--exit-zero`).
 
 ---
 
-## 5. Local Analytical SQL (`--sql`), Multi-Source `--join` & Keyed JSON
+## 5. Local Analytical SQL (`--sql`), Repeatable `--from` Joins & Keyed JSON
 
-Run single-table aggregations, window functions, CTEs, or multi-format joins (`CSV` + `Parquet` + `JSONL` + `Avro`) in `<80 ms` locally via sandboxed `:memory:` SQLite (built-in default) or `--sql-engine duckdb` (optional `duckdb` extra for full ANSI `FILTER (WHERE ...)`, `QUALIFY`, `GROUPING SETS`), with built-in `median(x)`, `quantile(x, p)`, `stddev_samp(x)`, and `to_utc(ts)` ISO-8601 UTC normalization:
+Run single-table aggregations, window functions, CTEs, or multi-format joins (`CSV` + `Parquet` + `JSONL` + `Avro`) in `<80 ms` locally via sandboxed `:memory:` SQLite (built-in default) or `--sql-engine duckdb` (optional `duckdb` extra for full ANSI `FILTER (WHERE ...)`, `QUALIFY`, `GROUPING SETS`), with built-in `median(x)`, `quantile(x, p)`, `regr_slope(y, x)`, `corr(x, y)`, and `to_utc(ts)` ISO-8601 UTC normalization:
 
 ```bash
-# Multi-source join + quantiles + UTC normalization -> keyed JSON object output:
+# Multi-source join (repeatable --from; --join also works) + quantiles + UTC normalization -> keyed JSON object:
 beam pipe \
   --from orders=data/orders_*.parquet \
-  --join fx=data/fx_rates.csv \
+  --from fx=data/fx_rates.csv \
   --sql "SELECT o.region, COUNT(*) AS n, ROUND(SUM(o.amount * fx.rate), 2) AS usd_total, quantile(o.amount, 0.95) AS p95, MIN(to_utc(o.created_at)) AS first_utc FROM orders o JOIN fx ON o.currency = fx.currency GROUP BY o.region" \
   --to out/by_region.json \
   --to-opt key=region \
@@ -122,7 +123,7 @@ beam pipe \
 
 ## 6. Running on Google Cloud Dataflow (`DataflowRunner`)
 
-`apache-beam-cli-preview` automatically synthesizes and stages its pure-Python worker wheel (`<5 ms`) + `--beam_plugin` runtime hooks onto remote Dataflow SDK workers whenever `--runner=DataflowRunner` is passed—no manual `--extra_package` flags needed:
+`apache-beam-cli-preview` automatically synthesizes and stages its pure-Python worker wheel (`<5 ms`) + `--beam_plugin` runtime hooks onto remote Dataflow SDK workers whenever `--runner=DataflowRunner` is passed (automatically skipped when a custom `--sdk_container_image` or `--no-stage-cli-wheel` / `BEAM_NO_STAGE_CLI_WHEEL=1` is supplied):
 
 ```bash
 beam pipe \
@@ -139,7 +140,7 @@ beam pipe \
   --temp_location="gs://<BUCKET>/tmp" \
   --json
 
-# Poll detached job until JOB_STATE_DONE and run deferred post-checks:
+# Poll detached job (zero-fork REST v1b3 poller with Cloud Console URL & stderr progress):
 beam wait <JOB_ID> --json
 ```
 

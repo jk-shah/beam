@@ -56,24 +56,28 @@ def render_llms_txt() -> str:
     Non-destructive bounded stream peek (default `5s` / `-n 5` for agents) or live
     follow (`-f` / `--follow` like Unix `tail -f`, streaming NDJSON across
     `pubsub://`, `kafka://`, `delta://`, `iceberg://`, and local/`gs://` files).
-- `beam pipe --from [ALIAS=]URI [--join [ALIAS=]URI ...] [--to URI] [flags]`
+- `beam pipe --from [ALIAS=]URI [--from [ALIAS=]URI ...] [--to URI] [flags]`
     Move, convert, filter (`--where`), project (`--select`), run multi-input
     SQL joins & aggregations (`--sql "SELECT ..."` across CSV, Parquet, JSONL,
-    mixed-format directory globs like `data/*`, `delta://`, and `iceberg://` in
-    `<100ms` locally or `type: Sql` on Dataflow), apply event-time windowing
+    text `.txt` (`Row(line: str)`), mixed-format directory globs like `data/*`,
+    `delta://`, and `iceberg://` in `<100ms` locally or `type: Sql` on Dataflow;
+    `--join` is accepted as an alias for repeating `--from`), apply event-time windowing
     (`--window fixed:60s`, `sliding:5m,1m`, `session:30m` with `--timestamp-col COL`),
     quarantine dirty rows (`--dlq`), enforce scan budget (`--max-bytes`), verify
     conservation (`--assert-counts`), reconcile output (`--verify`), apply
     cross-engine CDC (`--cdc --primary-key COL`), or register existing Parquet /
     `delta://` files into `iceberg://` in `<100ms` with `0` bytes copied
-    (`--zero-copy`). Pass `--emit-yaml` (alias `--dry-run`) to emit portable
-    Beam YAML (`outputs.yaml` with `--json`), even before source files exist.
+    (`--zero-copy`). Pass `--portable` (`--strict-beam`) to enforce Beam Calcite
+    SQL & runner portability (also reported via `outputs.portable_to_runner`);
+    pass `--preview` to include sampled `untrusted_data.rows` when `--to` writes
+    a file. Pass `--emit-yaml` (alias `--dry-run`) to emit portable Beam YAML
+    (`outputs.yaml` with `--json`), even before source files exist.
     Local file sinks with explicit extensions (`out/clean.parquet`) materialize
     exact single files; sharded Beam prefixes are also auto-resolved.
-    Small local file-to-file jobs (CSV/JSONL/Parquet/Avro in, up to 64 MB, an
-    exact CSV/JSONL/Parquet file out, no `--runner`) run in-process in
+    Small local file-to-file jobs (CSV/JSONL/Parquet/Avro/Text in, up to 64 MB, an
+    exact CSV/JSONL/Parquet/Text file out, no `--runner`) run in-process in
     ~0.1-0.4 s with the same typing, DLQ records and metrics (`runner:
-    "local_fast"`); `BEAM_CLI_NO_FAST_PATH=1` or `--runner` uses a Beam runner.
+    "local_fast"`); `BEAM_CLI_NO_FAST_PATH=1`, `--portable`, or `--runner` uses a Beam runner.
 - `beam package <FILE.yaml | FILE.py | -> --to|-o|--output <gs://.../spec.json> [--sdk yaml|python|auto] [flags] [--json]`
     Zero-Docker `<1s` Flex Template packager for Beam YAML (auto-extracts Jinja
     `{{{{ vars }}}}` into `metadata.parameters`) and AST-introspected single-image
@@ -102,7 +106,9 @@ def render_llms_txt() -> str:
     Offline catalog of connectors and options; also describes Beam YAML
     transforms such as `Filter`, `MapToFields`, `WindowInto`.
 - `beam doctor [--json]`
-    Verify Beam version, extras (`yaml`, `pyarrow`, `gcp`), Java 11–25, and ADC.
+    Verify Beam version, extras (`yaml`, `pyarrow`, `gcp`, `deltalake`, `pyiceberg`),
+    `PATH` binary collisions (prefer `apache-beam` if `beam-client` is installed),
+    Java 11–25, and ADC.
 - `beam config <set|get|unset|list|use>` / `beam sql [-e QUERY]`
     Manage `~/.beam/config.yaml` profiles or run Beam Calcite SQL.
 
@@ -118,7 +124,7 @@ def render_llms_txt() -> str:
 - `130` Interrupted (`SIGINT` / Ctrl-C)
 
 ## 4. Universal URI Grammar
-- Local / Cloud Files: `./users.csv`, `gs://bucket/path/*.parquet`, `s3://...`, `azfs://...`
+- Local / Cloud Files: `./users.csv`, `./logs.txt`, `gs://bucket/path/*.parquet`, `s3://...`, `azfs://...`
 - Delta Lake: `delta://gs://bucket/tables/orders` or `delta:///local/orders?version=3`
 - Iceberg v2: `iceberg://ns.orders?warehouse=gs://bucket/wh` or `iceberg:///local/wh/ns.orders`
 - BigQuery: `bigquery://PROJECT.DATASET.TABLE` (CDC UPSERT/DELETE via `--cdc --primary-key id`)
@@ -134,7 +140,7 @@ def render_llms_txt() -> str:
   `upper`, `strip`/`trim`, `len`/`length`, `coalesce`/`ifnull`, `abs`, `round`,
   `int`, `float`, `str`, `bool`.)
 - `--select "CAST(user_id AS INT) AS user_id, lower(email) AS email, `class`, round(amount * 1.08, 2) AS total"`
-- `--from o=orders.parquet --join c=customers.csv --sql "SELECT COALESCE(c.tier, 'UNMAPPED') AS tier, COUNT(*) AS n, ROUND(SUM(o.amount), 2) AS rev FROM o LEFT JOIN c ON o.cid = c.cid GROUP BY 1"`
+- `--from o=orders.parquet --from c=customers.csv --sql "SELECT COALESCE(c.tier, 'UNMAPPED') AS tier, COUNT(*) AS n, ROUND(SUM(o.amount), 2) AS rev FROM o LEFT JOIN c ON o.cid = c.cid GROUP BY 1"`
 - NULLs follow SQL three-valued logic everywhere: any comparison (`=`, `!=`, `<`, `IN`, `NOT IN`), arithmetic,
   `NOT`, nested access, string helpers and casts on NULL give NULL, and a row is kept only if the filter is TRUE.
   So `--where "state != 'CA'"` drops rows with no state, as in SQL. Test for NULL with `IS [NOT] NULL`
@@ -166,8 +172,8 @@ def render_llms_txt() -> str:
   such as `ROW_NUMBER() OVER (PARTITION BY k ORDER BY to_utc(ts) DESC)` work. Schema-evolution append / column
   rename is one query: `SELECT id, name, CAST(NULL AS TEXT) AS tier FROM old UNION ALL SELECT id, full_name AS name, tier FROM batch2`
   (local `--if-exists replace` stages new outputs and keeps previous files intact on any failure).
-  Not supported by SQLite: `PERCENTILE_CONT ... WITHIN GROUP`, `APPROX_QUANTILES`. Local-only functions are not
-  portable to `--emit-yaml` / remote Beam SQL (Calcite); the CLI warns when you export them.
+  Not supported by SQLite: `PERCENTILE_CONT ... WITHIN GROUP`, `APPROX_QUANTILES`. Local-only functions set
+  `outputs.portable_to_runner: false` and fail fast when `--portable` is passed.
 - Optional DuckDB engine: `--sql-engine duckdb` (install with `pip install duckdb` or the `[duckdb]` extra; `beam doctor`
   shows `sql_engines`) runs the same inputs (same typing, NULLs and `--dlq`) in a sandboxed in-memory DuckDB with
   file access disabled: ANSI `PERCENTILE_CONT ... WITHIN GROUP`, `QUALIFY`, `median`, `quantile_cont`, struct fields
@@ -190,9 +196,9 @@ beam pipe --from delta://gs://my-bucket/delta/orders \\
           --to "iceberg://lake.orders?warehouse=gs://my-bucket/iceberg" \\
           --zero-copy --verify --verify-key order_id --json
 
-# 3. Multi-input SQL join + aggregation across Parquet / CSV / Iceberg (<100ms locally)
+# 3. Multi-input SQL join + aggregation across Parquet / CSV / Iceberg (repeatable --from)
 beam pipe --from o=out/clean_orders.parquet \\
-          --join c=data/customers.csv \\
+          --from c=data/customers.csv \\
           --to out/revenue_by_tier.json \\
           --sql "SELECT COALESCE(c.tier, 'UNMAPPED') AS tier, COUNT(*) AS orders, ROUND(SUM(o.amount), 2) AS revenue FROM o LEFT JOIN c ON o.customer_id = c.customer_id GROUP BY 1 ORDER BY revenue DESC" \\
           --json
