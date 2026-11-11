@@ -734,6 +734,49 @@ def _register_scalar_functions(conn: sqlite3.Connection) -> None:
         if dt.microsecond == 0 else dt.isoformat().replace('+00:00', 'Z'))
 
   conn.create_function('TO_UTC', 1, _to_utc, deterministic=True)
+
+  def _beam_interval_add(ts: Any, seconds: Any) -> Any:
+    if ts is None:
+      return None
+    try:
+      secs = float(seconds)
+    except (ValueError, TypeError):
+      return ts
+    try:
+      num = float(ts) if not isinstance(ts, (int, float)) and str(ts).strip().lstrip('+-').replace('.', '', 1).isdigit() else ts
+      if isinstance(num, (int, float)):
+        if abs(num) >= 1e11:
+          return num + (secs * 1000.0)
+        return num + secs
+    except Exception:
+      pass
+
+    s = str(ts).strip()
+    try:
+      from datetime import datetime
+      from datetime import timezone
+      from datetime import timedelta
+      iso = s[:-1] + '+00:00' if s.endswith(('Z', 'z')) else s
+      dt = datetime.fromisoformat(iso)
+      dt = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+      new_dt = dt + timedelta(seconds=secs)
+      return (
+          new_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+          if new_dt.microsecond == 0 else new_dt.isoformat().replace('+00:00', 'Z'))
+    except Exception:
+      return ts
+
+  def _beam_interval_sub(ts: Any, seconds: Any) -> Any:
+    try:
+      secs = float(seconds)
+    except (ValueError, TypeError):
+      secs = 0.0
+    return _beam_interval_add(ts, -secs)
+
+  conn.create_function(
+      'BEAM_INTERVAL_ADD', 2, _beam_interval_add, deterministic=True)
+  conn.create_function(
+      'BEAM_INTERVAL_SUB', 2, _beam_interval_sub, deterministic=True)
   _register_aggregate_functions(conn)
 
 
@@ -1135,6 +1178,68 @@ def _normalize_sqlite_cast_types(sql_query: str) -> str:
   return ''.join(parts)
 
 
+_INTERVAL_ADD_RE = re.compile(
+    r'(?P<col>[A-Za-z0-9_."`]+)\s*\+\s*INTERVAL\s+(?:[\'"]([0-9.]+)\s*([A-Za-z]+)[\'"]|[\'"]?([0-9.]+)[\'"]?\s*([A-Za-z]+))',
+    re.I)
+_INTERVAL_SUB_RE = re.compile(
+    r'(?P<col>[A-Za-z0-9_."`]+)\s*-\s*INTERVAL\s+(?:[\'"]([0-9.]+)\s*([A-Za-z]+)[\'"]|[\'"]?([0-9.]+)[\'"]?\s*([A-Za-z]+))',
+    re.I)
+
+
+def _interval_unit_to_seconds(num_str: str, unit: str) -> float:
+  try:
+    num = float(num_str)
+  except (ValueError, TypeError):
+    return 0.0
+  u = unit.lower().rstrip('s')
+  mult = {
+      'millisecond': 0.001,
+      'ms': 0.001,
+      'second': 1.0,
+      'sec': 1.0,
+      'minute': 60.0,
+      'min': 60.0,
+      'm': 60.0,
+      'hour': 3600.0,
+      'hr': 3600.0,
+      'h': 3600.0,
+      'day': 86400.0,
+      'd': 86400.0,
+  }.get(u, 1.0)
+  return num * mult
+
+
+def _normalize_sqlite_interval_expressions(sql_query: str) -> str:
+  """Rewrites ANSI/Beam SQL `INTERVAL` expressions to SQLite `BEAM_INTERVAL_ADD/SUB`.
+
+  Examples:
+    `o.time BETWEEN c.time AND c.time + INTERVAL '15' MINUTE`
+    -> `o.time BETWEEN c.time AND BEAM_INTERVAL_ADD(c.time, 900.0)`
+    `o.time BETWEEN c.time - INTERVAL '1' MINUTE AND c.time + INTERVAL 15 SECOND`
+    -> `o.time BETWEEN BEAM_INTERVAL_SUB(c.time, 60.0) AND BEAM_INTERVAL_ADD(c.time, 15.0)`
+  """
+  if not re.search(r'\bINTERVAL\b', sql_query, re.I):
+    return sql_query
+
+  def _sub_add(m: re.Match) -> str:
+    col = m.group('col')
+    num = m.group(2) or m.group(4)
+    unit = m.group(3) or m.group(5)
+    secs = _interval_unit_to_seconds(num, unit)
+    return f'BEAM_INTERVAL_ADD({col}, {secs})'
+
+  def _sub_sub(m: re.Match) -> str:
+    col = m.group('col')
+    num = m.group(2) or m.group(4)
+    unit = m.group(3) or m.group(5)
+    secs = _interval_unit_to_seconds(num, unit)
+    return f'BEAM_INTERVAL_SUB({col}, {secs})'
+
+  res = _INTERVAL_ADD_RE.sub(_sub_add, sql_query)
+  res = _INTERVAL_SUB_RE.sub(_sub_sub, res)
+  return res
+
+
 def _rewrite_source_uri_table_refs(
     sql_query: str, named_sources: list[NamedSource]) -> str:
   """Rewrites `FROM "delta://..."` / `FROM "iceberg://..."` matching a lakehouse input to its alias."""
@@ -1504,8 +1609,9 @@ def run_in_memory_sql(
         dlq_records=dlq_records,
         warnings=warnings)
     return out_cols, out_rows, (dlq_records or []), total_read
-  clean_q = _normalize_sqlite_cast_types(
-      _rewrite_source_uri_table_refs(clean_q, named_sources))
+  clean_q = _normalize_sqlite_interval_expressions(
+      _normalize_sqlite_cast_types(
+          _rewrite_source_uri_table_refs(clean_q, named_sources)))
   total_read = 0
 
   conn = sqlite3.connect(':memory:')

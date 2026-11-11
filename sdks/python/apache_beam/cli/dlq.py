@@ -227,6 +227,12 @@ def cli_yaml_provider_spec() -> dict[str, Any]:
           'CliWriteToBigQueryCDC': (
               'apache_beam.cli.cdc.cli_write_to_bigquery_cdc'
           ),
+          'CliIntervalJoin': (
+              'apache_beam.cli.interval_join.cli_interval_join'
+          ),
+          'IntervalJoin': (
+              'apache_beam.cli.interval_join.cli_interval_join'
+          ),
       },
   }
 

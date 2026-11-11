@@ -187,3 +187,66 @@ beam pipe --from src=sales.parquet \
           --to-opt key=region --to-opt value=total_revenue \
           --json
 ```
+
+---
+
+## 7. Declarative Event-Time Interval Joins (`IntervalJoin` & Beam SQL)
+
+Event-time interval joins correlate records between two streaming or batch collections that occur within a dynamic temporal window (`BETWEEN t_l + lower_bound AND t_l + upper_bound`):
+
+### 1. Beam SQL Interval Joins
+`beam pipe --sql` supports standard ANSI / Calcite interval joins:
+```bash
+beam pipe --from c=clicks.jsonl \
+          --from o=orders.jsonl \
+          --to out/attributed.jsonl \
+          --sql "SELECT c.user_id, c.campaign, o.amount, o.order_time - c.click_time AS lag_sec
+                 FROM c JOIN o
+                   ON c.user_id = o.user_id
+                  AND o.order_time BETWEEN c.click_time AND c.click_time + INTERVAL '15' MINUTE" \
+          --json
+```
+- **Local Engine (<50ms)**: Automatically normalizes `col + INTERVAL '<val>' <unit>` into SQLite scalar functions `BEAM_INTERVAL_ADD` and `BEAM_INTERVAL_SUB`, executing in-process with zero JVM.
+- **Remote Engine Portability**: Compiles directly to Apache Calcite Beam SQL for distributed execution on Google Cloud Dataflow (`DataflowRunner`) or portable runners (`PrismRunner`).
+
+### 2. Beam YAML & Python Declarative Interval Joins (`type: IntervalJoin`)
+When authoring Beam YAML pipelines, declare interval joins as first-class transforms without writing custom DoFns:
+```yaml
+pipeline:
+  transforms:
+    - type: ReadFromJson
+      name: ReadClicks
+      config:
+        file_pattern: 'gs://my-bkt/clicks/*.json'
+    - type: ReadFromJson
+      name: ReadOrders
+      config:
+        file_pattern: 'gs://my-bkt/orders/*.json'
+    - type: IntervalJoin
+      name: CorrelateAttribution
+      input:
+        left: ReadClicks
+        right: ReadOrders
+      config:
+        key: user_id
+        left_time: click_time
+        right_time: order_time
+        lower_bound: 0s
+        upper_bound: 15m
+        join_type: inner
+        select:
+          user_id: left.user_id
+          campaign: left.campaign
+          amount: right.amount
+    - type: WriteToParquet
+      name: WriteAttributed
+      input: CorrelateAttribution
+      config:
+        file_pattern_prefix: 'gs://my-bkt/attributed/out'
+```
+
+### Execution Architecture & Guarantees
+- **Batch Processing**: Groups records by key via `CoGroupByKey` and computes bounded temporal matches in-memory.
+- **Streaming on Dataflow Windmill**: Uses stateful `BagStateSpec` buffers (`left_buffer`, `right_buffer`) and event-time watermark timers (`TimeDomain.WATERMARK`). When records arrive, forward and backward interval matches emit immediately, while expired records are garbage-collected as watermarks advance, preventing state leaks.
+- **Durations Supported**: `ms`, `s`, `m`, `h`, `d` (e.g. `500ms`, `30s`, `15m`, `2h`, `1d`). Negative lower bounds are supported (e.g. `lower_bound: -5m`, `upper_bound: 10m`).
+- **Join Semantics**: Supports `inner`, `left`, and `full` outer joins.

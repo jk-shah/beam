@@ -243,6 +243,10 @@ def parse_kv_options(
             f'first with: chmod 0600 {opt_file}')
     merged.update(loaded)
 
+  if isinstance(opt_items, dict):
+    merged.update(opt_items)
+    return merged
+
   for raw in opt_items or ():
     if '=' not in raw:
       shown = raw if re.fullmatch(r'[A-Za-z0-9_.-]{1,32}', raw) else '<redacted>'
@@ -889,8 +893,49 @@ def parse_endpoint(
         topic in ('.', '..') or '..' in topic or
         not re.fullmatch(r'[A-Za-z0-9._-]+', topic)):
       raise UriError(f'invalid Kafka topic name {topic!r}')
+    # Confluent Schema Registry configuration
+    schema_reg = (
+        opts.pop('schema_registry', None) or
+        opts.pop('schema_registry_url', None) or
+        opts.pop('confluent_schema_registry_url', None))
+    if schema_reg:
+      schema_reg_s = str(schema_reg).strip()
+      if not (schema_reg_s.startswith('http://') or schema_reg_s.startswith('https://')):
+        raise UriError(
+            f'invalid schema_registry URL {schema_reg!r}; expected http:// or https://')
+      opts['confluent_schema_registry_url'] = schema_reg_s
+
+    schema_subj = (
+        opts.pop('schema_registry_subject', None) or
+        opts.pop('confluent_schema_registry_subject', None))
+    if schema_subj:
+      opts['confluent_schema_registry_subject'] = str(schema_subj).strip()
+
+    # Consumer group / group.id configuration
+    consumer_grp = opts.pop('consumer_group', None) or opts.pop('group_id', None)
+    if consumer_grp:
+      c_cfg = opts.setdefault('consumer_config', {})
+      if isinstance(c_cfg, dict):
+        c_cfg['group.id'] = str(consumer_grp).strip()
+
+    # Offset reset configuration
+    offset_reset = (
+        opts.pop('auto_offset_reset', None) or
+        opts.pop('offset_reset', None) or
+        opts.pop('auto_offset_reset_config', None))
+    if offset_reset:
+      opts['auto_offset_reset_config'] = str(offset_reset).strip().lower()
+
+    # Timestamp policy / attribute configuration
+    ts_policy = (
+        opts.pop('timestamp_policy', None) or
+        opts.pop('timestamp_attribute', None))
+    if ts_policy:
+      opts['timestamp_policy'] = str(ts_policy).strip()
+
     _validate_kafka_options(opts)
-    fmt = (explicit_format or opts.pop('format', 'JSON')).upper()
+    default_kafka_fmt = 'AVRO' if schema_reg else 'JSON'
+    fmt = (explicit_format or opts.pop('format', default_kafka_fmt)).upper()
     cfg = {
         'bootstrap_servers': parsed.netloc,
         'topic': topic,
@@ -954,6 +999,12 @@ def parse_endpoint(
   cat_shortcut = str(
       opts.pop('catalog', None) or qparams.pop('catalog', '') or
       '').strip().lower()
+  if not cat_shortcut:
+    low_ident = raw_ident.lower()
+    if low_ident.startswith('biglake.'):
+      cat_shortcut = 'biglake'
+    elif low_ident.startswith('bigquery.'):
+      cat_shortcut = 'bigquery'
   warehouse_val = opts.pop('warehouse', None) or qparams.pop('warehouse', None)
   rest_uri = opts.pop('uri', None) or qparams.pop('uri', None)
   cat_props = dict(opts.pop('catalog_properties', None) or {})

@@ -657,6 +657,19 @@ def build_pipe_spec(
       sink_type = 'CliWriteToIceberg'
       sink_cfg = dict(dst_ep.config)
       sink_cfg['if_exists'] = 'append' if (cdc and if_exists == 'fail') else if_exists
+      if src_ep.is_unbounded:
+        freq = None
+        if 'triggering_frequency_seconds' in dst_ep.config:
+          freq = int(dst_ep.config['triggering_frequency_seconds'])
+        elif window_spec:
+          w_size = window_spec.get('period') or window_spec.get('size')
+          if w_size:
+            from . import jobs
+            try:
+              freq = max(1, int(jobs.parse_duration_seconds(w_size)))
+            except Exception:
+              freq = 60
+        sink_cfg.setdefault('triggering_frequency_seconds', freq or 60)
       if cdc:
         sink_cfg.setdefault('mode', 'merge-on-read')
         sink_cfg.setdefault('equality_columns', pks)
@@ -685,27 +698,41 @@ def build_pipe_spec(
         src_cfg['start_version'] = 0
       src_cfg.setdefault(
           'include_metadata_columns', ['_change_type', '_commit_version'])
-    if dst_ep.kind == 'iceberg' and cdc:
-      sink_cfg.setdefault('mode', 'merge-on-read')
-      sink_cfg.setdefault('equality_columns', pks)
-      sink_cfg.setdefault(
-          'change_type_column',
-          cdc_op_col or (
-              '_change_type' if src_ep.kind in ('delta', 'iceberg') else 'op'))
-      if src_ep.kind == 'delta' and not cdc_op_col:
+    if dst_ep.kind == 'iceberg':
+      if src_ep.is_unbounded:
+        freq = None
+        if 'triggering_frequency_seconds' in dst_ep.config:
+          freq = int(dst_ep.config['triggering_frequency_seconds'])
+        elif window_spec:
+          w_size = window_spec.get('period') or window_spec.get('size')
+          if w_size:
+            from . import jobs
+            try:
+              freq = max(1, int(jobs.parse_duration_seconds(w_size)))
+            except Exception:
+              freq = 60
+        sink_cfg.setdefault('triggering_frequency_seconds', freq or 60)
+      if cdc:
+        sink_cfg.setdefault('mode', 'merge-on-read')
+        sink_cfg.setdefault('equality_columns', pks)
         sink_cfg.setdefault(
-            'change_type_map', {
-                'insert': 'INSERT',
-                'update_preimage': 'UPDATE_BEFORE',
-                'update_postimage': 'UPDATE_AFTER',
-                'delete': 'DELETE',
-            })
-      sink_cfg.setdefault(
-          'sequence_number_column',
-          cdc_seq_col or (
-              '_commit_version' if src_ep.kind == 'delta' else
-              '_commit_snapshot_sequence_number'
-              if src_ep.kind == 'iceberg' else 'ts_ms'))
+            'change_type_column',
+            cdc_op_col or (
+                '_change_type' if src_ep.kind in ('delta', 'iceberg') else 'op'))
+        if src_ep.kind == 'delta' and not cdc_op_col:
+          sink_cfg.setdefault(
+              'change_type_map', {
+                  'insert': 'INSERT',
+                  'update_preimage': 'UPDATE_BEFORE',
+                  'update_postimage': 'UPDATE_AFTER',
+                  'delete': 'DELETE',
+              })
+        sink_cfg.setdefault(
+            'sequence_number_column',
+            cdc_seq_col or (
+                '_commit_version' if src_ep.kind == 'delta' else
+                '_commit_snapshot_sequence_number'
+                if src_ep.kind == 'iceberg' else 'ts_ms'))
     elif dst_ep.kind == 'bigquery' and cdc:
       sink_cfg['primary_key'] = pks
     elif prefer_python_bigquery_sink and dst_ep.kind == 'bigquery':
@@ -833,6 +860,8 @@ def build_pipe_spec(
             'transforms': chain_steps,
         }
     }
+    if src_ep.is_unbounded:
+      spec['options'] = {'streaming': True}
     if needs_cli_provider:
       spec['providers'] = [dlq.cli_yaml_provider_spec()]
     return PipeSpec(
@@ -1118,6 +1147,8 @@ def build_pipe_spec(
       },
       'providers': [dlq.cli_yaml_provider_spec()],
   }
+  if src_ep.is_unbounded:
+    spec['options'] = {'streaming': True}
   return PipeSpec(
       spec=spec,
       output_prefix=dst_ep.output_prefix,

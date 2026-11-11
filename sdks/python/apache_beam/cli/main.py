@@ -2961,6 +2961,20 @@ def _pipe(
         '(--runner=DataflowRunner)',
         EXIT_USAGE)
 
+  if pipe.is_unbounded and not is_local_runner:
+    runner_norm = _runner_name(explicit_runner)
+    if runner_norm == 'dataflow':
+      has_streaming = any(
+          a == '--streaming' or a.startswith('--streaming=') for a in resolved_args)
+      if not has_streaming:
+        resolved_args.append('--streaming')
+      has_streaming_engine = any(
+          a in ('--enable_streaming_engine', '--enable-streaming-engine') or
+          a.startswith('--enable_streaming_engine=')
+          for a in resolved_args)
+      if not has_streaming_engine:
+        resolved_args.append('--enable_streaming_engine')
+
   # Pre-flight `--max-bytes` guardrail (`EXIT_COST_LIMIT = 8`) before running!
   if args.max_bytes and pipe.source_endpoint is not None:
     try:

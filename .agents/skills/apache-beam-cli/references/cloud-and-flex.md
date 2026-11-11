@@ -306,4 +306,35 @@ When contract violations are detected, `beam schema diff` outputs concrete comma
 }
 ```
 
+---
+
+## 11. Turnkey Stream-to-Lakehouse Pipeline Declarations (Kafka $\to$ Iceberg/BigLake)
+
+`beam pipe` enables one-line continuous stream ingestion from Apache Kafka into Apache Iceberg v2 and Google Cloud BigLake REST catalogs with automatic schema resolution and runner tuning:
+
+```bash
+beam pipe --from "kafka://broker:9092/orders_topic?schema_registry=http://registry:8081&consumer_group=lakehouse_sync" \
+          --to "iceberg://biglake.prod_analytics.events?warehouse=gs://my-bkt/wh" \
+          --runner=DataflowRunner \
+          --project=my-project \
+          --region=us-central1 \
+          --json
+```
+
+### Supported Streaming Invariants & Auto-Tuning
+1. **Schema Registry Integration**:
+   - Parses `schema_registry`, `schema_registry_url`, `confluent_schema_registry_url`, and `schema_registry_subject`.
+   - Defaults Kafka format to `'AVRO'` when Schema Registry is specified unless explicit format is provided.
+2. **Consumer Group & Offset Guarantees**:
+   - `consumer_group` / `group_id` wired directly into Kafka consumer configuration.
+   - `auto_offset_reset` (`'earliest'` or `'latest'`) ensures deterministic replay or real-time ingestion.
+   - `timestamp_policy` (`'CreateTime'` or `'LogAppendTime'`) controls event-time extraction.
+3. **Dataflow Streaming Engine Auto-Injection**:
+   - For unbounded streaming sources (Kafka, Pub/Sub) targeting `DataflowRunner`, `beam` automatically injects `--streaming` and `--enable_streaming_engine`.
+   - Emits top-level `options: {'streaming': True}` into generated Beam YAML pipelines.
+4. **Triggering Frequency Derivation**:
+   - For Iceberg sinks, automatically derives commit frequency (`triggering_frequency_seconds`) from `--window` window period/size (e.g. `--window fixed:60s` $\to$ 60s) or defaults to 60s for unbounded streams.
+5. **BigLake REST Catalog Identification**:
+   - Detects `biglake.` and `bigquery.` prefixes on Iceberg table identifiers, automatically configuring Google Cloud BigLake REST Catalog (`https://biglake.googleapis.com/iceberg/v1/restcatalog`) with Google OAuth 2.0 authentication.
+
 
