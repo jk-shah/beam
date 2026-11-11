@@ -1346,6 +1346,14 @@ def _doctor(args, extra_args, *, json_session, t0: float) -> int:
   _reject_extra_args(extra_args)
   report = doctor.run_doctor()
   rc = EXIT_OK if report['healthy'] else EXIT_MISSING_PACKAGE
+  doc_warnings = list(report.pop('warnings', None) or [])
+  next_acts = [{
+      'command': 'apache-beam --version --json',
+      'description': (
+          "Invoke 'apache-beam' instead of 'beam' for unambiguous CLI "
+          'resolution when multiple beam binaries exist on PATH.'),
+      'requires_human': False,
+  }] if doc_warnings else []
   if json_session.enabled:
     json_session.emit(
         output.build_envelope(
@@ -1353,6 +1361,8 @@ def _doctor(args, extra_args, *, json_session, t0: float) -> int:
             command='doctor',
             exit_code=rc,
             duration_ms=int((time.monotonic() - t0) * 1000),
+            warnings=doc_warnings,
+            next_actions=next_acts,
             outputs=report))
   else:
     status = 'HEALTHY' if report['healthy'] else 'DEGRADED'
@@ -1362,6 +1372,8 @@ def _doctor(args, extra_args, *, json_session, t0: float) -> int:
       print(f"  extra.{k:14s}: {'ok' if ok_val else 'missing'}")
     print(f"  java                : {'ok (' + report['java']['java_bin'] + ')' if report['java']['ok'] else report['java']['message']}")
     print(f"  gcp_adc             : {'ok (project=' + str(report['gcp_adc'].get('default_project')) + ')' if report['gcp_adc']['ok'] else report['gcp_adc'].get('message')}")
+    for w in doc_warnings:
+      print(f'  warning             : {w}', file=sys.stderr)
   return rc
 
 

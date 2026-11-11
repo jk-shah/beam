@@ -4029,6 +4029,187 @@ class Round12FixesTest(unittest.TestCase):
     ])
     self.assertEqual(rc4, cli.EXIT_USAGE)
 
+  def test_doctor_detects_beam_path_collision_and_beam_client(self):
+    from unittest import mock
+    from apache_beam.cli import doctor as doc_mod
+
+    shadow_dir = os.path.join(self.tmp, 'shadow_bin')
+    os.makedirs(shadow_dir, exist_ok=True)
+    shadow_beam = os.path.join(shadow_dir, 'beam')
+    with open(shadow_beam, 'w', encoding='utf-8') as f:
+      f.write('#!/bin/sh\necho beam-cloud\n')
+    os.chmod(shadow_beam, 0o755)
+
+    new_path = shadow_dir + os.pathsep + os.environ.get('PATH', '')
+    with mock.patch.dict(
+        os.environ, {
+            'PATH': new_path, 'BEAM_HOME': os.path.join(self.tmp, 'bh')
+        }), mock.patch.object(
+            doc_mod,
+            '_package_version',
+            side_effect=lambda n: '0.9.1' if n == 'beam-client' else None):
+      rc, env, err = _run_json(['doctor'])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertTrue(env['outputs']['binary_resolution']['beam_client_installed'])
+    self.assertIn('deltalake', env['outputs']['extras'])
+    self.assertIn('pyiceberg', env['outputs']['extras'])
+    warns = ' | '.join(env.get('warnings') or [])
+    self.assertIn('beam-client', warns)
+    self.assertIn('apache-beam', warns)
+    self.assertEqual(
+        env['next_actions'][0]['command'], 'apache-beam --version --json')
+
+  def test_lakehouse_delta_v3_and_iceberg_v3_protocol_guards(self):
+    from unittest import mock
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import types
+    from apache_beam.cli import lakehouse as lh
+
+    # 1. Delta protocol v3 (`deletionVectors`): refuses raw Parquet read when
+    # `deltalake` is absent, and delegates cleanly when `deltalake` is installed.
+    delta_dir = os.path.join(self.tmp, 'delta_dv')
+    os.makedirs(os.path.join(delta_dir, '_delta_log'), exist_ok=True)
+    pq_file = os.path.join(delta_dir, 'part-00000.parquet')
+    pq.write_table(
+        pa.Table.from_pylist([{'id': 1, 'val': 'live'}, {'id': 2, 'val': 'deleted_by_dv'}]),
+        pq_file)
+    schema_json = json.dumps({
+        'type': 'struct',
+        'fields': [
+            {'name': 'id', 'type': 'long', 'nullable': True, 'metadata': {}},
+            {'name': 'val', 'type': 'string', 'nullable': True, 'metadata': {}},
+        ],
+    })
+    commit0 = os.path.join(delta_dir, '_delta_log', '00000000000000000000.json')
+    with open(commit0, 'w', encoding='utf-8') as f:
+      f.write(
+          json.dumps({
+              'protocol': {
+                  'minReaderVersion': 3,
+                  'minWriterVersion': 7,
+                  'readerFeatures': ['deletionVectors'],
+                  'writerFeatures': ['deletionVectors'],
+              }
+          }) + '\n')
+      f.write(
+          json.dumps({
+              'metaData': {
+                  'id': 't1',
+                  'schemaString': schema_json,
+                  'partitionColumns': [],
+                  'configuration': {'delta.enableDeletionVectors': 'true'},
+              }
+          }) + '\n')
+      f.write(
+          json.dumps({
+              'add': {
+                  'path': 'part-00000.parquet',
+                  'size': os.path.getsize(pq_file),
+                  'modificationTime': 1700000000000,
+                  'dataChange': True,
+              }
+          }) + '\n')
+
+    with mock.patch.dict(sys.modules, {'deltalake': None}):
+      rc_d, env_d, _ = _run_json(['inspect', f'delta://{delta_dir}'])
+    self.assertEqual(rc_d, cli.EXIT_MISSING_PACKAGE)
+    self.assertIn('deletionVectors', env_d['error']['message'])
+    self.assertIn('deltalake', env_d['error']['message'])
+
+    fake_dt_mod = types.ModuleType('deltalake')
+
+    class _FakeDeltaTable:
+      def __init__(self, root, **_kw):
+        self.root = root
+
+      def to_pyarrow_table(self):
+        return pa.Table.from_pylist([{'id': 1, 'val': 'live'}])
+
+    fake_dt_mod.DeltaTable = _FakeDeltaTable
+    with mock.patch.dict(sys.modules, {'deltalake': fake_dt_mod}):
+      rc_ok, env_ok, err_ok = _run_json(['inspect', f'delta://{delta_dir}'])
+    self.assertEqual(rc_ok, cli.EXIT_OK, err_ok)
+    self.assertEqual(env_ok['outputs']['row_count'], 1)
+    self.assertEqual(env_ok['untrusted_data']['rows'], [{'id': 1, 'val': 'live'}])
+
+    # 2. Iceberg format-version 3 fails closed with EXIT_MISSING_PACKAGE.
+    ice3_dir = os.path.join(self.tmp, 'wh', 'ns', 'ice_v3')
+    os.makedirs(os.path.join(ice3_dir, 'metadata'), exist_ok=True)
+    with open(
+        os.path.join(ice3_dir, 'metadata', 'v1.metadata.json'),
+        'w',
+        encoding='utf-8') as f:
+      json.dump({
+          'format-version': 3,
+          'table-uuid': 'u-3',
+          'location': ice3_dir,
+          'current-schema-id': 0,
+          'schemas': [{
+              'type': 'struct',
+              'schema-id': 0,
+              'fields': [{'id': 1, 'name': 'id', 'required': False, 'type': 'long'}],
+          }],
+      }, f)
+    rc_i3, env_i3, _ = _run_json([
+        'inspect', f'iceberg://ns.ice_v3?warehouse={os.path.join(self.tmp, "wh")}'
+    ])
+    self.assertEqual(rc_i3, cli.EXIT_MISSING_PACKAGE)
+    self.assertIn('format-version 3', env_i3['error']['message'])
+    self.assertIn('pyiceberg', env_i3['error']['message'])
+
+    # 3. Partitioned existing Iceberg v2 table refuses unpartitioned local mutation.
+    ice_part_dir = os.path.join(self.tmp, 'wh', 'ns', 'ice_part')
+    os.makedirs(os.path.join(ice_part_dir, 'metadata'), exist_ok=True)
+    with open(
+        os.path.join(ice_part_dir, 'metadata', 'v1.metadata.json'),
+        'w',
+        encoding='utf-8') as f:
+      json.dump({
+          'format-version': 2,
+          'table-uuid': 'u-part',
+          'location': ice_part_dir,
+          'last-sequence-number': 0,
+          'current-schema-id': 0,
+          'schemas': [{
+              'type': 'struct',
+              'schema-id': 0,
+              'fields': [{'id': 1, 'name': 'id', 'required': False, 'type': 'long'}],
+          }],
+          'default-spec-id': 0,
+          'partition-specs': [{
+              'spec-id': 0,
+              'fields': [{
+                  'source-id': 1,
+                  'field-id': 1000,
+                  'name': 'id_bucket',
+                  'transform': 'bucket[16]',
+              }],
+          }],
+      }, f)
+    with self.assertRaises(lh.LakehousePackageMissingError):
+      lh.commit_iceberg_snapshot(
+          ice_part_dir,
+          iceberg_fields=[{'id': 1, 'name': 'id', 'type': 'long', 'nullable': True}],
+          new_data_files=[])
+
+  def test_launcher_skips_wheel_staging_on_custom_container_or_flag(self):
+    from unittest import mock
+    import apache_beam_cli_preview.launcher as launcher
+
+    base_args = ['--runner=DataflowRunner', '--project=p']
+    custom_img = base_args + ['--sdk_container_image=gcr.io/p/custom:latest']
+    self.assertEqual(
+        launcher.maybe_inject_dataflow_worker_args(custom_img), custom_img)
+
+    no_stage = base_args + ['--no-stage-cli-wheel']
+    self.assertEqual(
+        launcher.maybe_inject_dataflow_worker_args(no_stage), base_args)
+
+    with mock.patch.dict(os.environ, {'BEAM_NO_STAGE_CLI_WHEEL': '1'}):
+      self.assertEqual(
+          launcher.maybe_inject_dataflow_worker_args(base_args), base_args)
+
 
 if __name__ == '__main__':
   unittest.main()

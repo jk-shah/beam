@@ -36,6 +36,69 @@ def _has_module(name: str) -> bool:
     return False
 
 
+def _package_version(dist_name: str) -> str | None:
+  try:
+    from importlib import metadata
+    return metadata.version(dist_name)
+  except Exception:  # pylint: disable=broad-except
+    return None
+
+
+def _detect_binary_resolution() -> tuple[dict[str, Any], list[str]]:
+  """Detects `beam` PATH shadowing (e.g. `beam-client` or Erlang `beam.smp`)."""
+  warnings: list[str] = []
+  path_dirs = [p for p in os.environ.get('PATH', '').split(os.pathsep) if p]
+  beam_bins: list[str] = []
+  apache_beam_bins: list[str] = []
+  beam_smp_bins: list[str] = []
+  seen_beam: set[str] = set()
+  seen_ab: set[str] = set()
+  seen_smp: set[str] = set()
+
+  for d in path_dirs:
+    for name, bucket, seen in (
+        ('beam', beam_bins, seen_beam),
+        ('apache-beam', apache_beam_bins, seen_ab),
+        ('beam.smp', beam_smp_bins, seen_smp),
+    ):
+      cand = os.path.join(d, name)
+      if os.path.isfile(cand) and os.access(cand, os.X_OK):
+        norm = os.path.abspath(cand)
+        if norm not in seen:
+          seen.add(norm)
+          bucket.append(norm)
+
+  beam_client_ver = _package_version('beam-client')
+  py_bin_dir = os.path.dirname(os.path.abspath(sys.executable))
+  expected_beam = os.path.join(py_bin_dir, 'beam')
+
+  if beam_client_ver is not None:
+    warnings.append(
+        f"beam-client {beam_client_ver} (Beam Cloud) is installed in this "
+        "environment and also defines a 'beam' console script; invoke "
+        "'apache-beam' in scripts/CI for unambiguous CLI resolution.")
+
+  if beam_bins and os.path.isfile(expected_beam):
+    if os.path.realpath(beam_bins[0]) != os.path.realpath(expected_beam):
+      warnings.append(
+          f"PATH resolves 'beam' to {beam_bins[0]!r} before this Python "
+          f"environment's {expected_beam!r}; invoke 'apache-beam' or prepend "
+          f"{py_bin_dir!r} to PATH.")
+    elif len(beam_bins) > 1:
+      warnings.append(
+          f"Multiple 'beam' executables exist on PATH ({', '.join(beam_bins[:3])}); "
+          "prefer 'apache-beam' in multi-tool automation.")
+
+  info = {
+      'active_beam': beam_bins[0] if beam_bins else None,
+      'active_apache_beam': apache_beam_bins[0] if apache_beam_bins else None,
+      'beam_on_path': beam_bins,
+      'beam_client_installed': beam_client_ver is not None,
+      'erlang_beam_smp_on_path': bool(beam_smp_bins),
+  }
+  return info, warnings
+
+
 def run_doctor() -> dict[str, Any]:
   """Runs local environment checks without executing any remote pipeline."""
   beam_ver = output.installed_beam_version()
@@ -50,6 +113,8 @@ def run_doctor() -> dict[str, Any]:
       'gcp_storage': _has_module('google.cloud.storage'),
       'fastavro': _has_module('fastavro'),
       'duckdb': _has_module('duckdb'),
+      'deltalake': _has_module('deltalake'),
+      'pyiceberg': _has_module('pyiceberg'),
   }
 
   # Local `beam pipe --sql` engines (`--sql-engine`). Versions come from
@@ -104,6 +169,7 @@ def run_doctor() -> dict[str, Any]:
   except OSError:
     cached_jars = 0
 
+  binary_info, warnings = _detect_binary_resolution()
   checks_ok = bool(extras['yaml'] and extras['pyarrow'])
   return {
       'healthy': checks_ok,
@@ -115,6 +181,8 @@ def run_doctor() -> dict[str, Any]:
       'sql_engines': sql_engines,
       'java': java_info,
       'gcp_adc': adc_info,
+      'binary_resolution': binary_info,
+      'warnings': warnings,
       'paths': {
           'beam_home': beam_home,
           'config_file': cfg_path,

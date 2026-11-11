@@ -44,6 +44,44 @@ class LakehouseError(ValueError):
   """Raised on invalid Delta Lake or Apache Iceberg table state or config."""
 
 
+class LakehousePackageMissingError(ImportError):
+  """Raised when advanced Delta v3+ or Iceberg v3+ features require extra packages."""
+
+
+_SAFE_DELTA_READER_FEATURES = frozenset({
+    'vacuumProtocolCheck',
+})
+
+
+def _detect_unsupported_delta_reader_features(
+    min_reader_version: int,
+    reader_features: list[str],
+    table_config: dict[str, str],
+) -> list[str]:
+  """Returns Delta protocol features unsafe for raw pure-Python Parquet reads."""
+  unsupported: list[str] = []
+  col_map = str(
+      table_config.get('delta.columnMapping.mode', 'none') or 'none').strip().lower()
+  if col_map not in ('', 'none') and 'columnMapping' not in unsupported:
+    unsupported.append(f'columnMapping({col_map})')
+  if str(table_config.get('delta.enableDeletionVectors', 'false')).lower() == 'true':
+    if 'deletionVectors' not in unsupported:
+      unsupported.append('deletionVectors')
+  for feat in reader_features:
+    f_str = str(feat).strip()
+    if f_str and f_str not in _SAFE_DELTA_READER_FEATURES and f_str not in unsupported:
+      unsupported.append(f_str)
+  if min_reader_version >= 2 and not unsupported and col_map in ('', 'none'):
+    # Delta minReaderVersion == 2 strictly signifies columnMapping; >= 3 uses
+    # readerFeatures. If minReaderVersion >= 3 without recognized safe features,
+    # flag protocol vN explicitly so readers never silently ignore table features.
+    if min_reader_version >= 3 and not reader_features:
+      unsupported.append(f'minReaderVersion={min_reader_version}')
+    elif min_reader_version == 2:
+      unsupported.append('minReaderVersion=2(columnMapping)')
+  return unsupported
+
+
 # ---------------------------------------------------------------------------
 # Filesystem helpers (local paths + `gs://`, `s3://`, `azfs://`, `hdfs://`)
 # ---------------------------------------------------------------------------
@@ -374,6 +412,10 @@ def parse_delta_log(
   schema_dict: dict[str, Any] = {'fields': []}
   partition_cols: list[str] = []
   table_config: dict[str, str] = {}
+  min_reader_version = 1
+  min_writer_version = 2
+  reader_features: list[str] = []
+  writer_features: list[str] = []
   start_ver = 0
 
   # Fast-forward from latest checkpoint <= target_version if present.
@@ -385,6 +427,12 @@ def parse_delta_log(
         pf = pq.ParquetFile(fobj)
         for batch in pf.iter_batches():
           for row in batch.to_pylist():
+            prot = row.get('protocol')
+            if prot:
+              min_reader_version = int(prot.get('minReaderVersion') or min_reader_version)
+              min_writer_version = int(prot.get('minWriterVersion') or min_writer_version)
+              reader_features = list(prot.get('readerFeatures') or reader_features)
+              writer_features = list(prot.get('writerFeatures') or writer_features)
             md = row.get('metaData')
             if md and md.get('schemaString'):
               schema_dict = json.loads(md['schemaString'])
@@ -415,6 +463,12 @@ def parse_delta_log(
       if not line.strip():
         continue
       act = json.loads(line)
+      prot = act.get('protocol')
+      if prot:
+        min_reader_version = int(prot.get('minReaderVersion') or min_reader_version)
+        min_writer_version = int(prot.get('minWriterVersion') or min_writer_version)
+        reader_features = list(prot.get('readerFeatures') or reader_features)
+        writer_features = list(prot.get('writerFeatures') or writer_features)
       md = act.get('metaData')
       if md and md.get('schemaString'):
         schema_dict = json.loads(md['schemaString'])
@@ -443,20 +497,24 @@ def parse_delta_log(
       'nullable': bool(f.get('nullable', True)),
   } for f in schema_dict.get('fields', [])]
 
-  # Estimate total rows from stats or Parquet footers when lightweight.
-  total_rows: Optional[int] = 0
-  for info in active_files.values():
-    st_raw = info.get('stats')
-    if isinstance(st_raw, str) and st_raw:
-      try:
-        st_obj = json.loads(st_raw)
-        if 'numRecords' in st_obj and total_rows is not None:
-          total_rows += int(st_obj['numRecords'])
-          continue
-      except ValueError:
-        pass
-    total_rows = None
-    break
+  unsupported_reader = _detect_unsupported_delta_reader_features(
+      min_reader_version, reader_features, table_config)
+
+  # Estimate total rows from stats only when deletion vectors are not active.
+  total_rows: Optional[int] = None if unsupported_reader else 0
+  if total_rows is not None:
+    for info in active_files.values():
+      st_raw = info.get('stats')
+      if isinstance(st_raw, str) and st_raw:
+        try:
+          st_obj = json.loads(st_raw)
+          if 'numRecords' in st_obj and total_rows is not None:
+            total_rows += int(st_obj['numRecords'])
+            continue
+        except ValueError:
+          pass
+      total_rows = None
+      break
 
   return {
       'root': root,
@@ -465,12 +523,65 @@ def parse_delta_log(
       'schema': schema_fields,
       'partition_columns': partition_cols,
       'configuration': table_config,
+      'protocol': {
+          'min_reader_version': min_reader_version,
+          'min_writer_version': min_writer_version,
+          'reader_features': reader_features,
+          'writer_features': writer_features,
+      },
+      'unsupported_reader_features': unsupported_reader,
       'cdc_enabled': str(
           table_config.get('delta.enableChangeDataFeed', 'false')).lower() == 'true',
       'active_files': list(active_files.values()),
       'estimated_bytes': sum(f['size'] for f in active_files.values()),
       'row_count': total_rows,
   }
+
+
+def _raise_delta_protocol_missing(snap: dict[str, Any]) -> None:
+  feats = ', '.join(snap.get('unsupported_reader_features') or ())
+  min_r = snap.get('protocol', {}).get('min_reader_version', 3)
+  raise LakehousePackageMissingError(
+      f"Delta table at {snap['root']!r} uses protocol reader v{min_r} features "
+      f"({feats}) not supported by the built-in Parquet reader; install "
+      "'deltalake' (`pip install deltalake`) or run on a distributed Beam "
+      'runner (--runner=DataflowRunner)')
+
+
+def _read_delta_via_deltalake(
+    snap: dict[str, Any],
+    *,
+    version: Optional[int] = None,
+    limit: Optional[int] = None,
+    search_term: Optional[str] = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+  try:
+    from deltalake import DeltaTable
+  except ImportError:
+    _raise_delta_protocol_missing(snap)
+  dt_kwargs: dict[str, Any] = {}
+  if version is not None:
+    dt_kwargs['version'] = int(version)
+  dt = DeltaTable(snap['root'], **dt_kwargs)
+  pa_tbl = dt.to_pyarrow_table()
+  snap['row_count'] = int(pa_tbl.num_rows)
+  type_map = {
+      f['name']: _delta_type_to_py_type(f['type']) for f in snap['schema']
+  }
+  needle = search_term.lower() if search_term else None
+  rows: list[dict[str, Any]] = []
+  if limit != 0:
+    for raw_r in pa_tbl.to_pylist():
+      rec = {
+          f['name']: _coerce_scalar_for_py(
+              raw_r.get(f['name']), type_map[f['name']])
+          for f in snap['schema']
+      }
+      if needle is None or _row_matches_search(rec, needle):
+        rows.append(rec)
+        if limit is not None and len(rows) >= limit:
+          break
+  return snap, rows
 
 
 def list_delta_cdc_actions(
@@ -480,13 +591,16 @@ def list_delta_cdc_actions(
     end_version: Optional[int] = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
   """Extracts Delta Change Data Feed (`cdc`) or commit `add`/`remove` actions."""
-  root = _normalize_fs_root(table_root)
+  snap = parse_delta_log(table_root, target_version=end_version)
+  if snap['unsupported_reader_features']:
+    _raise_delta_protocol_missing(snap)
+  root = snap['root']
   log_dir = _join_fs(root, '_delta_log')
   entries = _fs_list_files(_join_fs(log_dir, '*.json'))
   if not entries:
     raise FileNotFoundError(f'no Delta commits found in {log_dir!r}')
 
-  schema_fields: list[dict[str, Any]] = []
+  schema_fields: list[dict[str, Any]] = list(snap['schema'])
   actions: list[dict[str, Any]] = []
   for fpath, _ in entries:
     bname = os.path.basename(fpath.replace('\\', '/'))
@@ -494,19 +608,10 @@ def list_delta_cdc_actions(
     if not m_c:
       continue
     ver = int(m_c.group(1))
-    raw_lines = _fs_read_bytes(fpath).decode('utf-8').splitlines()
-    ver_objs = [json.loads(ln) for ln in raw_lines if ln.strip()]
-    for obj in ver_objs:
-      md = obj.get('metaData')
-      if md and md.get('schemaString'):
-        sd = json.loads(md['schemaString'])
-        schema_fields = [{
-            'name': str(f['name']),
-            'type': str(f['type']) if isinstance(f.get('type'), str) else 'string',
-            'nullable': bool(f.get('nullable', True)),
-        } for f in sd.get('fields', [])]
     if ver < start_version or (end_version is not None and ver > end_version):
       continue
+    raw_lines = _fs_read_bytes(fpath).decode('utf-8').splitlines()
+    ver_objs = [json.loads(ln) for ln in raw_lines if ln.strip()]
 
     has_explicit_cdc = any('cdc' in o for o in ver_objs)
     if has_explicit_cdc:
@@ -537,9 +642,6 @@ def list_delta_cdc_actions(
               'partition_values': dict(rem.get('partitionValues') or {}),
               'version': ver,
           })
-  if not schema_fields:
-    snap = parse_delta_log(table_root, target_version=end_version)
-    schema_fields = snap['schema']
   return schema_fields, actions
 
 
@@ -553,6 +655,9 @@ def read_delta_rows_local(
   """Reads up to `limit` rows from a Delta snapshot without booting a runner."""
   import pyarrow.parquet as pq
   snap = parse_delta_log(table_root, target_version=version)
+  if snap['unsupported_reader_features']:
+    return _read_delta_via_deltalake(
+        snap, version=version, limit=limit, search_term=search_term)
   type_map = {f['name']: _delta_type_to_py_type(f['type']) for f in snap['schema']}
   needle = search_term.lower() if search_term else None
   rows: list[dict[str, Any]] = []
@@ -878,6 +983,13 @@ def load_iceberg_state(
 
   meta_ver, meta_path = find_latest_iceberg_metadata_path(table_dir)
   meta = json.loads(_fs_read_bytes(meta_path).decode('utf-8'))
+  fmt_ver = int(meta.get('format-version') or 2)
+  if fmt_ver > 2:
+    raise LakehousePackageMissingError(
+        f'Iceberg table at {table_dir!r} uses format-version {fmt_ver} '
+        '(built-in metadata bridge supports Iceberg v1/v2); install '
+        "'pyiceberg' (`pip install pyiceberg`) or run with Beam Managed "
+        'Iceberg I/O (--runner=DataflowRunner)')
 
   schemas_list = meta.get('schemas') or (
       [meta['schema']] if 'schema' in meta else [])
@@ -1238,6 +1350,29 @@ def commit_iceberg_snapshot(
   if existing is not None:
     meta_ver = existing['metadata_version'] + 1
     old_meta = existing['metadata']
+    old_fmt = int(old_meta.get('format-version') or 2)
+    if old_fmt != 2:
+      raise LakehouseError(
+          f'existing Iceberg table at {table_dir!r} uses format-version '
+          f'{old_fmt}; local writer only commits Iceberg v2 manifests '
+          '(pass --if-exists replace to upgrade or --runner=DataflowRunner)')
+    default_spec_id = int(old_meta.get('default-spec-id') or 0)
+    spec_list = old_meta.get('partition-specs') or []
+    active_spec = next(
+        (s for s in spec_list if int(s.get('spec-id', 0)) == default_spec_id),
+        {'fields': old_meta.get('partition-spec') or []})
+    non_void_parts = [
+        str(f.get('name') or f.get('transform'))
+        for f in (active_spec.get('fields') or [])
+        if str(f.get('transform', 'void')).lower() != 'void'
+    ]
+    if non_void_parts:
+      raise LakehousePackageMissingError(
+          f'existing Iceberg table at {table_dir!r} uses partition spec '
+          f'({", ".join(non_void_parts)}); local zero-JVM writer refuses to '
+          'commit unpartitioned files into a partitioned table — install '
+          "'pyiceberg' (`pip install pyiceberg`) or run with Beam Managed "
+          'Iceberg I/O (--runner=DataflowRunner)')
     table_uuid = old_meta['table-uuid']
     seq_num = int(old_meta.get('last-sequence-number') or 0) + 1
     parent_snap_id = old_meta.get('current-snapshot-id')
@@ -1548,6 +1683,13 @@ def register_zero_copy_to_iceberg(
     snap = parse_delta_log(
         source_ep.config['table'],
         target_version=int(ver) if ver is not None else None)
+    if snap['unsupported_reader_features']:
+      feats = ', '.join(snap['unsupported_reader_features'])
+      raise LakehouseError(
+          f'Delta table uses protocol features ({feats}) whose raw Parquet '
+          'files cannot be zero-copy aliased into Iceberg without '
+          'materializing live rows; run standard `beam pipe` without '
+          '--zero-copy')
     if snap['partition_columns']:
       raise LakehouseError(
           'Delta table uses Hive directory partitioning where partition column '
@@ -1635,9 +1777,14 @@ def cli_read_from_delta(
   """Pure-Python distributed Delta Lake snapshot reader."""
   import apache_beam as beam
 
-  snap = parse_delta_log(
-      table, target_version=int(version) if version is not None else None)
+  target_ver = int(version) if version is not None else None
+  snap = parse_delta_log(table, target_version=target_ver)
   row_type = _fields_to_row_type(snap['schema'], is_delta=True)
+  if snap['unsupported_reader_features']:
+    _, rows = _read_delta_via_deltalake(snap, version=target_ver)
+    return (
+        'DeltaTableRows' >>
+        beam.Create([beam.Row(**r) for r in rows]).with_output_types(row_type))
   schema_spec = list(snap['schema'])
   active_files = list(snap['active_files'])
 

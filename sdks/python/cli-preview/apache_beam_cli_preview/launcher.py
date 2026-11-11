@@ -410,11 +410,30 @@ def ensure_preview_wheel() -> str:
   return str(wheel_path)
 
 
+def _has_custom_worker_container(args: list[str]) -> bool:
+  custom_prefixes = (
+      '--sdk_container_image',
+      '--sdk-container-image',
+      '--worker_harness_container_image',
+      '--worker-harness-container-image',
+  )
+  for a in args:
+    if a in custom_prefixes or any(
+        a.startswith(p + '=') for p in custom_prefixes):
+      return True
+  return False
+
+
 def maybe_inject_dataflow_worker_args(pipeline_args: list[str]) -> list[str]:
   """Stages the preview `.whl` + worker bootstrap plugin onto Dataflow VMs."""
-  out = list(pipeline_args)
-  has_preview_pkg = any(
-      'apache_beam_cli_preview' in a for a in out)
+  skip_flags = {'--no-stage-cli-wheel', '--no_stage_cli_wheel'}
+  explicit_skip = any(a in skip_flags for a in pipeline_args)
+  out = [a for a in pipeline_args if a not in skip_flags]
+  env_skip = os.environ.get(
+      'BEAM_NO_STAGE_CLI_WHEEL', '').strip().lower() in ('1', 'true', 'yes')
+  if explicit_skip or env_skip or _has_custom_worker_container(out):
+    return out
+  has_preview_pkg = any('apache_beam_cli_preview' in a for a in out)
   if not has_preview_pkg:
     whl = ensure_preview_wheel()
     out.append(f'--extra_package={whl}')
