@@ -109,7 +109,20 @@ class IntervalJoinConfig(NamedTuple):
 
 
 def parse_interval_join_config(cfg: dict[str, Any]) -> IntervalJoinConfig:
-  """Validates and parses interval join configuration."""
+  """Validates and parses interval join configuration for Beam YAML and CLI pipelines.
+
+  Args:
+    cfg: Configuration mapping containing join keys (`key`, `left_key`, `right_key`),
+      event-time columns (`left_time`, `right_time`), temporal bounds (`lower_bound`,
+      `upper_bound`), join semantics (`join_type: inner|left|full`), optional projection
+      (`select`), and watermark skew protection (`max_watermark_skew`, `skew_action`).
+
+  Returns:
+    An immutable, typed IntervalJoinConfig instance.
+
+  Raises:
+    ValueError: If keys, timestamps, or bounds are missing or semantically invalid.
+  """
   left_alias = str(cfg.get('left') or 'left').strip()
   right_alias = str(cfg.get('right') or 'right').strip()
 
@@ -248,6 +261,8 @@ def extract_record_timestamp(
           f'timestamp attribute {ts_attr!r} not found in element: {element!r}')
 
   if isinstance(val, (int, float)):
+    if not math.isfinite(val):
+      raise ValueError(f'timestamp attribute {ts_attr!r} must be finite numeric value, got {val!r}')
     # Epoch ms vs epoch s heuristic (> year 1973 in ms)
     if abs(val) > 1e11:
       return float(val) / 1000.0
@@ -444,6 +459,10 @@ class IntervalJoinStatefulDoFn(beam.DoFn):
       wm_state=beam.DoFn.StateParam(WATERMARK_STATE),
   ):
     key, (tag, t, row_payload) = element
+    if t is None or not isinstance(t, (int, float)) or not math.isfinite(t):
+      self.skew_dropped_counter.inc(1)
+      return
+
     max_skew = self.config.max_watermark_skew
 
     if max_skew is not None:

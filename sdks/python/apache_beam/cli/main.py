@@ -2137,7 +2137,27 @@ def _schema(args, extra_args, *, json_session, t0: float) -> int:
   return exit_code
 
 
-def _catalog(args, extra_args, *, json_session, t0: float) -> int:
+def _catalog(
+    args: argparse.Namespace,
+    extra_args: list[str],
+    *,
+    json_session: output.JsonEnvelopeSession,
+    t0: float,
+) -> int:
+  """Handles `beam catalog sync` execution with deterministic JSON envelopes or terminal summary.
+
+  Args:
+    args: Parsed arguments from argparse containing source, target, catalog, and flags.
+    extra_args: Unparsed trailing arguments (must be empty).
+    json_session: JSON envelope emitter session.
+    t0: Start timestamp for duration tracking.
+
+  Returns:
+    Exit code integer (0 on success).
+
+  Raises:
+    _CliError: If arguments or catalog synchronization fails.
+  """
   from . import lakehouse
   _reject_extra_args(extra_args)
   if getattr(args, 'catalog_action', None) != 'sync':

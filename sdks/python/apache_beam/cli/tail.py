@@ -49,6 +49,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import time
 from typing import Any
@@ -73,8 +74,21 @@ class TailError(Exception):
     self.exit_code = exit_code
 
 
+_ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?(\x07|\x1b\\)|[\x00-\x08\x0b-\x1f\x7f]')
+
+
+def _sanitize_terminal_str(s: str) -> str:
+  """Strips ANSI escape sequences and non-printable control characters from untrusted values."""
+  return _ANSI_ESCAPE_RE.sub('', s)
+
+
 class InteractiveTailFormatter:
-  """Human-friendly live terminal TUI with throughput tracking, ANSI colors, and field inspector."""
+  """Human-friendly live terminal TUI with throughput tracking, ANSI colors, and field inspector.
+
+  Provides live rolling rate calculation, colored field formatting, non-destructive
+  ephemeral peek banners, and graceful terminal exit summaries. All untrusted record
+  keys and values are sanitized to prevent terminal control character / ANSI escape injection.
+  """
 
   def __init__(self, uri: str, follow: bool = False, use_color: bool | None = None):
     self.uri = uri
@@ -119,6 +133,7 @@ class InteractiveTailFormatter:
     return self._style(text, '35')
 
   def render_start_banner(self) -> None:
+    """Renders the top banner on stderr showing stream URI and non-destructive mode."""
     mode_str = 'Live Follow (Ctrl-C to stop)' if self.follow else 'Sample Peek'
     banner = (
         f"{self.cyan('╭─')} {self.bold('Beam Stream')}: {self.yellow(self.uri)} "
@@ -131,6 +146,7 @@ class InteractiveTailFormatter:
     print(banner, file=sys.stderr, flush=True)
 
   def format_record(self, rec: dict[str, Any], idx: int) -> str:
+    """Formats a single stream record with timestamps, rolling rate, and sanitized fields."""
     now = time.monotonic()
     self.record_count += 1
     self.timestamps.append(now)
@@ -150,20 +166,24 @@ class InteractiveTailFormatter:
 
     parts = []
     for k, v in rec.items():
-      val_str = json.dumps(v, default=str) if isinstance(v, (dict, list)) else str(v)
-      if len(val_str) > 60:
-        val_str = val_str[:57] + '...'
-      parts.append(f"{self.bold(str(k))}={self.yellow(val_str)}")
+      safe_k = _sanitize_terminal_str(str(k))
+      val_raw = json.dumps(v, default=str) if isinstance(v, (dict, list)) else str(v)
+      safe_v = _sanitize_terminal_str(val_raw)
+      if len(safe_v) > 60:
+        safe_v = safe_v[:57] + '...'
+      parts.append(f"{self.bold(safe_k)}={self.yellow(safe_v)}")
 
     fields_str = '  '.join(parts)
     rate_str = self.dim(f"({rate:.1f} msg/s)") if self.follow else ""
     return f"{idx_str} {ts_str} {rate_str} {fields_str}"
 
   def on_stream_record(self, rec: dict[str, Any], idx: int) -> None:
+    """Callback invoked on every record arrival to print the formatted line."""
     line = self.format_record(rec, idx)
     print(line, flush=True)
 
   def render_exit_summary(self, interrupted: bool = False) -> None:
+    """Renders the summary card upon stream completion or Ctrl-C interrupt."""
     elapsed = max(0.001, time.monotonic() - self.start_time)
     avg_rate = self.record_count / elapsed
     bytes_kb = self.total_bytes / 1024.0

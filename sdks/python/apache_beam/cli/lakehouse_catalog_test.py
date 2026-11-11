@@ -469,6 +469,24 @@ class CatalogSyncTest(unittest.TestCase):
     self.assertEqual(data['outputs']['status'], 'dry_run')
     self.assertEqual(data['outputs']['files_to_sync'], 1)
 
+  def test_catalog_sync_security_path_traversal_rejection(self):
+    part_dir = os.path.join(self.tmp, 'security_test')
+    os.makedirs(part_dir, exist_ok=True)
+    with self.assertRaises(lakehouse.LakehouseError) as ctx:
+      lakehouse.sync_lakehouse_catalog(
+          self.tmp,
+          'iceberg://test_catalog/ns',
+          table='../../etc/passwd')
+    self.assertIn('path separators or ".."', str(ctx.exception))
+
+    with self.assertRaises(lakehouse.LakehouseError) as ctx2:
+      lakehouse.sync_lakehouse_catalog(
+          self.tmp,
+          'iceberg://test_catalog/ns',
+          catalog='../malicious')
+    self.assertIn('path separators or ".."', str(ctx2.exception))
+
 
 if __name__ == '__main__':
   unittest.main()
+

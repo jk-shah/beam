@@ -154,6 +154,15 @@ class RecordExtractionTest(unittest.TestCase):
         interval_join.extract_record_timestamp({'ts': dt}, 'ts'),
         dt.timestamp())
 
+  def test_extract_timestamp_non_finite_rejection(self):
+    with self.assertRaises(ValueError) as ctx_nan:
+      interval_join.extract_record_timestamp({'ts': float('nan')}, 'ts')
+    self.assertIn('finite numeric value', str(ctx_nan.exception))
+
+    with self.assertRaises(ValueError) as ctx_inf:
+      interval_join.extract_record_timestamp({'ts': float('inf')}, 'ts')
+    self.assertIn('finite numeric value', str(ctx_inf.exception))
+
 
 class BoundedIntervalJoinAlgorithmTest(unittest.TestCase):
   """Tests in-memory join algorithm for inner, left, and full outer joins."""
@@ -433,6 +442,36 @@ class WatermarkSkewCircuitBreakerTest(unittest.TestCase):
         (('u1',), ('R', 1030.0, {'user_id': 'u1', 'order_time': 1030.0, 'total': 42.0})),
         # Excessively late event on L: arrives with t=500, but R watermark is already at 1030 (skew = 530s > 60s)
         (('u1',), ('L', 500.0, {'user_id': 'u1', 'click_time': 500.0, 'ad': 'severely_late'})),
+    ]
+
+    with beam.Pipeline() as p:
+      results = (
+          p
+          | beam.Create(stream_events)
+          | beam.ParDo(interval_join.IntervalJoinStatefulDoFn(cfg))
+          | beam.Map(lambda r: (r.user_id, r.ad, r.total))
+      )
+      assert_that(results, equal_to([('u1', 'valid', 42.0)]))
+
+  def test_stateful_streaming_non_finite_timestamp_dropped(self):
+    import apache_beam as beam
+    from apache_beam.testing.util import assert_that
+    from apache_beam.testing.util import equal_to
+
+    cfg = interval_join.parse_interval_join_config({
+        'key': 'user_id',
+        'left_time': 'click_time',
+        'right_time': 'order_time',
+        'lower_bound': '0s',
+        'upper_bound': '10m',
+    })
+
+    # Keyed stream elements with NaN and inf timestamps mixed in with valid records
+    stream_events = [
+        (('u1',), ('L', 1000.0, {'user_id': 'u1', 'click_time': 1000.0, 'ad': 'valid'})),
+        (('u1',), ('L', float('nan'), {'user_id': 'u1', 'click_time': float('nan'), 'ad': 'nan_ts'})),
+        (('u1',), ('R', float('inf'), {'user_id': 'u1', 'order_time': float('inf'), 'total': -1.0})),
+        (('u1',), ('R', 1030.0, {'user_id': 'u1', 'order_time': 1030.0, 'total': 42.0})),
     ]
 
     with beam.Pipeline() as p:

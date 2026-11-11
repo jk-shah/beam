@@ -2308,12 +2308,47 @@ def sync_lakehouse_catalog(
     default_project: Optional[str] = None,
     catalog_opts: Optional[list[str]] = None,
 ) -> dict[str, Any]:
-  """Zero-copy synchronizes Delta Lake, Iceberg, or Parquet datasets into catalogs."""
+  """Synchronizes metadata from Delta Lake, Iceberg, or Parquet datasets into catalogs with zero copying.
+
+  Inspects active transaction logs (Delta Lake), snapshots (Iceberg), or Hive-partitioned
+  Parquet file structures and registers table metadata directly into target cloud catalogs
+  (BigQuery Managed Iceberg API, Google Cloud BigLake REST Catalog, or generic Iceberg REST
+  catalogs) in sub-second latency with 0 underlying data bytes copied.
+
+  Args:
+    from_uri: Source directory path or table URI (e.g. `delta://gs://bkt/tbl`, `path/to/table/`).
+    to_uri: Destination catalog URI (e.g. `iceberg://biglake.prod.events?warehouse=gs://...`,
+      `bigquery://project.dataset.table`).
+    table: Optional explicit table identifier override (e.g. `events`).
+    catalog: Optional explicit catalog type override (`'bigquery'`, `'biglake'`, `'rest'`).
+    mode: Sync operation mode (`'sync'`, `'register'`, or `'refresh'`). Defaults to `'sync'`.
+    zero_copy: When True, performs zero-copy metadata translation (`bytes_copied: 0`).
+    dry_run: When True, inspects source files and returns planned metadata changes without
+      committing to the catalog.
+    default_project: Default GCP project ID for resolving unqualified table paths.
+    catalog_opts: Optional key=value option pairs passed to catalog registration.
+
+  Returns:
+    A structured dictionary containing operation status, discovered file counts, byte sizes,
+    catalog registration details, and manifest metadata.
+
+  Raises:
+    LakehouseError: If an unsupported mode is provided, a path traversal attempt is detected,
+      or catalog metadata cannot be resolved.
+  """
   from . import uris
 
   if mode not in ('sync', 'register', 'refresh'):
     raise LakehouseError(
         f'unsupported catalog sync mode {mode!r}; expected "sync", "register", or "refresh"')
+
+  if table and ('..' in table or '/' in table or '\\' in table):
+    raise LakehouseError(
+        f'invalid table identifier {table!r}: table identifier cannot contain path separators or ".."')
+
+  if catalog and ('..' in catalog or '/' in catalog or '\\' in catalog):
+    raise LakehouseError(
+        f'invalid catalog identifier {catalog!r}: catalog cannot contain path separators or ".."')
 
   eff_from = from_uri
   format_override = None

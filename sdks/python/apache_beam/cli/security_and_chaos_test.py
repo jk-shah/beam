@@ -32,6 +32,7 @@ from unittest import mock
 from apache_beam.cli import expressions
 from apache_beam.cli import main as cli
 from apache_beam.cli import output
+from apache_beam.cli import tail
 
 _LAUNCHER = Path(__file__).resolve().parents[2] / '_apache_beam_cli.py'
 
@@ -1292,6 +1293,26 @@ class InputValidationAndResourceBoundsPass5Test(unittest.TestCase):
       with mock.patch.dict(os.environ, {'BEAM_CACHE_DIR': sym_cache}):
         with self.assertRaises(RuntimeError):
           prev_launcher.ensure_preview_wheel()
+
+  def test_interactive_tail_ansi_escape_sanitization(self):
+    formatter = tail.InteractiveTailFormatter('pubsub://test/topic', follow=False, use_color=False)
+    # Inject terminal escape sequences into keys and values (OSC window title, CSI color/clear, control chars)
+    malicious_record = {
+        'evil\x1b[31m_key\x1b[0m': 'normal_val',
+        'osc_payload': 'prefix\x1b]0;Hacked Title\x07suffix',
+        'csi_payload': 'hello\x1b[2J\x1b[Hworld\x08\x00',
+    }
+    formatted = formatter.format_record(malicious_record, 1)
+
+    # Verify no raw escape bytes (\x1b) or control characters remain in the output
+    self.assertNotIn('\x1b[31m', formatted)
+    self.assertNotIn('\x1b]0;Hacked Title', formatted)
+    self.assertNotIn('\x1b[2J', formatted)
+    self.assertNotIn('\x00', formatted)
+    self.assertNotIn('\x08', formatted)
+    self.assertIn('evil_key', formatted)
+    self.assertIn('prefixsuffix', formatted)
+    self.assertIn('helloworld', formatted)
 
 
 if __name__ == '__main__':
