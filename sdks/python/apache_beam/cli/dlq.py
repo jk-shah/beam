@@ -47,6 +47,7 @@ from typing import Optional
 TRANSFORMS_SUPPORTING_ERROR_HANDLING = frozenset([
     'Filter',
     'MapToFields',
+    'CliExpect',
     'ReadCsvWithDlq',
     'ReadFromJsonWithDlq',
     'ReadFromPubSub',
@@ -222,6 +223,7 @@ def cli_yaml_provider_spec() -> dict[str, Any]:
           'CliNormalizeCdc': 'apache_beam.cli.cdc.cli_normalize_cdc',
           'CliMaterializeCdc': 'apache_beam.cli.cdc.cli_materialize_cdc',
           'CliRowifyNested': 'apache_beam.cli.dlq.cli_rowify_nested',
+          'CliExpect': 'apache_beam.cli.expect.cli_expect',
           'CliWriteToBigQueryCDC': (
               'apache_beam.cli.cdc.cli_write_to_bigquery_cdc'
           ),

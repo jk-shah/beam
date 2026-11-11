@@ -819,12 +819,437 @@ def _validate_iceberg_ident_parts(parts: list[str], raw_ident: str) -> None:
           f'unsafe Iceberg table identifier {raw_ident!r}')
 
 
+def _iceberg_type_to_avro_type(itype: str) -> str:
+  low = str(itype or '').strip().lower()
+  if low in ('int', 'integer'):
+    return 'int'
+  if low == 'long':
+    return 'long'
+  if low == 'boolean':
+    return 'boolean'
+  if low == 'float':
+    return 'float'
+  if low == 'double':
+    return 'double'
+  if low in ('binary', 'fixed'):
+    return 'bytes'
+  return 'string'
+
+
+def _build_manifest_schema(
+    partition_spec: Optional[dict[str, Any]] = None,
+    name_to_type: Optional[dict[str, str]] = None,
+) -> dict[str, Any]:
+  import copy
+  schema = copy.deepcopy(_ICEBERG_V2_MANIFEST_SCHEMA)
+  part_fields = []
+  if partition_spec and partition_spec.get('fields'):
+    for pf in partition_spec['fields']:
+      p_name = str(pf['name'])
+      raw_t = (name_to_type or {}).get(p_name, 'string')
+      avro_t = _iceberg_type_to_avro_type(raw_t)
+      part_fields.append({
+          'name': p_name,
+          'type': ['null', avro_t],
+          'default': None,
+          'field-id': int(pf.get('field-id', 1000)),
+      })
+  for f in schema['fields']:
+    if f.get('name') == 'data_file':
+      for df_field in f['type']['fields']:
+        if df_field.get('name') == 'partition':
+          df_field['type']['fields'] = part_fields
+  return schema
+
+
+def _coerce_partition_value(val: Any, ptype: str) -> Any:
+  if val is None:
+    return None
+  ptype_low = str(ptype or '').lower()
+  if ptype_low in ('int', 'integer', 'long'):
+    try:
+      return int(val)
+    except (ValueError, TypeError):
+      return val
+  if ptype_low in ('float', 'double'):
+    try:
+      return float(val)
+    except (ValueError, TypeError):
+      return val
+  if ptype_low == 'boolean':
+    if isinstance(val, str):
+      return val.lower() == 'true'
+    return bool(val)
+  return str(val)
+
+
+def _validate_rest_catalog_security(rest_uri: str, cat_props: dict[str, Any]) -> tuple[str, str]:
+  parsed_rest = urllib.parse.urlsplit(rest_uri)
+  scheme = (parsed_rest.scheme or '').lower()
+  host = (parsed_rest.hostname or '').lower()
+  is_loopback = host in ('127.0.0.1', 'localhost', '::1')
+  wants_google_auth = (
+      str(cat_props.get('rest.auth.type', '')).lower() == 'google')
+  if scheme == 'https':
+    pass
+  elif scheme == 'http' and is_loopback and not wants_google_auth and not cat_props.get('token'):
+    pass
+  else:
+    raise LakehouseError(
+        f'Iceberg REST catalog URI must use https:// (got {scheme or "none"}://); '
+        'plaintext http:// is only allowed on localhost without bearer tokens')
+  if wants_google_auth and not (
+      host == 'biglake.googleapis.com' or host.endswith('.googleapis.com')):
+    raise LakehouseError(
+        f'refusing to send Google cloud-platform credentials to non-Google '
+        f'REST catalog host {host!r}')
+  return scheme, host
+
+
+def _resolve_via_bigquery_api(
+    table_ident: str,
+    cat_props: dict[str, Any],
+    default_project: Optional[str] = None,
+) -> Optional[str]:
+  """Queries Google Cloud BigQuery API (`bigquery.googleapis.com`) to resolve table storage."""
+  parts = [p for p in table_ident.split('.') if p]
+  if len(parts) == 3:
+    proj, ds, tbl = parts
+  elif len(parts) == 2:
+    proj = str(
+        cat_props.get('header.x-goog-user-project') or
+        default_project or
+        os.environ.get('GOOGLE_CLOUD_PROJECT', '') or
+        os.environ.get('GCP_PROJECT', '')).strip()
+    ds, tbl = parts
+  else:
+    return None
+
+  if not proj or not ds or not tbl:
+    return None
+
+  url = (
+      f"https://bigquery.googleapis.com/bigquery/v2/projects/{urllib.parse.quote(proj, safe='')}"
+      f"/datasets/{urllib.parse.quote(ds, safe='')}"
+      f"/tables/{urllib.parse.quote(tbl, safe='')}"
+  )
+  headers = {'Accept': 'application/json', 'x-goog-user-project': proj}
+  if cat_props.get('token'):
+    headers['Authorization'] = (
+        f"Bearer {str(cat_props['token']).replace(chr(13), '').replace(chr(10), '')}")
+  else:
+    try:
+      import google.auth
+      import google.auth.transport.requests
+      creds, _ = google.auth.default(
+          scopes=['https://www.googleapis.com/auth/cloud-platform'])
+      creds.refresh(google.auth.transport.requests.Request())
+      if creds.token:
+        headers['Authorization'] = f'Bearer {creds.token}'
+    except Exception:  # pylint: disable=broad-except
+      pass
+
+  try:
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(),
+        urllib.request.HTTPHandler(),
+        _SameOriginHttpsRedirectHandler())
+    req = urllib.request.Request(url, headers=headers)
+    with opener.open(req, timeout=10) as resp:
+      payload = json.loads(resp.read().decode('utf-8'))
+      bl_cfg = payload.get('bigLakeConfiguration')
+      if isinstance(bl_cfg, dict) and bl_cfg.get('storageUri'):
+        s_uri = str(bl_cfg['storageUri'])
+        _check_no_dotdot_or_controls(s_uri, 'BigQuery storageUri')
+        return _normalize_fs_root(s_uri)
+      ext_cfg = payload.get('externalDataConfiguration')
+      if isinstance(ext_cfg, dict) and ext_cfg.get('sourceUris'):
+        srcs = ext_cfg.get('sourceUris') or []
+        if srcs and isinstance(srcs[0], str):
+          _check_no_dotdot_or_controls(srcs[0], 'BigQuery sourceUri')
+          return _normalize_fs_root(srcs[0])
+      if payload.get('location') and payload.get('type') == 'EXTERNAL':
+        loc = str(payload['location'])
+        _check_no_dotdot_or_controls(loc, 'BigQuery table location')
+        return _normalize_fs_root(loc)
+  except Exception:  # pylint: disable=broad-except
+    pass
+  return None
+
+
+def _resolve_via_biglake_catalog(
+    table_ident: str,
+    cat_props: dict[str, Any],
+    default_project: Optional[str] = None,
+) -> Optional[str]:
+  rest_uri = str(cat_props.get('uri') or 'https://biglake.googleapis.com/iceberg/v1/restcatalog').rstrip('/')
+  _validate_rest_catalog_security(rest_uri, cat_props)
+  parts = [p for p in table_ident.split('.') if p]
+  _validate_iceberg_ident_parts(parts, table_ident)
+  if len(parts) < 2:
+    return None
+  ns = '%1F'.join(urllib.parse.quote(p, safe='') for p in parts[:-1])
+  tbl = urllib.parse.quote(parts[-1], safe='')
+  warehouse = str(cat_props.get('warehouse') or '')
+  prefix = ''
+  parsed = urllib.parse.urlsplit(rest_uri)
+  host = (parsed.hostname or '').lower()
+  if (host == 'biglake.googleapis.com' or host.endswith('.googleapis.com')) and warehouse.startswith('gs://'):
+    bkt = urllib.parse.quote(warehouse[len('gs://'):].split('/', 1)[0], safe='')
+    proj = urllib.parse.quote(str(cat_props.get('header.x-goog-user-project') or default_project or ''), safe='')
+    if proj:
+      prefix = f'/projects/{proj}/catalogs/{bkt}'
+  url = f'{rest_uri}/v1{prefix}/namespaces/{ns}/tables/{tbl}'
+  headers = {'Accept': 'application/json'}
+  if cat_props.get('header.x-goog-user-project'):
+    headers['x-goog-user-project'] = str(cat_props['header.x-goog-user-project']).replace('\r', '').replace('\n', '')
+  if cat_props.get('token'):
+    headers['Authorization'] = f"Bearer {str(cat_props['token']).replace(chr(13), '').replace(chr(10), '')}"
+  elif str(cat_props.get('rest.auth.type', '')).lower() == 'google' or host.endswith('.googleapis.com'):
+    try:
+      import google.auth
+      import google.auth.transport.requests
+      creds, _ = google.auth.default(scopes=['https://www.googleapis.com/auth/cloud-platform'])
+      creds.refresh(google.auth.transport.requests.Request())
+      if creds.token:
+        headers['Authorization'] = f'Bearer {creds.token}'
+    except Exception:  # pylint: disable=broad-except
+      pass
+  try:
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(),
+        urllib.request.HTTPHandler(),
+        _SameOriginHttpsRedirectHandler())
+    req = urllib.request.Request(url, headers=headers)
+    with opener.open(req, timeout=10) as resp:
+      payload = json.loads(resp.read().decode('utf-8'))
+      if payload.get('metadata-location'):
+        meta_loc = str(payload['metadata-location'])
+        _check_no_dotdot_or_controls(meta_loc, 'Iceberg metadata-location')
+        return meta_loc.rsplit('/metadata/', 1)[0]
+      if isinstance(payload.get('metadata'), dict) and payload['metadata'].get('location'):
+        loc = str(payload['metadata']['location']).rstrip('/')
+        _check_no_dotdot_or_controls(loc, 'Iceberg table location')
+        return loc
+  except Exception:  # pylint: disable=broad-except
+    pass
+  return None
+
+
+def _resolve_via_generic_rest_catalog(
+    table_ident: str,
+    cat_props: dict[str, Any],
+    default_project: Optional[str] = None,
+) -> Optional[str]:
+  rest_uri = str(cat_props.get('uri') or '').rstrip('/')
+  if not rest_uri:
+    return None
+  _validate_rest_catalog_security(rest_uri, cat_props)
+  parts = [p for p in table_ident.split('.') if p]
+  _validate_iceberg_ident_parts(parts, table_ident)
+  if len(parts) < 2:
+    return None
+  ns = '%1F'.join(urllib.parse.quote(p, safe='') for p in parts[:-1])
+  tbl = urllib.parse.quote(parts[-1], safe='')
+  url = f'{rest_uri}/v1/namespaces/{ns}/tables/{tbl}'
+  headers = {'Accept': 'application/json'}
+  if cat_props.get('token'):
+    headers['Authorization'] = f"Bearer {str(cat_props['token']).replace(chr(13), '').replace(chr(10), '')}"
+  try:
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(),
+        urllib.request.HTTPHandler(),
+        _SameOriginHttpsRedirectHandler())
+    req = urllib.request.Request(url, headers=headers)
+    with opener.open(req, timeout=10) as resp:
+      payload = json.loads(resp.read().decode('utf-8'))
+      if payload.get('metadata-location'):
+        meta_loc = str(payload['metadata-location'])
+        _check_no_dotdot_or_controls(meta_loc, 'Iceberg metadata-location')
+        return meta_loc.rsplit('/metadata/', 1)[0]
+      if isinstance(payload.get('metadata'), dict) and payload['metadata'].get('location'):
+        loc = str(payload['metadata']['location']).rstrip('/')
+        _check_no_dotdot_or_controls(loc, 'Iceberg table location')
+        return loc
+  except Exception:  # pylint: disable=broad-except
+    pass
+  return None
+
+
+def register_iceberg_catalog_table(
+    table_ident: str,
+    table_dir: str,
+    metadata_path: str,
+    *,
+    catalog_name: Optional[str] = None,
+    catalog_properties: Optional[dict[str, Any]] = None,
+    default_project: Optional[str] = None,
+) -> dict[str, Any]:
+  """Registers or updates table metadata in the configured Iceberg catalog.
+  
+  Follows the strict catalog hierarchy:
+  1. BigQuery managed Iceberg API (bigquery.googleapis.com)
+  2. Google Cloud Lakehouse / BigLake REST Catalog (biglake.googleapis.com)
+  3. Generic Iceberg REST Catalog
+  """
+  cat_props = dict(catalog_properties or {})
+  cat_name = str(catalog_name or '').lower()
+  cat_type = str(cat_props.get('type', '')).lower()
+
+  # 1. BigQuery managed Iceberg API
+  if cat_name in ('bigquery', 'bigquery-managed', 'bigquery_managed') or cat_type in ('bigquery', 'bigquery-managed', 'bigquery_managed'):
+    parts = [p for p in table_ident.split('.') if p]
+    if len(parts) == 3:
+      proj, ds, tbl = parts
+    elif len(parts) == 2:
+      proj = str(cat_props.get('header.x-goog-user-project') or default_project or os.environ.get('GOOGLE_CLOUD_PROJECT', '') or os.environ.get('GCP_PROJECT', '')).strip()
+      ds, tbl = parts
+    else:
+      return {'catalog': 'bigquery', 'status': 'skipped', 'reason': 'unrecognized_table_ident'}
+
+    if not proj or not ds or not tbl:
+      return {'catalog': 'bigquery', 'status': 'skipped', 'reason': 'missing_project'}
+
+    post_url = f"https://bigquery.googleapis.com/bigquery/v2/projects/{urllib.parse.quote(proj, safe='')}/datasets/{urllib.parse.quote(ds, safe='')}/tables"
+    headers = {'Accept': 'application/json', 'Content-Type': 'application/json', 'x-goog-user-project': proj}
+    if cat_props.get('token'):
+      headers['Authorization'] = f"Bearer {str(cat_props['token']).replace(chr(13), '').replace(chr(10), '')}"
+    else:
+      try:
+        import google.auth
+        import google.auth.transport.requests
+        creds, _ = google.auth.default(scopes=['https://www.googleapis.com/auth/cloud-platform'])
+        creds.refresh(google.auth.transport.requests.Request())
+        if creds.token:
+          headers['Authorization'] = f'Bearer {creds.token}'
+      except Exception:  # pylint: disable=broad-except
+        pass
+
+    payload = {
+        'tableReference': {'projectId': proj, 'datasetId': ds, 'tableId': tbl},
+        'bigLakeConfiguration': {
+            'storageUri': table_dir,
+            'tableFormat': 'ICEBERG',
+            'fileFormat': 'PARQUET',
+        },
+    }
+    try:
+      opener = urllib.request.build_opener(
+          urllib.request.HTTPSHandler(),
+          urllib.request.HTTPHandler(),
+          _SameOriginHttpsRedirectHandler())
+      req = urllib.request.Request(post_url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
+      with opener.open(req, timeout=10) as resp:
+        return {
+            'catalog': 'bigquery',
+            'status': 'registered',
+            'api': 'bigquery.googleapis.com',
+            'table': f'{proj}.{ds}.{tbl}',
+            'storage_uri': table_dir,
+        }
+    except urllib.error.HTTPError as e:
+      if e.code == 409:  # Conflict / Table already exists -> PATCH
+        try:
+          patch_url = f"{post_url}/{urllib.parse.quote(tbl, safe='')}"
+          req_patch = urllib.request.Request(
+              patch_url, data=json.dumps({'bigLakeConfiguration': payload['bigLakeConfiguration']}).encode('utf-8'),
+              headers=headers, method='PATCH')
+          with opener.open(req_patch, timeout=10) as resp:
+            return {
+                'catalog': 'bigquery',
+                'status': 'updated',
+                'api': 'bigquery.googleapis.com',
+                'table': f'{proj}.{ds}.{tbl}',
+                'storage_uri': table_dir,
+            }
+        except Exception as p_err:  # pylint: disable=broad-except
+          return {'catalog': 'bigquery', 'status': 'patch_failed', 'error': str(p_err)}
+      return {'catalog': 'bigquery', 'status': 'failed', 'error': str(e)}
+    except Exception as e:  # pylint: disable=broad-except
+      return {'catalog': 'bigquery', 'status': 'failed', 'error': str(e)}
+
+  # 2. BigLake REST Catalog
+  if cat_name == 'biglake' or (cat_type == 'rest' and 'biglake.googleapis.com' in str(cat_props.get('uri', ''))):
+    rest_uri = str(cat_props.get('uri') or 'https://biglake.googleapis.com/iceberg/v1/restcatalog').rstrip('/')
+    warehouse = str(cat_props.get('warehouse') or '')
+    prefix = ''
+    parts = [p for p in table_ident.split('.') if p]
+    if len(parts) >= 2:
+      ns = '%1F'.join(urllib.parse.quote(p, safe='') for p in parts[:-1])
+      tbl = urllib.parse.quote(parts[-1], safe='')
+      if warehouse.startswith('gs://'):
+        bkt = urllib.parse.quote(warehouse[len('gs://'):].split('/', 1)[0], safe='')
+        proj = urllib.parse.quote(str(cat_props.get('header.x-goog-user-project') or default_project or ''), safe='')
+        if proj:
+          prefix = f'/projects/{proj}/catalogs/{bkt}'
+      reg_url = f'{rest_uri}/v1{prefix}/namespaces/{ns}/register'
+      headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
+      if cat_props.get('header.x-goog-user-project'):
+        headers['x-goog-user-project'] = str(cat_props['header.x-goog-user-project']).replace('\r', '').replace('\n', '')
+      if cat_props.get('token'):
+        headers['Authorization'] = f"Bearer {str(cat_props['token']).replace(chr(13), '').replace(chr(10), '')}"
+      else:
+        try:
+          import google.auth
+          import google.auth.transport.requests
+          creds, _ = google.auth.default(scopes=['https://www.googleapis.com/auth/cloud-platform'])
+          creds.refresh(google.auth.transport.requests.Request())
+          if creds.token:
+            headers['Authorization'] = f'Bearer {creds.token}'
+        except Exception:  # pylint: disable=broad-except
+          pass
+      payload = {'name': tbl, 'metadata-location': _to_iceberg_uri(metadata_path)}
+      try:
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(),
+            urllib.request.HTTPHandler(),
+            _SameOriginHttpsRedirectHandler())
+        req = urllib.request.Request(reg_url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
+        with opener.open(req, timeout=10) as resp:
+          return {'catalog': 'biglake', 'status': 'registered', 'uri': rest_uri, 'table': table_ident}
+      except Exception as e:  # pylint: disable=broad-except
+        return {'catalog': 'biglake', 'status': 'failed', 'error': str(e)}
+
+  # 3. Generic Iceberg REST Catalog
+  if cat_type == 'rest' and cat_props.get('uri'):
+    rest_uri = str(cat_props['uri']).rstrip('/')
+    parts = [p for p in table_ident.split('.') if p]
+    if len(parts) >= 2:
+      ns = '%1F'.join(urllib.parse.quote(p, safe='') for p in parts[:-1])
+      tbl = urllib.parse.quote(parts[-1], safe='')
+      reg_url = f'{rest_uri}/v1/namespaces/{ns}/register'
+      headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
+      if cat_props.get('token'):
+        headers['Authorization'] = f"Bearer {str(cat_props['token']).replace(chr(13), '').replace(chr(10), '')}"
+      payload = {'name': tbl, 'metadata-location': _to_iceberg_uri(metadata_path)}
+      try:
+        opener = urllib.request.build_opener(
+            urllib.request.HTTPSHandler(),
+            urllib.request.HTTPHandler(),
+            _SameOriginHttpsRedirectHandler())
+        req = urllib.request.Request(reg_url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
+        with opener.open(req, timeout=10) as resp:
+          return {'catalog': 'rest', 'status': 'registered', 'uri': rest_uri, 'table': table_ident}
+      except Exception as e:  # pylint: disable=broad-except
+        return {'catalog': 'rest', 'status': 'failed', 'error': str(e)}
+
+  return {'catalog': 'none', 'status': 'local_metadata_only'}
+
+
 def resolve_iceberg_table_dir(
     config: dict[str, Any], default_project: Optional[str] = None
 ) -> str:
-  """Resolves an `iceberg://` config (`table` + `catalog_properties`) to its root dir."""
+  """Resolves an `iceberg://` config (`table` + `catalog_properties`) to its root dir.
+  
+  Catalog resolution hierarchy:
+  1. BigQuery managed Iceberg API first (bigquery.googleapis.com)
+  2. Google Cloud Lakehouse / BigLake REST Catalog second (biglake.googleapis.com)
+  3. Generic Iceberg REST Catalog third
+  4. Filesystem / GCS warehouse path
+  """
   cat_props = dict(config.get('catalog_properties') or {})
-  cat_type = str(cat_props.get('type', 'hadoop')).lower()
+  cat_type = str(cat_props.get('type', '')).lower()
+  cat_name = str(config.get('catalog_name') or '').lower()
   raw_table = str(config.get('table') or '').rstrip('/')
   table_ident = raw_table.lstrip('/')
 
@@ -833,82 +1258,40 @@ def resolve_iceberg_table_dir(
     _check_no_dotdot_or_controls(str(config['location']), 'Iceberg location')
     return _normalize_fs_root(str(config['location']))
 
-  # REST / BigLake catalog: query `/v1/.../namespaces/{ns}/tables/{tbl}` if URI set.
-  if cat_type == 'rest' and cat_props.get('uri') and table_ident:
-    parts = [p for p in table_ident.split('.') if p]
-    _validate_iceberg_ident_parts(parts, table_ident)
-    if len(parts) >= 2:
-      ns = '%1F'.join(urllib.parse.quote(p, safe='') for p in parts[:-1])
-      tbl = urllib.parse.quote(parts[-1], safe='')
-      rest_uri = str(cat_props['uri']).rstrip('/')
-      parsed_rest = urllib.parse.urlsplit(rest_uri)
-      scheme = (parsed_rest.scheme or '').lower()
-      host = (parsed_rest.hostname or '').lower()
-      is_loopback = host in ('127.0.0.1', 'localhost', '::1')
-      wants_google_auth = (
-          str(cat_props.get('rest.auth.type', '')).lower() == 'google')
-      if scheme == 'https':
-        pass
-      elif scheme == 'http' and is_loopback and not wants_google_auth and not cat_props.get('token'):
-        pass
-      else:
-        raise LakehouseError(
-            f'Iceberg REST catalog URI must use https:// (got {scheme or "none"}://); '
-            'plaintext http:// is only allowed on localhost without bearer tokens')
-      if wants_google_auth and not (
-          host == 'biglake.googleapis.com' or host.endswith('.googleapis.com')):
-        raise LakehouseError(
-            f'refusing to send Google cloud-platform credentials to non-Google '
-            f'REST catalog host {host!r}')
-      warehouse = str(cat_props.get('warehouse') or '')
-      prefix = ''
-      if host == 'biglake.googleapis.com' and warehouse.startswith('gs://'):
-        bkt = urllib.parse.quote(
-            warehouse[len('gs://'):].split('/', 1)[0], safe='')
-        proj = urllib.parse.quote(
-            str(cat_props.get('header.x-goog-user-project') or default_project or ''),
-            safe='')
-        if proj:
-          prefix = f'/projects/{proj}/catalogs/{bkt}'
-      url = f'{rest_uri}/v1{prefix}/namespaces/{ns}/tables/{tbl}'
-      headers = {'Accept': 'application/json'}
-      if cat_props.get('header.x-goog-user-project'):
-        headers['x-goog-user-project'] = str(
-            cat_props['header.x-goog-user-project']).replace('\r', '').replace('\n', '')
-      if cat_props.get('token'):
-        headers['Authorization'] = (
-            f"Bearer {str(cat_props['token']).replace(chr(13), '').replace(chr(10), '')}")
-      elif wants_google_auth:
-        try:
-          import google.auth
-          import google.auth.transport.requests
-          creds, _ = google.auth.default(
-              scopes=['https://www.googleapis.com/auth/cloud-platform'])
-          creds.refresh(google.auth.transport.requests.Request())
-          if creds.token:
-            headers['Authorization'] = f'Bearer {creds.token}'
-        except Exception:  # pylint: disable=broad-except
-          pass
-      try:
-        opener = urllib.request.build_opener(
-            urllib.request.HTTPSHandler(),
-            urllib.request.HTTPHandler(),
-            _SameOriginHttpsRedirectHandler())
-        req = urllib.request.Request(url, headers=headers)
-        with opener.open(req, timeout=10) as resp:
-          payload = json.loads(resp.read().decode('utf-8'))
-          if payload.get('metadata-location'):
-            meta_loc = str(payload['metadata-location'])
-            _check_no_dotdot_or_controls(meta_loc, 'Iceberg metadata-location')
-            # Strip `/metadata/vN.metadata.json`.
-            return meta_loc.rsplit('/metadata/', 1)[0]
-          if isinstance(payload.get('metadata'), dict) and payload['metadata'].get('location'):
-            loc = str(payload['metadata']['location']).rstrip('/')
-            _check_no_dotdot_or_controls(loc, 'Iceberg table location')
-            return loc
-      except Exception:  # pylint: disable=broad-except
-        pass
+  # If cat_type is explicitly rest with a uri, run security check immediately
+  if cat_type == 'rest' and cat_props.get('uri'):
+    _validate_rest_catalog_security(str(cat_props['uri']), cat_props)
 
+  # 1. BigQuery managed Iceberg API first:
+  if (cat_type in ('bigquery', 'bigquery-managed', 'bigquery_managed') or
+      cat_name in ('bigquery', 'bigquery-managed', 'bigquery_managed') or
+      (not cat_type and not cat_props.get('warehouse') and table_ident and '/' not in raw_table)):
+    bq_loc = _resolve_via_bigquery_api(table_ident, cat_props, default_project)
+    if bq_loc:
+      return bq_loc
+    if (cat_type in ('bigquery', 'bigquery-managed') or cat_name in ('bigquery', 'bigquery-managed')) and cat_props.get('warehouse'):
+      wh_norm = _normalize_fs_root(str(cat_props['warehouse']))
+      parts = [p for p in table_ident.split('.') if p]
+      _validate_iceberg_ident_parts(parts, table_ident)
+      if len(parts) >= 3 and cat_name and parts[0] == cat_name:
+        parts = parts[1:]
+      return _join_fs(wh_norm, *parts)
+
+  # 2. Google Cloud Lakehouse / BigLake REST Catalog second:
+  if (cat_type == 'rest' and (cat_name == 'biglake' or 'biglake.googleapis.com' in str(cat_props.get('uri', '')))) or (
+      cat_name == 'biglake') or (
+      not cat_type and not cat_props.get('warehouse') and table_ident and '/' not in raw_table):
+    bl_loc = _resolve_via_biglake_catalog(table_ident, cat_props, default_project)
+    if bl_loc:
+      return bl_loc
+
+  # 3. Generic Iceberg REST Catalog third:
+  if cat_type == 'rest' and cat_props.get('uri') and table_ident:
+    rest_loc = _resolve_via_generic_rest_catalog(table_ident, cat_props, default_project)
+    if rest_loc:
+      return rest_loc
+
+  # 4. Filesystem warehouse fallback:
   warehouse = str(cat_props.get('warehouse') or '').strip()
   if not warehouse:
     # Allow direct filesystem path in `table` (including `iceberg:///abs/wh/ns.tbl`
@@ -929,9 +1312,9 @@ def resolve_iceberg_table_dir(
             return _join_fs(parent_dir, *seg_parts)
       return norm_path
     raise LakehouseError(
-        f'Iceberg table {table_ident!r} requires a warehouse path '
-        '(e.g. iceberg://namespace.table?warehouse=gs://my-bucket/warehouse '
-        'or --from-opt warehouse=/path/to/warehouse)')
+        f'Iceberg table {table_ident!r} requires a warehouse path or resolvable catalog '
+        '(hierarchy: 1. BigQuery managed Iceberg API, 2. BigLake REST Catalog, 3. Generic REST Catalog). '
+        'Example: iceberg://namespace.table?warehouse=gs://my-bucket/warehouse or --to-opt catalog=bigquery')
 
   _check_no_dotdot_or_controls(warehouse, 'Iceberg warehouse')
   wh_norm = _normalize_fs_root(warehouse)
@@ -1161,11 +1544,14 @@ def read_iceberg_rows_local(
           row_idx += 1
           if cur_pos in file_pos_del:
             continue
-          rec = {
-              f['name']: _coerce_scalar_for_py(
-                  raw_r.get(f['name']), type_map[f['name']])
-              for f in state['schema']
-          }
+          part_map = df_info.get('partition') or {}
+          rec = {}
+          for f in state['schema']:
+            fname = f['name']
+            val = raw_r.get(fname)
+            if val is None and fname in part_map:
+              val = part_map[fname]
+            rec[fname] = _coerce_scalar_for_py(val, type_map[fname])
           deleted = False
           for cols, kset in applicable_eq:
             if tuple(rec.get(c) for c in cols) in kset:
@@ -1336,6 +1722,7 @@ def commit_iceberg_snapshot(
     identifier_columns: Optional[Iterable[str]] = None,
     new_data_files: list[dict[str, Any]],
     new_eq_delete_files: Optional[list[dict[str, Any]]] = None,
+    partition_spec: Optional[dict[str, Any]] = None,
     replace_table: bool = False,
 ) -> dict[str, Any]:
   """Atomically writes Iceberg v2 manifests, manifest-list, and `vN.metadata.json`."""
@@ -1370,12 +1757,19 @@ def commit_iceberg_snapshot(
         if str(f.get('transform', 'void')).lower() != 'void'
     ]
     if non_void_parts:
-      raise LakehousePackageMissingError(
-          f'existing Iceberg table at {table_dir!r} uses partition spec '
-          f'({", ".join(non_void_parts)}); local zero-JVM writer refuses to '
-          'commit unpartitioned files into a partitioned table — install '
-          "'pyiceberg' (`pip install pyiceberg`) or run with Beam Managed "
-          'Iceberg I/O (--runner=DataflowRunner)')
+      has_partition_data = any(
+          bool(df.get('partition')) for df in new_data_files
+      ) or (partition_spec and partition_spec.get('fields'))
+      if not has_partition_data:
+        raise LakehousePackageMissingError(
+            f'existing Iceberg table at {table_dir!r} uses partition spec '
+            f'({", ".join(non_void_parts)}); local zero-JVM writer refuses to '
+            'commit unpartitioned files into a partitioned table — install '
+            "'pyiceberg' (`pip install pyiceberg`) or run with Beam Managed "
+            'Iceberg I/O (--runner=DataflowRunner)')
+      part_spec = active_spec
+    else:
+      part_spec = partition_spec or {'spec-id': 0, 'fields': []}
     table_uuid = old_meta['table-uuid']
     seq_num = int(old_meta.get('last-sequence-number') or 0) + 1
     parent_snap_id = old_meta.get('current-snapshot-id')
@@ -1456,7 +1850,8 @@ def commit_iceberg_snapshot(
   name_mapping = [{
       'field-id': int(f['id']), 'names': [str(f['name'])]
   } for f in cur_schema['fields']]
-  part_spec = {'spec-id': 0, 'fields': []}
+  if existing is None:
+    part_spec = partition_spec or {'spec-id': 0, 'fields': []}
 
   snap_id = (int(time.time() * 1000000) ^ uuid.uuid4().int) & 0x7FFFFFFFFFFFFFFF
   if snap_id == 0:
@@ -1469,9 +1864,22 @@ def commit_iceberg_snapshot(
   if new_data_files:
     m_data_records = []
     total_added_rows = 0
+    name_to_type = {str(f['name']): str(f['type']) for f in cur_schema['fields']}
+    m_avro_schema = _build_manifest_schema(part_spec, name_to_type)
     for df in new_data_files:
       rc = int(df['record_count'])
       total_added_rows += rc
+      raw_part = dict(df.get('partition') or {})
+      coerced_part = {}
+      if part_spec and part_spec.get('fields'):
+        for pf in part_spec['fields']:
+          pcol = str(pf['name'])
+          raw_val = raw_part.get(pcol)
+          if raw_val is not None:
+            ptype = name_to_type.get(pcol, 'string')
+            coerced_part[pcol] = _coerce_partition_value(raw_val, ptype)
+          else:
+            coerced_part[pcol] = None
       m_data_records.append({
           'status': 1,
           'snapshot_id': snap_id,
@@ -1481,7 +1889,7 @@ def commit_iceberg_snapshot(
               'content': 0,
               'file_path': _to_iceberg_uri(df['path']),
               'file_format': 'PARQUET',
-              'partition': {},
+              'partition': coerced_part,
               'record_count': rc,
               'file_size_in_bytes': int(df['file_size_in_bytes']),
               'equality_ids': None,
@@ -1489,13 +1897,13 @@ def commit_iceberg_snapshot(
           },
       })
     m_data_bytes = _write_avro_bytes(
-        _ICEBERG_V2_MANIFEST_SCHEMA,
+        m_avro_schema,
         m_data_records,
         metadata={
             'schema': json.dumps(cur_schema),
             'schema-id': str(cur_schema.get('schema-id', 0)),
             'partition-spec': json.dumps(part_spec['fields']),
-            'partition-spec-id': '0',
+            'partition-spec-id': str(part_spec.get('spec-id', 0)),
             'format-version': '2',
             'content': 'data',
         })
@@ -1504,7 +1912,7 @@ def commit_iceberg_snapshot(
     new_ml_entries.append({
         'manifest_path': _to_iceberg_uri(m_data_path),
         'manifest_length': len(m_data_bytes),
-        'partition_spec_id': 0,
+        'partition_spec_id': int(part_spec.get('spec-id', 0)),
         'content': 0,
         'sequence_number': seq_num,
         'min_sequence_number': seq_num,
@@ -1617,6 +2025,19 @@ def commit_iceberg_snapshot(
     ] + [cur_schema]
   else:
     all_schemas = [cur_schema]
+  last_part_id = 999
+  if part_spec and part_spec.get('fields'):
+    last_part_id = max((int(f.get('field-id', 999)) for f in part_spec['fields']), default=999)
+  if existing is not None and old_meta.get('partition-specs'):
+    all_specs = [
+        s for s in old_meta['partition-specs']
+        if int(s.get('spec-id', 0)) != int(part_spec.get('spec-id', 0))
+    ] + [part_spec]
+    if old_meta.get('last-partition-id'):
+      last_part_id = max(last_part_id, int(old_meta['last-partition-id']))
+  else:
+    all_specs = [part_spec]
+
   meta_json_obj = {
       'format-version': 2,
       'table-uuid': table_uuid,
@@ -1626,9 +2047,9 @@ def commit_iceberg_snapshot(
       'last-column-id': last_col_id,
       'current-schema-id': cur_schema.get('schema-id', 0),
       'schemas': all_schemas,
-      'default-spec-id': 0,
-      'partition-specs': [part_spec],
-      'last-partition-id': 999,
+      'default-spec-id': int(part_spec.get('spec-id', 0)),
+      'partition-specs': all_specs,
+      'last-partition-id': last_part_id,
       'default-sort-order-id': 0,
       'sort-orders': [{'order-id': 0, 'fields': []}],
       'properties': {
@@ -1720,7 +2141,8 @@ def register_zero_copy_to_iceberg(
     raise LakehouseError(
         f'--zero-copy requires an iceberg:// destination, got {sink_ep.raw!r}')
 
-  parquet_files: list[tuple[str, int]] = []
+  parquet_files: list[tuple[str, int, dict[str, Any]]] = []
+  partition_cols: list[str] = []
   if source_ep.kind == 'delta':
     ver = source_ep.config.get('version')
     snap = parse_delta_log(
@@ -1733,15 +2155,19 @@ def register_zero_copy_to_iceberg(
           'files cannot be zero-copy aliased into Iceberg without '
           'materializing live rows; run standard `beam pipe` without '
           '--zero-copy')
-    if snap['partition_columns']:
-      raise LakehouseError(
-          'Delta table uses Hive directory partitioning where partition column '
-          'values live in folder paths rather than Parquet columns; run '
-          'standard `beam pipe` without --zero-copy to materialize partition '
-          'columns into Iceberg Parquet files')
-    parquet_files = [(f['path'], int(f['size'])) for f in snap['active_files']]
+    partition_cols = list(snap.get('partition_columns') or [])
+    parquet_files = [
+        (f['path'], int(f['size']), dict(f.get('partition_values') or {}))
+        for f in snap['active_files']
+    ]
   elif source_ep.kind == 'file' and source_ep.format == 'parquet':
-    parquet_files = _fs_list_files(source_ep.config['path'])
+    raw_files = _fs_list_files(source_ep.config['path'])
+    parquet_files = []
+    for p, sz in raw_files:
+      hive_parts = dict(re.findall(r'[/\\-]([^/=\\]+)=([^/=\\]+)', p))
+      if hive_parts and not partition_cols:
+        partition_cols = list(hive_parts.keys())
+      parquet_files.append((p, sz, hive_parts))
   else:
     raise LakehouseError(
         '--zero-copy supports delta:// tables and Parquet file/glob sources; '
@@ -1767,7 +2193,7 @@ def register_zero_copy_to_iceberg(
   data_entries: list[dict[str, Any]] = []
   total_rows = 0
   num_files = len(parquet_files)
-  for fpath, fsize in parquet_files:
+  for fpath, fsize, fpart in parquet_files:
     with _fs_open_read(fpath) as fobj:
       pf = pq.ParquetFile(fobj)
       for field in pf.schema_arrow:
@@ -1787,7 +2213,28 @@ def register_zero_copy_to_iceberg(
           'path': fpath,
           'record_count': nrows,
           'file_size_in_bytes': fsize,
+          'partition': fpart,
       })
+
+  # If source has partition columns that were stored purely in paths/partition_values,
+  # ensure they are included in seen_fields!
+  if source_ep.kind == 'delta':
+    for sf in snap.get('schema') or []:
+      sname = str(sf.get('name'))
+      if sname in partition_cols and sname not in seen_fields:
+        seen_fields[sname] = {
+            'name': sname,
+            'type': sf.get('type') or 'string',
+            'nullable': True,
+        }
+  elif partition_cols:
+    for pcol in partition_cols:
+      if pcol not in seen_fields:
+        seen_fields[pcol] = {
+            'name': pcol,
+            'type': 'string',
+            'nullable': True,
+        }
 
   # Build the unified Iceberg schema:
   # Any field that is absent from one or more registered files (e.g. Due to
@@ -1796,7 +2243,7 @@ def register_zero_copy_to_iceberg(
   # produce NULL when reading older files.
   iceberg_fields: list[dict[str, Any]] = []
   for idx, (fname, fdict) in enumerate(seen_fields.items(), start=1):
-    is_nullable = fdict['nullable'] or (file_field_presence.get(fname, 0) < num_files)
+    is_nullable = fdict['nullable'] or (file_field_presence.get(fname, 0) < num_files) or (fname in partition_cols)
     iceberg_fields.append({
         'id': idx,
         'name': fname,
@@ -1804,15 +2251,43 @@ def register_zero_copy_to_iceberg(
         'nullable': is_nullable,
     })
 
+  partition_spec = None
+  if partition_cols:
+    name_to_fid = {f['name']: f['id'] for f in iceberg_fields}
+    part_fields = []
+    for p_idx, pcol in enumerate(partition_cols, start=1000):
+      part_fields.append({
+          'source-id': name_to_fid.get(pcol, p_idx - 999),
+          'field-id': p_idx,
+          'name': pcol,
+          'transform': 'identity',
+      })
+    partition_spec = {'spec-id': 0, 'fields': part_fields}
+
   commit_res = commit_iceberg_snapshot(
       table_dir,
       iceberg_fields=iceberg_fields,
       new_data_files=data_entries,
+      partition_spec=partition_spec,
       replace_table=(if_exists == 'replace'))
-  commit_res['registered_files'] = [p for p, _ in parquet_files]
+
+  cat_reg = register_iceberg_catalog_table(
+      sink_ep.config.get('table', ''),
+      table_dir,
+      commit_res['metadata_path'],
+      catalog_name=sink_ep.config.get('catalog_name'),
+      catalog_properties=sink_ep.config.get('catalog_properties'),
+      default_project=default_project)
+  if cat_reg and cat_reg.get('status') != 'none':
+    commit_res['catalog_registration'] = cat_reg
+
+  commit_res['registered_files'] = [p for p, _, _ in parquet_files]
   commit_res['rows_registered'] = total_rows
   commit_res['bytes_copied'] = 0
   commit_res['zero_copy'] = True
+  if partition_cols:
+    commit_res['partition_columns'] = partition_cols
+    commit_res['partition_spec'] = partition_spec
   return commit_res
 
 
@@ -1984,11 +2459,14 @@ def cli_read_from_iceberg(
             pos += 1
             if cur_pos in file_pos:
               continue
-            rec = {
-                f['name']: _coerce_scalar_for_py(
-                    raw_r.get(f['name']), type_map[f['name']])
-                for f in schema_spec
-            }
+            part_map = df_info.get('partition') or {}
+            rec = {}
+            for f in schema_spec:
+              fname = f['name']
+              val = raw_r.get(fname)
+              if val is None and fname in part_map:
+                val = part_map[fname]
+              rec[fname] = _coerce_scalar_for_py(val, type_map[fname])
             if any(
                 tuple(rec.get(c) for c in cols) in kset
                 for cols, kset in applicable_eq):

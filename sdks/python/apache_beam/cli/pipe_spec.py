@@ -267,6 +267,8 @@ def build_pipe_spec(
     allow_jinja: bool = False,
     window: str | dict[str, Any] | None = None,
     timestamp_col: str | None = None,
+    expect: list[str] | list[dict[str, Any]] | None = None,
+    on_violation: str = 'dlq',
 ) -> PipeSpec:
   """Returns the `PipeSpec` for `beam pipe`."""
   if if_exists not in ('fail', 'append', 'replace'):
@@ -330,12 +332,26 @@ def build_pipe_spec(
   except uris.UriError as e:
     raise PipeSpecError(str(e)) from None
 
+  parsed_expect_rules = []
+  if expect:
+    from . import expect as expect_mod
+    for item in expect:
+      try:
+        r = expect_mod.parse_expectation_rule(item, default_on_violation=on_violation)
+        parsed_expect_rules.append(r)
+      except (ValueError, TypeError) as e:
+        raise PipeSpecError(f'invalid --expect rule {item!r}: {e}') from None
+    if any(r.on_violation == 'dlq' for r in parsed_expect_rules) and dlq_ep is None:
+      raise PipeSpecError(
+          "cannot route expectation violations to DLQ without a DLQ sink; "
+          "specify --dlq <PATH> or use --on-violation {fail|drop}")
+
   if zero_copy:
-    if cdc or where or select or dlq_ep is not None or window or timestamp_col:
+    if cdc or where or select or dlq_ep is not None or window or timestamp_col or expect:
       raise PipeSpecError(
           '--zero-copy registers existing Parquet files in-place without '
           'rewriting data, so it cannot be combined with --cdc, --where, '
-          '--select, --window, --timestamp-col, or --dlq')
+          '--select, --window, --timestamp-col, --expect, or --dlq')
     if dst_ep.kind != 'iceberg':
       raise PipeSpecError(
           f'--zero-copy requires an iceberg:// destination, got {dst_ep.raw!r}')
@@ -788,6 +804,17 @@ def build_pipe_spec(
         })
     if select_cfg is not None:
       chain_steps.append({'type': 'MapToFields', 'config': select_cfg})
+    if parsed_expect_rules:
+      needs_cli_provider = True
+      chain_steps.append({
+          'type': 'CliExpect',
+          'config': {
+              'rules': [
+                  {'name': r.name, 'expression': r.expression, 'on_violation': r.on_violation}
+                  for r in parsed_expect_rules
+              ],
+          },
+      })
     if inject_counters:
       chain_steps.append({
           'type': 'CliCountRows',
@@ -997,6 +1024,27 @@ def build_pipe_spec(
             'NormalizeSelectDlq', 'SelectFields.errors', 'MapToFields'))
     dlq_norm_refs.append('NormalizeSelectDlq')
     current_ref = 'SelectFields'
+
+  if parsed_expect_rules:
+    needs_cli_provider = True
+    exp_cfg = {
+        'rules': [
+            {'name': r.name, 'expression': r.expression, 'on_violation': r.on_violation}
+            for r in parsed_expect_rules
+        ],
+        'error_handling': {'output': 'errors'},
+    }
+    dag_transforms.append({
+        'name': 'ValidateExpect',
+        'type': 'CliExpect',
+        'input': current_ref,
+        'config': exp_cfg,
+    })
+    dag_transforms.append(
+        dlq.build_dlq_normalizer_transform(
+            'NormalizeExpectDlq', 'ValidateExpect.errors', 'CliExpect'))
+    dlq_norm_refs.append('NormalizeExpectDlq')
+    current_ref = 'ValidateExpect.good'
 
   if inject_counters:
     dag_transforms.append({

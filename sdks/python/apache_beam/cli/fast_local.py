@@ -235,10 +235,12 @@ def _transform_configs(spec: dict[str, Any]):
   cdc_mat_cfg = None
   where_cfg = None
   select_cfg = None
+  expect_cfg = None
   known = {
       'ReadFromCsv', 'ReadCsvWithDlq', 'ReadFromJson', 'ReadJsonWithDlq',
       'ReadFromText', 'ReadFromParquet', 'ReadFromAvro', 'CliRowifyNested',
-      'CliCountRows', 'WriteToCsv', 'WriteToJson', 'WriteToParquet', 'Flatten'
+      'CliCountRows', 'WriteToCsv', 'WriteToJson', 'WriteToParquet', 'Flatten',
+      'CliExpect',
   }
   for t in spec.get('pipeline', {}).get('transforms', []):
     t_type = t.get('type')
@@ -253,6 +255,8 @@ def _transform_configs(spec: dict[str, Any]):
       continue
     elif t_type == 'MapToFields':
       select_cfg = t.get('config', {})
+    elif t_type == 'CliExpect':
+      expect_cfg = t.get('config', {})
     elif t_type not in known:
       return None
   if (cdc_norm_cfg is not None) != (cdc_mat_cfg is not None):
@@ -260,7 +264,7 @@ def _transform_configs(spec: dict[str, Any]):
   for cfg in (where_cfg, select_cfg):
     if cfg is not None and cfg.get('language', 'python') != 'python':
       return None
-  return cdc_norm_cfg, cdc_mat_cfg, where_cfg, select_cfg
+  return cdc_norm_cfg, cdc_mat_cfg, where_cfg, select_cfg, expect_cfg
 
 
 def _safe_row_getattr(obj: Any, attr: str):
@@ -707,7 +711,7 @@ def run(
   formats, each file with its own reader. Existing outputs are kept untouched
   until every transform, count assertion, and staged write succeeds.
   """
-  cdc_norm_cfg, cdc_mat_cfg, where_cfg, select_cfg = _transform_configs(
+  cdc_norm_cfg, cdc_mat_cfg, where_cfg, select_cfg, expect_cfg = _transform_configs(
       pipe.spec)
   route_errors = pipe.dlq_endpoint is not None
   dlq_records: list[dict[str, Any]] = []
@@ -841,11 +845,64 @@ def run(
     columns = list(fields)
     types = out_types
 
+  exp_metrics: dict[str, int] = {}
+  if expect_cfg is not None:
+    from . import expect as expect_mod
+    raw_rules = expect_cfg.get('rules', [])
+    parsed_rules = [
+        expect_mod.parse_expectation_rule(r) if not isinstance(r, expect_mod.ExpectationRule) else r
+        for r in raw_rules
+    ]
+    compiled_rules = [
+        (r, compile(r.expression, f'<fast_expectation:{r.name}>', 'eval'))
+        for r in parsed_rules
+    ]
+    kept_exp = []
+    for row in rows:
+      failed_rule = None
+      for rule, code in compiled_rules:
+        if expect_mod.evaluate_record(code, row):
+          exp_metrics[f'expectation_passed_{rule.name}'] = (
+              exp_metrics.get(f'expectation_passed_{rule.name}', 0) + 1)
+        else:
+          failed_rule = rule
+          break
+      if failed_rule is None:
+        kept_exp.append(row)
+        continue
+
+      exp_metrics['expectation_violations_total'] = (
+          exp_metrics.get('expectation_violations_total', 0) + 1)
+      action = failed_rule.on_violation
+      if action == 'fail':
+        exp_metrics[f'expectation_failed_{failed_rule.name}'] = (
+            exp_metrics.get(f'expectation_failed_{failed_rule.name}', 0) + 1)
+        raise FastPipeError(
+            f"Expectation rule {failed_rule.name!r} ({failed_rule.expression}) "
+            f"violated by row: {row._asdict() if hasattr(row, '_asdict') else row}")
+      elif action == 'dlq':
+        exp_metrics[f'expectation_quarantined_{failed_rule.name}'] = (
+            exp_metrics.get(f'expectation_quarantined_{failed_rule.name}', 0) + 1)
+        exp_metrics['expectation_quarantined_rows'] = (
+            exp_metrics.get('expectation_quarantined_rows', 0) + 1)
+        if not route_errors:
+          raise FastPipeError(
+              f"Expectation rule {failed_rule.name!r} violated and no DLQ route configured; "
+              f"row: {row._asdict() if hasattr(row, '_asdict') else row}")
+        dlq_records.append(_error_record('CliExpect', expect_mod.ExpectationViolation(f"Rule {failed_rule.name!r} violated: {failed_rule.expression}"), row))
+      elif action == 'drop':
+        exp_metrics[f'expectation_dropped_{failed_rule.name}'] = (
+            exp_metrics.get(f'expectation_dropped_{failed_rule.name}', 0) + 1)
+        exp_metrics['expectation_dropped_rows'] = (
+            exp_metrics.get('expectation_dropped_rows', 0) + 1)
+        filtered_out += 1
+    rows = kept_exp
+
   out_rows = [_plain(r) for r in rows]
-  metrics: dict[str, int] = {'rows_read': rows_read, 'rows_written': len(out_rows)}
+  metrics: dict[str, int] = {'rows_read': rows_read, 'rows_written': len(out_rows), **exp_metrics}
   if cdc_superseded:
     metrics['cdc_superseded_rows'] = cdc_superseded
-  if (where_cfg is not None or cdc_superseded > 0 or cdc_preimage_skipped > 0):
+  if (where_cfg is not None or cdc_superseded > 0 or cdc_preimage_skipped > 0 or expect_cfg is not None):
     metrics['rows_filtered_out'] = (
         filtered_out + cdc_superseded + cdc_preimage_skipped)
   if route_errors:

@@ -129,15 +129,36 @@ beam tail "kafka://broker.example.com:9092/user-activity" \
 
 ---
 
-## 5. Production Scheduling & Operational Boundaries
+## 5. Production Scheduling & Operational Boundaries (`beam export-schedule`)
 
-`beam` is a single-pipeline execution CLI and driver; it is **not** an orchestrator, daemon, or background scheduler.
+`beam` is a single-pipeline execution CLI and driver; it is **not** an orchestrator daemon. Instead of running a local cron process, `beam export-schedule` compiles pipelines directly into enterprise orchestration deployment definitions:
 
-### Orchestrating Recurring Pipelines
-`beam` does not include an internal cron daemon or workflow scheduler. For production recurring schedules, multi-stage DAGs, or SLA alerting:
-1. **Package Declarative Pipelines**: Package your pipeline with `beam package pipeline.yaml --to gs://my-bucket/templates/pipeline.json --json`.
-2. **Trigger via Orchestrator**: Schedule executions using **Google Cloud Composer (Apache Airflow)**, **Cloud Scheduler + Cloud Functions / Cloud Run**, or **dbt** for warehouse transformations.
-3. **Programmatic Submission**: Trigger template runs via `gcloud dataflow flex-template run <JOB_NAME> --template-file-gcs-location=gs://.../pipeline.json`.
+### Export to Google Cloud Composer (Apache Airflow)
+Generates an idiomatic, PEP 8 Airflow DAG utilizing `DataflowStartFlexTemplateOperator`:
+```bash
+beam export-schedule pipeline.yaml \
+             --schedule "0 2 * * *" \
+             --orchestrator composer \
+             --project=my-project \
+             --region=us-central1 \
+             --template-gcs-path=gs://my-bucket/templates/pipeline.json \
+             --to dags/daily_orders_dag.py \
+             --json
+```
+
+### Export to Serverless Cloud Scheduler
+Generates a bash setup script creating a Cloud Scheduler HTTP trigger targeting Dataflow's `flexTemplates:launch` REST endpoint with OAuth authentication:
+```bash
+beam export-schedule pipeline.yaml \
+             --schedule "0 2 * * *" \
+             --orchestrator cloud-scheduler \
+             --project=my-project \
+             --region=us-central1 \
+             --template-gcs-path=gs://my-bucket/templates/pipeline.json \
+             --service-account-email=scheduler-sa@my-project.iam.gserviceaccount.com \
+             --to deploy_scheduler.sh \
+             --json
+```
 
 ### Progress Markers & Streaming Checkpointing
 `beam` maintains no local state or checkpoint databases on the CLI client. 
@@ -153,3 +174,100 @@ Autonomous agents interacting with `beam` must uphold strict operational guardra
 2. **Confirm Destructive Overwrites**: Always obtain user confirmation before specifying `--if-exists replace` or running operations that overwrite existing tables or storage paths.
 3. **Confirm Job Termination**: Always confirm before canceling or draining active production jobs via `beam cancel <JOB_ID>`.
 4. **Pre-Flight Cost Guard**: When running large ad-hoc scans on cloud storage or BigQuery, always include `--max-bytes <BUDGET>` (e.g., `--max-bytes 10GB`) to halt execution before incurring unexpected scan costs (exits with code 8 `EXIT_COST_LIMIT`).
+
+---
+
+## 7. Data Quality Expectations & Tagged DLQ Routing (`--expect`)
+
+Declare schema-aware data quality assertions directly on pipeline flows:
+```bash
+beam pipe --from gs://my-bucket/raw/transactions.csv \
+          --to bigquery://my-project.analytics.transactions \
+          --expect "positive_amount: amount > 0.0" \
+          --expect "valid_currency: currency in ['USD', 'EUR', 'GBP']" \
+          --expect "customer_id is not None -> fail" \
+          --on-violation dlq \
+          --dlq gs://my-bucket/dlq/transactions.jsonl \
+          --assert-counts \
+          --runner=DataflowRunner \
+          --project=my-project \
+          --json
+```
+
+### Violation Actions
+- `dlq` (default): Routes invalid records to `--dlq` sink with full error metadata (`error_type`, `error`, `raw_payload`).
+- `drop`: Silently filters out invalid records while incrementing audit counters.
+- `fail`: Halts pipeline execution immediately upon detecting a violation (raising `ExpectationViolationError`).
+
+### Live Google Cloud Dataflow Telemetry
+When executed on `DataflowRunner`, each expectation rule automatically publishes custom Beam metrics (`Metrics.counter` in `beam_cli` namespace):
+- `expectation_passed_{rule}`
+- `expectation_quarantined_{rule}`
+- `expectation_dropped_{rule}`
+- `expectation_failed_{rule}`
+These surface as live real-time time-series charts in the Google Cloud Dataflow Monitoring Console UI.
+
+---
+
+## 8. Apache Iceberg Catalog Integration Hierarchy
+
+When writing to or reading from Apache Iceberg lakehouses (`iceberg://`), the CLI resolves table locations and registers snapshots using a strict three-tier catalog hierarchy:
+
+### Tier 1: BigQuery Managed Iceberg API (Primary)
+Direct integration with BigQuery managed tables storing data in Apache Iceberg format:
+- **API Endpoint**: `https://bigquery.googleapis.com/bigquery/v2/projects/{project}/datasets/{dataset}/tables/{table}`
+- **Storage Mapping**: Tables are resolved and registered via `bigLakeConfiguration.storageUri` with `tableFormat: "ICEBERG"` and `fileFormat: "PARQUET"`.
+- **Authentication**: Seamlessly authenticated via Google Application Default Credentials (ADC) or active environment tokens.
+- **Auto-Resolution**: 3-part identifiers (`project.dataset.table`) automatically query the BigQuery API first. If the table already exists, updates are pushed via `PATCH /tables/{tableId}`; otherwise, it is created via `POST /tables`.
+
+```bash
+# Register or write directly to BigQuery managed Iceberg table
+beam pipe --from gs://my-bucket/clean_orders.parquet \
+          --to "iceberg://my-proj.analytics.orders?catalog=bigquery" \
+          --json
+```
+
+### Tier 2: Google Cloud Lakehouse / BigLake REST Catalog (Secondary)
+When an enterprise Iceberg catalog is configured in BigLake:
+- **API Endpoint**: `https://biglake.googleapis.com/iceberg/v1/restcatalog`
+- **Catalog Prefix**: Resolves tables under `/projects/{project}/catalogs/{catalog}/namespaces/{namespace}/tables/{table}`.
+- **Registration**: Publishes table metadata locations to `/namespaces/{namespace}/register` with GCP OAuth 2.0 bearer tokens.
+
+```bash
+# Register to BigLake REST Catalog
+beam pipe --from delta://gs://my-lakehouse/delta/events \
+          --to "iceberg://analytics.events?warehouse=gs://my-lakehouse/wh" \
+          --to-opt catalog_type=biglake \
+          --to-opt uri=https://biglake.googleapis.com/iceberg/v1/restcatalog \
+          --zero-copy --json
+```
+
+### Tier 3: Generic Iceberg REST Catalog (Tertiary)
+Portable standard Iceberg REST Catalog for open lakehouse deployments:
+- **API Endpoint**: Standard Iceberg REST OpenAPI `/v1/namespaces/{namespace}/tables/{table}`.
+- **Configuration**: Explicitly configured via `--to-opt catalog_type=rest` and `--to-opt uri=https://catalog.example.com/v1`.
+
+---
+
+## 9. Partition-Aware Zero-Copy Lakehouse Bridge (`--zero-copy`)
+
+`beam pipe --zero-copy` translates Delta Lake tables into Apache Iceberg v2 tables in-place without copying or re-encoding underlying Parquet data files (`bytes_copied: 0`):
+
+### Supported Capabilities
+1. **Partitioned & Unpartitioned Support**: Handles both flat tables and Hive-style partitioned tables (e.g. `date=2026-11-10/region=US/part-00000.parquet`).
+2. **Dynamic Manifest Schema Generation**: Dynamically inspects Delta partition columns, maps them into Iceberg schema field types, and generates dynamic Avro manifest schemas (`r102`) embedding typed partition records (`r102_partition`).
+3. **Iceberg v2 Metadata Generation**: Generates compliant `metadata.json` with `format-version: 2`, `partition-specs`, and `default-spec-id`.
+4. **Transparent Partition Column Reconstruction**: Reconstructs partition columns from manifest metadata during read operations across:
+   - In-process local fast reader (`read_iceberg_rows_local`)
+   - Portable Beam runner (`PrismRunner`)
+   - Google Cloud Dataflow (`DataflowRunner`)
+
+```bash
+# Zero-copy conversion of partitioned Delta table with BigQuery managed Iceberg catalog registration
+beam pipe --from delta://gs://my-lakehouse/orders_delta \
+          --to "iceberg://my-proj.analytics.orders_iceberg?catalog=bigquery" \
+          --zero-copy \
+          --verify --verify-key order_id \
+          --json
+```
+

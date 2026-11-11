@@ -139,6 +139,7 @@ _SUBCOMMANDS = frozenset([
     'wait',
     'cancel',
     'package',
+    'export-schedule',
 ])
 _PASSTHROUGH_SUBCOMMANDS = frozenset(['run', 'pipe', 'diff', 'check'])
 _CLI_ZERO_FLAGS = {
@@ -185,6 +186,12 @@ _CLI_ZERO_FLAGS = {
         '--no-config',
         '--help',
     ]),
+    'export-schedule': frozenset([
+        '--catchup',
+        '--verbose',
+        '--no-config',
+        '--help',
+    ]),
 }
 _CLI_ONE_FLAGS = {
     None: frozenset(['--output']),
@@ -223,6 +230,8 @@ _CLI_ONE_FLAGS = {
         '--cdc-seq-col',
         '--wait-timeout',
         '--profile',
+        '--expect',
+        '--on-violation',
     ]),
     'diff': frozenset([
         '--key',
@@ -269,6 +278,27 @@ _CLI_ONE_FLAGS = {
         '--num-workers',
         '--requirements',
         '--output-dir',
+        '--profile',
+    ]),
+    'export-schedule': frozenset([
+        '--schedule',
+        '--orchestrator',
+        '--to',
+        '-o',
+        '--output',
+        '--project',
+        '--location',
+        '--region',
+        '--template-gcs-path',
+        '--job-name',
+        '--dag-id',
+        '--service-account-email',
+        '--subnetwork',
+        '--network',
+        '--parameter',
+        '--max-active-runs',
+        '--retries',
+        '--retry-delay-min',
         '--profile',
     ]),
 }
@@ -460,6 +490,8 @@ def main(argv=None) -> int:
         return _config(args, extra_args, json_session=json_session, t0=t0)
       if active_cmd == 'package':
         return _package(args, extra_args, json_session=json_session, t0=t0)
+      if active_cmd == 'export-schedule':
+        return _export_schedule(args, extra_args, json_session=json_session, t0=t0)
 
       # External plugin dispatch (`apache_beam.cli.plugins`).
       from . import llms_txt as llms_mod
@@ -664,6 +696,18 @@ def _build_parser():
       help=(
           'projection / scalar expressions (e.g. '
           '"CAST(id AS INT) AS id, lower(email) AS email")'))
+  pipe.add_argument(
+      '--expect',
+      action='append',
+      metavar='EXPR',
+      help=(
+          'data quality expectation rule (repeatable; e.g. "amount > 0" or '
+          '"valid_amt: amount > 0 -> dlq|drop|fail")'))
+  pipe.add_argument(
+      '--on-violation',
+      choices=['dlq', 'drop', 'fail'],
+      default='dlq',
+      help='default action when an --expect rule is violated (default: dlq)')
   pipe.add_argument(
       '--window',
       metavar='SPEC',
@@ -1225,6 +1269,96 @@ def _build_parser():
       action='store_true',
       help='validate and preview ContainerSpec without writing files or building images')
   _add_config_selection_args(pkg_p)
+
+  # 14. `beam export-schedule`
+  sched_p = commands.add_parser(
+      'export-schedule',
+      help='export pipeline as a Cloud Composer (Airflow) DAG or Cloud Scheduler trigger',
+      allow_abbrev=False)
+  sched_p.add_argument(
+      'source',
+      metavar='FILE_OR_STDIN',
+      help='pipeline .yaml path, gs:// template URI, or - for stdin YAML')
+  sched_p.add_argument(
+      '--schedule',
+      default='@daily',
+      metavar='CRON',
+      help='cron schedule expression (e.g. "0 2 * * *") or Airflow macro (e.g. @daily, @hourly)')
+  sched_p.add_argument(
+      '--orchestrator',
+      choices=['composer', 'cloud-scheduler'],
+      default='composer',
+      help='target orchestrator: composer (Cloud Composer Airflow DAG) or cloud-scheduler (Cloud Scheduler script)')
+  sched_p.add_argument(
+      '--to',
+      '-o',
+      '--output',
+      dest='to_destination',
+      metavar='DEST_FILE',
+      help='destination file path for the generated DAG or script (prints to stdout if omitted)')
+  sched_p.add_argument(
+      '--project',
+      metavar='PROJECT',
+      help='GCP project ID')
+  sched_p.add_argument(
+      '--location',
+      '--region',
+      dest='location',
+      metavar='REGION',
+      help='GCP region/location (default: us-central1)')
+  sched_p.add_argument(
+      '--template-gcs-path',
+      metavar='GCS_URI',
+      help='GCS path to Flex Template JSON spec (defaults to gs://<project>-templates/<name>.json)')
+  sched_p.add_argument(
+      '--job-name',
+      metavar='NAME',
+      help='job name or prefix for triggered Dataflow jobs')
+  sched_p.add_argument(
+      '--dag-id',
+      metavar='DAG_ID',
+      help='Airflow DAG ID (default: derived from pipeline filename)')
+  sched_p.add_argument(
+      '--service-account-email',
+      metavar='EMAIL',
+      help='service account email for Dataflow workers / Cloud Scheduler auth')
+  sched_p.add_argument(
+      '--subnetwork',
+      metavar='SUBNET',
+      help='VPC subnetwork for Dataflow workers')
+  sched_p.add_argument(
+      '--network',
+      metavar='NETWORK',
+      help='VPC network for Dataflow workers')
+  sched_p.add_argument(
+      '--parameter',
+      action='append',
+      dest='parameters',
+      metavar='KEY=VAL',
+      help='Flex Template runtime parameters (repeatable; e.g. input_path=gs://...)')
+  sched_p.add_argument(
+      '--catchup',
+      action='store_true',
+      help='enable catchup for historical DAG execution runs in Airflow (default: False)')
+  sched_p.add_argument(
+      '--max-active-runs',
+      type=int,
+      default=1,
+      metavar='N',
+      help='maximum active DAG runs in Airflow (default: 1)')
+  sched_p.add_argument(
+      '--retries',
+      type=int,
+      default=2,
+      metavar='N',
+      help='number of retries on task failure (default: 2)')
+  sched_p.add_argument(
+      '--retry-delay-min',
+      type=int,
+      default=5,
+      metavar='MINUTES',
+      help='delay in minutes between retries (default: 5)')
+  _add_config_selection_args(sched_p)
   return parser
 
 
@@ -1638,6 +1772,66 @@ def _package(args, extra_args, *, json_session, t0: float) -> int:
       print(json.dumps(report['container_spec'], indent=2, sort_keys=True))
     print('\nLaunch with gcloud:')
     print(f"  {report['launch']['gcloud']}")
+  return EXIT_OK
+
+
+def _export_schedule(args, extra_args, *, json_session, t0: float) -> int:
+  from . import scheduler as sched_mod
+  _reject_extra_args(extra_args)
+  cfg_args = _resolve_config_args(args, [])
+  eff_project = args.project or _extract_opt_from_resolved(cfg_args, '--project')
+  eff_region = args.location or _extract_opt_from_resolved(cfg_args, '--region')
+  eff_sa = args.service_account_email or _extract_opt_from_resolved(
+      cfg_args, '--service_account_email', '--service-account-email')
+  eff_subnet = args.subnetwork or _extract_opt_from_resolved(cfg_args, '--subnetwork')
+  eff_net = args.network or _extract_opt_from_resolved(cfg_args, '--network')
+
+  kwargs: dict[str, Any] = {
+      'schedule': args.schedule,
+      'orchestrator': args.orchestrator,
+      'to_destination': args.to_destination,
+      'project': eff_project,
+      'location': eff_region,
+      'template_gcs_path': args.template_gcs_path,
+      'job_name': args.job_name,
+      'dag_id': args.dag_id,
+      'service_account_email': eff_sa,
+      'subnetwork': eff_subnet,
+      'network': eff_net,
+      'parameters': args.parameters,
+      'catchup': args.catchup,
+      'max_active_runs': args.max_active_runs,
+      'retries': args.retries,
+      'retry_delay_min': args.retry_delay_min,
+  }
+
+  try:
+    report = sched_mod.run_export_schedule(args.source, **kwargs)
+  except sched_mod.SchedulerError as e:
+    raise _CliError(str(e), e.exit_code) from None
+  except Exception as e:  # pylint: disable=broad-except
+    raise _CliError(f'export-schedule failed: {e}', EXIT_PIPELINE_FAILED) from None
+
+  if json_session.enabled:
+    json_session.emit(
+        output.build_envelope(
+            ok=True,
+            command='export-schedule',
+            exit_code=EXIT_OK,
+            duration_ms=int((time.monotonic() - t0) * 1000),
+            outputs={
+                'orchestrator': report.orchestrator,
+                'schedule': report.schedule,
+                'destination': report.destination,
+                'dag_id': report.dag_id,
+                'job_name': report.job_name,
+                'content': report.content,
+            }))
+  else:
+    if report.destination:
+      print(f"Exported {report.orchestrator} schedule to: {report.destination}", file=sys.stderr)
+    else:
+      print(report.content)
   return EXIT_OK
 
 
@@ -2605,7 +2799,9 @@ def _pipe(
         prefer_python_lakehouse_and_cdc=bool(not args.dry_run),
         allow_jinja=allow_jinja,
         window=getattr(args, 'window', None),
-        timestamp_col=getattr(args, 'timestamp_col', None))
+        timestamp_col=getattr(args, 'timestamp_col', None),
+        expect=getattr(args, 'expect', None),
+        on_violation=getattr(args, 'on_violation', 'dlq'))
   except pipe_spec.PipeSpecError as e:
     raise _CliError(str(e), EXIT_USAGE) from None
 

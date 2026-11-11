@@ -958,7 +958,16 @@ def parse_endpoint(
   rest_uri = opts.pop('uri', None) or qparams.pop('uri', None)
   cat_props = dict(opts.pop('catalog_properties', None) or {})
 
-  if cat_shortcut == 'biglake':
+  if cat_shortcut in ('bigquery', 'bigquery-managed', 'bigquery_managed'):
+    opts.setdefault('catalog_name', 'bigquery')
+    cat_props.setdefault('type', 'bigquery')
+    cat_props.setdefault('api', 'https://bigquery.googleapis.com')
+    cat_props.setdefault('rest.auth.type', 'google')
+    if warehouse_val:
+      cat_props.setdefault('warehouse', str(warehouse_val))
+    if default_project:
+      cat_props.setdefault('header.x-goog-user-project', default_project)
+  elif cat_shortcut == 'biglake':
     opts.setdefault('catalog_name', 'biglake')
     cat_props.setdefault('type', 'rest')
     cat_props.setdefault(
@@ -980,6 +989,17 @@ def parse_endpoint(
     opts.setdefault('catalog_name', cat_shortcut or 'hadoop')
     cat_props.setdefault('type', 'hadoop')
     cat_props.setdefault('warehouse', str(warehouse_val))
+  elif not cat_shortcut and not warehouse_val and not rest_uri and '/' not in raw_ident and '.' in raw_ident:
+    # Auto-resolve using the strict catalog hierarchy:
+    # 1. BigQuery managed Iceberg API first
+    # 2. Google Cloud Lakehouse / BigLake REST Catalog second
+    # 3. Generic Iceberg REST Catalog third
+    opts.setdefault('catalog_name', 'bigquery')
+    cat_props.setdefault('type', 'bigquery')
+    cat_props.setdefault('api', 'https://bigquery.googleapis.com')
+    cat_props.setdefault('rest.auth.type', 'google')
+    if default_project:
+      cat_props.setdefault('header.x-goog-user-project', default_project)
 
   for qk, qv in qparams.items():
     opts.setdefault(qk, _coerce_opt_value(qv))

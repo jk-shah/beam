@@ -1,33 +1,35 @@
 ---
 name: apache-beam-cli
-description: Pre-flight dataset diff reconciliation, verified data movement with row-count proofs (--assert-counts), dead-letter quarantine (--dlq), and sub-second local in-process execution across files, lakehouses (Delta Lake, Apache Iceberg), BigQuery, Cloud SQL, and streams (Pub/Sub, Kafka), with safe graduation to Google Cloud Dataflow.
+description: Pre-flight dataset diff reconciliation, verified data movement with row-count proofs (--assert-counts), dead-letter quarantine (--dlq), data quality expectations (--expect), enterprise orchestration export (beam export-schedule), and sub-second local in-process execution across files, lakehouses (Delta Lake, Apache Iceberg), BigQuery, Cloud SQL, and streams (Pub/Sub, Kafka), with safe graduation to Google Cloud Dataflow.
 ---
 
 # Apache Beam CLI (`beam`) Skill
 
-Use `beam` for universal data movement, verified dataset diff reconciliation, dead-letter quarantine (`--dlq`), mathematical row-conservation proofs (`--assert-counts`), stream peeking, zero-copy lakehouse registration, and Zero-Docker Dataflow Flex Template packaging.
+Use `beam` for universal data movement, verified dataset diff reconciliation, dead-letter quarantine (`--dlq`), data quality assertions (`--expect`), mathematical row-conservation proofs (`--assert-counts`), stream peeking, zero-copy lakehouse registration, Zero-Docker Dataflow Flex Template packaging (`beam package`), and enterprise orchestration export (`beam export-schedule`).
 
 ## Package & Maturity Status
 - **Package**: `apache-beam-cli-preview` v0.2.0 (`pip install apache-beam-cli-preview`)
 - **Upstream Scope vs. Preview Capabilities**:
   - **Core Apache Beam (issue #40891)**: `beam run <pipeline.yaml>` and foundational `beam pipe` for single-format file conversions.
-  - **Preview Package (`apache-beam-cli-preview`)**: Adds fast local in-process execution (`local_fast`, `local_sql`), cross-system reconciliation (`beam diff`), stream peeking (`beam tail`), Delta Lake <-> Apache Iceberg v2 bridging, row-count proofs (`--assert-counts`), dead-letter quarantine (`--dlq`), pre-flight scan cost guardrails (`--max-bytes`), and Zero-Docker Flex Template packaging (`beam package`).
+  - **Preview Package (`apache-beam-cli-preview`)**: Adds fast local in-process execution (`local_fast`, `local_sql`), cross-system reconciliation (`beam diff`), stream peeking (`beam tail`), Delta Lake <-> Apache Iceberg v2 bridging, row-count proofs (`--assert-counts`), dead-letter quarantine (`--dlq`), data quality expectations (`--expect`), pre-flight scan cost guardrails (`--max-bytes`), Zero-Docker Flex Template packaging (`beam package`), and orchestration export (`beam export-schedule`).
 
 ## When to Use `beam` vs. Other Tool Categories
 - **Use `beam` (Cross-Engine Reconciliation, Guardrailed ETL, & Cloud Graduation)**:
   - **Reconciliation & Diffing (`beam diff`)**: Proving data migration accuracy between source and target systems (e.g., Delta Lake vs BigQuery, Parquet vs Iceberg) with key-level diffs, multiset hashes, and schema comparisons without writing custom diff scripts.
-  - **Guardrailed Data Movement (`beam pipe`)**: Moving, cleaning, and transforming data with mandatory row-conservation proofs (`--assert-counts`) and quarantine capture (`--dlq`) so corrupt rows are never dropped silently.
+  - **Guardrailed Data Movement (`beam pipe`)**: Moving, cleaning, and transforming data with mandatory row-conservation proofs (`--assert-counts`), quarantine capture (`--dlq`), and data quality expectations (`--expect`).
+  - **Data Quality Expectations (`--expect`)**: Asserting row-level business rules at scale with fine-grained violation actions (`--on-violation dlq|drop|fail`) and live Google Cloud Dataflow monitoring counters (`expectation_passed_*`, `expectation_quarantined_*`, `expectation_dropped_*`).
+  - **Enterprise Orchestration Export (`beam export-schedule`)**: Exporting verified pipelines into production-ready Cloud Composer (Airflow) DAGs (`DataflowStartFlexTemplateOperator`) or serverless Cloud Scheduler HTTP triggers.
   - **Sub-Second Local Prototyping to Cloud Graduation**: Validating pipelines locally in `<0.4s` via `local_fast` / `local_sql`, checking Calcite portability (`--portable`), and graduating the exact pipeline to Google Cloud Dataflow (`--runner=DataflowRunner`).
-  - **Zero-Copy Lakehouse Registration**: In-place metadata translation registering unpartitioned Delta tables as Iceberg v2 without copying underlying Parquet data.
-  - **Bounded Stream Peeking (`beam tail`)**: Peeking at live Pub/Sub or Kafka topics without consumer group side effects.
+   - **Partition-Aware Zero-Copy Lakehouse Registration**: In-place metadata translation registering partitioned or unpartitioned Delta tables into Iceberg v2 without copying underlying Parquet data, automatically integrating with catalog hierarchies (BigQuery Managed Iceberg -> Google Cloud Lakehouse / BigLake REST -> Generic REST).
+   - **Bounded Stream Peeking (`beam tail`)**: Peeking at live Pub/Sub or Kafka topics without consumer group side effects.
 - **When NOT to Use `beam` (Select Dedicated Alternative Tools)**:
-  - **Multi-Table Scheduled DAG Orchestration**: `beam` is a single-pipeline execution CLI and driver, NOT an orchestrator or daemon. It has no built-in cron scheduler, DAG retry engine, or SLA alerting. Use **Apache Airflow / Cloud Composer** or **dbt**.
+  - **Multi-Table Scheduled DAG Orchestration**: `beam` is a single-pipeline execution CLI and driver, NOT an orchestration daemon. For production schedules, use `beam export-schedule` to generate **Apache Airflow / Cloud Composer** DAGs or **Cloud Scheduler** triggers.
   - **Continuous Stateful Complex Event Processing (CEP)**: Low-latency (<50ms) stateful stream processing over dual high-throughput streaming topics with session windows. Use a dedicated stream processing engine.
   - **Ad-Hoc Local Notebook Exploration on Clean Data**: Quick exploratory analysis on clean local data in a Jupyter notebook without cloud URIs, DLQ, or distributed execution needs. Use **DuckDB** or **Polars**.
 
 ## Enforced Limits & Architecture Invariants
 1. **64 MiB Local In-Process Fast Path**: File-to-file pipelines `<= 64 MiB` execute in-process via `local_fast` (Python, PyArrow, SQLite) in milliseconds without loading the Beam SDK or starting JVM/Docker. Datasets $> 64 MiB$ or remote engines execute via distributed Beam runners.
-2. **Zero-Copy Lakehouse Constraints**: `--zero-copy` requires unpartitioned Delta tables in the same cloud storage bucket. Partitioned Delta tables require physical data rewrite (`--if-exists append` or physical copy).
+2. **Partition-Aware Zero-Copy Lakehouse Translation**: `--zero-copy` translates both partitioned and unpartitioned Delta Lake tables directly into Iceberg v2 by mapping Delta partition columns into dynamic Iceberg partition specs (Avro `r102` schema) and registering metadata in the target catalog without copying Parquet data files. The source and destination must share the same cloud storage bucket or warehouse.
 3. **Delta Deletion Vectors & Column Mapping**: Delta tables using deletion vectors or column mapping require the optional `deltalake` Python package. If missing, `beam` halts with exit code `4` (`EXIT_MISSING_PACKAGE`).
 4. **SQL Engine Portability Cliff**: The default local engine runs Python's in-process SQLite with extended functions (`to_utc`, `quantile`, `median`, `regr_slope`, `corr`, `strftime`). These extensions do NOT exist in Apache Calcite SQL on remote Beam runners (Dataflow/Flink/Spark). Always pass `--portable` or run `beam check --portable` before graduating queries to a cluster.
 
@@ -128,9 +130,9 @@ beam pipe --from o=orders.parquet --from c=customers.csv \
           --sql "SELECT COALESCE(c.tier, 'UNMAPPED') AS tier, COUNT(*) AS orders, ROUND(SUM(o.amount), 2) AS revenue, quantile(o.amount, 0.95) AS p95 FROM o LEFT JOIN c ON o.customer_id = c.customer_id GROUP BY 1" \
           --json
 
-# Zero-copy Delta Lake -> Iceberg v2 registration (unpartitioned, same bucket; bytes_copied = 0)
+# Partition-aware zero-copy Delta Lake -> Iceberg v2 registration (same bucket; bytes_copied = 0)
 beam pipe --from src=delta://gs://my-bucket/delta/orders \
-          --to "iceberg://lake.orders?warehouse=gs://my-bucket/wh" \
+          --to "iceberg://prod-proj.analytics.orders?catalog=bigquery" \
           --zero-copy --verify --verify-key order_id --json
 ```
 
@@ -148,4 +150,16 @@ Validate Beam YAML pipelines offline and package Zero-Docker Dataflow Flex Templ
 beam check pipeline.yaml --portable --json
 beam package pipeline.yaml --to gs://my-bucket/templates/orders.json \
              --project=my-proj --region=us-central1 --json
+```
+
+### 6. Export Enterprise Orchestration Schedules
+Export validated pipelines directly into Cloud Composer (Airflow) DAGs or serverless Cloud Scheduler HTTP triggers:
+```bash
+# Export Cloud Composer DAG using DataflowStartFlexTemplateOperator
+beam export-schedule pipeline.yaml --schedule "0 2 * * *" \
+             --orchestrator composer --to dags/daily_orders_dag.py --json
+
+# Export serverless Cloud Scheduler HTTP trigger deployment script
+beam export-schedule pipeline.yaml --schedule "0 2 * * *" \
+             --orchestrator cloud-scheduler --to deploy_scheduler.sh --json
 ```

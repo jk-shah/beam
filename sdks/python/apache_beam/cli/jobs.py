@@ -302,17 +302,21 @@ def finalize_cli_row_metrics(raw_counters: dict[str, int]) -> dict[str, int]:
   cdc_superseded = int(raw_counters.get('cdc_superseded_rows', 0))
   if cdc_superseded:
     out['cdc_superseded_rows'] = cdc_superseded
+  exp_dropped = int(raw_counters.get('expectation_dropped_rows', 0))
   if (
       'pre_filter_rows' in raw_counters or 'post_filter_rows' in raw_counters
-      or cdc_skipped > 0 or cdc_superseded > 0):
+      or cdc_skipped > 0 or cdc_superseded > 0 or exp_dropped > 0):
     pre_f = int(raw_counters.get('pre_filter_rows', 0))
     post_f = int(raw_counters.get('post_filter_rows', 0))
     out['rows_filtered_out'] = (
         max(0, pre_f - post_f - filter_dlq_rows) + cdc_skipped +
-        cdc_superseded)
+        cdc_superseded + exp_dropped)
   if 'pre_sink_rows' in raw_counters or 'rows_read' in raw_counters:
     pre_sink = int(raw_counters.get('pre_sink_rows', 0))
     out['rows_written'] = max(0, pre_sink - sink_dlq_rows)
+  for k, v in raw_counters.items():
+    if k.startswith('expectation_') or k.startswith('expectations_'):
+      out[k] = int(v)
   return out
 
 
