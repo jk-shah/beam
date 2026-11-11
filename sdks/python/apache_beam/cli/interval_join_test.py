@@ -346,5 +346,104 @@ class YamlProviderRegistrationTest(unittest.TestCase):
     self.assertEqual(transforms['IntervalJoin'], 'apache_beam.cli.interval_join.cli_interval_join')
 
 
+class WatermarkSkewCircuitBreakerTest(unittest.TestCase):
+  """Tests watermark skew circuit breaker to prevent unbounded buffer growth."""
+
+  def test_skew_config_parsing(self):
+    cfg = interval_join.parse_interval_join_config({
+        'key': 'user_id',
+        'left_time': 'click_time',
+        'right_time': 'order_time',
+        'upper_bound': '15m',
+        'max_watermark_skew': '1h',
+        'skew_action': 'drop',
+    })
+    self.assertEqual(cfg.max_watermark_skew, 3600.0)
+    self.assertEqual(cfg.skew_action, 'drop')
+
+    cfg2 = interval_join.parse_interval_join_config({
+        'key': 'user_id',
+        'left_time': 'click_time',
+        'right_time': 'order_time',
+        'upper_bound': '15m',
+        'max_skew': 600,
+        'skew_action': 'warn',
+    })
+    self.assertEqual(cfg2.max_watermark_skew, 600.0)
+    self.assertEqual(cfg2.skew_action, 'warn')
+
+    with self.assertRaises(ValueError):
+      interval_join.parse_interval_join_config({
+          'key': 'user_id',
+          'left_time': 'click_time',
+          'right_time': 'order_time',
+          'upper_bound': '15m',
+          'max_watermark_skew': '-5m',
+      })
+
+    with self.assertRaises(ValueError):
+      interval_join.parse_interval_join_config({
+          'key': 'user_id',
+          'left_time': 'click_time',
+          'right_time': 'order_time',
+          'upper_bound': '15m',
+          'skew_action': 'invalid_action',
+      })
+
+  def test_bounded_skew_filtering(self):
+    cfg = interval_join.parse_interval_join_config({
+        'key': 'user_id',
+        'left_time': 'click_time',
+        'right_time': 'order_time',
+        'lower_bound': '0s',
+        'upper_bound': '2h',
+        'max_watermark_skew': '15m',
+    })
+    left_records = [
+        {'user_id': 1, 'click_time': 1000.0, 'ad': 'valid'},
+        {'user_id': 1, 'click_time': 2000.0, 'ad': 'valid2'},
+    ]
+    right_records = [
+        {'user_id': 1, 'order_time': 1060.0, 'total': 10.0},    # Skew = 60s <= 900s -> match
+        {'user_id': 1, 'order_time': 5000.0, 'total': 99.0},    # Skew = 3000s > 900s -> pruned by breaker
+    ]
+    results = interval_join.join_bounded_records(left_records, right_records, cfg)
+    self.assertEqual(len(results), 1)
+    self.assertEqual(results[0]['total'], 10.0)
+    self.assertEqual(results[0]['ad'], 'valid')
+
+  def test_stateful_streaming_skew_circuit_breaker(self):
+    import apache_beam as beam
+    from apache_beam.testing.util import assert_that
+    from apache_beam.testing.util import equal_to
+
+    cfg = interval_join.parse_interval_join_config({
+        'key': 'user_id',
+        'left_time': 'click_time',
+        'right_time': 'order_time',
+        'lower_bound': '0s',
+        'upper_bound': '10m',
+        'max_watermark_skew': '60s',
+        'skew_action': 'drop',
+    })
+
+    # Keyed stream elements: (key, (tag, timestamp, payload))
+    stream_events = [
+        (('u1',), ('L', 1000.0, {'user_id': 'u1', 'click_time': 1000.0, 'ad': 'valid'})),
+        (('u1',), ('R', 1030.0, {'user_id': 'u1', 'order_time': 1030.0, 'total': 42.0})),
+        # Excessively late event on L: arrives with t=500, but R watermark is already at 1030 (skew = 530s > 60s)
+        (('u1',), ('L', 500.0, {'user_id': 'u1', 'click_time': 500.0, 'ad': 'severely_late'})),
+    ]
+
+    with beam.Pipeline() as p:
+      results = (
+          p
+          | beam.Create(stream_events)
+          | beam.ParDo(interval_join.IntervalJoinStatefulDoFn(cfg))
+          | beam.Map(lambda r: (r.user_id, r.ad, r.total))
+      )
+      assert_that(results, equal_to([('u1', 'valid', 42.0)]))
+
+
 if __name__ == '__main__':
   unittest.main()

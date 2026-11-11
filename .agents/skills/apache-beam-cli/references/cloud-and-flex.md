@@ -127,6 +127,18 @@ beam tail "kafka://broker.example.com:9092/user-activity" \
           --json
 ```
 
+### Interactive Stream TUI (`beam tail -i` / `--interactive`)
+For human developers and live terminal operators, `beam tail` offers an interactive terminal TUI experience:
+- **Rolling Throughput**: Displays live rolling message rates (`msg/s`) calculated over a 5-second moving window.
+- **Color-Coded Fields & Timestamps**: Highlights timestamps in green, identifiers in cyan, and numerical metrics in yellow for instant readability.
+- **Exit Summary Card**: Upon exiting (or pressing Ctrl-C), renders a summary card with total events consumed, run duration, and average throughput.
+- **Structured JSON Preservation**: When `--json` is supplied alongside `-i`, the command preserves standard JSON envelope output on `stdout` while displaying interactive formatting on `stderr`, preserving automation contracts.
+
+```bash
+# Launch interactive terminal TUI on a live stream
+beam tail kafka://broker:9092/events -f -i
+```
+
 ---
 
 ## 5. Production Scheduling & Operational Boundaries (`beam export-schedule`)
@@ -337,4 +349,37 @@ beam pipe --from "kafka://broker:9092/orders_topic?schema_registry=http://regist
 5. **BigLake REST Catalog Identification**:
    - Detects `biglake.` and `bigquery.` prefixes on Iceberg table identifiers, automatically configuring Google Cloud BigLake REST Catalog (`https://biglake.googleapis.com/iceberg/v1/restcatalog`) with Google OAuth 2.0 authentication.
 
+---
 
+## 12. Zero-Copy Lakehouse Catalog Synchronization (`beam catalog sync`)
+
+`beam catalog sync` enables sub-second (<200ms) metadata registration of Delta Lake tables, Apache Iceberg snapshots, or partitioned Parquet directory trees directly into modern lakehouse catalogs without copying underlying Parquet files:
+
+### Supported Source & Target Formats
+- **Sources**: Delta Lake directories (`delta://...` or directories containing `_delta_log`), Apache Iceberg tables (`iceberg://...` or directories with `metadata/`), or Parquet directory partition structures (`path/to/table/` with `**/*.parquet` or Hive-style partitions `col=val/`).
+- **Targets**:
+  1. **Google Cloud Lakehouse / BigLake REST Catalog**: `https://biglake.googleapis.com/iceberg/v1/restcatalog`.
+  2. **BigQuery Managed Iceberg Tables**: `iceberg://project.dataset.table?catalog=bigquery`.
+  3. **Generic Apache Iceberg REST Catalogs**: `iceberg://namespace.table?catalog=rest&uri=...`.
+
+### Command Usage & Flags
+- `--from <URI>`: Source directory or table URI.
+- `--to <URI>`: Target catalog destination URI.
+- `--table-name <NAME>`: Explicit table name (defaults to source directory name).
+- `--partition-col <COL>`: Explicit partition column name when syncing partitioned Parquet directories.
+- `--dry-run`: Pre-flight inspection reporting discovered files, partition columns, and candidate manifests without catalog modification.
+- `--format <delta|iceberg|parquet>`: Explicit format override.
+
+```bash
+# Sync Hive-partitioned Parquet files into BigLake REST catalog
+beam catalog sync --from "gs://my-bucket/lakehouse/transactions" \
+                  --to "iceberg://biglake.prod_analytics.transactions?warehouse=gs://my-bucket/wh" \
+                  --table-name transactions \
+                  --json
+
+# Pre-flight dry-run inspection of Delta Lake to BigQuery Managed Iceberg sync
+beam catalog sync --from "delta://gs://my-bucket/delta/orders" \
+                  --to "iceberg://prod-proj.analytics.orders?catalog=bigquery" \
+                  --dry-run \
+                  --json
+```

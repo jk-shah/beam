@@ -380,5 +380,95 @@ class IcebergCatalogHierarchyAndPartitionTest(unittest.TestCase):
     self.assertEqual(sink_step['config']['table'], 'prod-proj.analytics.iceberg_tbl')
 
 
+class CatalogSyncTest(unittest.TestCase):
+  """Tests `beam catalog sync` and zero-copy Lakehouse metadata synchronization."""
+
+  def setUp(self):
+    self.tmp = tempfile.mkdtemp(prefix='catalog_sync_test_')
+
+  def tearDown(self):
+    shutil.rmtree(self.tmp, ignore_errors=True)
+
+  def test_catalog_sync_dry_run_parquet(self):
+    part_dir = os.path.join(self.tmp, 'dt=2026-11-11')
+    os.makedirs(part_dir, exist_ok=True)
+    fpath = os.path.join(part_dir, 'data.parquet')
+    table = pa.Table.from_pydict({
+        'user_id': [101, 102],
+        'score': [95.5, 88.0],
+    })
+    pq.write_table(table, fpath)
+
+    res = lakehouse.sync_lakehouse_catalog(
+        self.tmp,
+        'bigquery://my-proj.analytics.user_scores',
+        dry_run=True,
+    )
+    self.assertEqual(res['status'], 'dry_run')
+    self.assertEqual(res['source_format'], 'file')
+    self.assertEqual(res['target_table'], 'my-proj.analytics.user_scores')
+    self.assertEqual(res['target_catalog'], 'bigquery')
+    self.assertEqual(res['files_to_sync'], 1)
+    self.assertTrue(res['zero_copy'])
+    self.assertIn('user_id', [f['name'] for f in res['schema']])
+
+  def test_catalog_sync_local_execution(self):
+    part_dir = os.path.join(self.tmp, 'dt=2026-11-11')
+    os.makedirs(part_dir, exist_ok=True)
+    fpath = os.path.join(part_dir, 'data.parquet')
+    table = pa.Table.from_pydict({
+        'user_id': [101, 102],
+        'score': [95.5, 88.0],
+    })
+    pq.write_table(table, fpath)
+
+    wh_dir = os.path.join(self.tmp, 'warehouse')
+    dest_uri = f'iceberg://analytics.user_scores?warehouse={wh_dir}'
+
+    res = lakehouse.sync_lakehouse_catalog(
+        self.tmp,
+        dest_uri,
+        mode='sync',
+        dry_run=False,
+    )
+    self.assertEqual(res['status'], 'synced')
+    self.assertEqual(res['registered_files'], 1)
+    self.assertEqual(res['rows_registered'], 2)
+    self.assertEqual(res['bytes_copied'], 0)
+    self.assertTrue(res['zero_copy'])
+    self.assertTrue(os.path.exists(res['metadata_path']))
+
+    tbl_dir = os.path.join(wh_dir, 'analytics', 'user_scores')
+    state = lakehouse.load_iceberg_state(tbl_dir)
+    _, rows = lakehouse.read_iceberg_rows_local(state)
+    self.assertEqual(len(rows), 2)
+    self.assertEqual(rows[0]['user_id'], 101)
+    self.assertEqual(rows[0]['score'], 95.5)
+
+  def test_catalog_sync_cli_dry_run(self):
+    part_dir = os.path.join(self.tmp, 'dt=2026-11-11')
+    os.makedirs(part_dir, exist_ok=True)
+    fpath = os.path.join(part_dir, 'data.parquet')
+    table = pa.Table.from_pydict({'id': [1, 2], 'val': ['a', 'b']})
+    pq.write_table(table, fpath)
+
+    import subprocess
+    import sys
+    res = subprocess.run([
+        sys.executable,
+        '-m', 'apache_beam.cli.main',
+        '--json', 'catalog', 'sync',
+        '--from', self.tmp,
+        '--to', 'bigquery://test-proj.ds.tbl',
+        '--dry-run',
+    ], capture_output=True, text=True)
+    self.assertEqual(res.returncode, 0)
+    data = json.loads(res.stdout)
+    self.assertTrue(data['ok'])
+    self.assertEqual(data['command'], 'catalog sync')
+    self.assertEqual(data['outputs']['status'], 'dry_run')
+    self.assertEqual(data['outputs']['files_to_sync'], 1)
+
+
 if __name__ == '__main__':
   unittest.main()

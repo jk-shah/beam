@@ -141,6 +141,7 @@ _SUBCOMMANDS = frozenset([
     'package',
     'export-schedule',
     'schema',
+    'catalog',
 ])
 _PASSTHROUGH_SUBCOMMANDS = frozenset(['run', 'pipe', 'diff', 'check'])
 _CLI_ZERO_FLAGS = {
@@ -181,7 +182,7 @@ _CLI_ZERO_FLAGS = {
         '--no-config',
         '--help',
     ]),
-    'tail': frozenset(['-f', '--follow', '--help']),
+    'tail': frozenset(['-f', '--follow', '-i', '--interactive', '--help']),
     'package': frozenset([
         '--no-use-public-ips',
         '--no_use_public_ips',
@@ -199,6 +200,14 @@ _CLI_ZERO_FLAGS = {
         '--help',
     ]),
     'schema': frozenset(['--strict', '--verbose', '--no-config', '--help']),
+    'catalog': frozenset([
+        '--dry-run',
+        '--dry_run',
+        '--zero-copy',
+        '--verbose',
+        '--no-config',
+        '--help',
+    ]),
 }
 _CLI_ONE_FLAGS = {
     None: frozenset(['--output']),
@@ -322,6 +331,18 @@ _CLI_ONE_FLAGS = {
         '--source-opt',
         '--target-opt',
         '--project',
+        '--profile',
+    ]),
+    'catalog': frozenset([
+        '--from',
+        '--source',
+        '--to',
+        '--target',
+        '--table',
+        '--catalog',
+        '--mode',
+        '--project',
+        '--catalog-opt',
         '--profile',
     ]),
 }
@@ -522,6 +543,8 @@ def main(argv=None) -> int:
         return _export_schedule(args, extra_args, json_session=json_session, t0=t0)
       if active_cmd == 'schema':
         return _schema(args, extra_args, json_session=json_session, t0=t0)
+      if active_cmd == 'catalog':
+        return _catalog(args, extra_args, json_session=json_session, t0=t0)
 
       # External plugin dispatch (`apache_beam.cli.plugins`).
       from . import llms_txt as llms_mod
@@ -1082,6 +1105,12 @@ def _build_parser():
       action='store_true',
       help='follow new messages/rows continuously until Ctrl-C, -n, or --duration')
   tail_p.add_argument(
+      '-i',
+      '--interactive',
+      action='store_true',
+      default=False,
+      help='human interactive terminal mode with live throughput display, colors, and field inspector')
+  tail_p.add_argument(
       '-n',
       '--limit',
       dest='limit',
@@ -1471,6 +1500,71 @@ def _build_parser():
   _add_config_selection_args(schema_check_p)
   _add_config_selection_args(schema_p)
 
+  # 15. `beam catalog`
+  catalog_p = commands.add_parser(
+      'catalog',
+      help='manage and synchronize Lakehouse metadata catalogs',
+      allow_abbrev=False)
+  cat_sub = catalog_p.add_subparsers(dest='catalog_action', required=True)
+  sync_p = cat_sub.add_parser(
+      'sync',
+      help='zero-copy synchronize Lakehouse (Delta/Iceberg/Parquet) metadata to BigLake/BigQuery',
+      allow_abbrev=False)
+  sync_p.add_argument(
+      '--from',
+      '--source',
+      dest='from_uri',
+      required=True,
+      help='source lakehouse or parquet URI')
+  sync_p.add_argument(
+      '--to',
+      '--target',
+      dest='to_uri',
+      required=True,
+      help='target catalog or table (e.g. bigquery://project.dataset.table or biglake://...)')
+  sync_p.add_argument(
+      '--table',
+      dest='table',
+      default=None,
+      help='target table identifier (if not part of --to URI)')
+  sync_p.add_argument(
+      '--catalog',
+      dest='catalog',
+      default=None,
+      help='target catalog type: bigquery, biglake, or rest')
+  sync_p.add_argument(
+      '--mode',
+      choices=['sync', 'register', 'refresh'],
+      default='sync',
+      help='sync mode (default: sync)')
+  sync_p.add_argument(
+      '--zero-copy',
+      dest='zero_copy',
+      action='store_true',
+      default=True,
+      help='use zero-copy metadata conversion (default: True)')
+  sync_p.add_argument(
+      '--dry-run',
+      '--dry_run',
+      dest='dry_run',
+      action='store_true',
+      default=False,
+      help='preview catalog metadata changes without committing')
+  sync_p.add_argument(
+      '--project',
+      dest='project',
+      default=None,
+      help='default GCP project')
+  sync_p.add_argument(
+      '--catalog-opt',
+      dest='catalog_opts',
+      action='append',
+      default=[],
+      metavar='KEY=VAL',
+      help='catalog option (repeatable)')
+  _add_config_selection_args(sync_p)
+  _add_config_selection_args(catalog_p)
+
   return parser
 
 
@@ -1709,8 +1803,21 @@ def _tail(args, extra_args, *, json_session, t0: float) -> int:
       args.duration if args.duration is not None else (None if follow else '5s')
   )
 
+  interactive = bool(getattr(args, 'interactive', False) or (
+      hasattr(sys.stdout, 'isatty')
+      and sys.stdout.isatty()
+      and not json_session.enabled
+      and not getattr(args, 'ndjson', False)
+  ))
+
   on_record = None
-  if follow:
+  tail_formatter = None
+  if interactive:
+    tail_formatter = tail.InteractiveTailFormatter(args.uri, follow=follow)
+    tail_formatter.render_start_banner()
+    if follow:
+      on_record = tail_formatter.on_stream_record
+  elif follow:
     if json_session.enabled:
       def _stream_ndjson(rec: dict[str, Any], idx: int) -> None:
         json_session.emit_stream_line({
@@ -1763,6 +1870,14 @@ def _tail(args, extra_args, *, json_session, t0: float) -> int:
             duration_ms=int((time.monotonic() - t0) * 1000),
             outputs=info,
             untrusted_data=untrusted))
+  elif interactive and tail_formatter is not None:
+    if not follow:
+      rows = (untrusted or {}).get('rows', ())
+      for idx, r in enumerate(rows, 1):
+        print(tail_formatter.format_record(r, idx))
+      tail_formatter.render_exit_summary(interrupted=interrupted)
+    else:
+      tail_formatter.render_exit_summary(interrupted=interrupted)
   elif not follow:
     print(
         f"Sampled {info['sampled_count']} record(s) from {info['uri']} "
@@ -2018,6 +2133,53 @@ def _schema(args, extra_args, *, json_session, t0: float) -> int:
         print(f"  * {act['description']}: {act.get('command_hint')}")
 
   return exit_code
+
+
+def _catalog(args, extra_args, *, json_session, t0: float) -> int:
+  from . import lakehouse
+  _reject_extra_args(extra_args)
+  if getattr(args, 'catalog_action', None) != 'sync':
+    raise _CliError(
+        f"unsupported catalog action: {getattr(args, 'catalog_action', None)!r}; supported: sync",
+        EXIT_USAGE)
+
+  try:
+    res = lakehouse.sync_lakehouse_catalog(
+        args.from_uri,
+        args.to_uri,
+        table=args.table,
+        catalog=args.catalog,
+        mode=args.mode,
+        zero_copy=args.zero_copy,
+        dry_run=args.dry_run,
+        default_project=args.project,
+        catalog_opts=args.catalog_opts)
+  except lakehouse.LakehouseError as e:
+    raise _CliError(str(e), EXIT_USAGE) from None
+  except Exception as e:
+    raise _CliError(f'catalog sync failed: {e}', EXIT_PIPELINE_FAILED) from None
+
+  if json_session.enabled:
+    json_session.emit(
+        output.build_envelope(
+            ok=True,
+            command='catalog sync',
+            exit_code=EXIT_OK,
+            duration_ms=int((time.monotonic() - t0) * 1000),
+            outputs=res))
+  else:
+    status_label = 'Dry Run (Preview)' if res.get('status') == 'dry_run' else 'Synced'
+    print(
+        f"\nCatalog Sync [{status_label}]:\n"
+        f"  Source:      {res.get('source_uri')} ({res.get('source_format')})\n"
+        f"  Target:      {res.get('target_table')} (catalog={res.get('target_catalog')})\n"
+        f"  Files:       {res.get('files_to_sync') if res.get('files_to_sync') is not None else res.get('registered_files', 0)} data file(s)\n"
+        f"  Zero-Copy:   {res.get('zero_copy')}\n"
+        f"  Status:      {res.get('status')}"
+    )
+    if res.get('metadata_path'):
+      print(f"  Metadata:    {res.get('metadata_path')}")
+  return EXIT_OK
 
 
 def _check(args, extra_args, *, json_session, t0: float) -> int:

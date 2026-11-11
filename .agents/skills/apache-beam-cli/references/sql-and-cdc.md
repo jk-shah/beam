@@ -233,6 +233,8 @@ pipeline:
         right_time: order_time
         lower_bound: 0s
         upper_bound: 15m
+        max_watermark_skew: 30m
+        skew_action: drop
         join_type: inner
         select:
           user_id: left.user_id
@@ -248,5 +250,10 @@ pipeline:
 ### Execution Architecture & Guarantees
 - **Batch Processing**: Groups records by key via `CoGroupByKey` and computes bounded temporal matches in-memory.
 - **Streaming on Dataflow Windmill**: Uses stateful `BagStateSpec` buffers (`left_buffer`, `right_buffer`) and event-time watermark timers (`TimeDomain.WATERMARK`). When records arrive, forward and backward interval matches emit immediately, while expired records are garbage-collected as watermarks advance, preventing state leaks.
+- **Dual-Stream Watermark Skew Circuit Breaker (`max_watermark_skew` / `--max-watermark-skew`)**:
+  - **Problem**: When one input stream lags behind another by hours or days (e.g. historical replay or upstream partition lag), the faster stream's records accumulate in stateful `BagStateSpec` buffers indefinitely while waiting for the lagging stream's watermark to catch up, leading to worker memory exhaustion (OOM).
+  - **Mitigation**: Setting `max_watermark_skew: 30m` or `--max-watermark-skew 30m` activates a stateful circuit breaker. If an arriving record's timestamp is skewed behind the current tracking watermark by more than the threshold, it is dropped or quarantined without consuming state buffer memory.
+  - **Observability**: Increments `beam.metrics.Metrics.counter('IntervalJoin', 'watermark_skew_dropped')` for real-time visibility in Google Cloud Dataflow monitoring charts.
 - **Durations Supported**: `ms`, `s`, `m`, `h`, `d` (e.g. `500ms`, `30s`, `15m`, `2h`, `1d`). Negative lower bounds are supported (e.g. `lower_bound: -5m`, `upper_bound: 10m`).
 - **Join Semantics**: Supports `inner`, `left`, and `full` outer joins.
+

@@ -52,10 +52,16 @@ def render_llms_txt() -> str:
 ## 2. Subcommands
 - `beam inspect <URI> [--sample N] [--stats] [--search STR] [--json]`
     Zero-runner `<200ms` schema, row count, byte estimate, and sanitized preview.
-- `beam tail [-f] [-n N] <URI> [--duration 5s] [--max-scanned-bytes 64MB] [--json]`
+- `beam tail [-f] [-n N] [-i|--interactive] <URI> [--duration 5s] [--max-scanned-bytes 64MB] [--json]`
     Non-destructive bounded stream peek (default `5s` / `-n 5` for agents) or live
     follow (`-f` / `--follow` like Unix `tail -f`, streaming NDJSON across
     `pubsub://`, `kafka://`, `delta://`, `iceberg://`, and local/`gs://` files).
+    Pass `-i` / `--interactive` for terminal TUI with live msg/s throughput and field highlighting.
+- `beam catalog sync --from URI --to URI [--format parquet|delta|iceberg] [--table-name NAME] [--partition-col COL] [--dry-run] [--json]`
+    Zero-copy Lakehouse catalog synchronization in `<200ms`. Translates Delta Lake transaction
+    logs, Apache Iceberg metadata, or Parquet directory partition structures directly into target
+    Lakehouse catalogs (Google Cloud Lakehouse / BigLake REST, BigQuery managed Iceberg, or generic
+    Iceberg REST catalogs) with 0 data bytes copied.
 - `beam pipe --from [ALIAS=]URI [--from [ALIAS=]URI ...] [--to URI] [flags]`
     Move, convert, filter (`--where`), project (`--select`), run multi-input
     SQL joins & aggregations (`--sql "SELECT ..."` across CSV, Parquet, JSONL,
@@ -63,6 +69,7 @@ def render_llms_txt() -> str:
     `delta://`, and `iceberg://` in `<100ms` locally or `type: Sql` on Dataflow;
     `--join` is accepted as an alias for repeating `--from`), apply event-time windowing
     (`--window fixed:60s`, `sliding:5m,1m`, `session:30m` with `--timestamp-col COL`; `--window-size` is accepted),
+    correlate event streams with declarative interval joins and watermark skew circuit breaking (`--max-watermark-skew 30m`),
     enforce data quality rules (`--expect "rule: expr -> dlq|drop|fail"`), run pre-flight
     schema contract comparison (`--check-schema`), quarantine dirty rows (`--dlq` or `--dead-letter-target`),
     drop invalid rows (`--drop-bad` / `--skip-errors`), enforce scan budget (`--max-bytes`), verify

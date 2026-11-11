@@ -38,6 +38,7 @@ from typing import NamedTuple
 import apache_beam as beam
 from apache_beam.coders import PickleCoder
 from apache_beam.transforms.userstate import BagStateSpec
+from apache_beam.transforms.userstate import ReadModifyWriteStateSpec
 from apache_beam.transforms.userstate import TimeDomain
 from apache_beam.transforms.userstate import TimerSpec
 from apache_beam.transforms.userstate import on_timer
@@ -95,6 +96,8 @@ class IntervalJoinConfig(NamedTuple):
   upper_bound: float
   join_type: str = 'inner'  # 'inner', 'left', 'full'
   select: dict[str, str] | None = None
+  max_watermark_skew: float | None = None
+  skew_action: str = 'drop'  # 'drop' or 'warn'
 
   @property
   def lower_bound_sec(self) -> float:
@@ -163,6 +166,23 @@ def parse_interval_join_config(cfg: dict[str, Any]) -> IntervalJoinConfig:
   if select is not None and not isinstance(select, dict):
     raise ValueError('select must be a mapping of output_field: expression')
 
+  max_skew_raw = (
+      cfg.get('max_watermark_skew')
+      or cfg.get('max_skew')
+      or cfg.get('watermark_skew_breaker')
+      or cfg.get('max_watermark_skew_duration')
+  )
+  max_watermark_skew = (
+      parse_interval_duration(max_skew_raw) if max_skew_raw is not None else None
+  )
+  if max_watermark_skew is not None and max_watermark_skew <= 0:
+    raise ValueError(
+        f'max_watermark_skew must be positive (got {max_watermark_skew}s)')
+
+  skew_action = str(cfg.get('skew_action') or 'drop').strip().lower()
+  if skew_action not in ('drop', 'warn'):
+    raise ValueError(f'skew_action must be "drop" or "warn" (got {skew_action!r})')
+
   return IntervalJoinConfig(
       left_alias=left_alias,
       right_alias=right_alias,
@@ -174,6 +194,8 @@ def parse_interval_join_config(cfg: dict[str, Any]) -> IntervalJoinConfig:
       upper_bound=upper_bound,
       join_type=join_type,
       select=dict(select) if select else None,
+      max_watermark_skew=max_watermark_skew,
+      skew_action=skew_action,
   )
 
 
@@ -364,6 +386,8 @@ def join_bounded_records(
       t_l, l_elem, _ = l_entry
       for r_entry in r_list:
         t_r, r_elem, _ = r_entry
+        if config.max_watermark_skew is not None and abs(t_r - t_l) > config.max_watermark_skew:
+          continue
         if (t_l + config.lower_bound) <= t_r <= (t_l + config.upper_bound):
           l_entry[2] = True
           r_entry[2] = True
@@ -401,10 +425,15 @@ class IntervalJoinStatefulDoFn(beam.DoFn):
 
   LEFT_BUFFER = BagStateSpec('left_buffer', PickleCoder())
   RIGHT_BUFFER = BagStateSpec('right_buffer', PickleCoder())
+  WATERMARK_STATE = ReadModifyWriteStateSpec('wm_state', PickleCoder())
   GC_TIMER = TimerSpec('gc_timer', TimeDomain.WATERMARK)
 
   def __init__(self, config: IntervalJoinConfig):
     self.config = config
+    self.skew_dropped_counter = beam.metrics.Metrics.counter(
+        'IntervalJoin', 'watermark_skew_dropped')
+    self.skew_warn_counter = beam.metrics.Metrics.counter(
+        'IntervalJoin', 'watermark_skew_warn')
 
   def process(
       self,
@@ -412,8 +441,39 @@ class IntervalJoinStatefulDoFn(beam.DoFn):
       left_buf=beam.DoFn.StateParam(LEFT_BUFFER),
       right_buf=beam.DoFn.StateParam(RIGHT_BUFFER),
       timer=beam.DoFn.TimerParam(GC_TIMER),
+      wm_state=beam.DoFn.StateParam(WATERMARK_STATE),
   ):
     key, (tag, t, row_payload) = element
+    max_skew = self.config.max_watermark_skew
+
+    if max_skew is not None:
+      cur_wm = wm_state.read() or {'L': None, 'R': None, 'dropped': 0}
+      if tag == 'L':
+        r_max = cur_wm.get('R')
+        if r_max is not None:
+          if (r_max - t) > max_skew:
+            cur_wm['dropped'] = cur_wm.get('dropped', 0) + 1
+            wm_state.write(cur_wm)
+            self.skew_dropped_counter.inc(1)
+            if self.config.skew_action == 'drop':
+              return
+          elif (t - r_max) > max_skew:
+            self.skew_warn_counter.inc(1)
+        cur_wm['L'] = max(cur_wm.get('L') or t, t)
+        wm_state.write(cur_wm)
+      elif tag == 'R':
+        l_max = cur_wm.get('L')
+        if l_max is not None:
+          if (l_max - t) > max_skew:
+            cur_wm['dropped'] = cur_wm.get('dropped', 0) + 1
+            wm_state.write(cur_wm)
+            self.skew_dropped_counter.inc(1)
+            if self.config.skew_action == 'drop':
+              return
+          elif (t - l_max) > max_skew:
+            self.skew_warn_counter.inc(1)
+        cur_wm['R'] = max(cur_wm.get('R') or t, t)
+        wm_state.write(cur_wm)
 
     if tag == 'L':
       # Scan existing right elements

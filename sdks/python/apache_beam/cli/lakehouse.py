@@ -116,10 +116,15 @@ def _fs_exists(path: str) -> bool:
 def _fs_list_files(pattern: str) -> list[tuple[str, int]]:
   if '://' not in pattern:
     import glob as _glob
-    matched = sorted(p for p in _glob.glob(pattern) if os.path.isfile(p))
+    if os.path.isdir(pattern):
+      pattern = os.path.join(pattern, '**', '*.parquet')
+    matched = sorted(p for p in _glob.glob(pattern, recursive=True) if os.path.isfile(p))
     return [(p, os.path.getsize(p)) for p in matched]
   from apache_beam.io.filesystems import FileSystems
-  metas = FileSystems.match([pattern])[0].metadata_list
+  eff_pat = pattern
+  if not pattern.endswith('*') and not pattern.endswith('.parquet'):
+    eff_pat = pattern.rstrip('/') + '/**/*.parquet'
+  metas = FileSystems.match([eff_pat])[0].metadata_list
   return [(m.path, int(m.size_in_bytes or 0))
           for m in sorted(metas, key=lambda x: x.path)]
 
@@ -2289,6 +2294,137 @@ def register_zero_copy_to_iceberg(
     commit_res['partition_columns'] = partition_cols
     commit_res['partition_spec'] = partition_spec
   return commit_res
+
+
+def sync_lakehouse_catalog(
+    from_uri: str,
+    to_uri: str,
+    *,
+    table: Optional[str] = None,
+    catalog: Optional[str] = None,
+    mode: str = 'sync',
+    zero_copy: bool = True,
+    dry_run: bool = False,
+    default_project: Optional[str] = None,
+    catalog_opts: Optional[list[str]] = None,
+) -> dict[str, Any]:
+  """Zero-copy synchronizes Delta Lake, Iceberg, or Parquet datasets into catalogs."""
+  from . import uris
+
+  if mode not in ('sync', 'register', 'refresh'):
+    raise LakehouseError(
+        f'unsupported catalog sync mode {mode!r}; expected "sync", "register", or "refresh"')
+
+  eff_from = from_uri
+  format_override = None
+  if '://' not in eff_from:
+    if os.path.exists(os.path.join(eff_from, '_delta_log')):
+      eff_from = f'delta://{eff_from}'
+    elif os.path.isdir(eff_from):
+      format_override = 'parquet'
+
+  source_ep = uris.parse_endpoint(
+      eff_from,
+      is_read=True,
+      explicit_format=format_override,
+      default_project=default_project,
+      allow_sniff=True)
+
+  parsed_opts = uris.parse_kv_options(catalog_opts, None, '--catalog-opt')
+  if catalog:
+    parsed_opts['catalog'] = catalog
+  if table:
+    parsed_opts['table'] = table
+
+  eff_to_uri = to_uri
+  if eff_to_uri.startswith('bigquery://'):
+    tbl_part = eff_to_uri[len('bigquery://'):]
+    parsed_opts.setdefault('catalog', 'bigquery')
+    eff_to_uri = f'iceberg://{tbl_part}'
+  elif eff_to_uri.startswith('biglake://'):
+    tbl_part = eff_to_uri[len('biglake://'):]
+    parsed_opts.setdefault('catalog', 'biglake')
+    eff_to_uri = f'iceberg://{tbl_part}'
+  elif not eff_to_uri.startswith('iceberg://'):
+    eff_to_uri = f'iceberg://{eff_to_uri}'
+
+  sink_ep = uris.parse_endpoint(
+      eff_to_uri,
+      is_read=False,
+      options=parsed_opts,
+      default_project=default_project)
+
+  if dry_run:
+    files_count = 0
+    total_bytes = 0
+    partition_cols: list[str] = []
+    schema_fields: list[dict[str, Any]] = []
+
+    if source_ep.kind == 'delta':
+      ver = source_ep.config.get('version')
+      snap = parse_delta_log(
+          source_ep.config['table'],
+          target_version=int(ver) if ver is not None else None)
+      files_count = len(snap.get('active_files', []))
+      total_bytes = sum(int(f.get('size', 0)) for f in snap.get('active_files', []))
+      partition_cols = list(snap.get('partition_columns') or [])
+      schema_fields = snap.get('schema') or []
+    elif source_ep.kind == 'iceberg':
+      tdir = resolve_iceberg_table_dir(source_ep.config, default_project=default_project)
+      meta = read_iceberg_metadata(tdir)
+      schema_fields = meta.get('schema', {}).get('fields', [])
+      snap_list = meta.get('snapshots', [])
+      files_count = len(snap_list)
+    elif source_ep.kind == 'file':
+      raw_files = _fs_list_files(source_ep.config['path'])
+      files_count = len(raw_files)
+      total_bytes = sum(sz for _, sz in raw_files)
+      if raw_files:
+        import pyarrow.parquet as pq
+        with _fs_open_read(raw_files[0][0]) as fobj:
+          pf = pq.ParquetFile(fobj)
+          for field in pf.schema_arrow:
+            schema_fields.append({'name': field.name, 'type': str(field.type)})
+
+    return {
+        'status': 'dry_run',
+        'action': mode,
+        'zero_copy': zero_copy,
+        'source_uri': from_uri,
+        'source_format': source_ep.kind,
+        'target_uri': to_uri,
+        'target_table': sink_ep.config.get('table'),
+        'target_catalog': sink_ep.config.get('catalog_name') or parsed_opts.get('catalog') or 'iceberg',
+        'files_to_sync': files_count,
+        'total_bytes': total_bytes,
+        'partition_columns': partition_cols,
+        'schema': schema_fields,
+    }
+
+  commit_res = register_zero_copy_to_iceberg(
+      source_ep,
+      sink_ep,
+      if_exists=('replace' if mode == 'refresh' else 'append'),
+      default_project=default_project)
+
+  cat_info = commit_res.get('catalog_registration', {})
+  return {
+      'status': 'synced',
+      'action': mode,
+      'zero_copy': True,
+      'source_uri': from_uri,
+      'source_format': source_ep.kind,
+      'target_uri': to_uri,
+      'target_table': sink_ep.config.get('table'),
+      'target_catalog': cat_info.get('catalog') or sink_ep.config.get('catalog_name') or 'iceberg',
+      'catalog_status': cat_info.get('status', 'local_metadata_only'),
+      'snapshot_id': commit_res.get('snapshot_id'),
+      'metadata_path': commit_res.get('metadata_path'),
+      'registered_files': len(commit_res.get('registered_files', [])),
+      'rows_registered': commit_res.get('rows_registered', 0),
+      'bytes_copied': 0,
+      'partition_columns': commit_res.get('partition_columns', []),
+  }
 
 
 # ---------------------------------------------------------------------------

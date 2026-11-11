@@ -1,30 +1,31 @@
 ---
 name: apache-beam-cli
-description: Pre-flight dataset diff reconciliation, pre-flight schema contract guard (beam schema diff), verified data movement with row-count proofs (--assert-counts), dead-letter quarantine (--dlq), data quality expectations (--expect), enterprise orchestration export (beam export-schedule), turnkey stream-to-lakehouse ingestion (Kafka to Iceberg/BigLake on Dataflow Streaming Engine), declarative event-time interval joins (IntervalJoin), and sub-second local in-process execution across files, lakehouses (Delta Lake, Apache Iceberg), BigQuery, Cloud SQL, and streams (Pub/Sub, Kafka), with safe graduation to Google Cloud Dataflow.
+description: Pre-flight dataset diff reconciliation, pre-flight schema contract guard (beam schema diff), zero-copy lakehouse catalog sync (beam catalog sync), verified data movement with row-count proofs (--assert-counts), dead-letter quarantine (--dlq), data quality expectations (--expect), enterprise orchestration export (beam export-schedule), turnkey stream-to-lakehouse ingestion (Kafka to Iceberg/BigLake on Dataflow Streaming Engine), declarative event-time interval joins (IntervalJoin) with watermark skew circuit breaking, interactive stream monitoring (beam tail -i), and sub-second local in-process execution across files, lakehouses (Delta Lake, Apache Iceberg), BigQuery, Cloud SQL, and streams (Pub/Sub, Kafka), with safe graduation to Google Cloud Dataflow.
 ---
 
 # Apache Beam CLI (`beam`) Skill
 
-Use `beam` for universal data movement, verified dataset diff reconciliation, pre-flight schema contract guard (`beam schema diff`), dead-letter quarantine (`--dlq`), data quality assertions (`--expect`), mathematical row-conservation proofs (`--assert-counts`), stream peeking, zero-copy lakehouse registration, turnkey stream-to-lakehouse ingestion (Kafka $\to$ Iceberg/BigLake), declarative event-time interval joins (`IntervalJoin`), Zero-Docker Dataflow Flex Template packaging (`beam package`), and enterprise orchestration export (`beam export-schedule`).
+Use `beam` for universal data movement, verified dataset diff reconciliation, pre-flight schema contract guard (`beam schema diff`), zero-copy lakehouse catalog sync (`beam catalog sync`), dead-letter quarantine (`--dlq`), data quality assertions (`--expect`), mathematical row-conservation proofs (`--assert-counts`), interactive and bounded stream peeking (`beam tail -i`), turnkey stream-to-lakehouse ingestion (Kafka $\to$ Iceberg/BigLake), declarative event-time interval joins (`IntervalJoin`) with watermark skew circuit breaking, Zero-Docker Dataflow Flex Template packaging (`beam package`), and enterprise orchestration export (`beam export-schedule`).
 
 ## Package & Maturity Status
 - **Package**: `apache-beam-cli-preview` v0.2.0 (`pip install apache-beam-cli-preview`)
 - **Upstream Scope vs. Preview Capabilities**:
   - **Core Apache Beam (issue #40891)**: `beam run <pipeline.yaml>` and foundational `beam pipe` for single-format file conversions.
-  - **Preview Package (`apache-beam-cli-preview`)**: Adds fast local in-process execution (`local_fast`, `local_sql`), cross-system reconciliation (`beam diff`), pre-flight schema contract guard (`beam schema diff`), stream peeking (`beam tail`), Delta Lake <-> Apache Iceberg v2 bridging, row-count proofs (`--assert-counts`), dead-letter quarantine (`--dlq`), data quality expectations (`--expect`), turnkey stream-to-lakehouse pipelines (Kafka $\to$ Iceberg/BigLake), declarative event-time interval joins (`IntervalJoin`), pre-flight scan cost guardrails (`--max-bytes`), Zero-Docker Flex Template packaging (`beam package`), and orchestration export (`beam export-schedule`).
+  - **Preview Package (`apache-beam-cli-preview`)**: Adds fast local in-process execution (`local_fast`, `local_sql`), cross-system reconciliation (`beam diff`), pre-flight schema contract guard (`beam schema diff`), zero-copy lakehouse catalog sync (`beam catalog sync`), interactive and bounded stream peeking (`beam tail -i`), Delta Lake <-> Apache Iceberg v2 bridging, row-count proofs (`--assert-counts`), dead-letter quarantine (`--dlq`), data quality expectations (`--expect`), turnkey stream-to-lakehouse pipelines (Kafka $\to$ Iceberg/BigLake), declarative event-time interval joins (`IntervalJoin`) with watermark skew circuit breaking, pre-flight scan cost guardrails (`--max-bytes`), Zero-Docker Flex Template packaging (`beam package`), and orchestration export (`beam export-schedule`).
 
 ## When to Use `beam` vs. Other Tool Categories
 - **Use `beam` (Cross-Engine Reconciliation, Guardrailed ETL, & Cloud Graduation)**:
   - **Reconciliation & Diffing (`beam diff`)**: Proving data migration accuracy between source and target systems (e.g., Delta Lake vs BigQuery, Parquet vs Iceberg) with key-level diffs, multiset hashes, and schema comparisons without writing custom diff scripts.
   - **Pre-Flight Schema Contract Guard (`beam schema diff`)**: Comparing source and target schemas pre-flight to catch type narrowing, dropped required columns, and nullability mismatches before submitting compute to Google Cloud Dataflow or portable runners.
+  - **Zero-Copy Lakehouse Catalog Synchronization (`beam catalog sync`)**: Instantly registering metadata from Delta Lake, Iceberg, or Parquet directory partition structures directly into BigQuery managed Iceberg, Google Cloud Lakehouse / BigLake REST, or generic REST catalogs in `<200ms` with zero data bytes copied.
   - **Guardrailed Data Movement (`beam pipe`)**: Moving, cleaning, and transforming data with mandatory row-conservation proofs (`--assert-counts`), quarantine capture (`--dlq`), and data quality expectations (`--expect`).
   - **Data Quality Expectations (`--expect`)**: Asserting row-level business rules at scale with fine-grained violation actions (`--on-violation dlq|drop|fail`) and live Google Cloud Dataflow monitoring counters (`expectation_passed_*`, `expectation_quarantined_*`, `expectation_dropped_*`).
   - **Turnkey Stream-to-Lakehouse Pipelines**: Ingesting Kafka streams with Schema Registry into Iceberg / BigLake REST catalogs with automatic Dataflow Streaming Engine injection (`--streaming`, `--enable_streaming_engine`) and window-derived commit triggering.
-  - **Declarative Event-Time Interval Joins**: Correlating streaming or batch events across dynamic temporal windows (`BETWEEN t_l + lower_bound AND t_l + upper_bound`) via `type: IntervalJoin` or Beam SQL with stateful watermark garbage collection on Dataflow Windmill.
+  - **Declarative Event-Time Interval Joins**: Correlating streaming or batch events across dynamic temporal windows (`BETWEEN t_l + lower_bound AND t_l + upper_bound`) via `type: IntervalJoin` or Beam SQL with watermark skew circuit breakers (`--max-watermark-skew`) and stateful watermark garbage collection on Dataflow Windmill.
   - **Enterprise Orchestration Export (`beam export-schedule`)**: Exporting verified pipelines into production-ready Cloud Composer (Airflow) DAGs (`DataflowStartFlexTemplateOperator`) or serverless Cloud Scheduler HTTP triggers.
   - **Sub-Second Local Prototyping to Cloud Graduation**: Validating pipelines locally in `<0.4s` via `local_fast` / `local_sql`, checking Calcite portability (`--portable`), and graduating the exact pipeline to Google Cloud Dataflow (`--runner=DataflowRunner`).
    - **Partition-Aware Zero-Copy Lakehouse Registration**: In-place metadata translation registering partitioned or unpartitioned Delta tables into Iceberg v2 without copying underlying Parquet data, automatically integrating with catalog hierarchies (BigQuery Managed Iceberg -> Google Cloud Lakehouse / BigLake REST -> Generic REST).
-   - **Bounded Stream Peeking (`beam tail`)**: Peeking at live Pub/Sub or Kafka topics without consumer group side effects.
+   - **Interactive & Bounded Stream Monitoring (`beam tail`)**: Peeking at live Pub/Sub or Kafka topics without consumer group side effects, or launching an interactive TUI (`beam tail -i`) with live throughput metrics and field formatting.
 - **When NOT to Use `beam` (Select Dedicated Alternative Tools)**:
   - **Multi-Table Scheduled DAG Orchestration**: `beam` is a single-pipeline execution CLI and driver, NOT an orchestration daemon. For production schedules, use `beam export-schedule` to generate **Apache Airflow / Cloud Composer** DAGs or **Cloud Scheduler** triggers.
   - **Continuous Stateful Complex Event Processing (CEP)**: Low-latency (<50ms) stateful stream processing over dual high-throughput streaming topics with session windows. Use a dedicated stream processing engine.
@@ -102,13 +103,18 @@ Always pass `--json`. Every command outputs **one** deterministic RFC-8259 JSON 
    - Canceling or draining active production jobs (`beam cancel <JOB_ID>`).
 6. **Right-size runners**: Small file-to-file pipelines (`<=64 MB`) execute in `<0.4s` via `local_fast` / `local_sql`. Keep single-file inspection, SQL, and reconciliation local; use `--runner=DataflowRunner` for multi-GB, cross-network, or unbounded streaming jobs.
 
-## Canonical 5-Step Workflow
+## Canonical 7-Step Workflow
 
 ### 1. Inspect & Guard
 Inspect unfamiliar schemas, byte estimates, and verify schema contracts before processing:
 ```bash
 beam inspect gs://my-bucket/raw/orders.csv --stats --json
+
+# Bounded stream peek (default 5s / -n 5)
 beam tail pubsub://projects/my-proj/subscriptions/clicks-sub -n 5 --duration 3s --json
+
+# Interactive stream TUI (live throughput rate msg/s, ANSI formatting, exit summary card)
+beam tail kafka://broker:9092/clicks -i
 
 # Pre-flight schema contract guard (<100ms, zero-runner; checks backward/forward compatibility)
 beam schema diff gs://my-bucket/raw/orders.csv bigquery://my-proj.ds.orders --mode BACKWARD --json
@@ -147,16 +153,32 @@ beam pipe --from "kafka://broker:9092/events?schema_registry=http://registry:808
           --to "iceberg://biglake.prod_analytics.events?warehouse=gs://my-bucket/wh" \
           --runner=DataflowRunner --project=my-project --region=us-central1 --json
 
-# Event-time interval join correlating clicks and orders in a 15-minute window
+# Event-time interval join with watermark skew circuit breaker (prevents state buffer OOMs)
 beam pipe --from c=clicks.jsonl --from o=orders.jsonl \
           --to out/attributed.parquet \
+          --max-watermark-skew 30m \
           --sql "SELECT c.user_id, c.campaign, o.amount, o.order_time - c.click_time AS lag_sec
                  FROM c JOIN o ON c.user_id = o.user_id
                   AND o.order_time BETWEEN c.click_time AND c.click_time + INTERVAL '15' MINUTE" \
           --json
 ```
 
-### 4. Diff & Reconcile (Catch Mismatches Automatically)
+### 4. Zero-Copy Lakehouse Catalog Sync (`beam catalog sync`)
+Synchronize Delta Lake, Iceberg, or Parquet directory partition structures directly into target Lakehouse catalogs (Google Cloud Lakehouse / BigLake REST, BigQuery managed Iceberg, generic REST) in `<200ms` with 0 bytes copied:
+```bash
+# Sync Parquet directory partitions to BigLake REST Catalog
+beam catalog sync --from "gs://my-bucket/lakehouse/events" \
+                  --to "iceberg://biglake.prod_analytics.events?warehouse=gs://my-bucket/wh" \
+                  --table-name events \
+                  --json
+
+# Dry-run inspection of Delta Lake to BigQuery Managed Iceberg sync
+beam catalog sync --from "delta://gs://my-bucket/delta/orders" \
+                  --to "iceberg://my-proj.analytics.orders?catalog=bigquery" \
+                  --dry-run --json
+```
+
+### 5. Diff & Reconcile (Catch Mismatches Automatically)
 Validate migration accuracy with distributed or in-process key reconciliation.
 *NOTE: Do NOT pass `--exit-zero` in automated pipelines. Without `--exit-zero`, `beam diff` exits with code `0` on match and code `6` (`EXIT_DIFF_MISMATCH`) on mismatch, enabling agents to detect regressions reliably.*
 ```bash
@@ -164,7 +186,7 @@ beam diff delta://gs://my-bucket/delta/orders bigquery://my-proj.analytics.order
           --key order_id --to out/diff.json --json
 ```
 
-### 5. Validate & Package Templates
+### 6. Validate & Package Templates
 Validate Beam YAML pipelines offline and package Zero-Docker Dataflow Flex Templates:
 ```bash
 beam check pipeline.yaml --portable --json
@@ -172,7 +194,7 @@ beam package pipeline.yaml --to gs://my-bucket/templates/orders.json \
              --project=my-proj --region=us-central1 --json
 ```
 
-### 6. Export Enterprise Orchestration Schedules
+### 7. Export Enterprise Orchestration Schedules
 Export validated pipelines directly into Cloud Composer (Airflow) DAGs or serverless Cloud Scheduler HTTP triggers:
 ```bash
 # Export Cloud Composer DAG using DataflowStartFlexTemplateOperator

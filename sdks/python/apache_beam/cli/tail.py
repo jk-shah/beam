@@ -43,11 +43,13 @@ Guarantees:
 
 import collections
 import csv
+import datetime
 import glob
 import io
 import json
 import os
 from pathlib import Path
+import sys
 import time
 from typing import Any
 from typing import Callable
@@ -69,6 +71,116 @@ class TailError(Exception):
   def __init__(self, message: str, exit_code: int = 2):
     super().__init__(message)
     self.exit_code = exit_code
+
+
+class InteractiveTailFormatter:
+  """Human-friendly live terminal TUI with throughput tracking, ANSI colors, and field inspector."""
+
+  def __init__(self, uri: str, follow: bool = False, use_color: bool | None = None):
+    self.uri = uri
+    self.follow = follow
+    if use_color is None:
+      self.use_color = (
+          hasattr(sys.stdout, 'isatty')
+          and sys.stdout.isatty()
+          and 'NO_COLOR' not in os.environ
+          and os.environ.get('TERM') != 'dumb'
+      )
+    else:
+      self.use_color = use_color
+
+    self.start_time = time.monotonic()
+    self.record_count = 0
+    self.total_bytes = 0
+    self.timestamps: collections.deque[float] = collections.deque(maxlen=100)
+    self.peak_rate = 0.0
+
+  def _style(self, text: str, code: str) -> str:
+    if not self.use_color:
+      return text
+    return f'\033[{code}m{text}\033[0m'
+
+  def bold(self, text: str) -> str:
+    return self._style(text, '1')
+
+  def cyan(self, text: str) -> str:
+    return self._style(text, '36')
+
+  def green(self, text: str) -> str:
+    return self._style(text, '32')
+
+  def yellow(self, text: str) -> str:
+    return self._style(text, '33')
+
+  def dim(self, text: str) -> str:
+    return self._style(text, '2')
+
+  def magenta(self, text: str) -> str:
+    return self._style(text, '35')
+
+  def render_start_banner(self) -> None:
+    mode_str = 'Live Follow (Ctrl-C to stop)' if self.follow else 'Sample Peek'
+    banner = (
+        f"{self.cyan('╭─')} {self.bold('Beam Stream')}: {self.yellow(self.uri)} "
+        f"[{self.green(mode_str)}] "
+        f"{self.cyan('─' * max(4, 60 - len(self.uri) - len(mode_str)))}╮\n"
+        f"{self.cyan('│')} Non-destructive: {self.green('True')} (Zero loss / No offset commits) "
+        f"{self.cyan('│')}\n"
+        f"{self.cyan('╰' + '─' * 74 + '╯')}"
+    )
+    print(banner, file=sys.stderr, flush=True)
+
+  def format_record(self, rec: dict[str, Any], idx: int) -> str:
+    now = time.monotonic()
+    self.record_count += 1
+    self.timestamps.append(now)
+    rec_bytes = len(json.dumps(rec, default=str))
+    self.total_bytes += rec_bytes
+
+    if len(self.timestamps) > 1:
+      span = self.timestamps[-1] - self.timestamps[0]
+      rate = (len(self.timestamps) - 1) / max(0.001, span)
+    else:
+      rate = 1.0 / max(0.001, now - self.start_time)
+    if rate > self.peak_rate:
+      self.peak_rate = rate
+
+    idx_str = self.dim(f'[#{idx}]')
+    ts_str = self.cyan(datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3])
+
+    parts = []
+    for k, v in rec.items():
+      val_str = json.dumps(v, default=str) if isinstance(v, (dict, list)) else str(v)
+      if len(val_str) > 60:
+        val_str = val_str[:57] + '...'
+      parts.append(f"{self.bold(str(k))}={self.yellow(val_str)}")
+
+    fields_str = '  '.join(parts)
+    rate_str = self.dim(f"({rate:.1f} msg/s)") if self.follow else ""
+    return f"{idx_str} {ts_str} {rate_str} {fields_str}"
+
+  def on_stream_record(self, rec: dict[str, Any], idx: int) -> None:
+    line = self.format_record(rec, idx)
+    print(line, flush=True)
+
+  def render_exit_summary(self, interrupted: bool = False) -> None:
+    elapsed = max(0.001, time.monotonic() - self.start_time)
+    avg_rate = self.record_count / elapsed
+    bytes_kb = self.total_bytes / 1024.0
+    status_str = 'Stopped by user (Ctrl-C)' if interrupted else 'Completed'
+
+    summary = (
+        f"\n{self.cyan('╭─')} {self.bold('Stream Summary')} "
+        f"[{self.green(status_str)}] {self.cyan('─' * 46)}╮\n"
+        f"{self.cyan('│')} Elapsed: {self.bold(f'{elapsed:.1f}s')} | "
+        f"Records: {self.bold(str(self.record_count))} | "
+        f"Avg Rate: {self.bold(f'{avg_rate:.1f} msg/s')} | "
+        f"Peak: {self.bold(f'{self.peak_rate:.1f} msg/s')} {self.cyan('│')}\n"
+        f"{self.cyan('│')} Data Scanned: {self.bold(f'{bytes_kb:.1f} KB')} | "
+        f"Non-Destructive: {self.green('True')} {self.cyan('│')}\n"
+        f"{self.cyan('╰' + '─' * 68 + '╯')}"
+    )
+    print(summary, file=sys.stderr, flush=True)
 
 
 def _decode_payload_bytes(raw_bytes: bytes) -> Any:
