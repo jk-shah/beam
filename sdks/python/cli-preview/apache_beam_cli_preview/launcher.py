@@ -39,6 +39,9 @@ _PTH_CONTENT = (
 
 
 def _locate_cli_dir() -> Path:
+  env_dir = os.environ.get('BEAM_CLI_DIR')
+  if env_dir and (Path(env_dir) / 'main.py').is_file():
+    return Path(env_dir)
   bundled = Path(__file__).resolve().parent / '_bundled_cli'
   if (bundled / 'main.py').is_file():
     return bundled
