@@ -53,6 +53,11 @@ class PipeSpec(NamedTuple):
 
 
 def _normalize_primary_keys(primary_keys: Iterable[str] | None) -> list[str]:
+  """Flattens and deduplicates primary key arguments.
+
+  Supports repeated arguments (`--key id --key dept`), comma-separated strings
+  (`--key id,dept`), and mixed collections, preserving first-seen column ordering.
+  """
   out: list[str] = []
   for raw_pk in primary_keys or ():
     for part in str(raw_pk).split(','):
@@ -75,6 +80,12 @@ _AGG_CALL_RE = re.compile(
 
 
 def _split_window_tokens(s: str) -> list[str]:
+  """Splits window specification tokens by commas outside nested delimiters.
+
+  Respects grouping delimiters `()`, `[]`, and `{}` so that embedded lists
+  (e.g. `group_by=[region, dept]`) or composite arguments (e.g. `sum(metric)`)
+  are not prematurely split across commas.
+  """
   tokens: list[str] = []
   cur: list[str] = []
   depth = 0
@@ -103,27 +114,47 @@ def _split_window_tokens(s: str) -> list[str]:
 def _parse_inline_aggregations(
     tokens: list[str]
 ) -> tuple[dict[str, Any], list[str], list[str]]:
+  """Extracts inline group_by and aggregation expressions from window tokens.
+
+  Rationale:
+  In Apache Beam YAML, `WindowInto` defines element assignment to time windows
+  along the watermark timeline, but does not itself reduce data. Aggregation
+  is performed by `Combine`. To give users an ergonomic shorthand like:
+    --window "fixed:60s,sum(metric),avg(latency),by=region"
+  this function separates the window parameters from the reduction spec,
+  allowing the pipeline compiler to emit both a `WindowInto` step and a
+  subsequent `Combine` step.
+
+  Returns:
+    (combines_dict, group_by_list, remaining_window_tokens)
+  """
   combines: dict[str, Any] = {}
   group_by: list[str] = []
   remaining: list[str] = []
   for t in tokens:
+    # 1. Parse optional grouping key specification: group_by=... or by=...
     if t.startswith(('group_by=', 'by=')):
       val = t.split('=', 1)[1]
       cols = [c.strip("[] '\"") for c in val.split(',') if c.strip("[] '\"")]
       group_by.extend(cols)
       continue
+
+    # 2. Parse aggregation call: [alias=]fn(col)
     m = _AGG_CALL_RE.match(t)
     if m:
       fn = m.group('fn').lower()
+      # Beam YAML Combine uses 'mean' for averages.
       fn_clean = 'mean' if fn == 'avg' else fn
       val = m.group('val').strip()
       alias = m.group('alias')
+      # Infer output alias if not explicitly provided
       if not alias:
         alias = val if val and val != '*' else (fn if fn != 'mean' else 'avg')
       if not val or val == '*':
         val = alias if alias != fn_clean else '1'
       combines[alias] = {'value': val, 'fn': fn_clean}
       continue
+
     remaining.append(t)
   return combines, group_by, remaining
 

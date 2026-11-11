@@ -295,6 +295,10 @@ class SqlNullSemanticsTest(unittest.TestCase):
     cls.conn.executemany(
         'INSERT INTO t VALUES (:id, :state, :amount, :qty)', cls.ROWS)
 
+  @classmethod
+  def tearDownClass(cls):
+    cls.conn.close()
+
   def _sqlite_ids(self, expr):
     return sorted(
         r[0] for r in self.conn.execute(f'SELECT id FROM t WHERE {expr}'))

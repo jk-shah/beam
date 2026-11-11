@@ -225,7 +225,18 @@ def run_check(
 
 
 def _check_portability(pipeline_block: dict[str, Any]) -> list[str]:
-  """Recursively checks for SQL dialect or provider constructs non-portable to remote Beam runners."""
+  """Recursively checks for dialect or provider constructs non-portable to distributed Beam runners.
+
+  Why Pre-Flight Portability Verification:
+  Beam's distributed runners (DataflowRunner, FlinkRunner, SparkRunner) execute
+  `type: Sql` transforms via Apache Calcite and the Beam Java SQL expansion service.
+  Calcite conforms strictly to ANSI SQL rules and rejects engine-specific dialect
+  functions such as `strftime`, `to_utc`, `median`, `percentile`, `qualify`, or
+  single-document keyed JSON sinks (`key=`).
+
+  Catching non-portable constructs statically in `beam check --portable` prevents
+  submitting expensive distributed pipelines that would fail minutes into execution.
+  """
   issues: list[str] = []
   from . import pipe_sql
 

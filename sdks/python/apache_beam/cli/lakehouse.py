@@ -1394,6 +1394,17 @@ def commit_iceberg_snapshot(
     if old_meta.get('last-column-id'):
       last_col_id = max(last_col_id, int(old_meta['last-column-id']))
 
+    # -----------------------------------------------------------------------
+    # Iceberg v2 Schema Evolution Invariants:
+    # 1. Monotonic Field IDs: Iceberg tracks columns by persistent integer IDs,
+    #    never by name. Field IDs must never be recycled or reused.
+    # 2. Nullable Evolution: New columns added to an existing table MUST be
+    #    marked `required: False` (`nullable: True`). Pre-existing data files
+    #    lack values for new columns, so marking them required would cause
+    #    Iceberg v2 readers to abort with null constraint violations.
+    # 3. Schema Versioning: When any column is added, increment `schema-id`
+    #    so the new snapshot accurately captures the evolved schema.
+    # -----------------------------------------------------------------------
     existing_names = {str(f['name']).lower() for f in cur_fields}
     evolved = False
     for f in iceberg_fields:
@@ -1778,6 +1789,11 @@ def register_zero_copy_to_iceberg(
           'file_size_in_bytes': fsize,
       })
 
+  # Build the unified Iceberg schema:
+  # Any field that is absent from one or more registered files (e.g. Due to
+  # schema evolution across Delta commits or Parquet batches) MUST be marked
+  # nullable. Historical files lack data for that field, so readers will
+  # produce NULL when reading older files.
   iceberg_fields: list[dict[str, Any]] = []
   for idx, (fname, fdict) in enumerate(seen_fields.items(), start=1):
     is_nullable = fdict['nullable'] or (file_field_presence.get(fname, 0) < num_files)

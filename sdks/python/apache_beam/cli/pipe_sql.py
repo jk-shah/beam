@@ -861,6 +861,22 @@ class _VariancePop:
 class _RegrAccumulator:
   """Numerically stable two-variable accumulator for linear regression (OLS).
 
+  Why Welford's Algorithm:
+  The naive textbook formulas for covariance and variance (e.g. sum(x*y) - sum(x)*sum(y)/n)
+  suffer from catastrophic floating-point cancellation when x and y values are large
+  (such as epoch timestamps or high-magnitude IDs) with small relative variance.
+  This leads to precision collapse or false divide-by-zero errors.
+
+  Welford's two-variable online algorithm updates running means and cross-product
+  sums of deviations in a single pass with provable numerical stability:
+    dx = x_i - mean_x_{prev}
+    mean_x += dx / n
+    dy = y_i - mean_y_{prev}
+    mean_y += dy / n
+    m2_x += dx * (x_i - mean_x_{new})
+    m2_y += dy * (y_i - mean_y_{new})
+    c_xy += dx * (y_i - mean_y_{new})
+
   Maintains Welford running sums for (y, x) pairs where neither y nor x is null:
     n: count of pairs
     mean_x, mean_y: running sample means
@@ -1035,12 +1051,28 @@ _SQLITE_CAST_TYPE_MAP = {
 
 
 def _scan_sql_outside_literals(sql_text: str):
-  """Yields `(is_code, segment)` preserving SQL quotes and comments."""
+  """Lexical state machine yielding `(is_code, segment)` tuples for SQL text.
+
+  Design Rationale:
+  Avoids heavyweight external SQL AST parsing packages (e.g. sqlparse, antlr)
+  to ensure zero-overhead CLI cold starts (<50ms).
+
+  Accurately differentiates executable SQL syntax from:
+  1. Single-quoted string literals (`'value'`, with `''` escape support).
+  2. Double-quoted identifiers (`"column"`) and backtick identifiers (``` `column` ```).
+  3. Single-line comments (`-- comment\\n`).
+  4. Multi-line block comments (`/* comment */`).
+
+  Yields:
+    `(True, code_segment)` for raw SQL code (safe for rewriting/keyword checks).
+    `(False, literal_segment)` for strings, comments, and identifiers (preserved verbatim).
+  """
   n = len(sql_text)
   i = 0
   code_start = 0
   while i < n:
     ch = sql_text[i]
+    # Check for string literal or quoted identifier start ('...', "...", `...`)
     if ch in ("'", '"', '`'):
       if i > code_start:
         yield True, sql_text[code_start:i]
@@ -1048,6 +1080,7 @@ def _scan_sql_outside_literals(sql_text: str):
       j = i + 1
       while j < n:
         if sql_text[j] == q:
+          # Handle doubled quote escapes: '' or "" or ``
           if j + 1 < n and sql_text[j + 1] == q:
             j += 2
             continue
@@ -1057,6 +1090,8 @@ def _scan_sql_outside_literals(sql_text: str):
       yield False, sql_text[i:j]
       i = code_start = j
       continue
+
+    # Check for single-line SQL comment: -- ...
     if sql_text[i:i + 2] == '--':
       if i > code_start:
         yield True, sql_text[code_start:i]
@@ -1065,6 +1100,8 @@ def _scan_sql_outside_literals(sql_text: str):
       yield False, sql_text[i:end]
       i = code_start = end
       continue
+
+    # Check for multi-line block comment: /* ... */
     if sql_text[i:i + 2] == '/*':
       if i > code_start:
         yield True, sql_text[code_start:i]
@@ -1073,7 +1110,9 @@ def _scan_sql_outside_literals(sql_text: str):
       yield False, sql_text[i:end]
       i = code_start = end
       continue
+
     i += 1
+
   if code_start < n:
     yield True, sql_text[code_start:]
 
@@ -1191,54 +1230,86 @@ def local_only_sql_functions(query: str) -> list[str]:
   return [item.rstrip('()').lower() for item in analyze_sql_portability(query)]
 
 
+_LHS_BOOL_RE = re.compile(
+    r'(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?([A-Za-z_][A-Za-z0-9_]*)'
+    r'\s*(?:=|==|!=|<>|\bIS(?:\s+NOT)?)\s*$',
+    re.I)
+_OP_ONLY_RE = re.compile(r'^\s*(?:=|==|!=|<>|\bIS(?:\s+NOT)?)\s*$', re.I)
+_RHS_BOOL_RE = re.compile(
+    r'^\s*(?:=|==|!=|<>)\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?'
+    r'([A-Za-z_][A-Za-z0-9_]*)\b',
+    re.I)
+_RHS_OP_ONLY_RE = re.compile(
+    r'^\s*(?:=|==|!=|<>)\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?$')
+
+
+def _is_bool_col_comparison(
+    segs: list[tuple[bool, str]], idx: int, bool_cols: set[str]) -> bool:
+  """Returns True if the string literal at `segs[idx]` is in comparison with a boolean column.
+
+  Handles both unquoted identifiers (e.g. `col = 'true'`, `t.col = 'true'`)
+  and quoted identifiers (e.g. `"col" = 'true'`, `` `col` = 'true' ``),
+  whether the boolean column is on the left-hand side or right-hand side of
+  the comparison operator.
+  """
+  # 1. Left-hand side check: e.g. `col = 'true'` or `"col" = 'true'`
+  if idx > 0 and segs[idx - 1][0]:
+    prev_code = segs[idx - 1][1]
+    m_l = _LHS_BOOL_RE.search(prev_code)
+    if m_l and m_l.group(1).lower() in bool_cols:
+      return True
+    # Quoted column name followed by standalone operator: `"col"` + ` = ` + `'true'`
+    if (idx >= 2 and not segs[idx - 2][0] and
+        segs[idx - 2][1][:1] in ('"', '`') and
+        _OP_ONLY_RE.fullmatch(prev_code)):
+      unq = segs[idx - 2][1][1:-1].strip().lower()
+      if unq in bool_cols:
+        return True
+
+  # 2. Right-hand side check: e.g. `'true' = col` or `'true' = "col"`
+  if idx + 1 < len(segs) and segs[idx + 1][0]:
+    next_code = segs[idx + 1][1]
+    m_r = _RHS_BOOL_RE.match(next_code)
+    if m_r and m_r.group(1).lower() in bool_cols:
+      return True
+    # Standalone operator followed by quoted column name: `'true'` + ` = ` + `"col"`
+    if (idx + 2 < len(segs) and not segs[idx + 2][0] and
+        segs[idx + 2][1][:1] in ('"', '`') and
+        _RHS_OP_ONLY_RE.fullmatch(next_code)):
+      unq = segs[idx + 2][1][1:-1].strip().lower()
+      if unq in bool_cols:
+        return True
+
+  return False
+
+
 def _normalize_sqlite_bool_comparisons(
     sql_query: str, bool_cols: set[str]) -> str:
-  """Coerces `bool_col = 'true'|'false'` to `1|0` for SQLite INTEGER booleans."""
+  """Coerces `'true'` / `'false'` string literals to integer `1` / `0` for boolean columns.
+
+  Rationale (The SQLite Boolean Affinity Cliff):
+  SQLite lacks a dedicated BOOLEAN storage class; boolean values are represented
+  as INTEGER (1 for True, 0 for False). In standard ANSI SQL and Apache Beam SQL
+  (Calcite), queries frequently use string literals `'true'` / `'false'`.
+  However, in SQLite, comparing an INTEGER column to text `'true'` evaluates to
+  FALSE for both 0 and 1 due to SQLite's strict type affinity rules!
+  This causes queries like `WHERE is_active = 'true'` to silently return 0 rows.
+
+  This function detects columns whose non-null values are exclusively booleans
+  and rewrites `'true'` -> `1` and `'false'` -> `0` when appearing in binary
+  equality or inequality comparisons with those boolean columns.
+  """
   if not bool_cols:
     return sql_query
   segs = list(_scan_sql_outside_literals(sql_query))
   out: list[str] = []
-  lhs_re = re.compile(
-      r'(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?([A-Za-z_][A-Za-z0-9_]*)'
-      r'\s*(?:=|==|!=|<>|\bIS(?:\s+NOT)?)\s*$',
-      re.I)
-  op_only_re = re.compile(r'^\s*(?:=|==|!=|<>|\bIS(?:\s+NOT)?)\s*$', re.I)
-  rhs_re = re.compile(
-      r'^\s*(?:=|==|!=|<>)\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?'
-      r'([A-Za-z_][A-Za-z0-9_]*)\b',
-      re.I)
-  rhs_op_re = re.compile(
-      r'^\s*(?:=|==|!=|<>)\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?$')
 
   for idx, (is_code, seg) in enumerate(segs):
     if (not is_code and len(seg) >= 2 and seg[0] == "'" and seg[-1] == "'"):
       inner = seg[1:-1].replace("''", "'").strip().lower()
-      if inner in ('true', 'false'):
-        bit = '1' if inner == 'true' else '0'
-        matched = False
-        if idx > 0 and segs[idx - 1][0]:
-          m_l = lhs_re.search(segs[idx - 1][1])
-          if m_l and m_l.group(1).lower() in bool_cols:
-            matched = True
-          elif (idx >= 2 and not segs[idx - 2][0] and
-                segs[idx - 2][1][:1] in ('"', '`') and
-                op_only_re.fullmatch(segs[idx - 1][1])):
-            unq = segs[idx - 2][1][1:-1].strip().lower()
-            if unq in bool_cols:
-              matched = True
-        if not matched and idx + 1 < len(segs) and segs[idx + 1][0]:
-          m_r = rhs_re.match(segs[idx + 1][1])
-          if m_r and m_r.group(1).lower() in bool_cols:
-            matched = True
-          elif (idx + 2 < len(segs) and not segs[idx + 2][0] and
-                segs[idx + 2][1][:1] in ('"', '`') and
-                rhs_op_re.fullmatch(segs[idx + 1][1])):
-            unq = segs[idx + 2][1][1:-1].strip().lower()
-            if unq in bool_cols:
-              matched = True
-        if matched:
-          out.append(bit)
-          continue
+      if inner in ('true', 'false') and _is_bool_col_comparison(segs, idx, bool_cols):
+        out.append('1' if inner == 'true' else '0')
+        continue
     out.append(seg)
   return ''.join(out)
 
@@ -1335,6 +1406,11 @@ def _run_duckdb(
       used_lower.add(ns.alias.lower())
       first_alias = first_alias or ns.alias
     if first_alias is not None:
+      # Register Beam SQL standard `PCOLLECTION` and `source` views on the
+      # primary input, plus conventional single-table aliases (`data`, `tbl`,
+      # `input`) when there is only one source so queries like
+      # `SELECT * FROM data` execute without requiring the user to know the
+      # inferred file stem alias.
       extra_views = (
           ('PCOLLECTION', 'source', 'data', 'tbl', 'input')
           if len(named_sources) == 1 else ('PCOLLECTION', 'source'))
@@ -1481,7 +1557,7 @@ def run_in_memory_sql(
       clean_q = _normalize_sqlite_bool_comparisons(clean_q, pure_bool_cols)
 
     # Register Beam SQL `PCOLLECTION` and `source` views on the primary input
-    # (plus common single-table aliases `data`, `t`, `tbl`, `input` when unary).
+    # (plus common single-table aliases `data`, `tbl`, `input` when unary).
     if first_alias is not None:
       extra_views = (
           ('PCOLLECTION', 'source', 'data', 'tbl', 'input')
@@ -1492,8 +1568,19 @@ def run_in_memory_sql(
               f'CREATE VIEW {_quote_ident(view_name)} AS '
               f'SELECT * FROM {_quote_ident(first_alias)}')
 
-    # Lock down SQLite authorizer BEFORE executing user SQL: strictly read-only
-    # SELECT/FUNCTION/READ, blocking ATTACH, PRAGMA, DDL, and DML!
+    # -----------------------------------------------------------------------
+    # Sandboxing & Security Guarantees:
+    # 1. Authorizer Callback:
+    #    Strictly restricts SQLite bytecode evaluation to read-only operations
+    #    (SQLITE_SELECT, SQLITE_READ, SQLITE_FUNCTION, and SQLITE_RECURSIVE).
+    #    Explicitly blocks ATTACH DATABASE, PRAGMA, DDL, and DML mutations,
+    #    preventing queries from accessing local disk files or modifying state.
+    # 2. Progress Handler & Row-Limit Guard:
+    #    Defends against runaway queries (accidental Cartesian cross-joins or
+    #    infinite recursive CTEs) by checking deadlines every 10k opcodes and
+    #    enforcing BEAM_CLI_SQL_MAX_SECONDS (default 30s) and
+    #    BEAM_CLI_SQL_MAX_RESULT_ROWS (default 1,000,000 rows).
+    # -----------------------------------------------------------------------
     allowed_actions = {
         sqlite3.SQLITE_SELECT,
         sqlite3.SQLITE_READ,

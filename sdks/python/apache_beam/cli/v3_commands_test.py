@@ -2516,13 +2516,16 @@ class NullMatrixPipeTest(unittest.TestCase):
   def _expected(self, fmt, expr):
     import sqlite3
     conn = sqlite3.connect(':memory:')
-    conn.execute('CREATE TABLE t (id INT, state TEXT, amount REAL, qty INT)')
-    rows = [
-        dict(r, state=None if (fmt == 'csv' and r['state'] == '') else
-             r['state']) for r in self.ROWS
-    ]
-    conn.executemany('INSERT INTO t VALUES (:id, :state, :amount, :qty)', rows)
-    return sorted(i for (i, ) in conn.execute(f'SELECT id FROM t WHERE {expr}'))
+    try:
+      conn.execute('CREATE TABLE t (id INT, state TEXT, amount REAL, qty INT)')
+      rows = [
+          dict(r, state=None if (fmt == 'csv' and r['state'] == '') else
+               r['state']) for r in self.ROWS
+      ]
+      conn.executemany('INSERT INTO t VALUES (:id, :state, :amount, :qty)', rows)
+      return sorted(i for (i, ) in conn.execute(f'SELECT id FROM t WHERE {expr}'))
+    finally:
+      conn.close()
 
   def _ids(self, fmt, expr, fast):
     out = os.path.join(
