@@ -339,6 +339,7 @@ _CLI_ONE_FLAGS = {
         '--to',
         '--target',
         '--table',
+        '--table-name',
         '--catalog',
         '--mode',
         '--project',
@@ -1524,6 +1525,7 @@ def _build_parser():
       help='target catalog or table (e.g. bigquery://project.dataset.table or biglake://...)')
   sync_p.add_argument(
       '--table',
+      '--table-name',
       dest='table',
       default=None,
       help='target table identifier (if not part of --to URI)')
