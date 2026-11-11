@@ -3951,6 +3951,84 @@ class Round12FixesTest(unittest.TestCase):
     conn_j = env_j['outputs']['connector']
     self.assertIn('key', conn_j['options'])
 
+  def test_sqlite_boolean_string_literal_comparison_parity(self):
+    shipments = os.path.join(self.tmp, 'shipments.csv')
+    with open(shipments, 'w', encoding='utf-8') as f:
+      f.write(
+          'id,express,status\n'
+          '1,true,true\n'
+          '2,false,active\n'
+          '3,TRUE,false\n')
+    rc, env, err = _run_json([
+        'pipe',
+        '--from',
+        f's={shipments}',
+        '--sql',
+        (
+            "SELECT s.id, CASE WHEN s.express = 'true' THEN 10 ELSE 0 END AS fee "
+            "FROM s WHERE express != 'false' AND status != 'active' ORDER BY s.id"
+        ),
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, err)
+    self.assertEqual(
+        env['untrusted_data']['rows'],
+        [{'id': 1, 'fee': 10}, {'id': 3, 'fee': 10}])
+
+  def test_portable_flag_and_portable_to_runner_metadata(self):
+    src = os.path.join(self.tmp, 'sales.csv')
+    with open(src, 'w', encoding='utf-8') as f:
+      f.write('region,amount\nUS,10.0\nUS,30.0\nEU,20.0\n')
+
+    # 1. Local-only `quantile()` runs locally with `portable_to_runner == False`.
+    rc1, env1, err1 = _run_json([
+        'pipe',
+        '--from',
+        f's={src}',
+        '--sql',
+        'SELECT quantile(amount, 0.5) AS med FROM s',
+    ])
+    self.assertEqual(rc1, cli.EXIT_OK, err1)
+    self.assertFalse(env1['outputs']['portable_to_runner'])
+    self.assertIn('quantile()', env1['outputs']['non_portable_constructs'])
+
+    # 2. `--portable` rejects local-only SQL functions with EXIT_USAGE.
+    rc2, env2, _ = _run_json([
+        'pipe',
+        '--from',
+        f's={src}',
+        '--sql',
+        'SELECT quantile(amount, 0.5) AS med FROM s',
+        '--portable',
+    ])
+    self.assertEqual(rc2, cli.EXIT_USAGE)
+    self.assertIn('quantile()', env2['error']['message'])
+
+    # 3. Standard Calcite-compatible SQL passes `--portable` (and ignores string literals).
+    rc3, env3, err3 = _run_json([
+        'pipe',
+        '--from',
+        f's={src}',
+        '--sql',
+        "SELECT region, COUNT(*) AS n, 'quantile(x)' AS note FROM s GROUP BY 1 ORDER BY 1",
+        '--portable',
+    ])
+    self.assertEqual(rc3, cli.EXIT_OK, err3)
+    self.assertTrue(env3['outputs']['portable_to_runner'])
+
+    # 4. `--portable` rejects local-only `--to-opt key=` on non-SQL pipe.
+    out_json = os.path.join(self.tmp, 'keyed.json')
+    rc4, _, _ = _run_json([
+        'pipe',
+        '--from',
+        src,
+        '--to',
+        out_json,
+        '--to-opt',
+        'key=region',
+        '--portable',
+    ])
+    self.assertEqual(rc4, cli.EXIT_USAGE)
+
 
 if __name__ == '__main__':
   unittest.main()

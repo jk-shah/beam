@@ -161,6 +161,8 @@ _CLI_ZERO_FLAGS = {
         '--assert-counts',
         '--verify',
         '--preview',
+        '--portable',
+        '--strict-beam',
         '--verbose',
         '--no-config',
         '--help',
@@ -779,6 +781,15 @@ def _build_parser():
       '--preview',
       action='store_true',
       help='include sampled output rows in --json even when --to writes to a destination')
+  pipe.add_argument(
+      '--portable',
+      '--strict-beam',
+      dest='portable',
+      action='store_true',
+      help=(
+          'require SQL, options, and execution to be 100%% portable to '
+          'distributed Beam runners (Dataflow/Flink/Spark); bypasses '
+          'local-only shortcuts'))
   pipe.add_argument(
       '--dry-run',
       '--dry_run',
@@ -2247,29 +2258,59 @@ def _pipe(
     if args.dlq:
       local_sql_paths.append(args.dlq)
 
+    non_portable_sql = pipe_sql.analyze_sql_portability(
+        args.sql, sql_engine=args.sql_engine)
+    has_keyed_json = bool(sink_ep is not None and 'key' in (sink_ep.config or {}))
+    if getattr(args, 'portable', False):
+      if has_keyed_json:
+        raise _CliError(
+            '--portable rejects --to-opt key= because keyed single-object '
+            'JSON output is local-only; write standard JSONL or Parquet for '
+            'distributed Beam runners',
+            EXIT_USAGE)
+      from . import uris as uris_mod
+      for ns in named_sources:
+        if not (args.from_format or args.format):
+          mg = uris_mod.local_format_groups(ns.uri)
+          if len(mg) > 1:
+            raise _CliError(
+                f'--portable rejects mixed-format glob {ns.uri!r}; bind one '
+                '--from per file format and combine via UNION ALL',
+                EXIT_USAGE)
+      if non_portable_sql:
+        raise _CliError(
+            '--portable rejected local-only SQL construct(s): ' +
+            ', '.join(non_portable_sql) +
+            ' (supported by local SQLite/DuckDB but not Beam Calcite SQL on '
+            'Dataflow/Flink/Spark; rewrite in ANSI/Calcite SQL or omit '
+            '--portable for local-only analytics)',
+            EXIT_USAGE)
+
     if args.dry_run or not is_local_runner or (
         sink_ep is not None and sink_ep.kind != 'file'):
       if sink_ep is None and not args.dry_run:
         raise _CliError(
             'remote --sql execution requires --to <SINK>', EXIT_USAGE)
-      if sink_ep is not None and 'key' in (sink_ep.config or {}):
+      if has_keyed_json:
         raise _CliError(
             '--to-opt key= (one keyed JSON document) is only for local --sql '
             'runs, not --emit-yaml or remote runners', EXIT_USAGE)
-      non_portable = (
-          pipe_sql.local_only_sql_functions(args.sql)
-          if args.sql_engine == 'sqlite' else [])
+      sql_extra_warns: list[str] = []
       if args.sql_engine != 'sqlite':
-        print(
-            f'note: --sql-engine {args.sql_engine} applies to local runs; the '
-            "exported or remote pipeline uses Beam SQL's dialect (Calcite)",
-            file=sys.stderr)
-      if non_portable:
-        print(
-            'warning: --sql uses ' + ', '.join(non_portable) + ', which run '
-            "locally but are not in Beam SQL's remote dialect (Calcite); the "
-            'exported or remote pipeline may fail to build',
-            file=sys.stderr)
+        note_eng = (
+            f'--sql-engine {args.sql_engine} applies to local runs; the '
+            "exported or remote pipeline uses Beam SQL's dialect (Calcite)")
+        sql_extra_warns.append(note_eng)
+        if not json_session.enabled:
+          print(f'note: {note_eng}', file=sys.stderr)
+      if non_portable_sql:
+        warn_np = (
+            '--sql uses ' + ', '.join(non_portable_sql) +
+            ', which run locally but are not in Beam SQL\'s remote dialect '
+            '(Calcite); the exported or remote pipeline may fail to build')
+        sql_extra_warns.append(warn_np)
+        if not json_session.enabled:
+          print(f'warning: {warn_np}', file=sys.stderr)
       orig_sql_out = sink_ep.output_prefix if sink_ep else None
       orig_sql_dlq = dlq_ep.output_prefix if dlq_ep else None
       staged_sql_spec, sql_stage_dir, sql_stage_prefix, sql_dlq_dir, sql_dlq_stage = (
@@ -2305,6 +2346,7 @@ def _pipe(
             wait_timeout_sec=wait_timeout_sec,
             raw_argv_for_idem=raw_argv,
             plan_hash=sql_plan_hash,
+            extra_warnings=sql_extra_warns,
             json_session=json_session,
             t0=t0)
       finally:
@@ -2400,6 +2442,9 @@ def _pipe(
           f'SQL pipeline failed: {_summarize(e)}',
           EXIT_PIPELINE_FAILED) from None
 
+    non_portable_items = list(non_portable_sql)
+    if has_keyed_json:
+      non_portable_items.append('--to-opt key=')
     sql_metrics = {
         'rows_read': int(total_read),
         'rows_written': int(len(out_rows)),
@@ -2413,7 +2458,10 @@ def _pipe(
         'columns': out_cols,
         'plan_hash': sql_plan_hash,
         'sql_engine': args.sql_engine,
+        'portable_to_runner': len(non_portable_items) == 0,
     }
+    if non_portable_items:
+      sql_outputs['non_portable_constructs'] = non_portable_items
     if dlq_written:
       sql_outputs['dlq_files'] = dlq_written
 
@@ -2613,15 +2661,16 @@ def _pipe(
   # Small local file-to-file jobs run in-process, skipping the ~2 s Beam
   # runner start-up (see fast_local.py for what qualifies).
   from . import fast_local
-  fast_files = fast_local.plan(
-      pipe,
-      explicit_runner=explicit_runner,
-      dry_run=bool(args.dry_run),
-      cdc=bool(args.cdc),
-      zero_copy=bool(args.zero_copy),
-      verify=bool(args.verify),
-      if_exists=args.if_exists,
-      wait_timeout_sec=wait_timeout_sec)
+  fast_files = (
+      None if getattr(args, 'portable', False) else fast_local.plan(
+          pipe,
+          explicit_runner=explicit_runner,
+          dry_run=bool(args.dry_run),
+          cdc=bool(args.cdc),
+          zero_copy=bool(args.zero_copy),
+          verify=bool(args.verify),
+          if_exists=args.if_exists,
+          wait_timeout_sec=wait_timeout_sec))
   if (fast_files is None and pipe.sink_endpoint is not None and
       'key' in (pipe.sink_endpoint.config or {})):
     raise _CliError(
@@ -2877,10 +2926,14 @@ def _run_fast_local_pipe(
     if prefix:
       _cleanup_empty_beam_temp_dirs(prefix)
 
+  has_key_opt = bool(
+      pipe.sink_endpoint is not None and
+      'key' in (pipe.sink_endpoint.config or {}))
   outputs: dict[str, Any] = {
       'files': res.files,
       'file_count': len(res.files),
       'plan_hash': plan_hash,
+      'portable_to_runner': bool(not mixed_groups and not has_key_opt),
   }
   if pipe.dlq_endpoint is not None:
     outputs['dlq_files'] = res.dlq_files

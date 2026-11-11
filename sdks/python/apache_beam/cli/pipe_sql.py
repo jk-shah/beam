@@ -1139,25 +1139,108 @@ def _sql_error_hint(message: str, query: str) -> str:
   return ''
 
 
-# Functions that local `--sql` runs (SQLite + `_register_*_functions`) accept
-# but Beam's remote SQL dialect (Calcite) does not.
+# Functions and clauses that local `--sql` engines (SQLite / DuckDB) accept
+# but Beam's distributed SQL dialect (Apache Calcite) does not.
 _LOCAL_ONLY_SQL_FUNCTIONS = (
-    'median', 'percentile', 'quantile', 'quantile_cont', 'split_part',
-    'to_utc', 'strftime', 'julianday', 'ifnull', 'group_concat', 'printf',
-    'instr')
+    'median',
+    'percentile',
+    'quantile',
+    'quantile_cont',
+    'percentile_cont',
+    'percentile_disc',
+    'approx_quantiles',
+    'split_part',
+    'to_utc',
+    'strftime',
+    'julianday',
+    'unixepoch',
+    'ifnull',
+    'iif',
+    'group_concat',
+    'string_agg',
+    'printf',
+    'instr',
+    'typeof',
+    'json_extract',
+    'json_group_array',
+    'json_object',
+)
+
+_LOCAL_ONLY_SQL_KEYWORDS = ('qualify', 'glob', 'regexp', 'ilike')
+
+
+def analyze_sql_portability(
+    query: str, *, sql_engine: str = 'sqlite') -> list[str]:
+  """Returns non-portable SQL functions/clauses used outside string literals."""
+  del sql_engine
+  code_only = ' '.join(
+      seg for is_code, seg in _scan_sql_outside_literals(query)
+      if is_code).lower()
+  found: list[str] = []
+  for fn in _LOCAL_ONLY_SQL_FUNCTIONS:
+    if re.search(r'\b' + fn + r'\s*\(', code_only):
+      found.append(f'{fn}()')
+  for kw in _LOCAL_ONLY_SQL_KEYWORDS:
+    if re.search(r'\b' + kw + r'\b', code_only):
+      found.append(kw.upper())
+  return found
 
 
 def local_only_sql_functions(query: str) -> list[str]:
-  """Names of local-only functions used in `query`.
+  """Names of local-only constructs used in `query`."""
+  return [item.rstrip('()').lower() for item in analyze_sql_portability(query)]
 
-  `beam pipe --sql` warns with these when it exports Beam YAML (`--emit-yaml`)
-  or runs remotely, because the same query would fail in the remote dialect.
-  """
-  low = query.lower()
-  return [
-      fn for fn in _LOCAL_ONLY_SQL_FUNCTIONS
-      if re.search(r'\b' + fn + r'\s*\(', low)
-  ]
+
+def _normalize_sqlite_bool_comparisons(
+    sql_query: str, bool_cols: set[str]) -> str:
+  """Coerces `bool_col = 'true'|'false'` to `1|0` for SQLite INTEGER booleans."""
+  if not bool_cols:
+    return sql_query
+  segs = list(_scan_sql_outside_literals(sql_query))
+  out: list[str] = []
+  lhs_re = re.compile(
+      r'(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?([A-Za-z_][A-Za-z0-9_]*)'
+      r'\s*(?:=|==|!=|<>|\bIS(?:\s+NOT)?)\s*$',
+      re.I)
+  op_only_re = re.compile(r'^\s*(?:=|==|!=|<>|\bIS(?:\s+NOT)?)\s*$', re.I)
+  rhs_re = re.compile(
+      r'^\s*(?:=|==|!=|<>)\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?'
+      r'([A-Za-z_][A-Za-z0-9_]*)\b',
+      re.I)
+  rhs_op_re = re.compile(
+      r'^\s*(?:=|==|!=|<>)\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*\.\s*)?$')
+
+  for idx, (is_code, seg) in enumerate(segs):
+    if (not is_code and len(seg) >= 2 and seg[0] == "'" and seg[-1] == "'"):
+      inner = seg[1:-1].replace("''", "'").strip().lower()
+      if inner in ('true', 'false'):
+        bit = '1' if inner == 'true' else '0'
+        matched = False
+        if idx > 0 and segs[idx - 1][0]:
+          m_l = lhs_re.search(segs[idx - 1][1])
+          if m_l and m_l.group(1).lower() in bool_cols:
+            matched = True
+          elif (idx >= 2 and not segs[idx - 2][0] and
+                segs[idx - 2][1][:1] in ('"', '`') and
+                op_only_re.fullmatch(segs[idx - 1][1])):
+            unq = segs[idx - 2][1][1:-1].strip().lower()
+            if unq in bool_cols:
+              matched = True
+        if not matched and idx + 1 < len(segs) and segs[idx + 1][0]:
+          m_r = rhs_re.match(segs[idx + 1][1])
+          if m_r and m_r.group(1).lower() in bool_cols:
+            matched = True
+          elif (idx + 2 < len(segs) and not segs[idx + 2][0] and
+                segs[idx + 2][1][:1] in ('"', '`') and
+                rhs_op_re.fullmatch(segs[idx + 1][1])):
+            unq = segs[idx + 2][1][1:-1].strip().lower()
+            if unq in bool_cols:
+              matched = True
+        if matched:
+          out.append(bit)
+          continue
+    out.append(seg)
+  return ''.join(out)
 
 
 # Local `--sql` engines. SQLite ships with Python; DuckDB is optional
@@ -1354,6 +1437,8 @@ def run_in_memory_sql(
     _register_scalar_functions(conn)
     used_lower: set[str] = set()
     first_alias: str | None = None
+    bool_cols: set[str] = set()
+    non_bool_cols: set[str] = set()
 
     for ns in named_sources:
       cols, rows, raw_cnt = load_endpoint_rows(
@@ -1372,6 +1457,12 @@ def run_in_memory_sql(
       conn.execute(f'CREATE TABLE {t_ident} ({col_defs})')
       if rows:
         col_names = [cn for cn, _ in cols]
+        for cn in col_names:
+          non_null_vals = [r.get(cn) for r in rows if r.get(cn) is not None]
+          if non_null_vals and all(isinstance(v, bool) for v in non_null_vals):
+            bool_cols.add(cn.lower())
+          elif non_null_vals:
+            non_bool_cols.add(cn.lower())
         placeholders = ', '.join('?' for _ in col_names)
         col_list_sql = ', '.join(_quote_ident(cn) for cn in col_names)
         batch = [
@@ -1384,6 +1475,10 @@ def run_in_memory_sql(
       used_lower.add(ns.alias.lower())
       if first_alias is None:
         first_alias = ns.alias
+
+    pure_bool_cols = bool_cols - non_bool_cols
+    if pure_bool_cols:
+      clean_q = _normalize_sqlite_bool_comparisons(clean_q, pure_bool_cols)
 
     # Register Beam SQL `PCOLLECTION` and `source` views on the primary input
     # (plus common single-table aliases `data`, `t`, `tbl`, `input` when unary).
