@@ -1,21 +1,22 @@
 ---
 name: apache-beam-cli
-description: Pre-flight dataset diff reconciliation, verified data movement with row-count proofs (--assert-counts), dead-letter quarantine (--dlq), data quality expectations (--expect), enterprise orchestration export (beam export-schedule), and sub-second local in-process execution across files, lakehouses (Delta Lake, Apache Iceberg), BigQuery, Cloud SQL, and streams (Pub/Sub, Kafka), with safe graduation to Google Cloud Dataflow.
+description: Pre-flight dataset diff reconciliation, pre-flight schema contract guard (beam schema diff), verified data movement with row-count proofs (--assert-counts), dead-letter quarantine (--dlq), data quality expectations (--expect), enterprise orchestration export (beam export-schedule), and sub-second local in-process execution across files, lakehouses (Delta Lake, Apache Iceberg), BigQuery, Cloud SQL, and streams (Pub/Sub, Kafka), with safe graduation to Google Cloud Dataflow.
 ---
 
 # Apache Beam CLI (`beam`) Skill
 
-Use `beam` for universal data movement, verified dataset diff reconciliation, dead-letter quarantine (`--dlq`), data quality assertions (`--expect`), mathematical row-conservation proofs (`--assert-counts`), stream peeking, zero-copy lakehouse registration, Zero-Docker Dataflow Flex Template packaging (`beam package`), and enterprise orchestration export (`beam export-schedule`).
+Use `beam` for universal data movement, verified dataset diff reconciliation, pre-flight schema contract guard (`beam schema diff`), dead-letter quarantine (`--dlq`), data quality assertions (`--expect`), mathematical row-conservation proofs (`--assert-counts`), stream peeking, zero-copy lakehouse registration, Zero-Docker Dataflow Flex Template packaging (`beam package`), and enterprise orchestration export (`beam export-schedule`).
 
 ## Package & Maturity Status
 - **Package**: `apache-beam-cli-preview` v0.2.0 (`pip install apache-beam-cli-preview`)
 - **Upstream Scope vs. Preview Capabilities**:
   - **Core Apache Beam (issue #40891)**: `beam run <pipeline.yaml>` and foundational `beam pipe` for single-format file conversions.
-  - **Preview Package (`apache-beam-cli-preview`)**: Adds fast local in-process execution (`local_fast`, `local_sql`), cross-system reconciliation (`beam diff`), stream peeking (`beam tail`), Delta Lake <-> Apache Iceberg v2 bridging, row-count proofs (`--assert-counts`), dead-letter quarantine (`--dlq`), data quality expectations (`--expect`), pre-flight scan cost guardrails (`--max-bytes`), Zero-Docker Flex Template packaging (`beam package`), and orchestration export (`beam export-schedule`).
+  - **Preview Package (`apache-beam-cli-preview`)**: Adds fast local in-process execution (`local_fast`, `local_sql`), cross-system reconciliation (`beam diff`), pre-flight schema contract guard (`beam schema diff`), stream peeking (`beam tail`), Delta Lake <-> Apache Iceberg v2 bridging, row-count proofs (`--assert-counts`), dead-letter quarantine (`--dlq`), data quality expectations (`--expect`), pre-flight scan cost guardrails (`--max-bytes`), Zero-Docker Flex Template packaging (`beam package`), and orchestration export (`beam export-schedule`).
 
 ## When to Use `beam` vs. Other Tool Categories
 - **Use `beam` (Cross-Engine Reconciliation, Guardrailed ETL, & Cloud Graduation)**:
   - **Reconciliation & Diffing (`beam diff`)**: Proving data migration accuracy between source and target systems (e.g., Delta Lake vs BigQuery, Parquet vs Iceberg) with key-level diffs, multiset hashes, and schema comparisons without writing custom diff scripts.
+  - **Pre-Flight Schema Contract Guard (`beam schema diff`)**: Comparing source and target schemas pre-flight to catch type narrowing, dropped required columns, and nullability mismatches before submitting compute to Google Cloud Dataflow or portable runners.
   - **Guardrailed Data Movement (`beam pipe`)**: Moving, cleaning, and transforming data with mandatory row-conservation proofs (`--assert-counts`), quarantine capture (`--dlq`), and data quality expectations (`--expect`).
   - **Data Quality Expectations (`--expect`)**: Asserting row-level business rules at scale with fine-grained violation actions (`--on-violation dlq|drop|fail`) and live Google Cloud Dataflow monitoring counters (`expectation_passed_*`, `expectation_quarantined_*`, `expectation_dropped_*`).
   - **Enterprise Orchestration Export (`beam export-schedule`)**: Exporting verified pipelines into production-ready Cloud Composer (Airflow) DAGs (`DataflowStartFlexTemplateOperator`) or serverless Cloud Scheduler HTTP triggers.

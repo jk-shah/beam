@@ -271,3 +271,39 @@ beam pipe --from delta://gs://my-lakehouse/orders_delta \
           --json
 ```
 
+---
+
+## 10. Pre-Flight Schema Contract & Compatibility Guard (`beam schema diff`)
+
+Detect schema regressions, dropped columns, and incompatible type coercions **before** launching distributed compute on Dataflow:
+```bash
+# Validate that source Parquet schema safely maps to target BigQuery table
+beam schema diff gs://my-bucket/raw/orders_v2.parquet \
+                 bigquery://my-proj.analytics.orders \
+                 --mode=backward \
+                 --json
+```
+
+### Compatibility Modes
+- `BACKWARD` (default): Source can be safely written to target. Target may contain additional nullable columns. Source cannot drop non-nullable target columns or narrow column data types.
+- `FORWARD`: Readers expecting older schemas can read new source datasets without failure.
+- `FULL`: Enforces strict bidirectional compatibility across both source and target.
+
+### Detected Violations & Risk Classification
+- **`DROPPED_REQUIRED_COLUMN`**: Target schema requires a non-null column that the source does not provide (Exits with code `2`).
+- **`TYPE_NARROWING_ERROR`**: Unsafe type coercion that causes fractional precision loss, integer overflow, or runtime parse errors (e.g. `STRING` $\to$ `INT64`, `FLOAT64` $\to$ `INT32`).
+- **`NULLABILITY_MISMATCH`**: Source column allows `NULL`, but target table constraint is `REQUIRED`.
+- **`SAFE_TYPE_WIDENING`**: Safe type expansions (e.g. `INT32` $\to$ `INT64`, `FLOAT32` $\to$ `FLOAT64`) are logged as informational warnings under standard execution, or flagged as violations under `--strict`.
+
+### Actionable Remediation Hints
+When contract violations are detected, `beam schema diff` outputs concrete command remediation hints:
+```json
+{
+  "action": "explicit_type_cast",
+  "field": "customer_id",
+  "command_hint": "--select \"CAST(customer_id AS INT64) AS customer_id, *\"",
+  "description": "Explicitly cast column 'customer_id' to INT64 before writing."
+}
+```
+
+

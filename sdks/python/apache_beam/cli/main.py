@@ -140,6 +140,7 @@ _SUBCOMMANDS = frozenset([
     'cancel',
     'package',
     'export-schedule',
+    'schema',
 ])
 _PASSTHROUGH_SUBCOMMANDS = frozenset(['run', 'pipe', 'diff', 'check'])
 _CLI_ZERO_FLAGS = {
@@ -192,6 +193,7 @@ _CLI_ZERO_FLAGS = {
         '--no-config',
         '--help',
     ]),
+    'schema': frozenset(['--strict', '--verbose', '--no-config', '--help']),
 }
 _CLI_ONE_FLAGS = {
     None: frozenset(['--output']),
@@ -301,6 +303,15 @@ _CLI_ONE_FLAGS = {
         '--retry-delay-min',
         '--profile',
     ]),
+    'schema': frozenset([
+        '--mode',
+        '--source-format',
+        '--target-format',
+        '--source-opt',
+        '--target-opt',
+        '--project',
+        '--profile',
+    ]),
 }
 
 
@@ -373,8 +384,11 @@ def _extract_global_flags(
 
 
 def _normalize_cli_argv(argv: list[str]) -> list[str]:
+  res = list(argv)
+  if res and res[0] == 'schema' and len(res) > 1 and res[1] not in ('diff', 'check', '-h', '--help'):
+    res.insert(1, 'diff')
   return _option_arity.normalize_argv(
-      argv,
+      res,
       subcommands=_SUBCOMMANDS,
       passthrough_subcommands=_PASSTHROUGH_SUBCOMMANDS,
       cli_zero_flags_by_cmd=_CLI_ZERO_FLAGS,
@@ -492,6 +506,8 @@ def main(argv=None) -> int:
         return _package(args, extra_args, json_session=json_session, t0=t0)
       if active_cmd == 'export-schedule':
         return _export_schedule(args, extra_args, json_session=json_session, t0=t0)
+      if active_cmd == 'schema':
+        return _schema(args, extra_args, json_session=json_session, t0=t0)
 
       # External plugin dispatch (`apache_beam.cli.plugins`).
       from . import llms_txt as llms_mod
@@ -1359,6 +1375,65 @@ def _build_parser():
       metavar='MINUTES',
       help='delay in minutes between retries (default: 5)')
   _add_config_selection_args(sched_p)
+
+  # 15. `beam schema`
+  schema_p = commands.add_parser(
+      'schema',
+      help='pre-flight schema contract and compatibility comparison across endpoints',
+      allow_abbrev=False)
+  schema_sub = schema_p.add_subparsers(dest='schema_action', required=False)
+
+  # `beam schema diff <source> <target>`
+  schema_diff_p = schema_sub.add_parser(
+      'diff',
+      help='compare source and target schemas for compatibility and drift',
+      allow_abbrev=False)
+  schema_diff_p.add_argument('source', help='source dataset URI or file path')
+  schema_diff_p.add_argument('target', help='target dataset URI or file path')
+  schema_diff_p.add_argument(
+      '--mode',
+      choices=['backward', 'forward', 'full', 'BACKWARD', 'FORWARD', 'FULL'],
+      default='BACKWARD',
+      help='schema compatibility mode (default: BACKWARD)')
+  schema_diff_p.add_argument(
+      '--strict',
+      action='store_true',
+      help='reject safe type widening and extra source columns')
+  schema_diff_p.add_argument('--source-format', help='explicit source format')
+  schema_diff_p.add_argument('--target-format', help='explicit target format')
+  schema_diff_p.add_argument(
+      '--source-opt', action='append', dest='source_opts', help='key=val option for source')
+  schema_diff_p.add_argument(
+      '--target-opt', action='append', dest='target_opts', help='key=val option for target')
+  schema_diff_p.add_argument('--project', help='default GCP project for BigQuery/BigLake')
+  _add_config_selection_args(schema_diff_p)
+
+  # `beam schema check <source> <target>` (alias for diff)
+  schema_check_p = schema_sub.add_parser(
+      'check',
+      help='alias for schema diff; validates schema contract pre-flight',
+      allow_abbrev=False)
+  schema_check_p.add_argument('source', help='source dataset URI or file path')
+  schema_check_p.add_argument('target', help='target dataset URI or file path')
+  schema_check_p.add_argument(
+      '--mode',
+      choices=['backward', 'forward', 'full', 'BACKWARD', 'FORWARD', 'FULL'],
+      default='BACKWARD',
+      help='schema compatibility mode (default: BACKWARD)')
+  schema_check_p.add_argument(
+      '--strict',
+      action='store_true',
+      help='reject safe type widening and extra source columns')
+  schema_check_p.add_argument('--source-format', help='explicit source format')
+  schema_check_p.add_argument('--target-format', help='explicit target format')
+  schema_check_p.add_argument(
+      '--source-opt', action='append', dest='source_opts', help='key=val option for source')
+  schema_check_p.add_argument(
+      '--target-opt', action='append', dest='target_opts', help='key=val option for target')
+  schema_check_p.add_argument('--project', help='default GCP project for BigQuery/BigLake')
+  _add_config_selection_args(schema_check_p)
+  _add_config_selection_args(schema_p)
+
   return parser
 
 
@@ -1833,6 +1908,79 @@ def _export_schedule(args, extra_args, *, json_session, t0: float) -> int:
     else:
       print(report.content)
   return EXIT_OK
+
+
+def _schema(args, extra_args, *, json_session, t0: float) -> int:
+  from . import schema as schema_mod
+  _reject_extra_args(extra_args)
+  source = getattr(args, 'source', None)
+  target = getattr(args, 'target', None)
+  if not source or not target:
+    raise _CliError(
+        'usage: beam schema diff <SOURCE> <TARGET> [--mode=backward|forward|full] [--strict]',
+        EXIT_USAGE)
+
+  cfg_args = _resolve_config_args(args, [])
+  eff_project = args.project or _extract_opt_from_resolved(cfg_args, '--project')
+
+  mode = getattr(args, 'mode', 'BACKWARD') or 'BACKWARD'
+  strict = bool(getattr(args, 'strict', False))
+  source_fmt = getattr(args, 'source_format', None)
+  target_fmt = getattr(args, 'target_format', None)
+  source_opts = getattr(args, 'source_opts', None)
+  target_opts = getattr(args, 'target_opts', None)
+
+  try:
+    res = schema_mod.run_schema_diff(
+        source,
+        target,
+        mode=mode,
+        strict=strict,
+        source_format=source_fmt,
+        target_format=target_fmt,
+        source_opts=source_opts,
+        target_opts=target_opts,
+        default_project=eff_project)
+  except ValueError as e:
+    raise _CliError(str(e), EXIT_USAGE) from None
+  except Exception as e:  # pylint: disable=broad-except
+    raise _CliError(f'schema diff failed: {e}', EXIT_PIPELINE_FAILED) from None
+
+  is_compat = res['compatible']
+  exit_code = EXIT_OK if is_compat else EXIT_USAGE
+
+  if json_session.enabled:
+    json_session.emit(
+        output.build_envelope(
+            ok=is_compat,
+            command='schema-diff',
+            exit_code=exit_code,
+            duration_ms=int((time.monotonic() - t0) * 1000),
+            outputs=res,
+            next_actions=res.get('next_actions') or []))
+  else:
+    status_label = 'COMPATIBLE' if is_compat else 'INCOMPATIBLE'
+    print(f"Schema Contract Status: {status_label} (mode: {res['compatibility_mode']})")
+    print(f"Source: {source} ({len(res['source_columns'])} columns)")
+    print(f"Target: {target} ({len(res['target_columns'])} columns)")
+    if res['diff']['columns_added']:
+      print(f"  + Added in source ({len(res['diff']['columns_added'])}): {', '.join(res['diff']['columns_added'])}")
+    if res['diff']['columns_missing']:
+      print(f"  - Missing in source ({len(res['diff']['columns_missing'])}): {', '.join(res['diff']['columns_missing'])}")
+    if res['violations']:
+      print(f"\nContract Violations ({len(res['violations'])}):")
+      for v in res['violations']:
+        print(f"  [ERROR] {v['field']}: {v['issue']} - {v['description']}")
+    if res['warnings']:
+      print(f"\nWarnings / Safe Evolutions ({len(res['warnings'])}):")
+      for w in res['warnings']:
+        print(f"  [WARN] {w['field']}: {w['issue']} - {w['description']}")
+    if res.get('next_actions'):
+      print(f"\nSuggested Next Actions:")
+      for act in res['next_actions']:
+        print(f"  * {act['description']}: {act.get('command_hint')}")
+
+  return exit_code
 
 
 def _check(args, extra_args, *, json_session, t0: float) -> int:
