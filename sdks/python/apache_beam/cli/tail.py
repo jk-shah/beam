@@ -236,6 +236,7 @@ def run_tail(
     follow: bool = False,
     poll_interval: float = 0.5,
     max_scanned_bytes: str = '64MB',
+    explicit_format: str | None = None,
     from_opts: list[str] | None = None,
     default_project: str | None = None,
     on_record: RecordCallback | None = None,
@@ -249,12 +250,29 @@ def run_tail(
 
   try:
     parsed_opts = uris.parse_kv_options(from_opts, None, '--from-opt')
-    ep = uris.parse_endpoint(
-        location,
-        is_read=True,
-        options=parsed_opts,
-        default_project=default_project,
-        allow_sniff=True)
+    try:
+      ep = uris.parse_endpoint(
+          location,
+          is_read=True,
+          explicit_format=explicit_format,
+          options=parsed_opts,
+          default_project=default_project,
+          allow_sniff=True)
+    except uris.UriError as e:
+      scheme, _ = uris.split_scheme(location)
+      if (follow and not explicit_format and scheme in ('', 'gs') and
+          'cannot tell the format' in str(e)):
+        # Allow `beam tail -f` on empty, not-yet-created, or directory targets
+        # (for example `/var/log/messages` after rotation or log dirs).
+        ep = uris.parse_endpoint(
+            location,
+            is_read=True,
+            explicit_format='text',
+            options=parsed_opts,
+            default_project=default_project,
+            allow_sniff=True)
+      else:
+        raise
   except uris.UriError as e:
     raise TailError(str(e), 2) from None
 
@@ -304,6 +322,7 @@ def run_tail(
     eff_limit = 5 if limit is None else limit
     inspected = inspect_cmd.run_inspect(
         location,
+        explicit_format=explicit_format,
         sample_count=eff_limit,
         max_scanned_bytes=max_scanned_bytes,
         from_opts=from_opts,
@@ -825,7 +844,13 @@ def _tail_files_follow(
       saw_data = False
       for uri_item, sz in targets:
         prev_off = offsets.get(uri_item, 0)
+        if sz < prev_off and not uri_item.startswith('gs://'):
+          # Handle copytruncate / rotated local log files cleanly.
+          prev_off = 0
+          offsets[uri_item] = 0
         if sz <= prev_off:
+          if sz == 0:
+            offsets[uri_item] = 0
           continue
         lower = uri_item.lower()
         is_binary_columnar = (

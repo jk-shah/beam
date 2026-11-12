@@ -96,6 +96,28 @@ class UrisTest(unittest.TestCase):
     self.assertEqual(ep.format, 'parquet')
     self.assertEqual(ep.yaml_type, 'ReadFromParquet')
 
+  def test_log_extension_and_plain_text_sniffing(self):
+    tmp = tempfile.mkdtemp()
+    self.addCleanup(shutil.rmtree, tmp)
+
+    log_ep = uris.parse_endpoint(
+        os.path.join(tmp, 'service.log'), is_read=True, allow_sniff=True)
+    self.assertEqual(log_ep.format, 'text')
+    self.assertEqual(log_ep.yaml_type, 'ReadFromText')
+
+    syslog = os.path.join(tmp, 'messages')
+    with open(syslog, 'w', encoding='utf-8') as f:
+      f.write('Nov 12 14:40:00 host kernel: [12.34] initialized\n')
+    text_ep = uris.parse_endpoint(syslog, is_read=True, allow_sniff=True)
+    self.assertEqual(text_ep.format, 'text')
+    self.assertEqual(text_ep.yaml_type, 'ReadFromText')
+
+    binary_blob = os.path.join(tmp, 'raw_binary')
+    with open(binary_blob, 'wb') as f:
+      f.write(b'\x7fELF\x02\x01\x01\x00\x00\x00')
+    with self.assertRaisesRegex(UriError, 'cannot tell the format'):
+      uris.parse_endpoint(binary_blob, is_read=True, allow_sniff=True)
+
 
 if __name__ == '__main__':
   unittest.main()

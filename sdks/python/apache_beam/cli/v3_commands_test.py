@@ -1275,6 +1275,111 @@ class InspectCheckIoDoctorTailJobsTest(unittest.TestCase):
       fake_topic_sub.acknowledge.assert_called_once()
       fake_topic_sub.delete_subscription.assert_called_once()
 
+  def test_tail_extensionless_syslog_and_rotated_log(self):
+    import threading
+    import time as time_mod
+
+    # 1. Existing extensionless `/var/log/messages`-style file: snapshot + `-f`.
+    syslog = os.path.join(self.tmp, 'messages')
+    with open(syslog, 'w', encoding='utf-8') as f:
+      f.write('Nov 12 14:40:00 host kernel: existing boot line\n')
+
+    peek_buf = io.StringIO()
+    with contextlib.redirect_stdout(peek_buf), contextlib.redirect_stderr(
+        io.StringIO()):
+      rc_peek = cli.main(['tail', '-n', '1', syslog, '--json'])
+    self.assertEqual(rc_peek, cli.EXIT_OK)
+    peek_env = json.loads(peek_buf.getvalue().strip())
+    self.assertEqual(peek_env['outputs']['sampled_count'], 1)
+    self.assertEqual(
+        peek_env['untrusted_data']['rows'][0]['line'],
+        'Nov 12 14:40:00 host kernel: existing boot line')
+
+    def _append_syslog():
+      time_mod.sleep(0.15)
+      with open(syslog, 'a', encoding='utf-8') as wf:
+        wf.write('Nov 12 14:40:01 host sshd[42]: accepted key\n')
+        wf.flush()
+      time_mod.sleep(0.1)
+      with open(syslog, 'a', encoding='utf-8') as wf:
+        wf.write('Nov 12 14:40:02 host cron[99]: job ok\n')
+        wf.flush()
+
+    t1 = threading.Thread(target=_append_syslog, daemon=True)
+    t1.start()
+    out_buf = io.StringIO()
+    with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(
+        io.StringIO()):
+      rc_follow = cli.main([
+          'tail', '-f', '-n', '2', '--poll-interval', '0.05', '--duration', '5s',
+          syslog, '--json'
+      ])
+    t1.join(timeout=2.0)
+    self.assertEqual(rc_follow, cli.EXIT_OK)
+    ev = [
+        json.loads(ln) for ln in out_buf.getvalue().strip().splitlines() if ln.strip()
+    ]
+    self.assertEqual(len(ev), 3)
+    self.assertEqual(
+        ev[0]['record']['line'], 'Nov 12 14:40:01 host sshd[42]: accepted key')
+    self.assertEqual(ev[0]['record']['source'], syslog)
+    self.assertEqual(
+        ev[1]['record']['line'], 'Nov 12 14:40:02 host cron[99]: job ok')
+
+    # 2. Empty file (`0` bytes), log truncation/rotation, and `--from-format text`.
+    rotated = os.path.join(self.tmp, 'daemon_out')
+    with open(rotated, 'w', encoding='utf-8') as f:
+      f.write('initial long line before logrotate ' + ('X' * 120) + '\n')
+
+    empty_log = os.path.join(self.tmp, 'empty_app_log')
+    with open(empty_log, 'w', encoding='utf-8') as f:
+      f.write('')
+
+    def _rotate_writer():
+      time_mod.sleep(0.15)
+      # Copytruncate rotation: shrink to 0 then write a shorter new line.
+      with open(rotated, 'w', encoding='utf-8') as wf:
+        wf.write('post-rotate line 1\n')
+        wf.flush()
+
+    t2 = threading.Thread(target=_rotate_writer, daemon=True)
+    t2.start()
+    rot_buf = io.StringIO()
+    with contextlib.redirect_stdout(rot_buf), contextlib.redirect_stderr(
+        io.StringIO()):
+      rc_rot = cli.main([
+          'tail', '-f', '-n', '1', '--poll-interval', '0.05', '--duration', '5s',
+          rotated, '--json'
+      ])
+    t2.join(timeout=2.0)
+    self.assertEqual(rc_rot, cli.EXIT_OK)
+    rot_ev = [
+        json.loads(ln) for ln in rot_buf.getvalue().strip().splitlines() if ln.strip()
+    ]
+    self.assertEqual(rot_ev[0]['record']['line'], 'post-rotate line 1')
+
+    def _empty_writer():
+      time_mod.sleep(0.15)
+      with open(empty_log, 'a', encoding='utf-8') as wf:
+        wf.write('first line after empty start\n')
+        wf.flush()
+
+    t3 = threading.Thread(target=_empty_writer, daemon=True)
+    t3.start()
+    empty_buf = io.StringIO()
+    with contextlib.redirect_stdout(empty_buf), contextlib.redirect_stderr(
+        io.StringIO()):
+      rc_empty = cli.main([
+          'tail', '-f', '-n', '1', '--poll-interval', '0.05', '--duration', '5s',
+          '--from-format', 'text', empty_log, '--json'
+      ])
+    t3.join(timeout=2.0)
+    self.assertEqual(rc_empty, cli.EXIT_OK)
+    empty_ev = [
+        json.loads(ln) for ln in empty_buf.getvalue().strip().splitlines() if ln.strip()
+    ]
+    self.assertEqual(empty_ev[0]['record']['line'], 'first line after empty start')
+
   def test_delta_and_iceberg_zero_copy_inspect_cost_guard_and_diff(self):
     import pyarrow as pa
     import pyarrow.parquet as pq

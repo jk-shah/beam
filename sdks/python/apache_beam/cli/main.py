@@ -1138,6 +1138,10 @@ def _build_parser():
       metavar='SIZE',
       help='byte cap for sampled payloads (default: 64MB)')
   tail_p.add_argument(
+      '--from-format',
+      metavar='FMT',
+      help='source file format override (csv, json, jsonl, parquet, avro, text)')
+  tail_p.add_argument(
       '--from-opt',
       dest='from_opts',
       action='append',
@@ -1852,6 +1856,7 @@ def _tail(args, extra_args, *, json_session, t0: float) -> int:
         follow=follow,
         poll_interval=args.poll_interval,
         max_scanned_bytes=args.max_scanned_bytes,
+        explicit_format=args.from_format,
         from_opts=args.from_opts,
         default_project=args.project,
         on_record=on_record)

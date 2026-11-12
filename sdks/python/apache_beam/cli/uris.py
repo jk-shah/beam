@@ -83,10 +83,36 @@ EXTENSIONS = {
     '.csv': 'csv',
     '.json': 'json',
     '.jsonl': 'json',
+    '.log': 'text',
     '.parquet': 'parquet',
     '.avro': 'avro',
     '.txt': 'text',
 }
+
+
+def _looks_like_utf8_text(sample: bytes) -> bool:
+  """Returns True when `sample` looks like UTF-8 plain text/log content."""
+  if not sample or b'\x00' in sample:
+    return False
+  trimmed = sample
+  if len(trimmed) == 512:
+    # Avoid rejecting valid UTF-8 whose final multi-byte code point is split.
+    for _ in range(3):
+      if trimmed and (trimmed[-1] & 0xC0) == 0x80:
+        trimmed = trimmed[:-1]
+      else:
+        break
+    if trimmed and trimmed[-1] >= 0xC0:
+      trimmed = trimmed[:-1]
+  try:
+    text = trimmed.decode('utf-8')
+  except UnicodeDecodeError:
+    return False
+  if not text:
+    return False
+  return all(
+      ch in '\t\n\r\x0b\x0c\x1b' or (ord(ch) >= 32 and ord(ch) != 127)
+      for ch in text)
 
 _SHARD_OR_GLOB_SUFFIX = re.compile(r'(-\d+-of-\d+|[-*?])+$')
 _SECRET_KEY_RE = re.compile(
@@ -125,34 +151,34 @@ def local_format_groups(path: str) -> dict[str, list[str]]:
 
 
 def sniff_file_format(path: str) -> str | None:
-  """Sniffs `PAR1` / `Obj\\x01` / JSON magic bytes on extensionless shards."""
+  """Sniffs `PAR1` / `Obj\\x01` / JSON / plain UTF-8 text on shards."""
   try:
     if '://' not in path:
       import glob as _glob
       candidates = sorted(
           p for p in _glob.glob(path) if os.path.isfile(p) and
-          os.path.getsize(p) >= 4)
+          os.path.getsize(p) > 0)
       if not candidates and not any(c in path for c in '*?['):
         candidates = [
             p for p in sorted(_glob.glob(_glob.escape(path) + '*'))
-            if os.path.isfile(p) and os.path.getsize(p) >= 4
+            if os.path.isfile(p) and os.path.getsize(p) > 0
         ]
       if not candidates:
         return None
       with open(candidates[0], 'rb') as f:
-        head = f.read(64)
+        head = f.read(512)
         # Parquet also ends with PAR1, and starts with PAR1.
     else:
       from apache_beam.io.filesystems import FileSystems
       pattern = path if any(c in path for c in '*?[') else path + '*'
       matches = [
           m for m in FileSystems.match([pattern])[0].metadata_list
-          if m.size_in_bytes >= 4
+          if m.size_in_bytes > 0
       ]
       if not matches:
         return None
       with FileSystems.open(matches[0].path) as f:
-        head = f.read(64)
+        head = f.read(512)
   except Exception:  # pylint: disable=broad-except
     return None
 
@@ -170,6 +196,9 @@ def sniff_file_format(path: str) -> str | None:
     if ext in EXTENSIONS:
       ext_fmt = EXTENSIONS[ext]
       return 'json' if ext_fmt == 'jsonl' else ext_fmt
+
+  if _looks_like_utf8_text(head):
+    return 'text'
 
   return None
 
@@ -669,7 +698,7 @@ def parse_endpoint(
           f'cannot tell the format of {location!r} (no known file extension)\n'
           f'  add {flag_hint}, for example: {flag_hint} json{jinja_hint}')
     if fmt not in FILE_FORMATS:
-      valid = ', '.join(k for k in ('csv', 'json', 'parquet', 'avro'))
+      valid = ', '.join(k for k in ('csv', 'json', 'parquet', 'avro', 'text'))
       raise UriError(
           f'unsupported format {fmt!r} for {location!r}; use one of: {valid}')
     norm_fmt = 'json' if fmt == 'jsonl' else fmt

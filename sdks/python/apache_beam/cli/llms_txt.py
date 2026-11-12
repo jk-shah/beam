@@ -52,10 +52,12 @@ def render_llms_txt() -> str:
 ## 2. Subcommands
 - `beam inspect <URI> [--sample N] [--stats] [--search STR] [--json]`
     Zero-runner `<200ms` schema, row count, byte estimate, and sanitized preview.
-- `beam tail [-f] [-n N] [-i|--interactive] <URI> [--duration 5s] [--max-scanned-bytes 64MB] [--json]`
+- `beam tail [-f] [-n N] [-i|--interactive] [--from-format FMT] <URI> [--duration 5s] [--max-scanned-bytes 64MB] [--json]`
     Non-destructive bounded stream peek (default `5s` / `-n 5` for agents) or live
     follow (`-f` / `--follow` like Unix `tail -f`, streaming NDJSON across
-    `pubsub://`, `kafka://`, `delta://`, `iceberg://`, and local/`gs://` files).
+    `pubsub://`, `kafka://`, `delta://`, `iceberg://`, and local/`gs://` files
+    including append-only `.log` / extensionless plain-text logs such as `/var/log/messages`;
+    for continuous production `beam pipe` pipelines, ingest via `pubsub://` or `kafka://`).
     Pass `-i` / `--interactive` for terminal TUI with live msg/s throughput and field highlighting.
 - `beam catalog sync --from URI --to URI [--format parquet|delta|iceberg] [--table-name NAME] [--partition-col COL] [--dry-run] [--json]`
     Zero-copy Lakehouse catalog synchronization in `<200ms`. Translates Delta Lake transaction
