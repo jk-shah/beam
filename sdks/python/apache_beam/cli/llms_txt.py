@@ -69,9 +69,9 @@ def render_llms_txt() -> str:
     SQL joins & aggregations (`--sql "SELECT ..."` across CSV, Parquet, JSONL,
     text `.txt` (`Row(line: str)`), mixed-format directory globs like `data/*`,
     `delta://`, and `iceberg://` in `<100ms` locally or `type: Sql` on Dataflow;
-    `--join` is accepted as an alias for repeating `--from`), apply event-time windowing
-    (`--window fixed:60s`, `sliding:5m,1m`, `session:30m` with `--timestamp-col COL`; `--window-size` is accepted),
-    correlate event streams with declarative interval joins and watermark skew circuit breaking (`--max-watermark-skew 30m`),
+    `--join` is accepted as an alias for repeating `--from` or as the right stream for `--interval-join`),
+    apply event-time windowing (`--window fixed:60s`, `sliding:5m,1m`, `session:30m` with `--timestamp-col COL`; `--window-size` is accepted),
+    correlate event streams with declarative interval joins (`--from o=URI --join s=URI --interval-join "key=id,left_time=o_ts,right_time=s_ts,lower=0s,upper=15m,type=left"` or 2-source SQL `BETWEEN ... INTERVAL`) and watermark skew circuit breaking (`--max-watermark-skew 30m --skew-action dlq|drop|warn|fail`),
     enforce data quality rules (`--expect "rule: expr -> dlq|drop|fail"`), run pre-flight
     schema contract comparison (`--check-schema`), quarantine dirty rows (`--dlq` or `--dead-letter-target`),
     drop invalid rows (`--drop-bad` / `--skip-errors`), enforce scan budget (`--max-bytes`), verify

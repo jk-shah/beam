@@ -187,15 +187,606 @@ def validate_readonly_select_sql(
   return q
 
 
+def _unquote_sql_ident(ident: str) -> str:
+  s = ident.strip()
+  if len(s) >= 2 and s[0] in ('"', '`') and s[-1] == s[0]:
+    return s[1:-1].replace(s[0] * 2, s[0]).strip()
+  return s
+
+
+def _split_top_level_sql_and(clause: str) -> list[str]:
+  """Splits a SQL boolean expression on top-level `AND`, preserving `BETWEEN ... AND`."""
+  parts: list[str] = []
+  cur: list[str] = []
+  depth = 0
+  in_between = False
+  token_re = re.compile(r'(\(|\)|\bBETWEEN\b|\bAND\b|\bOR\b)', re.I)
+
+  for is_code, seg in _scan_sql_outside_literals(clause):
+    if not is_code:
+      cur.append(seg)
+      continue
+    pos = 0
+    for m in token_re.finditer(seg):
+      cur.append(seg[pos:m.start()])
+      tok = m.group(0)
+      up = tok.upper()
+      if tok == '(':
+        depth += 1
+        cur.append(tok)
+      elif tok == ')':
+        depth = max(0, depth - 1)
+        cur.append(tok)
+      elif depth == 0 and up == 'OR':
+        raise SqlPipeError(
+            'distributed temporal interval join does not support top-level OR '
+            'in ON (...); use --interval-join or split queries')
+      elif depth == 0 and up == 'BETWEEN':
+        in_between = True
+        cur.append(tok)
+      elif depth == 0 and up == 'AND':
+        if in_between:
+          in_between = False
+          cur.append(tok)
+        else:
+          piece = ''.join(cur).strip()
+          if piece:
+            parts.append(piece)
+          cur = []
+      else:
+        cur.append(tok)
+      pos = m.end()
+    cur.append(seg[pos:])
+  tail = ''.join(cur).strip()
+  if tail:
+    parts.append(tail)
+  return parts
+
+
+_SQL_TS_OFFSET_RE = re.compile(
+    r'^\s*(?P<alias>[A-Za-z0-9_"`]+)\s*\.\s*(?P<col>[A-Za-z0-9_"`]+)'
+    r'(?:\s*(?P<op>[+-])\s*INTERVAL\s+'
+    r'(?:[\'"](?P<qnum>[0-9.]+)\s*(?P<qunit>[A-Za-z]+)[\'"]'
+    r'|[\'"](?P<qnum2>[0-9.]+)[\'"]\s*(?P<qunit2>[A-Za-z]+)'
+    r'|(?P<num>[0-9.]+)\s*(?P<unit>[A-Za-z]+)))?\s*$',
+    re.I)
+
+
+def _parse_ts_offset_expr(expr: str) -> tuple[str, str, float] | None:
+  s = expr.strip()
+  while s.startswith('(') and s.endswith(')'):
+    inner = s[1:-1].strip()
+    # Verify outer parens are balanced
+    bal = 0
+    ok = True
+    for is_c, seg in _scan_sql_outside_literals(inner):
+      if not is_c:
+        continue
+      for ch in seg:
+        if ch == '(':
+          bal += 1
+        elif ch == ')':
+          bal -= 1
+          if bal < 0:
+            ok = False
+            break
+      if not ok:
+        break
+    if ok and bal == 0:
+      s = inner
+    else:
+      break
+  m = _SQL_TS_OFFSET_RE.match(s)
+  if not m:
+    return None
+  alias = _unquote_sql_ident(m.group('alias'))
+  col = _unquote_sql_ident(m.group('col'))
+  if not m.group('op'):
+    return (alias, col, 0.0)
+  sign = -1.0 if m.group('op') == '-' else 1.0
+  num_s = m.group('qnum') or m.group('qnum2') or m.group('num') or '0'
+  unit_s = m.group('qunit') or m.group('qunit2') or m.group('unit') or 's'
+  secs = _interval_unit_to_seconds(num_s, unit_s)
+  return (alias, col, sign * secs)
+
+
+def _format_seconds_duration(sec: float) -> str:
+  if float(sec).is_integer():
+    return f'{int(sec)}s'
+  return f'{sec}s'
+
+
+def _lower_temporal_interval_join_sql(
+    named_sources: list[NamedSource],
+    clean_q: str,
+    read_transforms: list[dict[str, Any]],
+    sql_inputs: dict[str, str],
+    sink_ep: uris.ParsedEndpoint | None,
+    *,
+    has_unbounded: bool,
+    max_watermark_skew: str | None = None,
+    skew_action: str | None = None,
+    dlq_ep: uris.ParsedEndpoint | None = None,
+    allow_jinja: bool = False,
+) -> dict[str, Any]:
+  """Fail-closed lowering of 2-source SQL interval joins onto `CliIntervalJoin`."""
+  from . import dlq
+  from . import expressions
+  from . import interval_join
+  from . import output
+
+  hint_suffix = (
+      '; for distributed interval joins use a single 2-source '
+      'SELECT ... FROM a [INNER|LEFT|RIGHT|FULL] JOIN b ON a.k = b.k '
+      "AND b.ts BETWEEN a.ts - INTERVAL '1' MINUTE AND a.ts + INTERVAL '15' MINUTE, "
+      'or pass --from a=URI --join b=URI --interval-join '
+      '"key=k,left_time=ts,right_time=ts,lower=-1m,upper=15m"')
+
+  rewritten_q = _rewrite_source_uri_table_refs(clean_q, named_sources)
+  code_only = ' '.join(
+      seg for is_c, seg in _scan_sql_outside_literals(rewritten_q) if is_c)
+  lead = code_only.lstrip('(').lstrip().split(
+      None, 1)[0].upper() if code_only.strip() else ''
+  if lead == 'WITH':
+    raise SqlPipeError(
+        'distributed SQL temporal interval joins do not support CTEs (WITH ...)'
+        + hint_suffix)
+  if len(named_sources) != 2 or len(re.findall(r'\bJOIN\b', code_only,
+                                               re.I)) != 1:
+    raise SqlPipeError(
+        'distributed SQL temporal interval join requires exactly 2 sources and '
+        f'1 JOIN (got {len(named_sources)} source(s))' + hint_suffix)
+  if re.search(r'\bCROSS\s+JOIN\b', code_only, re.I):
+    raise SqlPipeError(
+        'distributed SQL temporal interval join does not support CROSS JOIN' +
+        hint_suffix)
+  if re.search(
+      r'\b(?:GROUP\s+BY|HAVING|UNION|INTERSECT|EXCEPT|OVER|QUALIFY|ORDER\s+BY|LIMIT)\b',
+      code_only,
+      re.I):
+    raise SqlPipeError(
+        'distributed SQL temporal interval join cannot combine JOIN ... INTERVAL '
+        'with GROUP BY / ORDER BY / LIMIT / window analytics in one SQL step' +
+        hint_suffix)
+
+  clause_re = re.compile(
+      r'^\s*SELECT\s+(?P<select>.+?)\s+FROM\s+(?P<from_tbl>[A-Za-z0-9_"`]+)'
+      r'(?:\s+(?:AS\s+)?(?P<from_alias>(?!(?:INNER|LEFT|RIGHT|FULL|OUTER|JOIN)\b)[A-Za-z0-9_"`]+))?'
+      r'\s+(?P<jkind>(?:INNER|(?:LEFT|RIGHT|FULL)(?:\s+OUTER)?)\s+)?JOIN\s+'
+      r'(?P<join_tbl>[A-Za-z0-9_"`]+)'
+      r'(?:\s+(?:AS\s+)?(?P<join_alias>(?!(?:ON|WHERE)\b)[A-Za-z0-9_"`]+))?'
+      r'\s+ON\s+(?P<on_body>.+?)(?:\s+WHERE\s+(?P<where_body>.+))?\s*$',
+      re.I | re.S)
+  m = clause_re.match(rewritten_q)
+  if not m:
+    raise SqlPipeError(
+        'could not lower complex SQL temporal join safely for distributed '
+        'execution' + hint_suffix)
+
+  by_alias_low = {ns.alias.lower(): ns for ns in named_sources}
+  from_tbl = _unquote_sql_ident(m.group('from_tbl'))
+  join_tbl = _unquote_sql_ident(m.group('join_tbl'))
+  left_ns = by_alias_low.get(from_tbl.lower())
+  right_ns = by_alias_low.get(join_tbl.lower())
+  if left_ns is None or right_ns is None or left_ns.alias == right_ns.alias:
+    raise SqlPipeError(
+        f'SQL JOIN tables ({from_tbl!r}, {join_tbl!r}) must match the two '
+        f'distinct input aliases {[ns.alias for ns in named_sources]}' +
+        hint_suffix)
+
+  left_sql_alias = _unquote_sql_ident(m.group('from_alias') or left_ns.alias)
+  right_sql_alias = _unquote_sql_ident(m.group('join_alias') or right_ns.alias)
+  l_low = left_sql_alias.lower()
+  r_low = right_sql_alias.lower()
+
+  raw_jkind = (m.group('jkind') or 'INNER').strip().upper().split()[0]
+  join_type = {
+      'INNER': 'inner',
+      'LEFT': 'left',
+      'RIGHT': 'right',
+      'FULL': 'full',
+  }.get(raw_jkind, 'inner')
+
+  conjuncts = _split_top_level_sql_and(m.group('on_body'))
+  left_keys: list[str] = []
+  right_keys: list[str] = []
+  left_time: str | None = None
+  right_time: str | None = None
+  lower_bound: float | None = None
+  upper_bound: float | None = None
+  extra_inner_filters: list[str] = []
+
+  between_re = re.compile(
+      r'^\s*(?P<lhs>.+?)\s+(?P<neg>NOT\s+)?BETWEEN\s+(?P<low>.+?)\s+AND\s+(?P<high>.+?)\s*$',
+      re.I | re.S)
+  cmp_re = re.compile(
+      r'^\s*(?P<lhs>.+?)\s*(?P<op><=|>=|<>|!=|=|<|>)\s*(?P<rhs>.+?)\s*$', re.S)
+
+  for raw_conj in conjuncts:
+    conj = raw_conj.strip()
+    while conj.startswith('(') and conj.endswith(')'):
+      inner_c = conj[1:-1].strip()
+      if len(_split_top_level_sql_and(inner_c)) == 1:
+        conj = inner_c
+      else:
+        break
+
+    mb = between_re.match(conj)
+    if mb:
+      if mb.group('neg'):
+        raise SqlPipeError(
+            'distributed temporal interval join does not support NOT BETWEEN' +
+            hint_suffix)
+      p_lhs = _parse_ts_offset_expr(mb.group('lhs'))
+      p_low = _parse_ts_offset_expr(mb.group('low'))
+      p_high = _parse_ts_offset_expr(mb.group('high'))
+      if (not p_lhs or not p_low or not p_high or p_lhs[2] != 0.0 or
+          p_low[0].lower() != p_high[0].lower() or p_low[1] != p_high[1]):
+        raise SqlPipeError(
+            f'unsupported BETWEEN interval bound {conj!r}' + hint_suffix)
+      lhs_a, lhs_c, _ = p_lhs
+      oth_a, oth_c, off_low = p_low
+      _, _, off_high = p_high
+      if {lhs_a.lower(), oth_a.lower()} != {l_low, r_low}:
+        raise SqlPipeError(
+            f'BETWEEN interval bound {conj!r} must correlate {left_sql_alias} '
+            f'and {right_sql_alias}' + hint_suffix)
+      if lhs_a.lower() == r_low:
+        c_lt, c_rt = oth_c, lhs_c
+        c_low, c_high = off_low, off_high
+      else:
+        # Swapped `left.ts BETWEEN right.ts + off_low AND right.ts + off_high`
+        # => `left.ts - off_high <= right.ts <= left.ts - off_low`!
+        c_lt, c_rt = lhs_c, oth_c
+        c_low, c_high = -off_high, -off_low
+      left_time = left_time or c_lt
+      right_time = right_time or c_rt
+      lower_bound = c_low if lower_bound is None else max(lower_bound, c_low)
+      upper_bound = c_high if upper_bound is None else min(upper_bound, c_high)
+      continue
+
+    mc = cmp_re.match(conj)
+    if mc:
+      op = mc.group('op')
+      p_l = _parse_ts_offset_expr(mc.group('lhs'))
+      p_r = _parse_ts_offset_expr(mc.group('rhs'))
+      if (p_l and p_r and {p_l[0].lower(), p_r[0].lower()} == {l_low, r_low}):
+        if op == '=' and p_l[2] == 0.0 and p_r[2] == 0.0 and not re.search(
+            r'\bINTERVAL\b', conj, re.I):
+          if p_l[0].lower() == l_low:
+            left_keys.append(p_l[1])
+            right_keys.append(p_r[1])
+          else:
+            left_keys.append(p_r[1])
+            right_keys.append(p_l[1])
+          continue
+        if op in ('<', '>'):
+          raise SqlPipeError(
+              f'distributed temporal interval join requires closed bounds '
+              f'(BETWEEN or >= / <=), got strict {op!r} in {conj!r}; rewrite '
+              'with <= / >= or use --interval-join')
+        if op in ('<=', '>='):
+          a1, c1, off1 = p_l
+          a2, c2, off2 = p_r
+          if a1.lower() == r_low:
+            left_time = left_time or c2
+            right_time = right_time or c1
+            bound_val = off2 - off1
+            if op == '<=':
+              upper_bound = (
+                  bound_val if upper_bound is None else min(
+                      upper_bound, bound_val))
+            else:
+              lower_bound = (
+                  bound_val if lower_bound is None else max(
+                      lower_bound, bound_val))
+          else:
+            left_time = left_time or c1
+            right_time = right_time or c2
+            bound_val = off1 - off2
+            if op == '<=':
+              lower_bound = (
+                  bound_val if lower_bound is None else max(
+                      lower_bound, bound_val))
+            else:
+              upper_bound = (
+                  bound_val if upper_bound is None else min(
+                      upper_bound, bound_val))
+          continue
+
+    if join_type != 'inner':
+      raise SqlPipeError(
+          f'distributed {join_type.upper()} interval join cannot push '
+          f'non-temporal ON predicate {conj!r} without altering outer NULL '
+          'semantics; move post-join filters to WHERE or use --interval-join')
+    if re.search(r'\b(?:SELECT|INTERVAL)\b', conj, re.I):
+      raise SqlPipeError(
+          f'unsupported ON predicate {conj!r} in distributed interval join' +
+          hint_suffix)
+    extra_inner_filters.append(conj)
+
+  if not left_keys or not left_time or not right_time or (lower_bound is None or
+                                                          upper_bound is None):
+    raise SqlPipeError(
+        'distributed SQL interval join requires both an equi-join key '
+        '(a.id = b.id) and closed temporal range bounds (BETWEEN or >= AND <=)'
+        + hint_suffix)
+  if lower_bound > upper_bound:
+    raise SqlPipeError(
+        f'invalid SQL interval bounds: lower_bound ({lower_bound}s) > '
+        f'upper_bound ({upper_bound}s)')
+
+  select_raw = m.group('select').strip()
+  if re.match(r'^DISTINCT\b', select_raw, re.I):
+    raise SqlPipeError(
+        'distributed SQL interval join does not support SELECT DISTINCT; '
+        'use --interval-join with --dedupe-by instead')
+  select_map: dict[str, str] | None = None
+  if select_raw != '*':
+    select_map = {}
+    as_re = re.compile(
+        r'^(?P<expr>.+?)\s+AS\s+(?P<alias>[A-Za-z0-9_"`]+)\s*$', re.I | re.S)
+    bare_alias_re = re.compile(
+        r'^(?P<expr>[A-Za-z0-9_"`]+\.[A-Za-z0-9_"`]+)\s+(?P<alias>(?!(?:AND|OR)\b)[A-Za-z_][A-Za-z0-9_]*)\s*$',
+        re.I)
+    for item in interval_join.split_bracket_tokens(select_raw):
+      tok = item.strip()
+      if tok.endswith('.*') or tok == '*':
+        raise SqlPipeError(
+            f'SELECT wildcard {tok!r} cannot be mixed with explicit columns in '
+            'distributed SQL interval join; use SELECT * or list columns explicitly'
+        )
+      if re.search(r'\b(?:COUNT|SUM|AVG|MIN|MAX)\s*\(', tok, re.I):
+        raise SqlPipeError(
+            f'aggregate expression {tok!r} in distributed SQL interval join '
+            'requires a separate --window aggregation stage')
+      ma = as_re.match(tok) or bare_alias_re.match(tok)
+      if ma:
+        expr_s = ma.group('expr').strip()
+        out_name = _unquote_sql_ident(ma.group('alias'))
+      else:
+        expr_s = tok
+        if '.' in tok:
+          out_name = _unquote_sql_ident(tok.rsplit('.', 1)[-1])
+        else:
+          out_name = _unquote_sql_ident(tok)
+      if not output.SAFE_IDENTIFIER_RE.match(out_name):
+        raise SqlPipeError(
+            f'SELECT expression {tok!r} requires an explicit AS <column_name> alias'
+        )
+      if out_name in select_map:
+        raise SqlPipeError(
+            f'duplicate output column name {out_name!r} in SELECT; disambiguate with AS'
+        )
+      # Normalize backticked/double-quoted `a`.`col` to `a.col`
+      expr_norm = re.sub(r'([`"])([A-Za-z_][A-Za-z0-9_]*)\1', r'\2',
+                         expr_s).strip()
+      select_map[out_name] = expr_norm
+
+  where_parts: list[str] = list(extra_inner_filters)
+  if m.group('where_body'):
+    where_parts.append(f'({m.group("where_body").strip()})')
+  combined_where = ' AND '.join(where_parts) if where_parts else None
+
+  temp_where_cols: list[str] = []
+  final_user_cols: list[str] = list(select_map.keys()) if select_map else []
+  compiled_where_cfg: dict[str, Any] | None = None
+
+  if combined_where:
+    qual_ref_re = re.compile(
+        r'\b(?P<a>[A-Za-z_][A-Za-z0-9_]*)\s*\.\s*(?P<c>[A-Za-z_][A-Za-z0-9_]*)\b'
+    )
+    norm_where = re.sub(
+        r'([`"])([A-Za-z_][A-Za-z0-9_]*)\1', r'\2', combined_where)
+    if select_map is not None:
+      rev_map = {v: k for k, v in select_map.items()}
+
+      def _sub_qual(qm: re.Match) -> str:
+        qa = qm.group('a')
+        qc = qm.group('c')
+        if qa.lower() not in (l_low, r_low):
+          return qm.group(0)
+        canon_ref = f'{left_sql_alias if qa.lower() == l_low else right_sql_alias}.{qc}'
+        if canon_ref in rev_map:
+          return rev_map[canon_ref]
+        tmp_col = f'beam_sql_w{len(temp_where_cols)}'
+        temp_where_cols.append(tmp_col)
+        select_map[tmp_col] = canon_ref
+        rev_map[canon_ref] = tmp_col
+        return tmp_col
+
+      rewritten_where_segs = [
+          qual_ref_re.sub(_sub_qual, seg) if is_c else seg
+          for is_c, seg in _scan_sql_outside_literals(norm_where)
+      ]
+      norm_where = ''.join(rewritten_where_segs)
+    else:
+      # SELECT * with WHERE: strip unambiguous table alias prefix if non-key
+      def _sub_star_qual(qm: re.Match) -> str:
+        qa = qm.group('a')
+        qc = qm.group('c')
+        if qa.lower() in (l_low, r_low):
+          return qc
+        return qm.group(0)
+
+      norm_where = ''.join(
+          qual_ref_re.sub(_sub_star_qual, seg) if is_c else seg
+          for is_c, seg in _scan_sql_outside_literals(norm_where))
+    try:
+      compiled_where_cfg = expressions.compile_where(
+          norm_where, known_columns=None, allow_jinja=allow_jinja)[0]
+    except expressions.ExpressionError as e:
+      raise SqlPipeError(
+          f'unsupported WHERE filter in SQL interval join: {e}') from None
+
+  eff_skew_action = skew_action or (
+      'dlq' if
+      (dlq_ep is not None and max_watermark_skew is not None) else 'drop')
+  if eff_skew_action == 'dlq' and dlq_ep is None:
+    raise SqlPipeError('--skew-action=dlq requires --dlq <SINK>')
+
+  ij_cfg: dict[str, Any] = {
+      'left_alias': left_sql_alias,
+      'right_alias': right_sql_alias,
+      'left_key': left_keys[0] if len(left_keys) == 1 else left_keys,
+      'right_key': right_keys[0] if len(right_keys) == 1 else right_keys,
+      'left_time': left_time,
+      'right_time': right_time,
+      'lower_bound': _format_seconds_duration(lower_bound),
+      'upper_bound': _format_seconds_duration(upper_bound),
+      'join_type': join_type,
+      'skew_action': eff_skew_action,
+  }
+  if select_map is not None:
+    ij_cfg['select'] = select_map
+  if max_watermark_skew is not None:
+    ij_cfg['max_watermark_skew'] = max_watermark_skew
+
+  try:
+    interval_join.parse_interval_join_config(ij_cfg)
+  except ValueError as e:
+    raise SqlPipeError(str(e)) from None
+
+  transforms = list(read_transforms)
+  dlq_norm_refs: list[str] = []
+
+  left_read_ref = sql_inputs[left_ns.alias]
+  right_read_ref = sql_inputs[right_ns.alias]
+  ts_l_name = f'AssignTimestamps_{left_ns.alias}'
+  ts_r_name = f'AssignTimestamps_{right_ns.alias}'
+  ts_l_cfg: dict[str, Any] = {'timestamp_col': left_time}
+  ts_r_cfg: dict[str, Any] = {'timestamp_col': right_time}
+  if dlq_ep is not None:
+    ts_l_cfg['error_handling'] = {'output': 'errors'}
+    ts_r_cfg['error_handling'] = {'output': 'errors'}
+  transforms.append({
+      'name': ts_l_name,
+      'type': 'CliAssignTimestamps',
+      'input': left_read_ref,
+      'config': ts_l_cfg,
+  })
+  transforms.append({
+      'name': ts_r_name,
+      'type': 'CliAssignTimestamps',
+      'input': right_read_ref,
+      'config': ts_r_cfg,
+  })
+  if dlq_ep is not None:
+    ij_left_ref = f'{ts_l_name}.good'
+    ij_right_ref = f'{ts_r_name}.good'
+    n_l = f'NormalizeTsLeftDlq_{left_ns.alias}'
+    n_r = f'NormalizeTsRightDlq_{right_ns.alias}'
+    transforms.append(
+        dlq.build_dlq_normalizer_transform(
+            n_l, f'{ts_l_name}.errors', ts_l_name))
+    transforms.append(
+        dlq.build_dlq_normalizer_transform(
+            n_r, f'{ts_r_name}.errors', ts_r_name))
+    dlq_norm_refs.extend([n_l, n_r])
+    ij_cfg['error_handling'] = {'output': 'errors'}
+  else:
+    ij_left_ref = ts_l_name
+    ij_right_ref = ts_r_name
+
+  transforms.append({
+      'name': 'IntervalJoin',
+      'type': 'CliIntervalJoin',
+      'input': {
+          'left': ij_left_ref,
+          'right': ij_right_ref,
+      },
+      'config': ij_cfg,
+  })
+  if dlq_ep is not None:
+    current_ref = 'IntervalJoin.good'
+    transforms.append(
+        dlq.build_dlq_normalizer_transform(
+            'NormalizeJoinDlq', 'IntervalJoin.errors', 'CliIntervalJoin'))
+    dlq_norm_refs.append('NormalizeJoinDlq')
+  else:
+    current_ref = 'IntervalJoin'
+
+  if compiled_where_cfg is not None:
+    w_cfg = dict(compiled_where_cfg)
+    if dlq_ep is not None:
+      w_cfg['error_handling'] = {'output': 'errors'}
+    transforms.append({
+        'name': 'FilterWhere',
+        'type': 'Filter',
+        'input': current_ref,
+        'config': w_cfg,
+    })
+    if dlq_ep is not None:
+      transforms.append(
+          dlq.build_dlq_normalizer_transform(
+              'NormalizeFilterDlq', 'FilterWhere.errors', 'Filter'))
+      dlq_norm_refs.append('NormalizeFilterDlq')
+    current_ref = 'FilterWhere'
+
+  if temp_where_cols and final_user_cols:
+    transforms.append({
+        'name': 'SelectFields',
+        'type': 'MapToFields',
+        'input': current_ref,
+        'config': {
+            'language': 'generic',
+            'fields': {
+                c: c
+                for c in final_user_cols
+            },
+        },
+    })
+    current_ref = 'SelectFields'
+
+  if sink_ep is not None:
+    transforms.append({
+        'name': 'WriteSink',
+        'type': sink_ep.yaml_type,
+        'input': current_ref,
+        'config': dict(sink_ep.config),
+    })
+
+  if dlq_ep is not None and dlq_norm_refs:
+    if len(dlq_norm_refs) == 1:
+      dlq_in = dlq_norm_refs[0]
+    else:
+      transforms.append({
+          'name': 'MergeDlq',
+          'type': 'Flatten',
+          'input': dlq_norm_refs,
+      })
+      dlq_in = 'MergeDlq'
+    transforms.append({
+        'name': 'WriteDlq',
+        'type': dlq_ep.yaml_type,
+        'input': dlq_in,
+        'config': dict(dlq_ep.config),
+    })
+
+  spec_out: dict[str, Any] = {
+      'pipeline': {
+          'transforms': transforms,
+      },
+      'providers': [dlq.cli_yaml_provider_spec()],
+  }
+  if has_unbounded:
+    spec_out['options'] = {'streaming': True}
+  return spec_out
+
+
 def build_sql_yaml_spec(
     named_sources: list[NamedSource],
     sql_query: str,
     sink_ep: uris.ParsedEndpoint | None,
     *,
     allow_jinja: bool = False,
+    max_watermark_skew: str | None = None,
+    skew_action: str | None = None,
+    dlq_ep: uris.ParsedEndpoint | None = None,
 ) -> dict[str, Any]:
-  """Builds portable Beam YAML `type: Sql` spec for `--emit-yaml` / remote runs."""
+  """Builds portable Beam YAML spec (`type: Sql` or lowered `CliIntervalJoin`)."""
   clean_q = validate_readonly_select_sql(sql_query, allow_jinja=allow_jinja)
+  has_unbounded = any(ns.endpoint.is_unbounded for ns in named_sources)
   transforms: list[dict[str, Any]] = []
   sql_inputs: dict[str, str] = {}
   for ns in named_sources:
@@ -234,6 +825,30 @@ def build_sql_yaml_spec(
       })
     sql_inputs[ns.alias] = read_name
 
+  code_only = ' '.join(
+      seg for is_c, seg in _scan_sql_outside_literals(clean_q) if is_c)
+  has_join = bool(re.search(r'\bJOIN\b', code_only, re.I))
+  has_interval = bool(re.search(r'\bINTERVAL\b', code_only, re.I))
+  if (max_watermark_skew is not None or
+      skew_action is not None) and not has_join:
+    raise SqlPipeError(
+        '--max-watermark-skew / --skew-action with --sql requires a 2-source '
+        'temporal JOIN (or use --interval-join without --sql)')
+  if has_join and (has_interval or max_watermark_skew is not None or
+                   skew_action is not None or
+                   (has_unbounded and len(named_sources) >= 2)):
+    return _lower_temporal_interval_join_sql(
+        named_sources,
+        clean_q,
+        transforms,
+        sql_inputs,
+        sink_ep,
+        has_unbounded=has_unbounded,
+        max_watermark_skew=max_watermark_skew,
+        skew_action=skew_action,
+        dlq_ep=dlq_ep,
+        allow_jinja=allow_jinja)
+
   sql_input_val: Any = (
       next(iter(sql_inputs.values()))
       if len(sql_inputs) == 1 and 'pcollection' in clean_q.lower() else
@@ -253,11 +868,14 @@ def build_sql_yaml_spec(
         'input': 'SqlQuery',
         'config': dict(sink_ep.config),
     })
-  return {
+  spec_out: dict[str, Any] = {
       'pipeline': {
           'transforms': transforms,
       }
   }
+  if has_unbounded:
+    spec_out['options'] = {'streaming': True}
+  return spec_out
 
 
 def _match_source_files(

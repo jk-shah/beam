@@ -221,6 +221,9 @@ _CLI_ONE_FLAGS = {
         '--join',
         '--to',
         '--sql',
+        '--interval-join',
+        '--max-watermark-skew',
+        '--skew-action',
         '--window',
         '--window-size',
         '--window_size',
@@ -727,7 +730,9 @@ def _build_parser():
       action='append',
       default=[],
       metavar='[ALIAS=]SOURCE',
-      help='alias for repeating --from [ALIAS=]SOURCE in multi-source --sql queries')
+      help=(
+          'second input stream for --interval-join or alias for repeating '
+          '--from [ALIAS=]SOURCE in multi-source --sql queries'))
   pipe.add_argument(
       '--to',
       dest='sink',
@@ -802,6 +807,27 @@ def _build_parser():
       dest='timestamp_col',
       metavar='COL',
       help='source column to assign timestamps from (e.g. ts, event_time)')
+  pipe.add_argument(
+      '--interval-join',
+      dest='interval_join',
+      default=None,
+      metavar='SPEC',
+      help=(
+          'event-time interval join across --from and --join '
+          '(e.g. "key=order_id,left_time=order_ts,right_time=ship_ts,'
+          'lower=0s,upper=15m,type=left")'))
+  pipe.add_argument(
+      '--max-watermark-skew',
+      dest='max_watermark_skew',
+      default=None,
+      metavar='DUR',
+      help='maximum inter-stream watermark skew duration (e.g. 30m)')
+  pipe.add_argument(
+      '--skew-action',
+      dest='skew_action',
+      choices=['drop', 'warn', 'dlq', 'fail'],
+      default=None,
+      help='action when watermark skew exceeds --max-watermark-skew')
   pipe.add_argument(
       '--sql',
       dest='sql',
@@ -2770,6 +2796,12 @@ def _pipe(
   is_local_runner = _runner_name(explicit_runner) in _LOCAL_RUNNERS
 
   if getattr(args, 'primary_keys', None) and not args.cdc:
+    if getattr(args, 'interval_join', None):
+      raise _CliError(
+          '--key / --primary-key enables --cdc mode and cannot be implicitly '
+          'combined with --interval-join; pass key=COL inside --interval-join '
+          '(or pass --cdc explicitly if CDC is intended)',
+          EXIT_USAGE)
     args.cdc = True
 
   if getattr(args, 'drop_bad', False):
@@ -2800,8 +2832,11 @@ def _pipe(
 
   raw_sources = list(args.sources or [])
   raw_joins = list(args.joins or [])
-  if args.sink is None and args.sql is None and getattr(args, 'select', None) and not (
-      args.cdc or args.zero_copy or args.window or args.timestamp_col or args.dlq):
+  has_interval_join_flag = bool(getattr(args, 'interval_join', None))
+  if args.sink is None and args.sql is None and getattr(
+      args, 'select',
+      None) and not (args.cdc or args.zero_copy or args.window or
+                     args.timestamp_col or args.dlq or has_interval_join_flag):
     from . import pipe_sql as _ps_mod
     first_src = raw_sources[0] if raw_sources else ''
     m_alias = _ps_mod._ALIAS_PREFIX_RE.match(first_src)
@@ -2817,7 +2852,25 @@ def _pipe(
     args.where = None
     args.select = None
 
-  is_sql_mode = bool(args.sql is not None or raw_joins or len(raw_sources) > 1)
+  join_source_for_pipe: str | None = None
+  if has_interval_join_flag:
+    if args.sql is not None:
+      raise _CliError(
+          '--interval-join cannot be combined with --sql; either express the '
+          'temporal join inside --sql or omit --sql',
+          EXIT_USAGE)
+    combined_ij_inputs = raw_sources + raw_joins
+    if len(combined_ij_inputs) != 2:
+      raise _CliError(
+          '--interval-join requires exactly 2 input sources '
+          f'(e.g. --from left=A --join right=B), got {len(combined_ij_inputs)}',
+          EXIT_USAGE)
+    raw_sources = [combined_ij_inputs[0]]
+    join_source_for_pipe = combined_ij_inputs[1]
+    is_sql_mode = False
+  else:
+    is_sql_mode = bool(
+        args.sql is not None or raw_joins or len(raw_sources) > 1)
   allow_jinja = bool(args.dry_run)
 
   if is_sql_mode:
@@ -2825,7 +2878,8 @@ def _pipe(
     from . import uris
     if args.sql is None:
       raise _CliError(
-          'multiple --from sources or --join requires --sql "SELECT ..."',
+          'multiple --from sources or --join requires --sql "SELECT ..." '
+          'or --interval-join <SPEC>',
           EXIT_USAGE)
     if args.where or args.select or args.cdc or args.zero_copy:
       raise _CliError(
@@ -2871,7 +2925,13 @@ def _pipe(
               default_project=default_proj,
               allow_jinja=allow_jinja) if args.dlq else None)
       sql_spec = pipe_sql.build_sql_yaml_spec(
-          named_sources, args.sql, sink_ep, allow_jinja=allow_jinja)
+          named_sources,
+          args.sql,
+          sink_ep,
+          allow_jinja=allow_jinja,
+          max_watermark_skew=getattr(args, 'max_watermark_skew', None),
+          skew_action=getattr(args, 'skew_action', None),
+          dlq_ep=dlq_ep)
     except (uris.UriError, pipe_sql.SqlPipeError) as e:
       raise _CliError(str(e), EXIT_USAGE) from None
     sql_null_values = _split_null_values(args.null_values)
@@ -2914,6 +2974,38 @@ def _pipe(
     if args.dlq:
       local_sql_paths.append(args.dlq)
 
+    has_unbounded_sql = any(ns.endpoint.is_unbounded for ns in named_sources)
+    sql_uses_calcite = any(
+        t.get('type') == 'Sql'
+        for t in sql_spec.get('pipeline', {}).get('transforms', []))
+    sql_requires_java = bool(
+        sql_uses_calcite or
+        any(ns.endpoint.is_java_xlang for ns in named_sources) or
+        (sink_ep is not None and sink_ep.is_java_xlang) or
+        (dlq_ep is not None and dlq_ep.is_java_xlang))
+
+    if has_unbounded_sql and is_local_runner and not args.dry_run and not wait_timeout_sec:
+      raise _CliError(
+          'streaming --sql over an unbounded source requires --wait-timeout '
+          '<DURATION> for a bounded local run or a remote runner '
+          '(--runner=DataflowRunner)',
+          EXIT_USAGE)
+    if args.assert_counts and (has_unbounded_sql or
+                               not sql_uses_calcite) and not args.dry_run:
+      raise _CliError(
+          '--assert-counts cannot be combined with unbounded or multi-stream '
+          'interval-join --sql queries',
+          EXIT_USAGE)
+    if has_unbounded_sql and not is_local_runner and _runner_name(
+        explicit_runner) == 'dataflow':
+      if not any(a == '--streaming' or a.startswith('--streaming=')
+                 for a in resolved_args):
+        resolved_args.append('--streaming')
+      if not any(a in ('--enable_streaming_engine', '--enable-streaming-engine'
+                       ) or a.startswith('--enable_streaming_engine=')
+                 for a in resolved_args):
+        resolved_args.append('--enable_streaming_engine')
+
     non_portable_sql = pipe_sql.analyze_sql_portability(
         args.sql, sql_engine=args.sql_engine)
     has_keyed_json = bool(sink_ep is not None and 'key' in (sink_ep.config or {}))
@@ -2933,7 +3025,7 @@ def _pipe(
                 f'--portable rejects mixed-format glob {ns.uri!r}; bind one '
                 '--from per file format and combine via UNION ALL',
                 EXIT_USAGE)
-      if non_portable_sql:
+      if non_portable_sql and sql_uses_calcite:
         raise _CliError(
             '--portable rejected local-only SQL construct(s): ' +
             ', '.join(non_portable_sql) +
@@ -2942,24 +3034,26 @@ def _pipe(
             '--portable for local-only analytics)',
             EXIT_USAGE)
 
-    if args.dry_run or not is_local_runner or (
-        sink_ep is not None and sink_ep.kind != 'file'):
+    if (args.dry_run or not is_local_runner or has_unbounded_sql or
+        (getattr(args, 'portable', False) and not sql_uses_calcite) or
+        (sink_ep is not None and sink_ep.kind != 'file')):
       if sink_ep is None and not args.dry_run:
         raise _CliError(
-            'remote --sql execution requires --to <SINK>', EXIT_USAGE)
+            'remote or streaming --sql execution requires --to <SINK>',
+            EXIT_USAGE)
       if has_keyed_json:
         raise _CliError(
             '--to-opt key= (one keyed JSON document) is only for local --sql '
             'runs, not --emit-yaml or remote runners', EXIT_USAGE)
       sql_extra_warns: list[str] = []
-      if args.sql_engine != 'sqlite':
+      if args.sql_engine != 'sqlite' and sql_uses_calcite:
         note_eng = (
             f'--sql-engine {args.sql_engine} applies to local runs; the '
             "exported or remote pipeline uses Beam SQL's dialect (Calcite)")
         sql_extra_warns.append(note_eng)
         if not json_session.enabled:
           print(f'note: {note_eng}', file=sys.stderr)
-      if non_portable_sql:
+      if non_portable_sql and sql_uses_calcite:
         warn_np = (
             '--sql uses ' + ', '.join(non_portable_sql) +
             ', which run locally but are not in Beam SQL\'s remote dialect '
@@ -2998,7 +3092,7 @@ def _pipe(
             if_exists=args.if_exists,
             dlq_prefix=sql_dlq_stage or orig_sql_dlq,
             dlq_commit_target=orig_sql_dlq if sql_dlq_stage else None,
-            requires_java_xlang=True,
+            requires_java_xlang=sql_requires_java,
             wait_timeout_sec=wait_timeout_sec,
             raw_argv_for_idem=raw_argv,
             plan_hash=sql_plan_hash,
@@ -3158,12 +3252,28 @@ def _pipe(
   if not args.sink:
     raise _CliError('the following arguments are required: --to', EXIT_USAGE)
 
-  source_uri = raw_sources[0]
+  raw_left_source = raw_sources[0]
+  source_uri = raw_left_source
   if '=' in source_uri and not os.path.exists(source_uri):
     from . import pipe_sql as _ps_mod
     m_alias = _ps_mod._ALIAS_PREFIX_RE.match(source_uri)
     if m_alias and m_alias.group('uri').strip():
       source_uri = m_alias.group('uri').strip()
+
+  clean_join_uri: str | None = None
+  if join_source_for_pipe:
+    clean_join_uri = join_source_for_pipe
+    if '=' in clean_join_uri and not os.path.exists(clean_join_uri):
+      from . import pipe_sql as _ps_mod
+      m_j = _ps_mod._ALIAS_PREFIX_RE.match(clean_join_uri)
+      if m_j and m_j.group('uri').strip():
+        clean_join_uri = m_j.group('uri').strip()
+
+  if args.assert_counts and has_interval_join_flag:
+    raise _CliError(
+        '--assert-counts cannot be combined with --interval-join because '
+        '2-stream M:N joins change row cardinality across left and right inputs',
+        EXIT_USAGE)
 
   # Track row counters whenever `--json` or `--assert-counts` is active, except
   # when `--dry-run` is emitting clean minimal YAML without `--assert-counts`.
@@ -3175,13 +3285,14 @@ def _pipe(
   # is read file by file on the in-process path; elsewhere it's an error
   # instead of reading every file with the first file's format.
   from . import uris as uris_mod
-  mixed_groups = ({} if (args.from_format or args.format or args.cdc) else
-                  uris_mod.local_format_groups(source_uri))
+  mixed_groups = ({} if (
+      args.from_format or args.format or args.cdc or has_interval_join_flag)
+                  else uris_mod.local_format_groups(source_uri))
   mixed_from_format = next(iter(mixed_groups), None)
 
   try:
     pipe = pipe_spec.build_pipe_spec(
-        source_uri,
+        raw_left_source if has_interval_join_flag else source_uri,
         args.sink,
         args.from_format or args.format or mixed_from_format,
         args.to_format or args.format,
@@ -3209,7 +3320,11 @@ def _pipe(
         window=getattr(args, 'window', None),
         timestamp_col=getattr(args, 'timestamp_col', None),
         expect=getattr(args, 'expect', None),
-        on_violation=getattr(args, 'on_violation', 'dlq'))
+        on_violation=getattr(args, 'on_violation', 'dlq'),
+        join_source=join_source_for_pipe,
+        interval_join=getattr(args, 'interval_join', None),
+        max_watermark_skew=getattr(args, 'max_watermark_skew', None),
+        skew_action=getattr(args, 'skew_action', None))
   except pipe_spec.PipeSpecError as e:
     raise _CliError(str(e), EXIT_USAGE) from None
 
@@ -3408,6 +3523,8 @@ def _pipe(
       staged_spec, Dumper=dumper, sort_keys=False, width=100000)
 
   local_check_paths = [source_uri, args.sink]
+  if clean_join_uri:
+    local_check_paths.append(clean_join_uri)
   if args.dlq:
     local_check_paths.append(args.dlq)
 

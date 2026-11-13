@@ -262,14 +262,8 @@ class BeamPipelineIntervalJoinTest(unittest.TestCase):
           upper_bound='10m',
       )
 
-      def check_results(actual):
-        self.assertEqual(len(actual), 1)
-        r = actual[0]
-        self.assertEqual(r.uid, 'u1')
-        self.assertEqual(r.campaign, 'c1')
-        self.assertEqual(r.rev, 50.0)
-
-      assert_that(joined, check_results)
+      tuples = joined | beam.Map(lambda r: (r.uid, r.campaign, r.rev))
+      assert_that(tuples, equal_to([('u1', 'c1', 50.0)]))
 
 
 class SqlIntervalJoinTest(unittest.TestCase):
@@ -534,6 +528,413 @@ class WatermarkSkewCircuitBreakerTest(unittest.TestCase):
                   'out_col': malicious_expr
               },
           })
+
+
+class StatefulHardeningAndTimerTest(unittest.TestCase):
+  """Tests multi-record GC re-arming, TimestampedValue, state drain, & skew DLQ."""
+  def test_multi_record_gc_rearm_and_timestamped_outer_emission(self):
+    import apache_beam as beam
+    from apache_beam.runners.direct.direct_runner import BundleBasedDirectRunner
+    from apache_beam.testing.test_stream import TestStream
+    from apache_beam.testing.util import assert_that
+    from apache_beam.testing.util import equal_to
+    from apache_beam.transforms.window import TimestampedValue
+
+    # Two unmatched left records for the SAME key ('k1') at t=10 and t=100
+    # with upper_bound=20s:
+    # - t=10 sets GC timer to 31s; t=100 has deadline 121s (> 31s).
+    # - When watermark reaches 50s, on_gc emits t=10 (preserving ts=10!) AND
+    #   must re-arm NEXT_GC_STATE/GC_TIMER to 121s so t=100 emits when WM=130s!
+    # Single TestStream root branched into L and R so BundleBasedDirectRunner
+    # advances both stream watermarks deterministically in lockstep:
+    ts = (
+        TestStream().advance_watermark_to(0).add_elements([
+            TimestampedValue(
+                ('L', {
+                    'id': 'k1', 'l_ts': 10.0, 'l_val': 'first'
+                }), 10),
+            TimestampedValue(
+                ('L', {
+                    'id': 'k1', 'l_ts': 100.0, 'l_val': 'second'
+                }), 100),
+            TimestampedValue(('R', {
+                'id': 'other', 'r_ts': 15.0, 'r_val': 9
+            }),
+                             15),
+        ]).advance_watermark_to(50).advance_watermark_to(
+            130).advance_watermark_to_infinity())
+
+    with beam.Pipeline(runner=BundleBasedDirectRunner()) as p:
+      raw = p | 'Stream' >> ts
+      left_pc = (
+          raw
+          | 'FilterL' >> beam.Filter(lambda x: x[0] == 'L')
+          | 'UnpackL' >> beam.Map(lambda x: x[1]))
+      right_pc = (
+          raw
+          | 'FilterR' >> beam.Filter(lambda x: x[0] == 'R')
+          | 'UnpackR' >> beam.Map(lambda x: x[1]))
+      joined = {
+          'left': left_pc,
+          'right': right_pc,
+      } | interval_join.CliIntervalJoin(
+          key='id',
+          left_time='l_ts',
+          right_time='r_ts',
+          lower_bound='0s',
+          upper_bound='20s',
+          join_type='left',
+          right_fields=['id', 'r_ts', 'r_val'],
+      )
+      inspected = joined | beam.ParDo(_CaptureRowAndTsDoFn())
+      assert_that(
+          inspected,
+          equal_to([
+              ('k1', 'first', None, 10.0),
+              ('k1', 'second', None, 100.0),
+          ]))
+
+  def test_right_outer_join_and_cross_window_global_rewindowing(self):
+    import apache_beam as beam
+    from apache_beam.runners.direct.direct_runner import BundleBasedDirectRunner
+    from apache_beam.testing.test_stream import TestStream
+    from apache_beam.testing.util import assert_that
+    from apache_beam.testing.util import equal_to
+    from apache_beam.transforms.window import FixedWindows
+    from apache_beam.transforms.window import TimestampedValue
+
+    # Left at t=9 (FixedWindow [0,10)) matches Right at t=12 (FixedWindow [10,20)),
+    # plus unmatched Right 'k2' at t=30 emits right-outer with None-padded left cols!
+    ts = (
+        TestStream().advance_watermark_to(0).add_elements([
+            TimestampedValue(('L', {
+                'id': 'k1', 'l_ts': 9.0, 'l_name': 'nine'
+            }),
+                             9),
+            TimestampedValue(('R', {
+                'id': 'k1', 'r_ts': 12.0, 'r_amt': 55.0
+            }),
+                             12),
+            TimestampedValue(('R', {
+                'id': 'k2', 'r_ts': 30.0, 'r_amt': 77.0
+            }),
+                             30),
+        ]).advance_watermark_to_infinity())
+
+    with beam.Pipeline(runner=BundleBasedDirectRunner()) as p:
+      raw = p | 'Stream' >> ts
+      left_pc = (
+          raw
+          | 'FilterL' >> beam.Filter(lambda x: x[0] == 'L')
+          | 'UnpackL' >> beam.Map(lambda x: x[1])
+          | 'WinL' >> beam.WindowInto(FixedWindows(10)))
+      right_pc = (
+          raw
+          | 'FilterR' >> beam.Filter(lambda x: x[0] == 'R')
+          | 'UnpackR' >> beam.Map(lambda x: x[1])
+          | 'WinR' >> beam.WindowInto(FixedWindows(10)))
+      joined = {
+          'left': left_pc,
+          'right': right_pc,
+      } | interval_join.CliIntervalJoin(
+          key='id',
+          left_time='l_ts',
+          right_time='r_ts',
+          lower_bound='0s',
+          upper_bound='10s',
+          join_type='right',
+          left_fields=['id', 'l_ts', 'l_name'],
+          right_fields=['id', 'r_ts', 'r_amt'],
+      )
+      out = joined | beam.ParDo(_CaptureRightJoinDoFn())
+      assert_that(
+          out,
+          equal_to([
+              ('k1', 'nine', 55.0, 9.0),
+              ('k2', None, 77.0, 30.0),
+          ]))
+
+  def test_zero_epoch_watermark_warn_counter_and_skew_dlq(self):
+    import apache_beam as beam
+    from apache_beam.cli import jobs
+    from apache_beam.testing.util import assert_that
+    from apache_beam.testing.util import equal_to
+
+    # 1. Verify skew_action='warn' at epoch 0.0 keeps max=0.0 (not overwritten by
+    # negative -100.0) and NEVER increments beam_cli:skew_dropped!
+    warn_cfg = interval_join.parse_interval_join_config({
+        'key': 'id',
+        'left_time': 'l_ts',
+        'right_time': 'r_ts',
+        'lower_bound': '0s',
+        'upper_bound': '10s',
+        'max_watermark_skew': '30s',
+        'skew_action': 'warn',
+    })
+    events_warn = [
+        (b'k1', ('R', 0.0, {
+            'id': 'k1', 'r_ts': 0.0, 'v': 1
+        })),
+        (b'k1', ('R', -10.0, {
+            'id': 'k1', 'r_ts': -10.0, 'v': 2
+        })),
+        # Lag relative to R max (0.0) is 45s > 30s (would be 35s if 0.0 had been
+        # clobbered by -10.0!). Under 'warn' it still joins/processes without
+        # bumping skew_dropped!
+        (b'k1', ('L', -45.0, {
+            'id': 'k1', 'l_ts': -45.0, 'a': 'x'
+        })),
+    ]
+    p_warn = beam.Pipeline(runner='DirectRunner')
+    _ = (
+        p_warn
+        | beam.Create(events_warn)
+        | beam.ParDo(interval_join.IntervalJoinStatefulDoFn(warn_cfg)))
+    res_warn = p_warn.run()
+    res_warn.wait_until_finish()
+    ctrs = jobs.extract_beam_cli_counters(res_warn)
+    self.assertEqual(ctrs.get('skew_dropped', 0), 0)
+
+    # 2. Verify skew_action='dlq' routes skewed records to errors PCollection
+    dlq_cfg = interval_join.parse_interval_join_config({
+        'key': 'id',
+        'left_time': 'l_ts',
+        'right_time': 'r_ts',
+        'lower_bound': '0s',
+        'upper_bound': '10s',
+        'max_watermark_skew': '30s',
+        'skew_action': 'dlq',
+    })
+    events_dlq = [
+        (b'k1', ('R', 100.0, {
+            'id': 'k1', 'r_ts': 100.0, 'v': 1
+        })),
+        (b'k1', ('L', 20.0, {
+            'id': 'k1', 'l_ts': 20.0, 'a': 'late_skew'
+        })),
+    ]
+    with beam.Pipeline(runner='DirectRunner') as p_dlq:
+      out_dlq = (
+          p_dlq
+          | beam.Create(events_dlq)
+          | beam.ParDo(
+              interval_join.IntervalJoinStatefulDoFn(
+                  dlq_cfg, err_tag='errors', route_errors=True)).with_outputs(
+                      'errors', main='good'))
+      err_types = out_dlq['errors'] | beam.Map(lambda r: r.error_type)
+      assert_that(err_types, equal_to(['WatermarkSkewError']))
+
+
+class _CaptureRowAndTsDoFn(interval_join.beam.DoFn):
+  def process(self, element, ts=interval_join.beam.DoFn.TimestampParam):
+    yield (
+        element.id, element.l_val, getattr(element, 'r_val', None), float(ts))
+
+
+class _CaptureRightJoinDoFn(interval_join.beam.DoFn):
+  def process(self, element, ts=interval_join.beam.DoFn.TimestampParam):
+    yield (
+        element.id,
+        getattr(element, 'l_name', None),
+        element.r_amt,
+        float(ts),
+    )
+
+
+class CliPipeAndSqlIntervalJoinLoweringTest(unittest.TestCase):
+  """Tests `beam pipe --interval-join` E2E and fail-closed SQL lowering."""
+  def test_cli_pipe_interval_join_e2e_with_dlq_and_parquet(self):
+    from apache_beam.cli import main as cli_main
+    import pyarrow.parquet as pq
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+      orders_p = os.path.join(tmpdir, 'orders.jsonl')
+      ships_p = os.path.join(tmpdir, 'ships.jsonl')
+      out_p = os.path.join(tmpdir, 'joined.parquet')
+      dlq_p = os.path.join(tmpdir, 'dlq.jsonl')
+
+      with open(orders_p, 'w', encoding='utf-8') as f:
+        f.write(
+            json.dumps({
+                'tenant': 't1',
+                'oid': 1,
+                'o_ts': '2026-05-01T00:00:00Z',
+                'amt': 120.0
+            }) + '\n')
+        f.write(
+            json.dumps({
+                'tenant': 't1',
+                'oid': 2,
+                'o_ts': '2026-05-01T00:10:00Z',
+                'amt': 40.0
+            }) + '\n')
+        f.write(
+            json.dumps({
+                'tenant': 't1',
+                'oid': 3,
+                'o_ts': 'NOT_A_TIMESTAMP',
+                'amt': 99.0
+            }) + '\n')
+
+      with open(ships_p, 'w', encoding='utf-8') as f:
+        f.write(
+            json.dumps({
+                'tenant': 't1',
+                'oid': 1,
+                's_ts': '2026-05-01T00:05:00Z',
+                'carrier': 'UPS'
+            }) + '\n')
+
+      rc = cli_main.main([
+          'pipe',
+          '--from',
+          f'o={orders_p}',
+          '--join',
+          f's={ships_p}',
+          '--to',
+          out_p,
+          '--dlq',
+          dlq_p,
+          '--interval-join',
+          'key=[tenant,oid],left_time=o_ts,right_time=s_ts,lower=0s,upper=15m,type=left',
+          '--select',
+          'oid, amt, carrier',
+          '--json',
+      ])
+      self.assertEqual(rc, 0)
+      tbl = pq.read_table(out_p)
+      rows = sorted(tbl.to_pylist(), key=lambda r: r['oid'])
+      self.assertEqual(
+          rows,
+          [
+              {
+                  'oid': 1, 'amt': 120.0, 'carrier': 'UPS'
+              },
+              {
+                  'oid': 2, 'amt': 40.0, 'carrier': None
+              },
+          ])
+      with open(dlq_p, encoding='utf-8') as df:
+        dlq_rows = [json.loads(line) for line in df if line.strip()]
+      self.assertEqual(len(dlq_rows), 1)
+      self.assertIn('NOT_A_TIMESTAMP', dlq_rows[0]['error'])
+
+  def test_cli_interval_join_guards(self):
+    from apache_beam.cli import main as cli_main
+
+    # 1. --key collision guard without explicit --cdc
+    rc_key = cli_main.main([
+        'pipe',
+        '--from',
+        'a.jsonl',
+        '--join',
+        'b.jsonl',
+        '--to',
+        'out.jsonl',
+        '--interval-join',
+        'key=id,left_time=t1,right_time=t2,upper=5m',
+        '--key',
+        'id',
+        '--dry-run',
+        '--json',
+    ])
+    self.assertEqual(rc_key, cli_main.EXIT_USAGE)
+
+    # 2. --assert-counts rejected on --interval-join
+    rc_ac = cli_main.main([
+        'pipe',
+        '--from',
+        'a.jsonl',
+        '--join',
+        'b.jsonl',
+        '--to',
+        'out.jsonl',
+        '--interval-join',
+        'key=id,left_time=t1,right_time=t2,upper=5m',
+        '--assert-counts',
+        '--dry-run',
+        '--json',
+    ])
+    self.assertEqual(rc_ac, cli_main.EXIT_USAGE)
+
+  def test_sql_lowering_swapped_bounds_streaming_and_fail_closed(self):
+    from apache_beam.cli import main as cli_main
+
+    # 1. Swapped BETWEEN bounds (`c.ts BETWEEN o.ts - 15m AND o.ts + 1m`
+    #    => lower_bound = -60s, upper_bound = 900s) + streaming Pub/Sub option!
+    ns_stream = pipe_sql.parse_named_sources(
+        [
+            'c=pubsub://projects/p/subscriptions/clicks',
+            'o=pubsub://projects/p/subscriptions/orders',
+        ],
+        raw_joins=None,
+        allow_sniff=False,
+    )
+    swapped_sql = (
+        'SELECT c.uid, o.amount AS rev '
+        'FROM c LEFT JOIN o ON c.uid = o.uid '
+        "AND c.click_ts BETWEEN o.order_ts - INTERVAL '15' MINUTE "
+        "AND o.order_ts + INTERVAL '1' MINUTE "
+        "WHERE c.country = 'US'")
+    spec = pipe_sql.build_sql_yaml_spec(
+        ns_stream,
+        swapped_sql,
+        uris.parse_endpoint('gs://bkt/out.parquet', is_read=False),
+        max_watermark_skew='30m',
+    )
+    self.assertEqual(spec.get('options'), {'streaming': True})
+    ij_node = next(
+        t for t in spec['pipeline']['transforms']
+        if t['type'] == 'CliIntervalJoin')
+    self.assertEqual(ij_node['config']['lower_bound'], '-60s')
+    self.assertEqual(ij_node['config']['upper_bound'], '900s')
+    self.assertEqual(ij_node['config']['join_type'], 'left')
+    self.assertEqual(ij_node['config']['max_watermark_skew'], '30m')
+
+    # 2. Fail-closed rejections: CTE, strict `<` bound, outer-join non-temporal ON
+    for bad_sql in (
+        'WITH x AS (SELECT * FROM c) SELECT x.uid FROM x JOIN o '
+        "ON x.uid = o.uid AND o.ts BETWEEN x.ts AND x.ts + INTERVAL '5' MINUTE",
+        'SELECT c.uid FROM c JOIN o '
+        "ON c.uid = o.uid AND o.ts >= c.ts AND o.ts < c.ts + INTERVAL '5' MINUTE",
+        'SELECT c.uid FROM c LEFT JOIN o '
+        "ON c.uid = o.uid AND o.ts BETWEEN c.ts AND c.ts + INTERVAL '5' MINUTE "
+        "AND o.status = 'PAID'",
+    ):
+      with self.subTest(sql=bad_sql):
+        with self.assertRaises(pipe_sql.SqlPipeError):
+          pipe_sql.build_sql_yaml_spec(ns_stream, bad_sql, None)
+
+    # 3. End-to-end `--sql ... --portable` execution through lowered CliIntervalJoin!
+    with tempfile.TemporaryDirectory() as tmpdir:
+      c_path = os.path.join(tmpdir, 'clicks.jsonl')
+      o_path = os.path.join(tmpdir, 'orders.jsonl')
+      out_path = os.path.join(tmpdir, 'out.jsonl')
+      with open(c_path, 'w', encoding='utf-8') as f:
+        f.write(json.dumps({'uid': 1, 'ts': 1000, 'src': 'ads'}) + '\n')
+        f.write(json.dumps({'uid': 2, 'ts': 2000, 'src': 'organic'}) + '\n')
+      with open(o_path, 'w', encoding='utf-8') as f:
+        f.write(json.dumps({'uid': 1, 'ts': 1120, 'total': 75.0}) + '\n')
+      rc = cli_main.main([
+          'pipe',
+          '--from',
+          f'c={c_path}',
+          '--join',
+          f'o={o_path}',
+          '--to',
+          out_path,
+          '--sql',
+          'SELECT c.uid, o.total FROM c LEFT JOIN o '
+          'ON c.uid = o.uid '
+          "AND o.ts BETWEEN c.ts AND c.ts + INTERVAL '5' MINUTE "
+          "WHERE c.src = 'ads'",
+          '--portable',
+          '--json',
+      ])
+      self.assertEqual(rc, 0)
+      with open(out_path, encoding='utf-8') as f:
+        got = [json.loads(line) for line in f if line.strip()]
+      self.assertEqual(got, [{'uid': 1, 'total': 75.0}])
 
 
 if __name__ == '__main__':

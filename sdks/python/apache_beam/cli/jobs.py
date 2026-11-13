@@ -261,6 +261,10 @@ def extract_beam_cli_counters(metrics_result: Any) -> dict[str, int]:
   """Extracts `Metrics.counter`/`distribution('beam_cli', ...)` from `MetricResults`."""
   if metrics_result is None:
     return {}
+  if (hasattr(metrics_result, 'metrics') and
+      callable(metrics_result.metrics) and
+      not hasattr(metrics_result, 'query')):
+    metrics_result = metrics_result.metrics()
   counters: dict[str, int] = {}
   dist_sums: dict[str, tuple[float, int]] = {}
   try:

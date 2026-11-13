@@ -26,6 +26,7 @@ Supports:
 - Fusion-safe `beam_cli` row counters (`rows_read`, `pre_sink_rows`, `dlq_rows`)
 """
 
+import os
 import re
 import shlex
 from typing import Any
@@ -237,6 +238,15 @@ def parse_window_spec(spec: str | dict[str, Any]) -> dict[str, Any]:
   return out
 
 
+def _split_source_alias_prefix(raw: str) -> tuple[str | None, str]:
+  s = (raw or '').strip()
+  if '=' in s and not os.path.exists(s):
+    m = re.match(r'^(?P<alias>[A-Za-z_][A-Za-z0-9_]*)=(?P<uri>.+)$', s)
+    if m and m.group('uri').strip():
+      return m.group('alias'), m.group('uri').strip()
+  return None, s
+
+
 def build_pipe_spec(
     source: str,
     sink: str,
@@ -269,6 +279,10 @@ def build_pipe_spec(
     timestamp_col: str | None = None,
     expect: list[str] | list[dict[str, Any]] | None = None,
     on_violation: str = 'dlq',
+    join_source: str | None = None,
+    interval_join: str | dict[str, Any] | None = None,
+    max_watermark_skew: str | None = None,
+    skew_action: str | None = None,
 ) -> PipeSpec:
   """Returns the `PipeSpec` for `beam pipe`."""
   if if_exists not in ('fail', 'append', 'replace'):
@@ -279,6 +293,28 @@ def build_pipe_spec(
   if cdc_format not in ('auto', 'debezium', 'flat'):
     raise PipeSpecError(
         f'invalid --cdc-format {cdc_format!r}; use auto, debezium, or flat')
+
+  if interval_join and not join_source:
+    raise PipeSpecError(
+        '--interval-join requires a second source via --join [ALIAS=]URI '
+        '(or a second --from)')
+  if join_source and not interval_join:
+    raise PipeSpecError('--join without --sql requires --interval-join <SPEC>')
+  if (max_watermark_skew is not None or
+      skew_action is not None) and not interval_join:
+    raise PipeSpecError(
+        '--max-watermark-skew / --skew-action requires --interval-join '
+        '(or a 2-source temporal --sql JOIN)')
+  if interval_join and cdc:
+    raise PipeSpecError('--interval-join cannot be combined with --cdc')
+
+  left_alias_hint: str | None = None
+  right_alias_hint: str | None = None
+  clean_join_source: str | None = None
+  if interval_join:
+    left_alias_hint, source = _split_source_alias_prefix(source)
+    right_alias_hint, clean_join_source = _split_source_alias_prefix(
+        str(join_source))
 
   try:
     parsed_from_opts = uris.parse_kv_options(
@@ -298,11 +334,20 @@ def build_pipe_spec(
         source,
         is_read=True,
         explicit_format=from_format,
-        options=parsed_from_opts,
+        options=dict(parsed_from_opts),
         default_project=default_project,
         allow_sniff=not allow_jinja,
         cdc=cdc,
         allow_jinja=allow_jinja)
+    right_ep = (
+        uris.parse_endpoint(
+            clean_join_source,
+            is_read=True,
+            explicit_format=from_format,
+            options=dict(parsed_from_opts),
+            default_project=default_project,
+            allow_sniff=not allow_jinja,
+            allow_jinja=allow_jinja) if clean_join_source else None)
     dst_ep = uris.parse_endpoint(
         sink,
         is_read=False,
@@ -332,6 +377,9 @@ def build_pipe_spec(
   except uris.UriError as e:
     raise PipeSpecError(str(e)) from None
 
+  is_unbounded = bool(
+      src_ep.is_unbounded or (right_ep is not None and right_ep.is_unbounded))
+
   parsed_expect_rules = []
   if expect:
     from . import expect as expect_mod
@@ -347,11 +395,13 @@ def build_pipe_spec(
           "specify --dlq <PATH> or use --on-violation {fail|drop}")
 
   if zero_copy:
-    if cdc or where or select or dlq_ep is not None or window or timestamp_col or expect:
+    if (cdc or where or select or dlq_ep is not None or window or
+        timestamp_col or expect or interval_join):
       raise PipeSpecError(
           '--zero-copy registers existing Parquet files in-place without '
           'rewriting data, so it cannot be combined with --cdc, --where, '
-          '--select, --window, --timestamp-col, --expect, or --dlq')
+          '--select, --window, --timestamp-col, --expect, --interval-join, '
+          'or --dlq')
     if dst_ep.kind != 'iceberg':
       raise PipeSpecError(
           f'--zero-copy requires an iceberg:// destination, got {dst_ep.raw!r}')
@@ -455,18 +505,55 @@ def build_pipe_spec(
   if clean_timestamp_col == '':
     raise PipeSpecError('--timestamp-col cannot be empty')
 
+  interval_join_cfg: dict[str, Any] | None = None
+  ij_parsed = None
+  if interval_join is not None:
+    from . import interval_join as ij_mod
+    eff_skew_act = skew_action or (
+        'dlq' if
+        (dlq_ep is not None and max_watermark_skew is not None) else None)
+    try:
+      if isinstance(interval_join, str):
+        interval_join_cfg = ij_mod.parse_interval_join_spec_str(
+            interval_join,
+            max_watermark_skew=max_watermark_skew,
+            skew_action=eff_skew_act,
+            left_alias=left_alias_hint,
+            right_alias=right_alias_hint)
+      elif isinstance(interval_join, dict):
+        interval_join_cfg = dict(interval_join)
+        if left_alias_hint and 'left_alias' not in interval_join_cfg:
+          interval_join_cfg['left_alias'] = left_alias_hint
+        if right_alias_hint and 'right_alias' not in interval_join_cfg:
+          interval_join_cfg['right_alias'] = right_alias_hint
+        if max_watermark_skew is not None:
+          interval_join_cfg['max_watermark_skew'] = max_watermark_skew
+        if eff_skew_act is not None and 'skew_action' not in interval_join_cfg:
+          interval_join_cfg['skew_action'] = eff_skew_act
+      else:
+        raise ValueError(
+            f'unsupported interval_join type {type(interval_join).__name__}')
+      ij_parsed = ij_mod.parse_interval_join_config(interval_join_cfg)
+    except ValueError as e:
+      raise PipeSpecError(str(e)) from None
+    if ij_parsed.skew_action == 'dlq' and dlq_ep is None:
+      raise PipeSpecError(
+          '--skew-action=dlq requires --dlq <SINK> (or use --skew-action {drop|warn|fail})'
+      )
+
+  eff_where_cols = None if interval_join_cfg is not None else known_source_columns
+  eff_select_cols = (
+      None if (interval_join_cfg is not None or window_aggs is not None) else
+      known_source_columns)
+
   try:
     where_cfg = (
         expressions.compile_where(
-            where,
-            known_columns=known_source_columns,
-            allow_jinja=allow_jinja)[0]
+            where, known_columns=eff_where_cols, allow_jinja=allow_jinja)[0]
         if where else None)
     select_cfg = (
         expressions.compile_select(
-            select,
-            known_columns=known_source_columns,
-            allow_jinja=allow_jinja)[0]
+            select, known_columns=eff_select_cols, allow_jinja=allow_jinja)[0]
         if select else None)
   except expressions.ExpressionError as e:
     raise PipeSpecError(str(e)) from None
@@ -657,7 +744,7 @@ def build_pipe_spec(
       sink_type = 'CliWriteToIceberg'
       sink_cfg = dict(dst_ep.config)
       sink_cfg['if_exists'] = 'append' if (cdc and if_exists == 'fail') else if_exists
-      if src_ep.is_unbounded:
+      if is_unbounded:
         freq = None
         if 'triggering_frequency_seconds' in dst_ep.config:
           freq = int(dst_ep.config['triggering_frequency_seconds'])
@@ -699,7 +786,7 @@ def build_pipe_spec(
       src_cfg.setdefault(
           'include_metadata_columns', ['_change_type', '_commit_version'])
     if dst_ep.kind == 'iceberg':
-      if src_ep.is_unbounded:
+      if is_unbounded:
         freq = None
         if 'triggering_frequency_seconds' in dst_ep.config:
           freq = int(dst_ep.config['triggering_frequency_seconds'])
@@ -740,6 +827,70 @@ def build_pipe_spec(
       sink_java = False
       needs_cli_provider = True
 
+  # Prepare optional second stream (`--join` + `--interval-join`).
+  right_type: str | None = None
+  right_cfg: dict[str, Any] = {}
+  right_java = False
+  if right_ep is not None:
+    if null_values and right_ep.kind == 'file' and right_ep.format == 'csv':
+      right_ep.config['null_values'] = [str(v) for v in null_values]
+    if right_ep.kind == 'file' and right_ep.format in (
+        'csv', 'json') and 'fields' in right_ep.config:
+      from . import cdc as cdc_mod
+      try:
+        r_types = dict(
+            cdc_mod.parse_fields_shorthand(str(right_ep.config.pop('fields'))))
+      except ValueError as e:
+        raise PipeSpecError(f'--from-opt fields: {e}') from None
+      right_ep.config['types'] = r_types
+    right_type = right_ep.yaml_type
+    right_cfg = dict(right_ep.config)
+    right_java = right_ep.is_java_xlang
+    if right_type == 'ReadFromJson':
+      right_cfg.pop('sample_rows', None)
+      right_cfg.pop('on_unknown_fields', None)
+    if right_type == 'ReadFromCsv' and 'null_values' in right_cfg:
+      right_cfg['na_values'] = [''] + right_cfg.pop('null_values')
+      right_cfg['keep_default_na'] = False
+    if right_type in ('ReadFromCsv', 'ReadFromJson') and 'types' in right_cfg:
+      right_cfg['dtype'] = {
+          c: {
+              'int': 'Int64',
+              'float': 'float64',
+              'bool': 'boolean',
+              'str': 'string',
+          }[t]
+          for c, t in right_cfg.pop('types').items()
+      }
+    if prefer_python_lakehouse_and_cdc:
+      if right_ep.kind == 'delta':
+        right_type = 'ReadFromDeltaPy'
+        right_java = False
+        needs_cli_provider = True
+      elif right_ep.kind == 'iceberg':
+        right_type = 'ReadFromIcebergPy'
+        right_java = False
+        needs_cli_provider = True
+      elif right_ep.kind == 'file' and right_ep.format == 'json':
+        right_type = 'ReadJsonWithDlq'
+        right_cfg = {
+            k: v
+            for k, v in right_ep.config.items()
+            if k in ('path', 'types', 'sample_rows', 'on_unknown_fields')
+        }
+        right_java = False
+        needs_cli_provider = True
+      elif (right_ep.kind == 'file' and right_ep.format == 'csv' and set(
+          right_ep.config) <= {'path', 'delimiter', 'null_values', 'types'}):
+        right_type = 'ReadCsvWithDlq'
+        right_cfg = {
+            k: v
+            for k, v in right_ep.config.items()
+            if k in ('path', 'delimiter', 'null_values', 'types')
+        }
+        right_java = False
+        needs_cli_provider = True
+
   # Plain files can't apply upserts or deletes like Iceberg/BigQuery CDC sinks,
   # so --cdc into a file writes the latest live row per key.
   materialize_cdc = cdc_norm_cfg is not None and dst_ep.kind == 'file'
@@ -747,21 +898,25 @@ def build_pipe_spec(
   # expressions like address.city need rows, so convert them locally.
   rowify_nested = bool(
       prefer_python_lakehouse_and_cdc and src_ep.kind == 'file' and
-      src_ep.format in ('parquet', 'avro') and (where_cfg or select_cfg))
-  if rowify_nested:
+      src_ep.format in ('parquet', 'avro') and
+      (where_cfg or select_cfg or interval_join_cfg is not None))
+  right_rowify_nested = bool(
+      prefer_python_lakehouse_and_cdc and right_ep is not None and
+      right_ep.kind == 'file' and right_ep.format in ('parquet', 'avro'))
+  if rowify_nested or right_rowify_nested or interval_join_cfg is not None:
     needs_cli_provider = True
 
   # Pure Java-to-Java fast path: skip Python counter stages unless explicitly
   # requested (`include_counters=True` when `--assert-counts` or Python stage).
   pure_java_pipe = (
       src_java and sink_java and cdc_norm_cfg is None and not where_cfg and
-      not select_cfg and not dlq_ep)
+      not select_cfg and not dlq_ep and interval_join_cfg is None)
   inject_counters = bool(include_counters) and not pure_java_pipe
   if inject_counters:
     needs_cli_provider = True
 
-  # Simple linear chain when `--dlq` is NOT active -> clean, idiomatic YAML!
-  if dlq_ep is None:
+  # Simple linear chain when neither `--dlq` nor `--interval-join` is active!
+  if dlq_ep is None and interval_join_cfg is None:
     chain_steps: list[dict[str, Any]] = [
         {
             'type': src_type,
@@ -788,21 +943,6 @@ def build_pipe_spec(
               'timestamp': clean_timestamp_col
           },
       })
-    if window_spec is not None:
-      chain_steps.append({
-          'type': 'WindowInto',
-          'config': {
-              'windowing': window_spec
-          },
-      })
-      if window_aggs:
-        chain_steps.append({
-            'type': 'Combine',
-            'config': {
-                'group_by': window_aggs.get('group_by', []),
-                'combine': window_aggs.get('combine', {}),
-            },
-        })
     if cdc_norm_cfg is not None:
       chain_steps.append({
           'type': 'CliNormalizeCdc',
@@ -827,6 +967,21 @@ def build_pipe_spec(
             'type': 'CliCountRows',
             'config': {
                 'counter': 'post_filter_rows'
+            },
+        })
+    if window_spec is not None:
+      chain_steps.append({
+          'type': 'WindowInto',
+          'config': {
+              'windowing': window_spec
+          },
+      })
+      if window_aggs:
+        chain_steps.append({
+            'type': 'Combine',
+            'config': {
+                'group_by': window_aggs.get('group_by', []),
+                'combine': window_aggs.get('combine', {}),
             },
         })
     if select_cfg is not None:
@@ -860,7 +1015,7 @@ def build_pipe_spec(
             'transforms': chain_steps,
         }
     }
-    if src_ep.is_unbounded:
+    if is_unbounded:
       spec['options'] = {'streaming': True}
     if needs_cli_provider:
       spec['providers'] = [dlq.cli_yaml_provider_spec()]
@@ -871,82 +1026,288 @@ def build_pipe_spec(
         sink_endpoint=dst_ep,
         dlq_endpoint=None,
         requires_java_xlang=src_java or sink_java,
-        is_unbounded=src_ep.is_unbounded)
+        is_unbounded=is_unbounded)
 
-  # Non-linear DAG when `--dlq` IS active!
+  # Non-linear DAG when `--dlq` or `--interval-join` IS active!
+  has_dlq = dlq_ep is not None
   needs_cli_provider = True
   dag_transforms: list[dict[str, Any]] = []
   dlq_norm_refs: list[str] = []
 
-  source_counts_internally = False
-  if src_ep.kind == 'file' and src_ep.format == 'csv':
-    src_type = 'ReadCsvWithDlq'
-    src_cfg = {
-        k: v
-        for k, v in src_cfg.items() if k in ('path', 'delimiter', 'null_values', 'types')
-    }
-    src_cfg['error_handling'] = {'output': 'errors'}
-    source_counts_internally = True
-  elif src_ep.kind == 'file' and src_ep.format == 'json' and not cdc:
-    src_type = 'ReadJsonWithDlq'
-    src_cfg = {
-        **{
+  def _attach_source_node(
+      node_name: str,
+      ep: uris.ParsedEndpoint,
+      s_type: str,
+      s_cfg: dict[str, Any],
+      norm_dlq_name: str,
+  ) -> tuple[str, bool]:
+    counts_internally = False
+    cfg_copy = dict(s_cfg)
+    if has_dlq:
+      if ep.kind == 'file' and ep.format == 'csv':
+        s_type = 'ReadCsvWithDlq'
+        cfg_copy = {
             k: v
-            for k, v in src_ep.config.items()
-            if k in ('path', 'types', 'sample_rows', 'on_unknown_fields')
-        },
-        'error_handling': {'output': 'errors'},
-    }
-    source_counts_internally = True
-  elif (
-      src_type in dlq.TRANSFORMS_SUPPORTING_ERROR_HANDLING
-      and not (cdc and src_type == 'ReadFromPubSub'
-               and src_cfg.get('format') == 'STRING')):
-    src_cfg['error_handling'] = {'output': 'errors'}
+            for k, v in ep.config.items()
+            if k in ('path', 'delimiter', 'null_values', 'types')
+        }
+        cfg_copy['error_handling'] = {'output': 'errors'}
+        counts_internally = True
+      elif ep.kind == 'file' and ep.format == 'json' and not cdc:
+        s_type = 'ReadJsonWithDlq'
+        cfg_copy = {
+            **{
+                k: v
+                for k, v in ep.config.items() if k in (
+                    'path', 'types', 'sample_rows', 'on_unknown_fields')
+            },
+            'error_handling': {
+                'output': 'errors'
+            },
+        }
+        counts_internally = True
+      elif (s_type in dlq.TRANSFORMS_SUPPORTING_ERROR_HANDLING and
+            not (cdc and s_type == 'ReadFromPubSub' and
+                 cfg_copy.get('format') == 'STRING')):
+        cfg_copy['error_handling'] = {'output': 'errors'}
+    elif s_type in ('ReadCsvWithDlq', 'ReadJsonWithDlq'):
+      counts_internally = True
 
-  dag_transforms.append({'name': 'ReadSource', 'type': src_type, 'config': src_cfg})
-  if 'error_handling' in src_cfg:
-    current_ref = (
-        'ReadSource.good' if source_counts_internally else 'ReadSource')
-    norm_name = 'NormalizeSourceDlq'
-    dag_transforms.append(
-        dlq.build_dlq_normalizer_transform(
-            norm_name, 'ReadSource.errors', src_type))
-    dlq_norm_refs.append(norm_name)
+    dag_transforms.append({
+        'name': node_name, 'type': s_type, 'config': cfg_copy
+    })
+    if 'error_handling' in cfg_copy:
+      out_ref = f'{node_name}.good' if counts_internally else node_name
+      dag_transforms.append(
+          dlq.build_dlq_normalizer_transform(
+              norm_dlq_name, f'{node_name}.errors', s_type))
+      dlq_norm_refs.append(norm_dlq_name)
+    else:
+      out_ref = node_name
+    return out_ref, counts_internally
+
+  if interval_join_cfg is not None and right_ep is not None and right_type is not None:
+    left_ref, left_counted = _attach_source_node(
+        'ReadLeft', src_ep, src_type, src_cfg, 'NormalizeLeftSourceDlq')
+    if rowify_nested:
+      dag_transforms.append({
+          'name': 'RowifyNestedLeft',
+          'type': 'CliRowifyNested',
+          'input': left_ref,
+          'config': {},
+      })
+      left_ref = 'RowifyNestedLeft'
+    if inject_counters and not left_counted:
+      dag_transforms.append({
+          'name': 'CountReadLeft',
+          'type': 'CliCountRows',
+          'input': left_ref,
+          'config': {
+              'counter': 'rows_read'
+          },
+      })
+      left_ref = 'CountReadLeft'
+
+    right_ref, right_counted = _attach_source_node(
+        'ReadRight', right_ep, right_type, right_cfg, 'NormalizeRightSourceDlq')
+    if right_rowify_nested:
+      dag_transforms.append({
+          'name': 'RowifyNestedRight',
+          'type': 'CliRowifyNested',
+          'input': right_ref,
+          'config': {},
+      })
+      right_ref = 'RowifyNestedRight'
+    if inject_counters and not right_counted:
+      dag_transforms.append({
+          'name': 'CountReadRight',
+          'type': 'CliCountRows',
+          'input': right_ref,
+          'config': {
+              'counter': 'rows_read'
+          },
+      })
+      right_ref = 'CountReadRight'
+
+    assert ij_parsed is not None
+    ts_l_cfg: dict[str, Any] = {'timestamp_col': ij_parsed.left_timestamp}
+    ts_r_cfg: dict[str, Any] = {'timestamp_col': ij_parsed.right_timestamp}
+    if has_dlq:
+      ts_l_cfg['error_handling'] = {'output': 'errors'}
+      ts_r_cfg['error_handling'] = {'output': 'errors'}
+    dag_transforms.append({
+        'name': 'AssignTimestampsLeft',
+        'type': 'CliAssignTimestamps',
+        'input': left_ref,
+        'config': ts_l_cfg,
+    })
+    dag_transforms.append({
+        'name': 'AssignTimestampsRight',
+        'type': 'CliAssignTimestamps',
+        'input': right_ref,
+        'config': ts_r_cfg,
+    })
+    if has_dlq:
+      ij_l_in = 'AssignTimestampsLeft.good'
+      ij_r_in = 'AssignTimestampsRight.good'
+      dag_transforms.append(
+          dlq.build_dlq_normalizer_transform(
+              'NormalizeAssignTsLeftDlq',
+              'AssignTimestampsLeft.errors',
+              'CliAssignTimestamps'))
+      dag_transforms.append(
+          dlq.build_dlq_normalizer_transform(
+              'NormalizeAssignTsRightDlq',
+              'AssignTimestampsRight.errors',
+              'CliAssignTimestamps'))
+      dlq_norm_refs.extend(
+          ['NormalizeAssignTsLeftDlq', 'NormalizeAssignTsRightDlq'])
+    else:
+      ij_l_in = 'AssignTimestampsLeft'
+      ij_r_in = 'AssignTimestampsRight'
+
+    ij_node_cfg = dict(interval_join_cfg)
+    if has_dlq:
+      ij_node_cfg['error_handling'] = {'output': 'errors'}
+    dag_transforms.append({
+        'name': 'IntervalJoin',
+        'type': 'CliIntervalJoin',
+        'input': {
+            'left': ij_l_in,
+            'right': ij_r_in,
+        },
+        'config': ij_node_cfg,
+    })
+    if has_dlq:
+      current_ref = 'IntervalJoin.good'
+      dag_transforms.append(
+          dlq.build_dlq_normalizer_transform(
+              'NormalizeIntervalJoinDlq',
+              'IntervalJoin.errors',
+              'CliIntervalJoin'))
+      dlq_norm_refs.append('NormalizeIntervalJoinDlq')
+    else:
+      current_ref = 'IntervalJoin'
+
+    if clean_timestamp_col:
+      dag_transforms.append({
+          'name': 'AssignTimestamps',
+          'type': 'AssignTimestamps',
+          'input': current_ref,
+          'config': {
+              'timestamp': clean_timestamp_col
+          },
+      })
+      current_ref = 'AssignTimestamps'
   else:
-    current_ref = 'ReadSource'
+    current_ref, source_counts_internally = _attach_source_node(
+        'ReadSource', src_ep, src_type, src_cfg, 'NormalizeSourceDlq')
+    if rowify_nested:
+      # Must directly follow the source (see the chain form above).
+      dag_transforms.append({
+          'name': 'RowifyNested',
+          'type': 'CliRowifyNested',
+          'input': current_ref,
+          'config': {},
+      })
+      current_ref = 'RowifyNested'
 
-  if rowify_nested:
-    # Must directly follow the source (see the chain form above).
-    dag_transforms.append({
-        'name': 'RowifyNested',
-        'type': 'CliRowifyNested',
-        'input': current_ref,
-        'config': {},
-    })
-    current_ref = 'RowifyNested'
+    if inject_counters and not source_counts_internally:
+      dag_transforms.append({
+          'name': 'CountRead',
+          'type': 'CliCountRows',
+          'input': current_ref,
+          'config': {
+              'counter': 'rows_read'
+          },
+      })
+      current_ref = 'CountRead'
 
-  if inject_counters and not source_counts_internally:
-    dag_transforms.append({
-        'name': 'CountRead',
-        'type': 'CliCountRows',
-        'input': current_ref,
-        'config': {
-            'counter': 'rows_read'
-        },
-    })
-    current_ref = 'CountRead'
+    if clean_timestamp_col:
+      dag_transforms.append({
+          'name': 'AssignTimestamps',
+          'type': 'AssignTimestamps',
+          'input': current_ref,
+          'config': {
+              'timestamp': clean_timestamp_col
+          },
+      })
+      current_ref = 'AssignTimestamps'
 
-  if clean_timestamp_col:
+  if cdc_norm_cfg is not None:
+    norm_cdc = dict(cdc_norm_cfg)
+    if has_dlq:
+      norm_cdc['error_handling'] = {'output': 'errors'}
     dag_transforms.append({
-        'name': 'AssignTimestamps',
-        'type': 'AssignTimestamps',
+        'name': 'NormalizeCdc',
+        'type': 'CliNormalizeCdc',
         'input': current_ref,
-        'config': {
-            'timestamp': clean_timestamp_col
-        },
+        'config': norm_cdc,
     })
-    current_ref = 'AssignTimestamps'
+    if has_dlq:
+      dag_transforms.append(
+          dlq.build_dlq_normalizer_transform(
+              'NormalizeCdcDlq', 'NormalizeCdc.errors', 'NormalizeCdc'))
+      dlq_norm_refs.append('NormalizeCdcDlq')
+      current_ref = 'NormalizeCdc.good'
+    else:
+      current_ref = 'NormalizeCdc'
+    if materialize_cdc:
+      dag_transforms.append({
+          'name': 'MaterializeCdc',
+          'type': 'CliMaterializeCdc',
+          'input': current_ref,
+          'config': _materialize_cdc_config(pks, cdc_seq_col),
+      })
+      current_ref = 'MaterializeCdc'
+
+  if where_cfg is not None:
+    if inject_counters:
+      dag_transforms.append({
+          'name': 'CountPreFilter',
+          'type': 'CliCountRows',
+          'input': current_ref,
+          'config': {
+              'counter': 'pre_filter_rows'
+          },
+      })
+      current_ref = 'CountPreFilter'
+    w_cfg = dict(where_cfg)
+    if has_dlq:
+      w_cfg['error_handling'] = {'output': 'errors'}
+    dag_transforms.append({
+        'name': 'FilterWhere',
+        'type': 'Filter',
+        'input': current_ref,
+        'config': w_cfg,
+    })
+    if has_dlq:
+      dag_transforms.append(
+          dlq.build_dlq_normalizer_transform(
+              'NormalizeFilterDlq', 'FilterWhere.errors', 'Filter'))
+      filter_dlq_ref = 'NormalizeFilterDlq'
+      if inject_counters:
+        dag_transforms.append({
+            'name': 'CountFilterDlq',
+            'type': 'CliCountRows',
+            'input': filter_dlq_ref,
+            'config': {
+                'counter': 'filter_dlq_rows'
+            },
+        })
+        filter_dlq_ref = 'CountFilterDlq'
+      dlq_norm_refs.append(filter_dlq_ref)
+    current_ref = 'FilterWhere'
+    if inject_counters:
+      dag_transforms.append({
+          'name': 'CountPostFilter',
+          'type': 'CliCountRows',
+          'input': current_ref,
+          'config': {
+              'counter': 'post_filter_rows'
+          },
+      })
+      current_ref = 'CountPostFilter'
 
   if window_spec is not None:
     dag_transforms.append({
@@ -970,110 +1331,48 @@ def build_pipe_spec(
       })
       current_ref = 'WindowCombine'
 
-  if cdc_norm_cfg is not None:
-    norm_cdc = dict(cdc_norm_cfg)
-    norm_cdc['error_handling'] = {'output': 'errors'}
-    dag_transforms.append({
-        'name': 'NormalizeCdc',
-        'type': 'CliNormalizeCdc',
-        'input': current_ref,
-        'config': norm_cdc,
-    })
-    dag_transforms.append(
-        dlq.build_dlq_normalizer_transform(
-            'NormalizeCdcDlq', 'NormalizeCdc.errors', 'NormalizeCdc'))
-    dlq_norm_refs.append('NormalizeCdcDlq')
-    current_ref = 'NormalizeCdc.good'
-    if materialize_cdc:
-      dag_transforms.append({
-          'name': 'MaterializeCdc',
-          'type': 'CliMaterializeCdc',
-          'input': current_ref,
-          'config': _materialize_cdc_config(pks, cdc_seq_col),
-      })
-      current_ref = 'MaterializeCdc'
-
-  if where_cfg is not None:
-    if inject_counters:
-      dag_transforms.append({
-          'name': 'CountPreFilter',
-          'type': 'CliCountRows',
-          'input': current_ref,
-          'config': {
-              'counter': 'pre_filter_rows'
-          },
-      })
-      current_ref = 'CountPreFilter'
-    w_cfg = dict(where_cfg)
-    w_cfg['error_handling'] = {'output': 'errors'}
-    dag_transforms.append({
-        'name': 'FilterWhere',
-        'type': 'Filter',
-        'input': current_ref,
-        'config': w_cfg,
-    })
-    dag_transforms.append(
-        dlq.build_dlq_normalizer_transform(
-            'NormalizeFilterDlq', 'FilterWhere.errors', 'Filter'))
-    filter_dlq_ref = 'NormalizeFilterDlq'
-    if inject_counters:
-      dag_transforms.append({
-          'name': 'CountFilterDlq',
-          'type': 'CliCountRows',
-          'input': filter_dlq_ref,
-          'config': {
-              'counter': 'filter_dlq_rows'
-          },
-      })
-      filter_dlq_ref = 'CountFilterDlq'
-    dlq_norm_refs.append(filter_dlq_ref)
-    current_ref = 'FilterWhere'
-    if inject_counters:
-      dag_transforms.append({
-          'name': 'CountPostFilter',
-          'type': 'CliCountRows',
-          'input': current_ref,
-          'config': {
-              'counter': 'post_filter_rows'
-          },
-      })
-      current_ref = 'CountPostFilter'
-
   if select_cfg is not None:
     s_cfg = dict(select_cfg)
-    s_cfg['error_handling'] = {'output': 'errors'}
+    if has_dlq:
+      s_cfg['error_handling'] = {'output': 'errors'}
     dag_transforms.append({
         'name': 'SelectFields',
         'type': 'MapToFields',
         'input': current_ref,
         'config': s_cfg,
     })
-    dag_transforms.append(
-        dlq.build_dlq_normalizer_transform(
-            'NormalizeSelectDlq', 'SelectFields.errors', 'MapToFields'))
-    dlq_norm_refs.append('NormalizeSelectDlq')
+    if has_dlq:
+      dag_transforms.append(
+          dlq.build_dlq_normalizer_transform(
+              'NormalizeSelectDlq', 'SelectFields.errors', 'MapToFields'))
+      dlq_norm_refs.append('NormalizeSelectDlq')
     current_ref = 'SelectFields'
 
   if parsed_expect_rules:
     needs_cli_provider = True
-    exp_cfg = {
-        'rules': [
-            {'name': r.name, 'expression': r.expression, 'on_violation': r.on_violation}
-            for r in parsed_expect_rules
-        ],
-        'error_handling': {'output': 'errors'},
+    exp_cfg: dict[str, Any] = {
+        'rules': [{
+            'name': r.name,
+            'expression': r.expression,
+            'on_violation': r.on_violation
+        } for r in parsed_expect_rules],
     }
+    if has_dlq:
+      exp_cfg['error_handling'] = {'output': 'errors'}
     dag_transforms.append({
         'name': 'ValidateExpect',
         'type': 'CliExpect',
         'input': current_ref,
         'config': exp_cfg,
     })
-    dag_transforms.append(
-        dlq.build_dlq_normalizer_transform(
-            'NormalizeExpectDlq', 'ValidateExpect.errors', 'CliExpect'))
-    dlq_norm_refs.append('NormalizeExpectDlq')
-    current_ref = 'ValidateExpect.good'
+    if has_dlq:
+      dag_transforms.append(
+          dlq.build_dlq_normalizer_transform(
+              'NormalizeExpectDlq', 'ValidateExpect.errors', 'CliExpect'))
+      dlq_norm_refs.append('NormalizeExpectDlq')
+      current_ref = 'ValidateExpect.good'
+    else:
+      current_ref = 'ValidateExpect'
 
   if inject_counters:
     dag_transforms.append({
@@ -1087,8 +1386,8 @@ def build_pipe_spec(
     current_ref = 'CountPreSink'
 
   dst_cfg = dict(sink_cfg)
-  if sink_type in dlq.TRANSFORMS_SUPPORTING_ERROR_HANDLING or (
-      sink_type in ('CliWriteToBigQuery', 'CliWriteToBigQueryCDC')):
+  if has_dlq and (sink_type in dlq.TRANSFORMS_SUPPORTING_ERROR_HANDLING or
+                  sink_type in ('CliWriteToBigQuery', 'CliWriteToBigQueryCDC')):
     dst_cfg['error_handling'] = {'output': 'errors'}
     dag_transforms.append({
         'name': 'WriteSink',
@@ -1108,7 +1407,8 @@ def build_pipe_spec(
         'config': dst_cfg,
     })
 
-  if dlq_norm_refs:
+  if has_dlq and dlq_norm_refs:
+    assert dlq_ep is not None
     if len(dlq_norm_refs) == 1:
       dlq_input_ref = dlq_norm_refs[0]
     else:
@@ -1147,7 +1447,7 @@ def build_pipe_spec(
       },
       'providers': [dlq.cli_yaml_provider_spec()],
   }
-  if src_ep.is_unbounded:
+  if is_unbounded:
     spec['options'] = {'streaming': True}
   return PipeSpec(
       spec=spec,
@@ -1155,8 +1455,10 @@ def build_pipe_spec(
       source_endpoint=src_ep,
       sink_endpoint=dst_ep,
       dlq_endpoint=dlq_ep,
-      requires_java_xlang=(src_java or sink_java or dlq_ep.is_java_xlang),
-      is_unbounded=src_ep.is_unbounded)
+      requires_java_xlang=(
+          src_java or right_java or sink_java or
+          (dlq_ep is not None and dlq_ep.is_java_xlang)),
+      is_unbounded=is_unbounded)
 
 
 def _redact_spec_secrets(

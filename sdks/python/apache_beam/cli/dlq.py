@@ -211,28 +211,23 @@ def cli_yaml_provider_spec() -> dict[str, Any]:
           'CliWriteToBigQuery': 'apache_beam.cli.dlq.cli_write_to_bigquery',
           'ReadFromDeltaPy': 'apache_beam.cli.lakehouse.cli_read_from_delta',
           'ReadFromDeltaCdcPy': (
-              'apache_beam.cli.lakehouse.cli_read_from_delta_cdc'
-          ),
+              'apache_beam.cli.lakehouse.cli_read_from_delta_cdc'),
           'ReadFromIcebergPy': (
-              'apache_beam.cli.lakehouse.cli_read_from_iceberg'
-          ),
+              'apache_beam.cli.lakehouse.cli_read_from_iceberg'),
           'ReadFromIcebergCdcPy': (
-              'apache_beam.cli.lakehouse.cli_read_from_iceberg_cdc'
-          ),
+              'apache_beam.cli.lakehouse.cli_read_from_iceberg_cdc'),
           'CliWriteToIceberg': 'apache_beam.cli.lakehouse.cli_write_to_iceberg',
           'CliNormalizeCdc': 'apache_beam.cli.cdc.cli_normalize_cdc',
           'CliMaterializeCdc': 'apache_beam.cli.cdc.cli_materialize_cdc',
           'CliRowifyNested': 'apache_beam.cli.dlq.cli_rowify_nested',
           'CliExpect': 'apache_beam.cli.expect.cli_expect',
           'CliWriteToBigQueryCDC': (
-              'apache_beam.cli.cdc.cli_write_to_bigquery_cdc'
-          ),
+              'apache_beam.cli.cdc.cli_write_to_bigquery_cdc'),
           'CliIntervalJoin': (
-              'apache_beam.cli.interval_join.cli_interval_join'
-          ),
-          'IntervalJoin': (
-              'apache_beam.cli.interval_join.cli_interval_join'
-          ),
+              'apache_beam.cli.interval_join.cli_interval_join'),
+          'IntervalJoin': ('apache_beam.cli.interval_join.cli_interval_join'),
+          'CliAssignTimestamps': (
+              'apache_beam.cli.interval_join.cli_assign_timestamps'),
       },
   }
 
@@ -1511,4 +1506,3 @@ def cli_write_to_bigquery(
       return None
 
   return _CliWriteBqTransform()
-
