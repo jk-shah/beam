@@ -173,6 +173,7 @@ _CLI_ZERO_FLAGS = {
         '--ignore-errors',
         '--check-schema',
         '--schema-check',
+        '--dedupe-dlq',
         '--verbose',
         '--no-config',
         '--help',
@@ -224,6 +225,11 @@ _CLI_ONE_FLAGS = {
         '--interval-join',
         '--max-watermark-skew',
         '--skew-action',
+        '--dedupe-by',
+        '--dedupe-window',
+        '--dedupe-keep',
+        '--dedupe-order',
+        '--dedupe-time-domain',
         '--window',
         '--window-size',
         '--window_size',
@@ -828,6 +834,51 @@ def _build_parser():
       choices=['drop', 'warn', 'dlq', 'fail'],
       default=None,
       help='action when watermark skew exceeds --max-watermark-skew')
+  pipe.add_argument(
+      '--dedupe-by',
+      dest='dedupe_by',
+      default=None,
+      metavar='COLS',
+      help=
+      'key column(s) for deduplication (e.g. event_id or "[tenant_id,event_id]")'
+  )
+  pipe.add_argument(
+      '--dedupe-window',
+      dest='dedupe_window',
+      default=None,
+      metavar='DUR',
+      help='TTL deduplication horizon (required on unbounded streams, e.g. 10m)'
+  )
+  pipe.add_argument(
+      '--dedupe-keep',
+      dest='dedupe_keep',
+      choices=['first', 'last'],
+      default='first',
+      help=
+      'winner policy per deduplication key: first (default) or last (bounded only)'
+  )
+  pipe.add_argument(
+      '--dedupe-order',
+      dest='dedupe_order',
+      default=None,
+      metavar='COL',
+      help=
+      'ordering column for bounded --dedupe-keep tie-breaking (e.g. seq_num)')
+  pipe.add_argument(
+      '--dedupe-time-domain',
+      dest='dedupe_time_domain',
+      choices=['auto', 'event', 'processing'],
+      default='auto',
+      help=
+      'TTL clock domain for streaming deduplication: auto, event, or processing'
+  )
+  pipe.add_argument(
+      '--dedupe-dlq',
+      dest='dedupe_dlq',
+      action='store_true',
+      help=
+      'route suppressed duplicate records to --dlq instead of dropping silently'
+  )
   pipe.add_argument(
       '--sql',
       dest='sql',
@@ -2796,11 +2847,12 @@ def _pipe(
   is_local_runner = _runner_name(explicit_runner) in _LOCAL_RUNNERS
 
   if getattr(args, 'primary_keys', None) and not args.cdc:
-    if getattr(args, 'interval_join', None):
+    if getattr(args, 'interval_join', None) or getattr(args, 'dedupe_by', None):
       raise _CliError(
           '--key / --primary-key enables --cdc mode and cannot be implicitly '
-          'combined with --interval-join; pass key=COL inside --interval-join '
-          '(or pass --cdc explicitly if CDC is intended)',
+          'combined with --interval-join or --dedupe-by; pass key=COL inside '
+          '--interval-join or --dedupe-by COL (or pass --cdc explicitly if CDC '
+          'is intended)',
           EXIT_USAGE)
     args.cdc = True
 
@@ -2836,7 +2888,8 @@ def _pipe(
   if args.sink is None and args.sql is None and getattr(
       args, 'select',
       None) and not (args.cdc or args.zero_copy or args.window or
-                     args.timestamp_col or args.dlq or has_interval_join_flag):
+                     args.timestamp_col or args.dlq or has_interval_join_flag or
+                     getattr(args, 'dedupe_by', None)):
     from . import pipe_sql as _ps_mod
     first_src = raw_sources[0] if raw_sources else ''
     m_alias = _ps_mod._ALIAS_PREFIX_RE.match(first_src)
@@ -2881,10 +2934,12 @@ def _pipe(
           'multiple --from sources or --join requires --sql "SELECT ..." '
           'or --interval-join <SPEC>',
           EXIT_USAGE)
-    if args.where or args.select or args.cdc or args.zero_copy:
+    if (args.where or args.select or args.cdc or args.zero_copy or
+        getattr(args, 'dedupe_by', None)):
       raise _CliError(
-          '--sql cannot be combined with --where, --select, --cdc, or '
-          '--zero-copy; express filters and projections inside --sql',
+          '--sql cannot be combined with --where, --select, --cdc, '
+          '--dedupe-by, or --zero-copy; express filters and projections '
+          'inside --sql (or use --interval-join without --sql)',
           EXIT_USAGE)
     try:
       parsed_from_opts = uris.parse_kv_options(
@@ -3324,7 +3379,13 @@ def _pipe(
         join_source=join_source_for_pipe,
         interval_join=getattr(args, 'interval_join', None),
         max_watermark_skew=getattr(args, 'max_watermark_skew', None),
-        skew_action=getattr(args, 'skew_action', None))
+        skew_action=getattr(args, 'skew_action', None),
+        dedupe_by=getattr(args, 'dedupe_by', None),
+        dedupe_window=getattr(args, 'dedupe_window', None),
+        dedupe_keep=getattr(args, 'dedupe_keep', 'first'),
+        dedupe_order=getattr(args, 'dedupe_order', None),
+        dedupe_time_domain=getattr(args, 'dedupe_time_domain', 'auto'),
+        dedupe_dlq=bool(getattr(args, 'dedupe_dlq', False)))
   except pipe_spec.PipeSpecError as e:
     raise _CliError(str(e), EXIT_USAGE) from None
 
@@ -3552,6 +3613,16 @@ def _pipe(
     extra_warnings.append(note)
     if not json_session.enabled:
       print(f'note: {note}', file=sys.stderr)
+  if (pipe.is_unbounded and getattr(args, 'dedupe_by', None) and
+      getattr(args, 'dedupe_time_domain', 'auto') in ('auto', 'processing') and
+      not getattr(args, 'timestamp_col', None) and not has_interval_join_flag):
+    warn_dedup_pt = (
+        'streaming --dedupe-by without --timestamp-col uses processing-time '
+        'TTLs, which can vary across backlog replays; pass --timestamp-col '
+        '<COL> for deterministic event-time deduplication')
+    extra_warnings.append(warn_dedup_pt)
+    if not json_session.enabled:
+      print(f'warning: {warn_dedup_pt}', file=sys.stderr)
 
   try:
     return _run_yaml(

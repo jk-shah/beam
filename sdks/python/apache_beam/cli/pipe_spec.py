@@ -283,6 +283,12 @@ def build_pipe_spec(
     interval_join: str | dict[str, Any] | None = None,
     max_watermark_skew: str | None = None,
     skew_action: str | None = None,
+    dedupe_by: Iterable[str] | str | None = None,
+    dedupe_window: str | None = None,
+    dedupe_keep: str = 'first',
+    dedupe_order: str | None = None,
+    dedupe_time_domain: str = 'auto',
+    dedupe_dlq: bool = False,
 ) -> PipeSpec:
   """Returns the `PipeSpec` for `beam pipe`."""
   if if_exists not in ('fail', 'append', 'replace'):
@@ -396,12 +402,12 @@ def build_pipe_spec(
 
   if zero_copy:
     if (cdc or where or select or dlq_ep is not None or window or
-        timestamp_col or expect or interval_join):
+        timestamp_col or expect or interval_join or dedupe_by):
       raise PipeSpecError(
           '--zero-copy registers existing Parquet files in-place without '
           'rewriting data, so it cannot be combined with --cdc, --where, '
           '--select, --window, --timestamp-col, --expect, --interval-join, '
-          'or --dlq')
+          '--dedupe-by, or --dlq')
     if dst_ep.kind != 'iceberg':
       raise PipeSpecError(
           f'--zero-copy requires an iceberg:// destination, got {dst_ep.raw!r}')
@@ -540,6 +546,72 @@ def build_pipe_spec(
       raise PipeSpecError(
           '--skew-action=dlq requires --dlq <SINK> (or use --skew-action {drop|warn|fail})'
       )
+
+  dedupe_yaml_cfg: dict[str, Any] | None = None
+  if not dedupe_by:
+    if (dedupe_window is not None or dedupe_order is not None or dedupe_dlq or
+        (dedupe_keep and dedupe_keep != 'first') or
+        (dedupe_time_domain and dedupe_time_domain != 'auto')):
+      raise PipeSpecError(
+          '--dedupe-window, --dedupe-keep, --dedupe-order, '
+          '--dedupe-time-domain, and --dedupe-dlq require --dedupe-by <COLS>')
+  else:
+    from . import dedup as dedup_mod
+    raw_dcfg: dict[str, Any] = {
+        'keys': dedupe_by,
+        'keep': dedupe_keep or 'first',
+        'time_domain': dedupe_time_domain or 'auto',
+    }
+    if dedupe_window is not None:
+      raw_dcfg['window'] = dedupe_window
+    if dedupe_order is not None:
+      raw_dcfg['order_by'] = dedupe_order
+    if clean_timestamp_col:
+      raw_dcfg['timestamp_col'] = clean_timestamp_col
+    elif ij_parsed is not None and ij_parsed.left_timestamp:
+      raw_dcfg['timestamp_col'] = ij_parsed.left_timestamp
+    if dedupe_dlq:
+      raw_dcfg['dedupe_dlq'] = True
+    if isinstance(dedupe_by, dict) and dedupe_by.get('force_stateful'):
+      raw_dcfg['force_stateful'] = True
+    try:
+      parsed_dedup = dedup_mod.parse_deduplicate_config(raw_dcfg)
+    except ValueError as e:
+      raise PipeSpecError(str(e)) from None
+    if is_unbounded and parsed_dedup.window_sec is None:
+      raise PipeSpecError(
+          'streaming --dedupe-by on an unbounded source requires '
+          '--dedupe-window <DURATION> (e.g. --dedupe-window 10m)')
+    if is_unbounded and (parsed_dedup.keep != 'first' or
+                         parsed_dedup.order_col is not None):
+      raise PipeSpecError(
+          'streaming --dedupe-by on an unbounded source only supports '
+          '--dedupe-keep=first without --dedupe-order; use bounded inputs or '
+          '--window aggregations for keep=last')
+    if (not is_unbounded and parsed_dedup.time_domain == 'processing' and
+        not parsed_dedup.force_stateful):
+      raise PipeSpecError(
+          '--dedupe-time-domain=processing is only valid on unbounded '
+          'streaming sources; use --dedupe-time-domain=event or omit it on '
+          'bounded inputs')
+    if parsed_dedup.route_duplicates_to_dlq and dlq_ep is None:
+      raise PipeSpecError('--dedupe-dlq requires --dlq <SINK>')
+    dedupe_yaml_cfg = {
+        'keys': list(parsed_dedup.keys),
+        'keep': parsed_dedup.keep,
+    }
+    if dedupe_window is not None:
+      dedupe_yaml_cfg['window'] = str(dedupe_window).strip()
+    if parsed_dedup.order_col:
+      dedupe_yaml_cfg['order_by'] = parsed_dedup.order_col
+    if parsed_dedup.time_domain != 'auto':
+      dedupe_yaml_cfg['time_domain'] = parsed_dedup.time_domain
+    if parsed_dedup.timestamp_col:
+      dedupe_yaml_cfg['timestamp_col'] = parsed_dedup.timestamp_col
+    if parsed_dedup.route_duplicates_to_dlq:
+      dedupe_yaml_cfg['dedupe_dlq'] = True
+    if parsed_dedup.force_stateful:
+      dedupe_yaml_cfg['force_stateful'] = True
 
   eff_where_cols = None if interval_join_cfg is not None else known_source_columns
   eff_select_cols = (
@@ -903,14 +975,15 @@ def build_pipe_spec(
   right_rowify_nested = bool(
       prefer_python_lakehouse_and_cdc and right_ep is not None and
       right_ep.kind == 'file' and right_ep.format in ('parquet', 'avro'))
-  if rowify_nested or right_rowify_nested or interval_join_cfg is not None:
+  if rowify_nested or right_rowify_nested or interval_join_cfg is not None or dedupe_yaml_cfg is not None:
     needs_cli_provider = True
 
   # Pure Java-to-Java fast path: skip Python counter stages unless explicitly
   # requested (`include_counters=True` when `--assert-counts` or Python stage).
   pure_java_pipe = (
       src_java and sink_java and cdc_norm_cfg is None and not where_cfg and
-      not select_cfg and not dlq_ep and interval_join_cfg is None)
+      not select_cfg and not dlq_ep and interval_join_cfg is None and
+      dedupe_yaml_cfg is None)
   inject_counters = bool(include_counters) and not pure_java_pipe
   if inject_counters:
     needs_cli_provider = True
@@ -953,6 +1026,11 @@ def build_pipe_spec(
             'type': 'CliMaterializeCdc',
             'config': _materialize_cdc_config(pks, cdc_seq_col),
         })
+    if dedupe_yaml_cfg is not None:
+      chain_steps.append({
+          'type': 'CliDeduplicate',
+          'config': dict(dedupe_yaml_cfg),
+      })
     if where_cfg is not None:
       if inject_counters:
         chain_steps.append({
@@ -1260,6 +1338,25 @@ def build_pipe_spec(
           'config': _materialize_cdc_config(pks, cdc_seq_col),
       })
       current_ref = 'MaterializeCdc'
+
+  if dedupe_yaml_cfg is not None:
+    d_cfg = dict(dedupe_yaml_cfg)
+    if has_dlq:
+      d_cfg['error_handling'] = {'output': 'errors'}
+    dag_transforms.append({
+        'name': 'Deduplicate',
+        'type': 'CliDeduplicate',
+        'input': current_ref,
+        'config': d_cfg,
+    })
+    if has_dlq:
+      dag_transforms.append(
+          dlq.build_dlq_normalizer_transform(
+              'NormalizeDedupeDlq', 'Deduplicate.errors', 'CliDeduplicate'))
+      dlq_norm_refs.append('NormalizeDedupeDlq')
+      current_ref = 'Deduplicate.good'
+    else:
+      current_ref = 'Deduplicate'
 
   if where_cfg is not None:
     if inject_counters:

@@ -72,6 +72,7 @@ def render_llms_txt() -> str:
     `--join` is accepted as an alias for repeating `--from` or as the right stream for `--interval-join`),
     apply event-time windowing (`--window fixed:60s`, `sliding:5m,1m`, `session:30m` with `--timestamp-col COL`; `--window-size` is accepted),
     correlate event streams with declarative interval joins (`--from o=URI --join s=URI --interval-join "key=id,left_time=o_ts,right_time=s_ts,lower=0s,upper=15m,type=left"` or 2-source SQL `BETWEEN ... INTERVAL`) and watermark skew circuit breaking (`--max-watermark-skew 30m --skew-action dlq|drop|warn|fail`),
+    deduplicate at-least-once streams or batches (`--dedupe-by COL[,COL2] [--dedupe-window 10m] [--dedupe-keep first|last] [--dedupe-order COL] [--dedupe-dlq]`),
     enforce data quality rules (`--expect "rule: expr -> dlq|drop|fail"`), run pre-flight
     schema contract comparison (`--check-schema`), quarantine dirty rows (`--dlq` or `--dead-letter-target`),
     drop invalid rows (`--drop-bad` / `--skip-errors`), enforce scan budget (`--max-bytes`), verify

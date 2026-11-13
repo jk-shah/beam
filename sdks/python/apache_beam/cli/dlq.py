@@ -228,6 +228,8 @@ def cli_yaml_provider_spec() -> dict[str, Any]:
           'IntervalJoin': ('apache_beam.cli.interval_join.cli_interval_join'),
           'CliAssignTimestamps': (
               'apache_beam.cli.interval_join.cli_assign_timestamps'),
+          'CliDeduplicate': 'apache_beam.cli.dedup.cli_deduplicate',
+          'Deduplicate': 'apache_beam.cli.dedup.cli_deduplicate',
       },
   }
 
