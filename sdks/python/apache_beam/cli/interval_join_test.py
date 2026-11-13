@@ -233,7 +233,6 @@ class BoundedIntervalJoinAlgorithmTest(unittest.TestCase):
 
 class BeamPipelineIntervalJoinTest(unittest.TestCase):
   """Tests end-to-end execution of CliIntervalJoin in an Apache Beam pipeline."""
-
   def test_beam_pipeline_execution(self):
     import apache_beam as beam
     from apache_beam.testing.test_pipeline import TestPipeline
@@ -253,7 +252,9 @@ class BeamPipelineIntervalJoinTest(unittest.TestCase):
       left_pc = p | 'CreateLeft' >> beam.Create(left_data)
       right_pc = p | 'CreateRight' >> beam.Create(right_data)
 
-      joined = {'left': left_pc, 'right': right_pc} | interval_join.CliIntervalJoin(
+      joined = {
+          'left': left_pc, 'right': right_pc
+      } | interval_join.CliIntervalJoin(
           key='uid',
           left_time='click_ts',
           right_time='purchase_ts',
@@ -345,19 +346,21 @@ class SqlIntervalJoinTest(unittest.TestCase):
 
 class YamlProviderRegistrationTest(unittest.TestCase):
   """Tests that CliIntervalJoin is correctly registered in Beam YAML provider spec."""
-
   def test_yaml_provider_registration(self):
     spec = dlq.cli_yaml_provider_spec()
     transforms = spec.get('transforms', {})
     self.assertIn('CliIntervalJoin', transforms)
     self.assertIn('IntervalJoin', transforms)
-    self.assertEqual(transforms['CliIntervalJoin'], 'apache_beam.cli.interval_join.cli_interval_join')
-    self.assertEqual(transforms['IntervalJoin'], 'apache_beam.cli.interval_join.cli_interval_join')
+    self.assertEqual(
+        transforms['CliIntervalJoin'],
+        'apache_beam.cli.interval_join.cli_interval_join')
+    self.assertEqual(
+        transforms['IntervalJoin'],
+        'apache_beam.cli.interval_join.cli_interval_join')
 
 
 class WatermarkSkewCircuitBreakerTest(unittest.TestCase):
   """Tests watermark skew circuit breaker to prevent unbounded buffer growth."""
-
   def test_skew_config_parsing(self):
     cfg = interval_join.parse_interval_join_config({
         'key': 'user_id',
@@ -479,9 +482,58 @@ class WatermarkSkewCircuitBreakerTest(unittest.TestCase):
           p
           | beam.Create(stream_events)
           | beam.ParDo(interval_join.IntervalJoinStatefulDoFn(cfg))
-          | beam.Map(lambda r: (r.user_id, r.ad, r.total))
-      )
+          | beam.Map(lambda r: (r.user_id, r.ad, r.total)))
       assert_that(results, equal_to([('u1', 'valid', 42.0)]))
+
+  def test_select_safe_ast_projection_and_rce_rejection(self):
+    cfg = interval_join.parse_interval_join_config({
+        'key': 'user_id',
+        'left_alias': 'c',
+        'right_alias': 'o',
+        'left_time': 'click_time',
+        'right_time': 'order_time',
+        'lower_bound': '0s',
+        'upper_bound': '10m',
+        'join_type': 'left',
+        'select': {
+            'uid': 'c.user_id',
+            'lag': 'o.order_time - c.click_time',
+            'net': 'coalesce(o.total, 0.0) - cost',
+        },
+    })
+    matched = interval_join.project_joined_row(
+        {
+            'user_id': 'u1', 'click_time': 100, 'cost': 10.0
+        }, {
+            'user_id': 'u1', 'order_time': 145, 'total': 50.0
+        },
+        cfg)
+    self.assertEqual(matched, {'uid': 'u1', 'lag': 45, 'net': 40.0})
+
+    unmatched = interval_join.project_joined_row({
+        'user_id': 'u2', 'click_time': 200, 'cost': 5.0
+    },
+                                                 None,
+                                                 cfg)
+    self.assertEqual(unmatched, {'uid': 'u2', 'lag': None, 'net': -5.0})
+
+    for malicious_expr in (
+        '().__class__.__bases__[0].__subclasses__()',
+        '__import__("os").system("id")',
+        '2 ** 64',
+        '(lambda x: x)(1)',
+    ):
+      with self.subTest(expr=malicious_expr):
+        with self.assertRaises(ValueError):
+          interval_join.parse_interval_join_config({
+              'key': 'user_id',
+              'left_time': 'click_time',
+              'right_time': 'order_time',
+              'upper_bound': '5m',
+              'select': {
+                  'out_col': malicious_expr
+              },
+          })
 
 
 if __name__ == '__main__':

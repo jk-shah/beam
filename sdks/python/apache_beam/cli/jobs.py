@@ -253,14 +253,16 @@ def load_job_record(job_id: str) -> dict[str, Any]:
   try:
     return json.loads(out_mod.read_bounded_text(job_path, label=str(job_path)))
   except (OSError, ValueError) as e:
-    raise JobError(f'corrupt job record for {safe_id!r}: {e}', EXIT_USAGE) from None
+    raise JobError(
+        f'corrupt job record for {safe_id!r}: {e}', EXIT_USAGE) from None
 
 
 def extract_beam_cli_counters(metrics_result: Any) -> dict[str, int]:
-  """Extracts `Metrics.counter('beam_cli', ...)` from a Beam `MetricResults`."""
+  """Extracts `Metrics.counter`/`distribution('beam_cli', ...)` from `MetricResults`."""
   if metrics_result is None:
     return {}
   counters: dict[str, int] = {}
+  dist_sums: dict[str, tuple[float, int]] = {}
   try:
     from apache_beam.metrics.metric import MetricsFilter
     queried = metrics_result.query(MetricsFilter().with_namespace('beam_cli'))
@@ -275,10 +277,39 @@ def extract_beam_cli_counters(metrics_result: Any) -> dict[str, int]:
       if metric_name:
         counters[str(metric_name)] = (
             counters.get(str(metric_name), 0) + int(val or 0))
+    for d in queried.get('distributions', ()):
+      name = getattr(getattr(d, 'key', None), 'metric', None)
+      metric_name = getattr(name, 'name', None)
+      committed = getattr(d, 'committed', None)
+      attempted = getattr(d, 'attempted', None)
+      dist = committed if committed is not None else attempted
+      cnt = int(getattr(dist, 'count', 0) or 0) if dist is not None else 0
+      total = float(
+          getattr(dist, 'sum', 0.0) or 0.0) if dist is not None else 0.0
+      if metric_name and cnt > 0:
+        prev_sum, prev_cnt = dist_sums.get(str(metric_name), (0.0, 0))
+        dist_sums[str(metric_name)] = (prev_sum + total, prev_cnt + cnt)
+    for m_name, (total, cnt) in dist_sums.items():
+      if cnt > 0:
+        counters[m_name] = int(round(total / cnt))
   except Exception:  # pylint: disable=broad-except
     return {}
 
   return finalize_cli_row_metrics(counters)
+
+
+_TIER1_EXPORTED_METRICS = (
+    'duplicates_dropped',
+    'skew_dropped',
+    'enrich_hits',
+    'enrich_misses',
+    'enrich_misses_dropped',
+    'enrich_errors',
+    'inference_batches',
+    'inference_rows',
+    'inference_errors',
+    'inference_latency_ms',
+)
 
 
 def finalize_cli_row_metrics(raw_counters: dict[str, int]) -> dict[str, int]:
@@ -303,20 +334,27 @@ def finalize_cli_row_metrics(raw_counters: dict[str, int]) -> dict[str, int]:
   if cdc_superseded:
     out['cdc_superseded_rows'] = cdc_superseded
   exp_dropped = int(raw_counters.get('expectation_dropped_rows', 0))
-  if (
-      'pre_filter_rows' in raw_counters or 'post_filter_rows' in raw_counters
-      or cdc_skipped > 0 or cdc_superseded > 0 or exp_dropped > 0):
+  dupes_dropped = int(raw_counters.get('duplicates_dropped', 0))
+  enrich_dropped = int(raw_counters.get('enrich_misses_dropped', 0))
+  skew_dropped = int(raw_counters.get('skew_dropped', 0))
+  stage_drops = (
+      cdc_skipped + cdc_superseded + exp_dropped + dupes_dropped +
+      enrich_dropped + skew_dropped)
+  if ('pre_filter_rows' in raw_counters or 'post_filter_rows' in raw_counters or
+      stage_drops > 0):
     pre_f = int(raw_counters.get('pre_filter_rows', 0))
     post_f = int(raw_counters.get('post_filter_rows', 0))
     out['rows_filtered_out'] = (
-        max(0, pre_f - post_f - filter_dlq_rows) + cdc_skipped +
-        cdc_superseded + exp_dropped)
+        max(0, pre_f - post_f - filter_dlq_rows) + stage_drops)
   if 'pre_sink_rows' in raw_counters or 'rows_read' in raw_counters:
     pre_sink = int(raw_counters.get('pre_sink_rows', 0))
     out['rows_written'] = max(0, pre_sink - sink_dlq_rows)
   for k, v in raw_counters.items():
     if k.startswith('expectation_') or k.startswith('expectations_'):
       out[k] = int(v)
+  for k in _TIER1_EXPORTED_METRICS:
+    if k in raw_counters:
+      out[k] = int(raw_counters[k])
   return out
 
 

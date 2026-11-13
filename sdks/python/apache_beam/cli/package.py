@@ -244,6 +244,42 @@ def _find_custom_python_providers(doc: dict[str, Any]) -> list[str]:
   return custom
 
 
+def _detect_yaml_extra_packages(yaml_doc: Any) -> list[str]:
+  """Returns third-party runtime packages implied by YAML enrichment/ML stages."""
+  needed: list[str] = []
+
+  def _walk(node: Any) -> None:
+    if isinstance(node, dict):
+      t_type = str(node.get('type') or '')
+      cfg = node.get('config') if isinstance(node.get('config'), dict) else {}
+      if t_type in ('Enrichment', 'CliEnrich'):
+        handler = str(
+            cfg.get('enrichment_handler') or cfg.get('handler') or
+            cfg.get('provider') or '').lower()
+        if 'feast' in handler:
+          needed.append('feast[gcp]')
+        if 'vertex' in handler:
+          needed.append('google-cloud-aiplatform')
+        if cfg.get('redis') or cfg.get('redis_host'):
+          needed.append('redis')
+      elif t_type in ('RunInference', 'CliInfer'):
+        mh = cfg.get('model_handler')
+        mh_type = str((mh.get('type') if isinstance(mh, dict) else None) or
+                      cfg.get('provider') or cfg.get('handler') or '').lower()
+        if 'huggingface' in mh_type or mh_type == 'hf':
+          needed.extend(['transformers', 'torch'])
+        if 'vertex' in mh_type:
+          needed.append('google-cloud-aiplatform')
+      for v in node.values():
+        _walk(v)
+    elif isinstance(node, list):
+      for item in node:
+        _walk(item)
+
+  _walk(yaml_doc)
+  return list(dict.fromkeys(needed))
+
+
 def extract_python_pipeline_parameters(py_source: str) -> list[dict[str, Any]]:
   """Extracts `add_argument` / `add_value_provider_argument` via Python AST."""
   try:
@@ -717,16 +753,24 @@ def run_package(
     yaml_doc = _validate_yaml_with_jinja_placeholders(source_text)
     custom_provs = _find_custom_python_providers(yaml_doc)
     if custom_provs:
-      raise PackageError(
-          'YAML pipeline references custom Python providers '
-          f'({", ".join(custom_provs)}) not present in the stock Dataflow '
-          'YAML template container. Re-run with `--sdk=python '
-          '--output-dir=./flex_bundle --image=<ARTIFACT_REGISTRY_IMAGE>` '
-          'to bundle custom Python providers into a single-image Flex Template.',
-          EXIT_USAGE)
+      if sdk_norm == 'auto':
+        resolved_sdk = 'PYTHON'
+        warnings_out.append(
+            'Auto-selected --sdk=python because YAML pipeline references '
+            f'custom Python providers ({", ".join(custom_provs)}).')
+      else:
+        raise PackageError(
+            'YAML pipeline references custom Python providers '
+            f'({", ".join(custom_provs)}) not present in the stock Dataflow '
+            'YAML template container. Re-run with `--sdk=python '
+            '--output-dir=./flex_bundle --image=<ARTIFACT_REGISTRY_IMAGE>` '
+            'to bundle custom Python providers into a single-image Flex Template.',
+            EXIT_USAGE)
 
+  if resolved_sdk == 'YAML':
     parameters = extract_jinja_parameters(source_text)
-    allow_net = bool(not dry_run or (to_location and to_location.startswith('gs://')))
+    allow_net = bool(
+        not dry_run or (to_location and to_location.startswith('gs://')))
     resolved_image, img_warnings = resolve_yaml_template_image(
         region=region, explicit_image=image, allow_network=allow_net)
     warnings_out.extend(img_warnings)
@@ -827,6 +871,14 @@ def run_package(
         extra_wheels.append(bundle_preview_wheel_path.name)
       except ImportError:
         pass
+    if not requirements_file:
+      needed_pkgs = _detect_yaml_extra_packages(yaml_doc)
+      if needed_pkgs:
+        warnings_out.append(
+            'Pipeline references transforms requiring extra Python packages '
+            f'({", ".join(needed_pkgs)}) not preinstalled in the base Beam '
+            'container; pass --requirements <requirements.txt> before building '
+            'the Flex Template image.')
 
   if build_image and not image:
     raise PackageError(

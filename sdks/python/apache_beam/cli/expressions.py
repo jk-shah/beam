@@ -905,6 +905,58 @@ def _build_callable_source(
   return '\n'.join(lines) + '\n'
 
 
+_SAFE_EXEC_BUILTINS: dict[str, Any] = {
+    'abs': abs,
+    'bool': bool,
+    'bytes': bytes,
+    'float': float,
+    'getattr': getattr,
+    'int': int,
+    'isinstance': isinstance,
+    'len': len,
+    'list': list,
+    'max': max,
+    'min': min,
+    'round': round,
+    'str': str,
+    'tuple': tuple,
+    'TypeError': TypeError,
+}
+
+
+def compile_scalar_callable(
+    raw_expr: str,
+    *,
+    as_bool: bool = False,
+) -> tuple[Any, frozenset[str]]:
+  """Compiles a scalar expression into `(safe_fn(__row__), referenced_columns)`."""
+  if not isinstance(raw_expr, str) or not raw_expr.strip():
+    raise ExpressionError('expression cannot be empty')
+  normalized, colref_map = _lex_and_normalize_with_colmap(raw_expr)
+  try:
+    parsed = ast.parse(normalized, mode='eval')
+  except SyntaxError as e:
+    raise ExpressionError(f'invalid expression {raw_expr!r}: {e.msg}') from None
+
+  nodes, depth = _ast_stats(parsed)
+  if nodes > MAX_AST_NODES or depth > MAX_AST_DEPTH:
+    raise ExpressionError(
+        f'expression {raw_expr!r} is too complex ({nodes} AST nodes, '
+        f'depth {depth}; max {MAX_AST_NODES} nodes, depth {MAX_AST_DEPTH})')
+
+  compiler = _RowExprCompiler(colref_map)
+  rewritten = ast.fix_missing_locations(compiler.visit(parsed))
+  expr_code = ast.unparse(rewritten.body)
+  callable_src = _build_callable_source(
+      expr_code,
+      as_bool=as_bool,
+      uses_safe_mul=compiler.uses_safe_mul,
+      uses_coalesce=compiler.uses_coalesce)
+  ns: dict[str, Any] = {'__builtins__': _SAFE_EXEC_BUILTINS}
+  exec(compile(callable_src, '<beam_cli_expr>', 'exec'), ns)  # pylint: disable=exec-used
+  return ns['_cli_fn'], frozenset(compiler.columns)
+
+
 def compile_where(
     raw_expr: str,
     known_columns: set[str] | None = None,

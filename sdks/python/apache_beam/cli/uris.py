@@ -114,11 +114,13 @@ def _looks_like_utf8_text(sample: bytes) -> bool:
       ch in '\t\n\r\x0b\x0c\x1b' or (ord(ch) >= 32 and ord(ch) != 127)
       for ch in text)
 
+
 _SHARD_OR_GLOB_SUFFIX = re.compile(r'(-\d+-of-\d+|[-*?])+$')
 _SECRET_KEY_RE = re.compile(
-    r'(password|passwd|secret|token|private_key|client_secret|'
-    r'access_key|api_key|apikey|authorization|bearer|jaas|credential|'
-    r'connection_string)',
+    r'(password|passwd|passphrase|secret|token|private_key|signing_key|'
+    r'encryption_key|client_secret|access_key|api[-_]?key|authorization|'
+    r'bearer|jaas|credential|connection_string|'
+    r'(?:^|[_.-])(?:auth|pwd|cookie)(?:$|[_.-]))',
     re.IGNORECASE)
 _BQ_TABLE_ID_RE = re.compile(
     r'^(?:(?P<project>[A-Za-z0-9_.:-]+)[:.])?'

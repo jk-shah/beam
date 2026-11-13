@@ -1156,9 +1156,102 @@ class InspectCheckIoDoctorTailJobsTest(unittest.TestCase):
     ])
     self.assertEqual(rc_py, cli.EXIT_OK)
     self.assertEqual(env_py['outputs']['sdk_language'], 'PYTHON')
-    ep_code = Path(dlq_bundle, 'flex_yaml_entrypoint.py').read_text(encoding='utf-8')
+    ep_code = Path(dlq_bundle,
+                   'flex_yaml_entrypoint.py').read_text(encoding='utf-8')
     self.assertIn("'src'", ep_code)
     self.assertIn('--jinja_variables=', ep_code)
+
+    # 3. `--sdk=auto` (default) auto-upgrades custom CLI provider YAML to PYTHON
+    #    and emits extra-package hints when ML/Feast/Redis stages omit `--requirements`!
+    ml_yaml = os.path.join(self.tmp, 'ml_pipe.yaml')
+    with open(ml_yaml, 'w', encoding='utf-8') as f:
+      f.write(
+          'providers:\n'
+          '  - type: python\n'
+          '    config: {}\n'
+          '    transforms:\n'
+          '      CliCountRows: "apache_beam.cli.dlq.cli_count_rows"\n'
+          'pipeline:\n'
+          '  type: chain\n'
+          '  transforms:\n'
+          '    - type: CliCountRows\n'
+          '      config: {counter: rows_read}\n'
+          '    - type: RunInference\n'
+          '      config:\n'
+          '        model_handler:\n'
+          '          type: HuggingFacePipelineModelHandler\n'
+          '          config: {task: text-classification, model: org/m}\n')
+    rc_auto, env_auto, _ = _run_json(['package', ml_yaml, '--dry-run'])
+    self.assertEqual(rc_auto, cli.EXIT_OK)
+    self.assertEqual(env_auto['outputs']['sdk_language'], 'PYTHON')
+    joined_warns = ' '.join(env_auto['warnings'])
+    self.assertIn('Auto-selected --sdk=python', joined_warns)
+    self.assertIn('transformers', joined_warns)
+
+  def test_tier1_metrics_conservation_and_unbounded_assert_counts_guard(self):
+    from apache_beam.cli import jobs
+
+    class _FakeMetricKey:
+      def __init__(self, name):
+        self.metric = type('M', (), {'name': name})()
+
+    class _FakeCounter:
+      def __init__(self, name, val):
+        self.key = _FakeMetricKey(name)
+        self.committed = val
+        self.attempted = val
+
+    class _FakeDist:
+      def __init__(self, name, total, count):
+        self.key = _FakeMetricKey(name)
+        self.committed = type('D', (), {'sum': total, 'count': count})()
+        self.attempted = self.committed
+
+    class _FakeMetricsResult:
+      def query(self, _flt):
+        return {
+            'counters': [
+                _FakeCounter('rows_read', 10),
+                _FakeCounter('pre_filter_rows', 9),
+                _FakeCounter('post_filter_rows', 8),
+                _FakeCounter('duplicates_dropped', 1),
+                _FakeCounter('enrich_hits', 6),
+                _FakeCounter('enrich_misses', 2),
+                _FakeCounter('enrich_misses_dropped', 2),
+                _FakeCounter('skew_dropped', 1),
+                _FakeCounter('inference_batches', 2),
+                _FakeCounter('inference_rows', 4),
+                _FakeCounter('dlq_rows', 1),
+                _FakeCounter('pre_sink_rows', 4),
+            ],
+            'distributions': [
+                _FakeDist('inference_latency_ms', 150.0, 3),
+            ],
+        }
+
+    metrics = jobs.extract_beam_cli_counters(_FakeMetricsResult())
+    # 10 read = 4 written + 1 dlq + (1 where + 1 dupe + 2 enrich_drop + 1 skew_drop = 5 filtered)
+    self.assertEqual(metrics['rows_read'], 10)
+    self.assertEqual(metrics['rows_written'], 4)
+    self.assertEqual(metrics['dlq_rows'], 1)
+    self.assertEqual(metrics['rows_filtered_out'], 5)
+    self.assertIsNone(jobs.check_assert_counts(metrics))
+    self.assertEqual(metrics['duplicates_dropped'], 1)
+    self.assertEqual(metrics['enrich_hits'], 6)
+    self.assertEqual(metrics['inference_batches'], 2)
+    self.assertEqual(metrics['inference_latency_ms'], 50)
+
+    # Unbounded `--assert-counts` fails fast with EXIT_USAGE!
+    rc_ub, env_ub, _ = _run_json([
+        'pipe',
+        '--from', 'pubsub://projects/demo-p/topics/events',
+        '--to', os.path.join(self.tmp, 'out.jsonl'),
+        '--wait-timeout', '5s',
+        '--assert-counts',
+    ])
+    self.assertEqual(rc_ub, cli.EXIT_USAGE)
+    self.assertIn(
+        '--assert-counts requires a bounded source', env_ub['error']['message'])
 
   def test_tail_follow_live_file_and_pubsub_ephemeral_vs_nack(self):
     import threading
@@ -1370,15 +1463,27 @@ class InspectCheckIoDoctorTailJobsTest(unittest.TestCase):
     with contextlib.redirect_stdout(empty_buf), contextlib.redirect_stderr(
         io.StringIO()):
       rc_empty = cli.main([
-          'tail', '-f', '-n', '1', '--poll-interval', '0.05', '--duration', '5s',
-          '--from-format', 'text', empty_log, '--json'
+          'tail',
+          '-f',
+          '-n',
+          '1',
+          '--poll-interval',
+          '0.05',
+          '--duration',
+          '5s',
+          '--from-format',
+          'text',
+          empty_log,
+          '--json'
       ])
     t3.join(timeout=2.0)
     self.assertEqual(rc_empty, cli.EXIT_OK)
     empty_ev = [
-        json.loads(ln) for ln in empty_buf.getvalue().strip().splitlines() if ln.strip()
+        json.loads(ln) for ln in empty_buf.getvalue().strip().splitlines()
+        if ln.strip()
     ]
-    self.assertEqual(empty_ev[0]['record']['line'], 'first line after empty start')
+    self.assertEqual(
+        empty_ev[0]['record']['line'], 'first line after empty start')
 
   def test_delta_and_iceberg_zero_copy_inspect_cost_guard_and_diff(self):
     import pyarrow as pa

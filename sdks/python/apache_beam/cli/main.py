@@ -181,6 +181,8 @@ _CLI_ZERO_FLAGS = {
     'check': frozenset([
         '--plan',
         '--trust-providers',
+        '--portable',
+        '--strict-beam',
         '--no-config',
         '--help',
     ]),
@@ -249,7 +251,6 @@ _CLI_ONE_FLAGS = {
         '--key',
         '--pk',
         '--cdc-pk',
-        '--portable',
         '--cdc-format',
         '--cdc-op-col',
         '--cdc-seq-col',
@@ -271,21 +272,25 @@ _CLI_ONE_FLAGS = {
         '--atol',
         '--columns',
         '--to',
+        '--limit',
         '--max-bytes',
         '--profile',
     ]),
-    'check': frozenset(['--jinja-variables', '--profile', '--portable']),
+    'check': frozenset(['--jinja-variables', '--profile']),
     'tail': frozenset([
         '-n',
         '--limit',
         '--duration',
         '--poll-interval',
         '--max-scanned-bytes',
+        '--from-format',
         '--from-opt',
         '--project',
     ]),
     'package': frozenset([
         '--to',
+        '-o',
+        '--output',
         '--name',
         '--description',
         '--sdk',
@@ -1140,7 +1145,8 @@ def _build_parser():
   tail_p.add_argument(
       '--from-format',
       metavar='FMT',
-      help='source file format override (csv, json, jsonl, parquet, avro, text)')
+      help='source file format override (csv, json, jsonl, parquet, avro, text)'
+  )
   tail_p.add_argument(
       '--from-opt',
       dest='from_opts',
@@ -3214,6 +3220,11 @@ def _pipe(
         'for a non-destructive stream peek, or specify a remote runner '
         '(--runner=DataflowRunner)',
         EXIT_USAGE)
+  if args.assert_counts and pipe.is_unbounded and not args.dry_run:
+    raise _CliError(
+        '--assert-counts requires a bounded source; unbounded streaming '
+        'pipelines do not terminate with end-of-stream row counts',
+        EXIT_USAGE)
 
   if pipe.is_unbounded and not is_local_runner:
     runner_norm = _runner_name(explicit_runner)
@@ -3353,7 +3364,8 @@ def _pipe(
         '--cdc). Otherwise use one glob per format, for example --from '
         'a=DIR/*.csv --join b=DIR/*.jsonl with --sql SELECT ... FROM a '
         'UNION ALL SELECT ... FROM b, or pass --from-format to read every '
-        'file as one format', EXIT_USAGE)
+        'file as one format',
+        EXIT_USAGE)
   if fast_files is not None:
     fast_rc = _run_fast_local_pipe(
         pipe,
@@ -3741,12 +3753,15 @@ def _run_yaml(
           if direct_yaml_text is not None:
             # Safe direct YAML compile: bypasses `expand_jinja()` completely so
             # untrusted `--where`, file paths, or stdin YAML cannot trigger SSTI!
+            from . import pipe_spec
             options, constructor = (
                 yaml_main.build_pipeline_components_from_yaml(
                     direct_yaml_text,
                     yaml_or_pipeline_argv,
                     validate_schema='generic'))
-            display_data = {'yaml': direct_yaml_text}
+            display_data = {
+                'yaml': pipe_spec.redact_yaml_text(direct_yaml_text)
+            }
           else:
             options, constructor, display_data = (
                 yaml_main.build_pipeline_components_from_argv(

@@ -35,6 +35,8 @@ def _all_subclasses(cls):
 
 class OptionAritySyncTest(unittest.TestCase):
   def test_static_tables_match_pipeline_options_subclasses(self):
+    from apache_beam.yaml import options as _yaml_options
+    self.assertIsNotNone(_yaml_options)
     parser = argparse.ArgumentParser(add_help=False, conflict_handler='resolve')
     for sub in _all_subclasses(PipelineOptions):
       sub._add_argparse_args(parser)
@@ -108,6 +110,26 @@ class OptionAritySyncTest(unittest.TestCase):
         cli._normalize_cli_argv(
             ['config', 'set', 'runner', 'DirectRunner', '--profle', 'dev']),
         ['config', 'set', 'runner', 'DirectRunner', '--profle', 'dev'])
+
+  def test_cli_subcommand_arity_tables_match_build_parser(self):
+    parser = cli._build_parser()
+    subparsers_action = next(
+        a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+    for cmd in ('run', 'pipe', 'diff', 'check', 'tail', 'package'):
+      sp = subparsers_action.choices[cmd]
+      live_zero = {
+          s
+          for a in sp._actions if a.option_strings and a.nargs == 0
+          for s in a.option_strings
+      } - {'-h'}
+      live_one = {
+          s
+          for a in sp._actions if a.option_strings and a.nargs != 0
+          for s in a.option_strings
+      }
+      with self.subTest(command=cmd):
+        self.assertEqual(set(cli._CLI_ZERO_FLAGS[cmd]), live_zero)
+        self.assertEqual(set(cli._CLI_ONE_FLAGS[cmd]), live_one)
 
 
 if __name__ == '__main__':

@@ -29,11 +29,16 @@ Supports:
 from __future__ import annotations
 
 import datetime
+import functools
 import math
 import re
+import types
 from typing import Any
 from typing import Iterable
 from typing import NamedTuple
+
+from . import expressions
+from . import output
 
 import apache_beam as beam
 from apache_beam.coders import PickleCoder
@@ -123,8 +128,9 @@ def parse_interval_join_config(cfg: dict[str, Any]) -> IntervalJoinConfig:
   Raises:
     ValueError: If keys, timestamps, or bounds are missing or semantically invalid.
   """
-  left_alias = str(cfg.get('left') or 'left').strip()
-  right_alias = str(cfg.get('right') or 'right').strip()
+  left_alias = str(cfg.get('left_alias') or cfg.get('left') or 'left').strip()
+  right_alias = str(cfg.get('right_alias') or cfg.get('right') or
+                    'right').strip()
 
   key_raw = cfg.get('key')
   left_key_raw = cfg.get('left_key') or key_raw
@@ -173,21 +179,28 @@ def parse_interval_join_config(cfg: dict[str, Any]) -> IntervalJoinConfig:
     join_type = 'left'
   if join_type not in ('inner', 'left', 'full'):
     raise ValueError(
-        f'unsupported join_type {join_type!r}; expected "inner", "left", or "full"')
+        f'unsupported join_type {join_type!r}; expected "inner", "left", or "full"'
+    )
 
   select = cfg.get('select')
-  if select is not None and not isinstance(select, dict):
-    raise ValueError('select must be a mapping of output_field: expression')
+  if select is not None:
+    if not isinstance(select, dict):
+      raise ValueError('select must be a mapping of output_field: expression')
+    for out_k, expr_val in select.items():
+      if not output.SAFE_IDENTIFIER_RE.match(str(out_k)):
+        raise ValueError(f'invalid select output column {out_k!r}')
+      if not isinstance(expr_val, str) or not expr_val.strip():
+        raise ValueError(
+            f'select expression for {out_k!r} must be a non-empty string')
+      _compile_join_select_expr(expr_val.strip())
 
   max_skew_raw = (
-      cfg.get('max_watermark_skew')
-      or cfg.get('max_skew')
-      or cfg.get('watermark_skew_breaker')
-      or cfg.get('max_watermark_skew_duration')
-  )
+      cfg.get('max_watermark_skew') or cfg.get('max_skew') or
+      cfg.get('watermark_skew_breaker') or
+      cfg.get('max_watermark_skew_duration'))
   max_watermark_skew = (
-      parse_interval_duration(max_skew_raw) if max_skew_raw is not None else None
-  )
+      parse_interval_duration(max_skew_raw)
+      if max_skew_raw is not None else None)
   if max_watermark_skew is not None and max_watermark_skew <= 0:
     raise ValueError(
         f'max_watermark_skew must be positive (got {max_watermark_skew}s)')
@@ -296,6 +309,31 @@ def _to_plain_dict(elem: Any) -> dict[str, Any]:
   return {'value': elem}
 
 
+@functools.lru_cache(maxsize=256)
+def _compile_join_select_expr(expr: str) -> Any:
+  fn, _ = expressions.compile_scalar_callable(expr)
+  return fn
+
+
+class _NullDefaultNamespace(types.SimpleNamespace):
+  """Namespace returning `None` for missing public fields on outer-join rows."""
+  def __getattr__(self, name: str) -> Any:
+    if name.startswith('_'):
+      raise AttributeError(name)
+    return None
+
+
+def _to_namespace(val: Any) -> Any:
+  if isinstance(val, dict):
+    return _NullDefaultNamespace(
+        **{
+            str(k): _to_namespace(v)
+            for k, v in val.items()
+            if isinstance(k, str) and not k.startswith('_')
+        })
+  return val
+
+
 def project_joined_row(
     left_elem: Any | None,
     right_elem: Any | None,
@@ -306,42 +344,56 @@ def project_joined_row(
   right_dict = _to_plain_dict(right_elem)
 
   if config.select:
-    # Build evaluation context
-    ctx = {
-        'left': left_dict,
-        'right': right_dict,
-        **{f'left_{k}': v for k, v in left_dict.items()},
-        **{f'right_{k}': v for k, v in right_dict.items()},
+    left_ns = _to_namespace(left_dict)
+    right_ns = _to_namespace(right_dict)
+    ctx: dict[str, Any] = {
+        'left': left_ns,
+        'right': right_ns,
+        config.left_alias: left_ns,
+        config.right_alias: right_ns,
+        **{
+            f'left_{k}': _to_namespace(v)
+            for k, v in left_dict.items()
+        },
+        **{
+            f'right_{k}': _to_namespace(v)
+            for k, v in right_dict.items()
+        },
     }
     # Direct field aliases without prefix if unique
     for k, v in left_dict.items():
       if k not in ctx:
-        ctx[k] = v
+        ctx[k] = _to_namespace(v)
     for k, v in right_dict.items():
       if k not in ctx and k not in left_dict:
-        ctx[k] = v
+        ctx[k] = _to_namespace(v)
+    row_ns = _NullDefaultNamespace(**ctx)
 
     out: dict[str, Any] = {}
     for out_k, expr_str in config.select.items():
       expr = expr_str.strip()
-      # 1. Direct path lookup: left.col or right.col or col
+      # 1. Fast direct path lookup: left.col or right.col or plain col
       if '.' in expr:
-        side, field = expr.split('.', 1)
-        if side in ('left', config.left_alias):
-          out[out_k] = left_dict.get(field)
-          continue
-        if side in ('right', config.right_alias):
-          out[out_k] = right_dict.get(field)
-          continue
+        parts = expr.split('.')
+        if len(parts) == 2 and all(output.SAFE_IDENTIFIER_RE.match(p)
+                                   for p in parts):
+          side, field = parts
+          if side in ('left', config.left_alias):
+            out[out_k] = left_dict.get(field)
+            continue
+          if side in ('right', config.right_alias):
+            out[out_k] = right_dict.get(field)
+            continue
       if expr in left_dict:
         out[out_k] = left_dict[expr]
         continue
       if expr in right_dict:
         out[out_k] = right_dict[expr]
         continue
-      # 2. Simple expression evaluation (arithmetic/expressions)
+      # 2. Safe AST-compiled expression evaluation (zero raw eval())
+      fn = _compile_join_select_expr(expr)
       try:
-        out[out_k] = eval(expr, {'__builtins__': {}}, ctx)
+        out[out_k] = fn(row_ns)
       except Exception:
         out[out_k] = None
     return out
@@ -588,7 +640,6 @@ def cli_interval_join(
   join_cfg = parse_interval_join_config(cfg_dict)
 
   class _CliIntervalJoinTransform(beam.PTransform):
-
     def expand(self, pcolls):
       pcoll_left = None
       pcoll_right = None

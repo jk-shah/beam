@@ -1314,6 +1314,132 @@ class InputValidationAndResourceBoundsPass5Test(unittest.TestCase):
     self.assertIn('prefixsuffix', formatted)
     self.assertIn('helloworld', formatted)
 
+  def test_tier1_slice0_check_ml_hooks_and_yaml_argv_secret_redaction(self):
+    from apache_beam.cli import pipe_spec
+
+    # 1. `beam check --plan` blocks RunInference preprocess path/callable,
+    #    trust_remote_code, and MLTransform unless `--trust-providers` is passed!
+    for idx, unsafe_yaml in enumerate((
+        (
+            'pipeline:\n'
+            '  transforms:\n'
+            '    - type: Create\n'
+            '      config: {elements: [{x: "hi"}]}\n'
+            '    - type: RunInference\n'
+            '      config:\n'
+            '        model_handler:\n'
+            '          type: VertexAIModelHandlerJSON\n'
+            '          config:\n'
+            '            endpoint_id: "123"\n'
+            '            project: "p"\n'
+            '            location: "us-central1"\n'
+            '            preprocess:\n'
+            '              path: "gs://evil-bkt/udf.py"\n'
+            '              name: "pwn"\n'
+        ),
+        (
+            'pipeline:\n'
+            '  transforms:\n'
+            '    - type: Create\n'
+            '      config: {elements: [{x: "hi"}]}\n'
+            '    - type: RunInference\n'
+            '      config:\n'
+            '        model_handler:\n'
+            '          type: HuggingFacePipelineModelHandler\n'
+            '          config:\n'
+            '            task: "text-classification"\n'
+            '            model: "org/model"\n'
+            '            load_pipeline_args:\n'
+            '              trust_remote_code: true\n'
+        ),
+        (
+            'pipeline:\n'
+            '  transforms:\n'
+            '    - type: Create\n'
+            '      config: {elements: [{x: "hi"}]}\n'
+            '    - type: MLTransform\n'
+            '      config:\n'
+            '        read_artifact_location: "gs://bkt/artifacts"\n'
+        ),
+    )):
+      yp = os.path.join(self.tmp, f'ml_untrusted_{idx}.yaml')
+      with open(yp, 'w', encoding='utf-8') as f:
+        f.write(unsafe_yaml)
+      rc, env, _ = _run_json_cli(['check', '--plan', yp])
+      self.assertNotEqual(rc, cli.EXIT_OK)
+      self.assertIn('--trust-providers', env['error']['message'])
+
+    # 2. Static `beam check` rejects malicious `CliIntervalJoin.select` AST!
+    ij_yaml = os.path.join(self.tmp, 'evil_ij.yaml')
+    with open(ij_yaml, 'w', encoding='utf-8') as f:
+      f.write(
+          'pipeline:\n'
+          '  transforms:\n'
+          '    - type: CliIntervalJoin\n'
+          '      config:\n'
+          '        key: id\n'
+          '        left_time: t1\n'
+          '        right_time: t2\n'
+          '        upper_bound: 5m\n'
+          '        select:\n'
+          '          leak: "().__class__.__bases__[0]"\n')
+    rc_ij, _, _ = _run_json_cli(['check', ij_yaml])
+    self.assertNotEqual(rc_ij, cli.EXIT_OK)
+
+    # 3. `to_yaml` and `redact_yaml_text` scrub argv header, empty-user Redis URIs,
+    #    HuggingFace tokens, X-Api-Key, and string values inside MapToFields while
+    #    preserving legitimate `token_count` column names!
+    redis_pw = 'RedisSuperSecret77!'
+    hf_tok = 'hf_AbCdEfGhIjKlMnOpQrStUvWxYz1234'
+    hdr_key = 'HeaderKeySecret55!'
+    spec = {
+        'pipeline': {
+            'transforms': [
+                {
+                    'type': 'MapToFields',
+                    'config': {
+                        'language': 'python',
+                        'fields': {
+                            'token_count': 'token_count',
+                            'dsn': f'redis://:{redis_pw}@cache.internal:6379/0',
+                        },
+                    },
+                },
+                {
+                    'type': 'CliInfer',
+                    'config': {
+                        'X-Api-Key': hdr_key,
+                        'args': [f'token={hf_tok}'],
+                    },
+                },
+            ]
+        }
+    }
+    rendered = pipe_spec.to_yaml(
+        spec,
+        [
+            '--from',
+            'in.csv',
+            '--enrich-redis',
+            f'redis://:{redis_pw}@cache.internal:6379',
+            '--api-key',
+            hdr_key,
+            f'--token={hf_tok}',
+        ])
+    for secret in (redis_pw, hf_tok, hdr_key):
+      self.assertNotIn(secret, rendered)
+    self.assertIn('token_count: token_count', rendered)
+
+    raw_yaml = (
+        'pipeline:\n'
+        '  transforms:\n'
+        '    - type: CliEnrich\n'
+        f'      config: {{redis: "redis://:{redis_pw}@10.0.0.5:6379", '
+        f'hf: "{hf_tok}"}}\n')
+    scrubbed_display = pipe_spec.redact_yaml_text(raw_yaml)
+    self.assertNotIn(redis_pw, scrubbed_display)
+    self.assertNotIn(hf_tok, scrubbed_display)
+
 
 if __name__ == '__main__':
   unittest.main()

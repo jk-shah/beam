@@ -203,13 +203,16 @@ def _keep_quoted(literal: str) -> bool:
 
 # Explicit credential patterns (unquoted or <28 chars) scrubbed in error text.
 _URI_USERINFO_SECRET_RE = re.compile(
-    r'([A-Za-z][A-Za-z0-9+.-]*://[^/\s:@\'"]+:)(?!<redacted)([^@\s/\'"]+)(@)')
+    r'([A-Za-z][A-Za-z0-9+.-]*://[^/\s:@\'"]*:)(?!<(?:redacted|REDACTED))(?:[^@\s/\'"]+)(@)'
+)
 _AUTH_HEADER_SECRET_RE = re.compile(
-    r'\b(Bearer|Basic)\s+(?!<redacted)[A-Za-z0-9._~+/=-]{8,}', re.IGNORECASE)
+    r'\b(Bearer|Basic)\s+(?!<(?:redacted|REDACTED))[A-Za-z0-9._~+/=-]{8,}',
+    re.IGNORECASE)
 _KV_SECRET_RE = re.compile(
-    r'(\b(?:password|passwd|secret|token|api_key|access_key|private_key|'
-    r'client_secret|aws_secret_access_key|sasl\.jaas\.config)\b\s*[:=]\s*)'
-    r"""(?!['"]?<redacted)(?:(['"])(?:\\.|(?!\2).)*?\2|[^\s,'";)\]}]+)""",
+    r'(\b(?:password|passwd|pwd|passphrase|secret|token|api[-_]?key|'
+    r'x-api-key|access_key|private_key|signing_key|encryption_key|'
+    r'client_secret|auth|aws_secret_access_key|sasl\.jaas\.config)\b\s*[:=]\s*)'
+    r"""(?!['"]?<(?:redacted|REDACTED))(?:(['"])(?:\\.|(?!\2).)*?\2|[^\s,'";)\]}]+)""",
     re.IGNORECASE)
 _KNOWN_TOKEN_RE = re.compile(
     r'\b(?:'
@@ -217,6 +220,7 @@ _KNOWN_TOKEN_RE = re.compile(
     r'eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|'
     r'gh[pousr]_[A-Za-z0-9_]{16,}|'
     r'github_pat_[A-Za-z0-9_]{16,}|'
+    r'hf_[A-Za-z0-9]{20,}|'
     r'AKIA[0-9A-Z]{16}|'
     r'AIza[0-9A-Za-z_-]{30,}|'
     r'sk-[A-Za-z0-9_-]{16,}|'
@@ -224,13 +228,21 @@ _KNOWN_TOKEN_RE = re.compile(
     r')\b')
 
 
+def redact_inline_secrets(
+    text: str, placeholder: str = '<REDACTED_SECRET>') -> str:
+  """Redacts URI userinfo passwords, bearer headers, KV secrets, and known tokens."""
+  if not text:
+    return text
+  clean = _URI_USERINFO_SECRET_RE.sub(rf'\1{placeholder}\2', text)
+  clean = _AUTH_HEADER_SECRET_RE.sub(rf'\1 {placeholder}', clean)
+  clean = _KV_SECRET_RE.sub(rf'\1{placeholder}', clean)
+  return _KNOWN_TOKEN_RE.sub(placeholder, clean)
+
+
 def scrub_error_message(message: str, verbose: bool = False) -> str:
   """Strips terminal escapes/BiDi chars and scrubs credentials & long literals."""
   clean = sanitize_untrusted_text(message, max_chars=16384 if verbose else 4096)
-  clean = _URI_USERINFO_SECRET_RE.sub(r'\1<redacted-value>\3', clean)
-  clean = _AUTH_HEADER_SECRET_RE.sub(r'\1 <redacted-value>', clean)
-  clean = _KV_SECRET_RE.sub(r'\1<redacted-value>', clean)
-  clean = _KNOWN_TOKEN_RE.sub('<redacted-value>', clean)
+  clean = redact_inline_secrets(clean, placeholder='<redacted-value>')
   if verbose:
     return clean
 

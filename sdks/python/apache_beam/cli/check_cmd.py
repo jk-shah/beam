@@ -124,7 +124,16 @@ def run_check(
   for idx, t in enumerate(transforms):
     if not isinstance(t, dict) or 'type' not in t:
       raise CheckError(
-          f'{source_label}: transform #{idx + 1} must be a mapping with "type:"')
+          f'{source_label}: transform #{idx + 1} must be a mapping with "type:"'
+      )
+    if t['type'] in ('CliIntervalJoin', 'IntervalJoin') and isinstance(
+        t.get('config'), dict):
+      from . import interval_join
+      try:
+        interval_join.parse_interval_join_config(t['config'])
+      except ValueError as e:
+        raise CheckError(
+            f'{source_label}: invalid {t["type"]} config: {e}') from None
     stages.append({
         'index': idx,
         'name': t.get('name') or t['type'],
@@ -164,12 +173,15 @@ def run_check(
           '--trust-providers to allow code execution')
     import apache_beam as beam
     from apache_beam.yaml import main as yaml_main
+    from . import pipe_spec
     dumper = getattr(yaml, 'CSafeDumper', yaml.SafeDumper)
     clean_yaml = yaml.dump(spec, Dumper=dumper, sort_keys=False)
     options, constructor = (
         yaml_main.build_pipeline_components_from_yaml(
             clean_yaml, list(pipeline_args or []), validate_schema='generic'))
-    p = beam.Pipeline(options=options, display_data={'yaml': clean_yaml})
+    p = beam.Pipeline(
+        options=options,
+        display_data={'yaml': pipe_spec.redact_yaml_text(clean_yaml)})
     try:
       with _quiet_expansion(enabled=not verbose):
         constructor(p)
@@ -457,15 +469,27 @@ def _is_safe_inline_callable(src: str) -> bool:
       if (node.module or '') not in _SAFE_CALLABLE_IMPORTS:
         return False
     elif isinstance(node, ast.Name):
-      if node.id in _DANGEROUS_CALLABLE_NAMES or (
-          node.id.startswith('__') and node.id != '__row__'):
+      if node.id in _DANGEROUS_CALLABLE_NAMES or (node.id.startswith('__') and
+                                                  node.id != '__row__'):
         return False
     elif isinstance(node, ast.Attribute):
-      if node.attr.startswith('__') or node.attr in (
-          'gi_frame', 'f_globals', 'f_builtins', 'tb_frame', 'cr_frame',
-          'ag_frame'):
+      if node.attr.startswith('__') or node.attr in ('gi_frame',
+                                                     'f_globals',
+                                                     'f_builtins',
+                                                     'tb_frame',
+                                                     'cr_frame',
+                                                     'ag_frame'):
         return False
   return True
+
+
+_UDF_HOOK_KEYS = frozenset([
+    'preprocess',
+    'postprocess',
+    'inference_fn',
+    'row_key_fn',
+    'join_fn',
+])
 
 
 def _config_has_untrusted_python(obj: Any) -> bool:
@@ -482,6 +506,25 @@ def _config_has_untrusted_python(obj: Any) -> bool:
   return False
 
 
+def _config_has_untrusted_udf_hooks(obj: Any) -> bool:
+  """Detects Python callables, UDF hooks, or trust_remote_code outside `language: python`."""
+  if isinstance(obj, dict):
+    if 'callable' in obj:
+      c = obj.get('callable')
+      if not isinstance(c, str) or not _is_safe_inline_callable(c):
+        return True
+    if bool(obj.get('trust_remote_code')):
+      return True
+    for k, v in obj.items():
+      if k in _UDF_HOOK_KEYS and _config_has_untrusted_python(v):
+        return True
+      if _config_has_untrusted_udf_hooks(v):
+        return True
+  elif isinstance(obj, list):
+    return any(_config_has_untrusted_udf_hooks(item) for item in obj)
+  return False
+
+
 def _has_executable_python_transforms(block: Any) -> bool:
   """Detects `PyTransform` or untrusted Python callables before `--plan`."""
   if isinstance(block, list):
@@ -489,16 +532,20 @@ def _has_executable_python_transforms(block: Any) -> bool:
   if not isinstance(block, dict):
     return False
   t_type = str(block.get('type') or '')
-  if t_type in ('PyTransform', 'PythonCallable'):
+  if t_type in ('PyTransform', 'PythonCallable', 'MLTransform'):
     return True
   cfg = block.get('config')
   if isinstance(cfg, dict):
     lang = str(cfg.get('language') or '').lower()
     if lang == 'python' and _config_has_untrusted_python(cfg):
       return True
-    if 'constructor' in cfg and t_type not in (
-        'ReadFromCsv', 'ReadFromJson', 'ReadFromParquet', 'ReadFromAvro',
-        'ReadFromText'):
+    if _config_has_untrusted_udf_hooks(cfg):
+      return True
+    if 'constructor' in cfg and t_type not in ('ReadFromCsv',
+                                               'ReadFromJson',
+                                               'ReadFromParquet',
+                                               'ReadFromAvro',
+                                               'ReadFromText'):
       return True
   for child_key in ('transforms', 'extra_transforms', 'source', 'sink'):
     if child_key in block and _has_executable_python_transforms(
