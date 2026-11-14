@@ -62,7 +62,7 @@ sys.exit(code)
 class FastCliIsolationTest(unittest.TestCase):
   def setUp(self):
     self.tmp = tempfile.mkdtemp()
-    self.addCleanup(shutil.rmtree, self.tmp)
+    self.addCleanup(shutil.rmtree, self.tmp, True)
     self.beam_home = os.path.join(self.tmp, '.beam')
 
   def _probe(self, argv, extra_env=None):
@@ -199,16 +199,23 @@ class FastCliIsolationTest(unittest.TestCase):
         self.assertFalse(status['beam_imported'])
 
     # Measure median wall-clock subprocess latency on `beam --version --json`.
+    baseline_ms = 0.0
+    if os.name == 'nt':
+      tb = time.monotonic()
+      subprocess.run([sys.executable, '-c', 'pass'], check=False)
+      baseline_ms = (time.monotonic() - tb) * 1000.0
     durations_ms = []
     for _ in range(5):
       t0 = time.monotonic()
       proc, _ = self._probe(['--version', '--json'])
       durations_ms.append((time.monotonic() - t0) * 1000.0)
       self.assertEqual(proc.returncode, 0)
+    budget_ms = max(120.0, baseline_ms * 3.5)
     self.assertLess(
         statistics.median(durations_ms),
-        120.0,
-        f'Expected median fast CLI startup <120ms, got {durations_ms}')
+        budget_ms,
+        f'Expected median fast CLI startup <{budget_ms:.0f}ms, got {durations_ms}'
+    )
 
 
 if __name__ == '__main__':

@@ -35,7 +35,7 @@ from apache_beam.cli import main as cli_main
 from apache_beam.cli import package as package_mod
 from apache_beam.options.pipeline_options import PipelineOptions
 from apache_beam.runners.portability.fn_api_runner import fn_runner
-from apache_beam.testing.test_stream import TestStream
+from apache_beam.testing.test_stream import TestStream as _TestStream
 from apache_beam.testing.util import assert_that
 from apache_beam.testing.util import equal_to
 from apache_beam.transforms.window import TimestampedValue
@@ -170,7 +170,7 @@ class CliPatternMatchTestStreamAndOverflowTest(unittest.TestCase):
   def test_teststream_out_of_order_sequence_and_negated_absence(self):
     # 1. Out-of-order positive sequence (`purchase@30` arrives before `login@10` & `mfa@20`)
     ts_pos = (
-        TestStream().advance_watermark_to(0).add_elements([
+        _TestStream().advance_watermark_to(0).add_elements([
             TimestampedValue(
                 beam.Row(uid='u1', ts=30, event_type='purchase', amt=900), 30),
             TimestampedValue(
@@ -205,7 +205,7 @@ class CliPatternMatchTestStreamAndOverflowTest(unittest.TestCase):
     # - `o_paid` has checkout@10 and payment@25 (<= 30s) -> cancelled!
     # - `o_abandoned` has checkout@15 and NO payment within 20s -> emits at WM >= 35s!
     ts_neg = (
-        TestStream().advance_watermark_to(0).add_elements([
+        _TestStream().advance_watermark_to(0).add_elements([
             TimestampedValue(
                 beam.Row(order_id='o_paid', ts=10, event_type='checkout'), 10),
             TimestampedValue(

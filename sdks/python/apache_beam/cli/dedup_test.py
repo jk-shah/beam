@@ -34,7 +34,7 @@ from apache_beam.cli import jobs
 from apache_beam.cli import main as cli_main
 from apache_beam.cli import pipe_spec
 from apache_beam.runners.direct.direct_runner import BundleBasedDirectRunner
-from apache_beam.testing.test_stream import TestStream
+from apache_beam.testing.test_stream import TestStream as _TestStream
 from apache_beam.testing.util import assert_that
 from apache_beam.testing.util import equal_to
 from apache_beam.transforms.window import TimestampedValue
@@ -214,7 +214,7 @@ class StatefulStreamingDeduplicateTest(unittest.TestCase):
     # 5. Watermark advances to 250 (clears buckets 0 & 1 via TTL timer)
     # 6. t=260 (bucket 2) -> KEPT!
     ts_stream = (
-        TestStream().advance_watermark_to(0).add_elements([
+        _TestStream().advance_watermark_to(0).add_elements([
             TimestampedValue({
                 'id': 'e1', 'ts': 170.0, 'seq': 1
             }, 170),
@@ -252,7 +252,7 @@ class StatefulStreamingDeduplicateTest(unittest.TestCase):
 
   def test_processing_time_stateful_deduplicate_and_dlq(self):
     ts_stream = (
-        TestStream().advance_watermark_to(0).add_elements([
+        _TestStream().advance_watermark_to(0).add_elements([
             {
                 'id': 'k1', 'n': 1
             },

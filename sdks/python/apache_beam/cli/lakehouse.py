@@ -28,6 +28,7 @@ import decimal
 import io
 import json
 import os
+import pathlib
 import re
 import time
 import urllib.parse
@@ -187,16 +188,19 @@ def _to_iceberg_uri(path: str) -> str:
   """Formats a path as a URI suitable for Iceberg v2 manifests/metadata."""
   if '://' in path:
     return path
-  abs_p = os.path.abspath(path).replace('\\', '/')
-  if not abs_p.startswith('/'):
-    abs_p = '/' + abs_p
-  return f'file://{abs_p}' if os.environ.get('BEAM_ICEBERG_FILE_URI') else abs_p
+  abs_p = os.path.abspath(path)
+  if os.environ.get('BEAM_ICEBERG_FILE_URI'):
+    return pathlib.Path(abs_p).as_uri()
+  return abs_p.replace('\\', '/')
 
 
 def _from_iceberg_uri(uri_or_path: str) -> str:
   if uri_or_path.lower().startswith('file://'):
     parsed = urllib.parse.urlsplit(uri_or_path)
-    return urllib.parse.unquote(parsed.path)
+    p = urllib.parse.unquote(parsed.path)
+    if re.match(r'^/[A-Za-z]:/', p):
+      p = p[1:]
+    return p
   return uri_or_path
 
 
@@ -982,6 +986,14 @@ def _resolve_via_bigquery_api(
   return None
 
 
+def _is_googleapis_https_uri(uri: str) -> bool:
+  """Returns True iff `uri` is `https://*.googleapis.com` (safe for Google ADC tokens)."""
+  parsed = urllib.parse.urlsplit(uri)
+  host = (parsed.hostname or '').lower()
+  return parsed.scheme.lower() == 'https' and (
+      host == 'googleapis.com' or host.endswith('.googleapis.com'))
+
+
 def _resolve_via_biglake_catalog(
     table_ident: str,
     cat_props: dict[str, Any],
@@ -989,6 +1001,12 @@ def _resolve_via_biglake_catalog(
 ) -> Optional[str]:
   rest_uri = str(cat_props.get('uri') or 'https://biglake.googleapis.com/iceberg/v1/restcatalog').rstrip('/')
   _validate_rest_catalog_security(rest_uri, cat_props)
+  is_goog = _is_googleapis_https_uri(rest_uri)
+  if str(cat_props.get('rest.auth.type',
+                       '')).lower() == 'google' and not is_goog:
+    raise LakehouseError(
+        f'refusing to send Google ADC credentials (rest.auth.type=google) to '
+        f'non-googleapis.com host in {rest_uri!r}')
   parts = [p for p in table_ident.split('.') if p]
   _validate_iceberg_ident_parts(parts, table_ident)
   if len(parts) < 2:
@@ -997,9 +1015,7 @@ def _resolve_via_biglake_catalog(
   tbl = urllib.parse.quote(parts[-1], safe='')
   warehouse = str(cat_props.get('warehouse') or '')
   prefix = ''
-  parsed = urllib.parse.urlsplit(rest_uri)
-  host = (parsed.hostname or '').lower()
-  if (host == 'biglake.googleapis.com' or host.endswith('.googleapis.com')) and warehouse.startswith('gs://'):
+  if is_goog and warehouse.startswith('gs://'):
     bkt = urllib.parse.quote(warehouse[len('gs://'):].split('/', 1)[0], safe='')
     proj = urllib.parse.quote(str(cat_props.get('header.x-goog-user-project') or default_project or ''), safe='')
     if proj:
@@ -1010,7 +1026,7 @@ def _resolve_via_biglake_catalog(
     headers['x-goog-user-project'] = str(cat_props['header.x-goog-user-project']).replace('\r', '').replace('\n', '')
   if cat_props.get('token'):
     headers['Authorization'] = f"Bearer {str(cat_props['token']).replace(chr(13), '').replace(chr(10), '')}"
-  elif str(cat_props.get('rest.auth.type', '')).lower() == 'google' or host.endswith('.googleapis.com'):
+  elif is_goog:
     try:
       import google.auth
       import google.auth.transport.requests
@@ -1027,7 +1043,7 @@ def _resolve_via_biglake_catalog(
         _SameOriginHttpsRedirectHandler())
     req = urllib.request.Request(url, headers=headers)
     with opener.open(req, timeout=10) as resp:
-      payload = json.loads(resp.read().decode('utf-8'))
+      payload = json.loads(resp.read(16 * 1024 * 1024).decode('utf-8'))
       if payload.get('metadata-location'):
         meta_loc = str(payload['metadata-location'])
         _check_no_dotdot_or_controls(meta_loc, 'Iceberg metadata-location')
@@ -1050,6 +1066,12 @@ def _resolve_via_generic_rest_catalog(
   if not rest_uri:
     return None
   _validate_rest_catalog_security(rest_uri, cat_props)
+  if str(cat_props.get(
+      'rest.auth.type',
+      '')).lower() == 'google' and not _is_googleapis_https_uri(rest_uri):
+    raise LakehouseError(
+        f'refusing to send Google ADC credentials (rest.auth.type=google) to '
+        f'non-googleapis.com host in {rest_uri!r}')
   parts = [p for p in table_ident.split('.') if p]
   _validate_iceberg_ident_parts(parts, table_ident)
   if len(parts) < 2:
@@ -1067,7 +1089,7 @@ def _resolve_via_generic_rest_catalog(
         _SameOriginHttpsRedirectHandler())
     req = urllib.request.Request(url, headers=headers)
     with opener.open(req, timeout=10) as resp:
-      payload = json.loads(resp.read().decode('utf-8'))
+      payload = json.loads(resp.read(16 * 1024 * 1024).decode('utf-8'))
       if payload.get('metadata-location'):
         meta_loc = str(payload['metadata-location'])
         _check_no_dotdot_or_controls(meta_loc, 'Iceberg metadata-location')
@@ -1091,7 +1113,7 @@ def register_iceberg_catalog_table(
     default_project: Optional[str] = None,
 ) -> dict[str, Any]:
   """Registers or updates table metadata in the configured Iceberg catalog.
-  
+
   Follows the strict catalog hierarchy:
   1. BigQuery managed Iceberg API (bigquery.googleapis.com)
   2. Google Cloud Lakehouse / BigLake REST Catalog (biglake.googleapis.com)
@@ -1174,8 +1196,18 @@ def register_iceberg_catalog_table(
       return {'catalog': 'bigquery', 'status': 'failed', 'error': str(e)}
 
   # 2. BigLake REST Catalog
-  if cat_name == 'biglake' or (cat_type == 'rest' and 'biglake.googleapis.com' in str(cat_props.get('uri', ''))):
-    rest_uri = str(cat_props.get('uri') or 'https://biglake.googleapis.com/iceberg/v1/restcatalog').rstrip('/')
+  cand_uri = str(
+      cat_props.get('uri') or
+      'https://biglake.googleapis.com/iceberg/v1/restcatalog').rstrip('/')
+  cand_host = (urllib.parse.urlsplit(cand_uri).hostname or '').lower()
+  if cat_name == 'biglake' or (cat_type == 'rest' and
+                               cand_host == 'biglake.googleapis.com'):
+    rest_uri = cand_uri
+    _validate_rest_catalog_security(rest_uri, cat_props)
+    if not cat_props.get('token') and not _is_googleapis_https_uri(rest_uri):
+      raise LakehouseError(
+          f'BigLake catalog registration refuses to send Google ADC credentials '
+          f'to non-googleapis.com URI {rest_uri!r}')
     warehouse = str(cat_props.get('warehouse') or '')
     prefix = ''
     parts = [p for p in table_ident.split('.') if p]
@@ -1193,7 +1225,7 @@ def register_iceberg_catalog_table(
         headers['x-goog-user-project'] = str(cat_props['header.x-goog-user-project']).replace('\r', '').replace('\n', '')
       if cat_props.get('token'):
         headers['Authorization'] = f"Bearer {str(cat_props['token']).replace(chr(13), '').replace(chr(10), '')}"
-      else:
+      elif _is_googleapis_https_uri(rest_uri):
         try:
           import google.auth
           import google.auth.transport.requests
@@ -1245,7 +1277,7 @@ def resolve_iceberg_table_dir(
     config: dict[str, Any], default_project: Optional[str] = None
 ) -> str:
   """Resolves an `iceberg://` config (`table` + `catalog_properties`) to its root dir.
-  
+
   Catalog resolution hierarchy:
   1. BigQuery managed Iceberg API first (bigquery.googleapis.com)
   2. Google Cloud Lakehouse / BigLake REST Catalog second (biglake.googleapis.com)

@@ -21,12 +21,12 @@ import contextlib
 import io
 import json
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from apache_beam.cli import expressions
@@ -732,16 +732,15 @@ class InputValidationAndResourceBoundsTest(unittest.TestCase):
     fn = fast_local._compile_callable('def f(r):\n  return len(str(r.x))\n')
     self.assertEqual(fn(beam.Row(x=123)), 3)
 
-    # `__import__` / `open` / `eval` are absent from `_SAFE_FAST_BUILTINS`!
-    bad_fn = fast_local._compile_callable('def f(r):\n  return open("/etc/hosts")\n')
-    with self.assertRaises(NameError):
-      bad_fn(beam.Row(x=1))
-
-    # `_safe_row_getattr` rejects `_`-prefixed attributes even if called directly.
-    priv_fn = fast_local._compile_callable(
-        'def f(r):\n  return getattr(r, "__class__")\n')
+    # `__import__` / `open` / dunder `getattr` are rejected at compile time by AST check,
+    # and `_safe_row_getattr` also blocks `_`-prefixed attributes at runtime!
+    with self.assertRaises(fast_local.FastPipeError):
+      fast_local._compile_callable('def f(r):\n  return open("/etc/hosts")\n')
+    with self.assertRaises(fast_local.FastPipeError):
+      fast_local._compile_callable(
+          'def f(r):\n  return getattr(r, "__class__")\n')
     with self.assertRaises(AttributeError):
-      priv_fn(beam.Row(x=1))
+      fast_local._safe_row_getattr(beam.Row(x=1), '__class__')
 
   def test_inspect_header_ansi_and_dirty_col_sanitized(self):
     bad_csv = os.path.join(self.tmp, 'bad_hdr.csv')

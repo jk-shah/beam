@@ -34,13 +34,13 @@ Implements lightweight Complex Event Processing (`--pattern`) for Apache Beam CL
 from __future__ import annotations
 
 import ast
+import json
+import math
+import re
 from collections.abc import Iterable
 from collections.abc import Mapping
 from datetime import datetime
 from datetime import timezone
-import json
-import math
-import re
 from typing import Any
 from typing import NamedTuple
 from typing import Optional

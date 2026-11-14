@@ -69,8 +69,9 @@ class ConfigTest(unittest.TestCase):
         value='DataflowRunner',
         profile=None)
     self.assertEqual(rc, 0)
-    mode = stat.S_IMODE(os.stat(self.cfg_path).st_mode)
-    self.assertEqual(mode, 0o600)
+    if os.name == 'posix':
+      mode = stat.S_IMODE(os.stat(self.cfg_path).st_mode)
+      self.assertEqual(mode, 0o600)
 
     rc, out, _ = self._run(config_action='get', option='runner', profile=None)
     self.assertEqual(rc, 0)

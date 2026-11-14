@@ -177,6 +177,18 @@ def run_check(
       except ValueError as e:
         raise CheckError(
             f'{source_label}: invalid {t["type"]} config: {e}') from None
+    if t['type'] == 'CliExpect' and isinstance(t.get('config'), dict):
+      from . import expect
+      try:
+        raw_rules = t['config'].get('rules', t['config'])
+        if isinstance(raw_rules, list):
+          for r_item in raw_rules:
+            expect.parse_expectation_rule(r_item)
+        else:
+          expect.parse_expectation_rule(raw_rules)
+      except ValueError as e:
+        raise CheckError(
+            f'{source_label}: invalid {t["type"]} config: {e}') from None
 
   def _walk_and_validate_cli_transforms(items: Any) -> None:
     if isinstance(items, dict):

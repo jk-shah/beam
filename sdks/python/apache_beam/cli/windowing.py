@@ -41,14 +41,14 @@ Bridges Beam YAML's trigger-less `WindowInto` (`yaml_provider.py:1185`) inside
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 import datetime
 import json
 import math
+import zlib
+from collections.abc import Mapping
 from typing import Any
 from typing import NamedTuple
 from typing import Optional
-import zlib
 
 import apache_beam as beam
 from apache_beam.coders import BytesCoder

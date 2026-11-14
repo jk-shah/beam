@@ -17,8 +17,9 @@
 
 """Setup hook installing `apache_beam_cli_preview.pth` & bundling `cli/`."""
 
-from pathlib import Path
 import shutil
+from pathlib import Path
+
 from setuptools import setup
 from setuptools.command.build_py import build_py as _build_py
 from setuptools.command.sdist import sdist as _sdist

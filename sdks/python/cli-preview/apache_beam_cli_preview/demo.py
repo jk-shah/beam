@@ -18,10 +18,10 @@
 """Runs the interactive 12-step `beam` CLI showcase (`beam-demo` / `python -m apache_beam_cli_preview.demo`)."""
 
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import sys
+from pathlib import Path
 
 
 def main() -> int:

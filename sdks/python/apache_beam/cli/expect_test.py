@@ -162,7 +162,7 @@ class ExpectFastLocalExecutionTest(unittest.TestCase):
       writer.writerow(['4', '0.0', 'GBP'])
 
   def tearDown(self):
-    shutil.rmtree(self.tmp_dir)
+    shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
   def test_fast_local_dlq_routing(self):
     pipe = pipe_spec.build_pipe_spec(
@@ -221,7 +221,8 @@ class ExpectBeamRunnerExecutionTest(unittest.TestCase):
   def test_beam_direct_runner_expect_transform(self):
     import apache_beam as beam
     from apache_beam.runners.direct.direct_runner import BundleBasedDirectRunner
-    from apache_beam.testing.util import assert_that, equal_to
+    from apache_beam.testing.util import assert_that
+    from apache_beam.testing.util import equal_to
 
     records = [
         beam.Row(id=1, amount=50.0),

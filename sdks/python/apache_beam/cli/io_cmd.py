@@ -17,8 +17,8 @@
 
 """Zero-SDK-import Beam YAML & URI connector catalog (`beam io`)."""
 
-from pathlib import Path
 import re
+from pathlib import Path
 from typing import Any
 
 _CATALOG: list[dict[str, Any]] = [

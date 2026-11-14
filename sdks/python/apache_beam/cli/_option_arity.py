@@ -234,15 +234,16 @@ _ALL_ONE_ARG = PIPELINE_ONE_ARG_FLAGS | YAML_ONE_ARG_FLAGS
 
 # Map kebab-case / snake_case spellings to the exact canonical flag expected by
 # `PipelineOptions` / `yaml.main` (e.g. `--temp-location` -> `--temp_location`).
-_CANONICAL_ZERO: dict[str, str] = {}
-for _f in _ALL_ZERO_ARG:
-  _CANONICAL_ZERO[_f] = _f
-  _CANONICAL_ZERO['--' + _f[2:].replace('_', '-')] = _f
+def _build_canonical_map(flags: frozenset[str]) -> dict[str, str]:
+  out: dict[str, str] = {}
+  for f in flags:
+    out[f] = f
+    out['--' + f[2:].replace('_', '-')] = f
+  return out
 
-_CANONICAL_ONE: dict[str, str] = {}
-for _f in _ALL_ONE_ARG:
-  _CANONICAL_ONE[_f] = _f
-  _CANONICAL_ONE['--' + _f[2:].replace('_', '-')] = _f
+
+_CANONICAL_ZERO = _build_canonical_map(_ALL_ZERO_ARG)
+_CANONICAL_ONE = _build_canonical_map(_ALL_ONE_ARG)
 
 
 def normalize_argv(

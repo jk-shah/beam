@@ -801,21 +801,22 @@ class EnrichCliPipeIntegrationTest(unittest.TestCase):
         f.write(
             'redis: redis://127.0.0.1:6379\nredis_password: top_secret_pw\n')
 
-      # Permissive 0644 secret opt-file must be rejected!
-      os.chmod(opt_file, 0o644)
-      rc_bad, _, _ = _run_cli([
-          'pipe',
-          '--from',
-          src_path,
-          '--enrich',
-          f'file:path={dims_path},key=user_id,columns=[tier]',
-          '--enrich-opt-file',
-          opt_file,
-          '--to',
-          os.path.join(tmp, 'out.jsonl'),
-          '--dry-run',
-      ])
-      self.assertEqual(rc_bad, 2)
+      # Permissive 0644 secret opt-file must be rejected on POSIX!
+      if os.name == 'posix':
+        os.chmod(opt_file, 0o644)
+        rc_bad, _, _ = _run_cli([
+            'pipe',
+            '--from',
+            src_path,
+            '--enrich',
+            f'file:path={dims_path},key=user_id,columns=[tier]',
+            '--enrich-opt-file',
+            opt_file,
+            '--to',
+            os.path.join(tmp, 'out.jsonl'),
+            '--dry-run',
+        ])
+        self.assertEqual(rc_bad, 2)
 
       # Restrict to 0600 -> succeeds and scrubs password in emitted YAML!
       os.chmod(opt_file, 0o600)

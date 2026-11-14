@@ -23,8 +23,8 @@ import os
 import shutil
 import tempfile
 import unittest
-from unittest import mock
 import urllib.error
+from unittest import mock
 
 import pyarrow as pa
 import pyarrow.parquet as pq

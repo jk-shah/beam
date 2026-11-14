@@ -34,10 +34,10 @@ Security & reliability invariants:
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import tempfile
 import time
+from pathlib import Path
 from typing import Any
 
 EXIT_OK = 0

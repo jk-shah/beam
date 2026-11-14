@@ -43,15 +43,15 @@ Implements backlog item `B1.4` purely inside `apache_beam.cli`:
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from collections.abc import Mapping
-from collections.abc import Sequence
 import json
 import math
 import os
 import re
 import threading
 import time
+from collections.abc import Iterable
+from collections.abc import Mapping
+from collections.abc import Sequence
 from typing import Any
 from typing import NamedTuple
 from typing import Optional

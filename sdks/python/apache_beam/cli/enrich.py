@@ -485,6 +485,11 @@ def parse_enrich_spec_str(
         'HANDLER:key=val,... (handlers: file, bigquery, bigtable, vertexai, feast)'
     )
   raw_handler, rest = s.split(':', 1)
+  if len(raw_handler.strip()) == 1 and raw_handler.strip().isalpha() and (
+      rest.startswith(('\\', '/'))):
+    raise ValueError(
+        f'invalid --enrich specification {spec_str!r}; expected '
+        f'HANDLER:key=val,... (for example: file:path={spec_str},key=...)')
   h_key = raw_handler.strip().lower().replace('-', '_')
   handler = _HANDLER_ALIASES.get(h_key)
   if handler is None:

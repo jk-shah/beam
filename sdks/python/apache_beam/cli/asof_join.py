@@ -35,11 +35,11 @@ Bridges ahead of Apache Beam `#41309` with leak-free 1:1 point-in-time joins:
 from __future__ import annotations
 
 import bisect
-from collections.abc import Iterable
-from collections.abc import Mapping
 import decimal
 import json
 import math
+from collections.abc import Iterable
+from collections.abc import Mapping
 from typing import Any
 from typing import NamedTuple
 

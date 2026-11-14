@@ -124,17 +124,13 @@ def sanitize_untrusted_value(value: Any, max_depth: int = 12) -> Any:
     }
   if isinstance(value, decimal.Decimal):
     return str(value)
-  if hasattr(value, '_asdict'):
+  if hasattr(value, '_asdict') or isinstance(value, dict):
+    items = value._asdict().items() if hasattr(value,
+                                               '_asdict') else value.items()
     return {
-        sanitize_untrusted_text(str(k), max_chars=256):
-        sanitize_untrusted_value(v, max_depth - 1)
-        for k, v in value._asdict().items()
-    }
-  if isinstance(value, dict):
-    return {
-        sanitize_untrusted_text(str(k), max_chars=256):
-        sanitize_untrusted_value(v, max_depth - 1)
-        for k, v in value.items()
+        sanitize_untrusted_text(str(k), max_chars=256): sanitize_untrusted_value(
+            v, max_depth - 1)
+        for k, v in items
     }
   if isinstance(value, (list, tuple)):
     return [sanitize_untrusted_value(v, max_depth - 1) for v in value]
@@ -572,13 +568,17 @@ class JsonOutputSession:
         sys.stderr.flush()
       except OSError:
         pass
-      saved_fd = os.dup(1)
-      # Permanent redirection: intentionally NOT undone in `__exit__` so gRPC /
-      # Prism `atexit` teardown writes to FD 2 rather than corrupting FD 1.
-      os.dup2(2, 1)
-      self._json_stream = os.fdopen(saved_fd, 'w', encoding='utf-8')
-      self._owns_fd = True
-      sys.stdout = sys.stderr
+      try:
+        saved_fd = os.dup(1)
+        # Permanent redirection: intentionally NOT undone in `__exit__` so gRPC /
+        # Prism `atexit` teardown writes to FD 2 rather than corrupting FD 1.
+        os.dup2(2, 1)
+        self._json_stream = os.fdopen(saved_fd, 'w', encoding='utf-8')
+        self._owns_fd = True
+        sys.stdout = sys.stderr
+      except OSError:
+        self._json_stream = self._prev_stdout
+        sys.stdout = sys.stderr
     else:
       self._json_stream = self._prev_stdout
       sys.stdout = sys.stderr

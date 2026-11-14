@@ -39,15 +39,15 @@ modes:
 import ast
 import json
 import os
-from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
-from typing import Any
 import urllib.error
 import urllib.request
+from pathlib import Path
+from typing import Any
 
 import yaml
 

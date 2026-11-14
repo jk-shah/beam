@@ -108,7 +108,7 @@ pipeline:
 """)
 
   def tearDown(self):
-    shutil.rmtree(self.tmp_dir)
+    shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
   def test_export_schedule_inherits_yaml_options(self):
     out_file = os.path.join(self.tmp_dir, 'dag.py')
@@ -157,7 +157,7 @@ class CliExportScheduleIntegrationTest(unittest.TestCase):
       f.write("pipeline:\n  transforms: []\n")
 
   def tearDown(self):
-    shutil.rmtree(self.tmp_dir)
+    shutil.rmtree(self.tmp_dir, ignore_errors=True)
 
   def test_cli_export_schedule_json(self):
     argv = [

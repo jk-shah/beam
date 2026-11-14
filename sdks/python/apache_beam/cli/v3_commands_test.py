@@ -23,13 +23,12 @@ import decimal
 import glob
 import io
 import json
-import math
 import os
-from pathlib import Path
 import shutil
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import pyarrow as pa
@@ -389,10 +388,15 @@ class OfflineRobustnessTest(unittest.TestCase):
     self.assertFalse(any('WRITE_EMPTY' in w for w in env['warnings']))
 
   def test_prism_probe_requires_a_runnable_binary(self):
-    ok = os.path.join(self.tmp, 'prism')
-    with open(ok, 'w', encoding='utf-8') as f:
-      f.write('#!/bin/sh\nexit 0\n')
-    os.chmod(ok, 0o755)
+    if os.name == 'nt':
+      ok = os.path.join(self.tmp, 'prism.bat')
+      with open(ok, 'w', encoding='utf-8') as f:
+        f.write('@exit /b 0\r\n')
+    else:
+      ok = os.path.join(self.tmp, 'prism')
+      with open(ok, 'w', encoding='utf-8') as f:
+        f.write('#!/bin/sh\nexit 0\n')
+      os.chmod(ok, 0o755)
     self.assertTrue(cli._prism_binary_runs(ok))
     self.assertFalse(cli._prism_binary_runs(os.path.join(self.tmp, 'missing')))
 
@@ -884,7 +888,11 @@ class InspectCheckIoDoctorTailJobsTest(unittest.TestCase):
     from apache_beam_cli_preview import launcher
 
     cache_dir = os.path.join(self.tmp, 'wheel_cache')
-    with mock.patch.dict(os.environ, {'BEAM_CACHE_DIR': cache_dir}):
+    with mock.patch.dict(os.environ,
+                         {
+                             'BEAM_CACHE_DIR': cache_dir,
+                             'BEAM_CLI_DIR': os.path.dirname(__file__),
+                         }):
       whl_path = launcher.ensure_preview_wheel()
       self.assertTrue(os.path.isfile(whl_path))
       with zipfile.ZipFile(whl_path, 'r') as zf:
@@ -4248,10 +4256,15 @@ class Round12FixesTest(unittest.TestCase):
 
     shadow_dir = os.path.join(self.tmp, 'shadow_bin')
     os.makedirs(shadow_dir, exist_ok=True)
-    shadow_beam = os.path.join(shadow_dir, 'beam')
-    with open(shadow_beam, 'w', encoding='utf-8') as f:
-      f.write('#!/bin/sh\necho beam-cloud\n')
-    os.chmod(shadow_beam, 0o755)
+    if os.name == 'nt':
+      shadow_beam = os.path.join(shadow_dir, 'beam.cmd')
+      with open(shadow_beam, 'w', encoding='utf-8') as f:
+        f.write('@echo beam-cloud\r\n')
+    else:
+      shadow_beam = os.path.join(shadow_dir, 'beam')
+      with open(shadow_beam, 'w', encoding='utf-8') as f:
+        f.write('#!/bin/sh\necho beam-cloud\n')
+      os.chmod(shadow_beam, 0o755)
 
     new_path = shadow_dir + os.pathsep + os.environ.get('PATH', '')
     with mock.patch.dict(
@@ -4653,4 +4666,3 @@ class Round12FixesTest(unittest.TestCase):
 
 if __name__ == '__main__':
   unittest.main()
-

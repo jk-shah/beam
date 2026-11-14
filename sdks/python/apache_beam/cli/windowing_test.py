@@ -36,7 +36,7 @@ from apache_beam.cli import package as package_mod
 from apache_beam.cli import windowing
 from apache_beam.options.pipeline_options import PipelineOptions
 from apache_beam.runners import pipeline_context
-from apache_beam.testing.test_stream import TestStream
+from apache_beam.testing.test_stream import TestStream as _TestStream
 from apache_beam.testing.util import assert_that
 from apache_beam.testing.util import equal_to
 from apache_beam.transforms import core
@@ -186,7 +186,7 @@ class CliWindowIntoTestStreamTest(unittest.TestCase):
 
     # Window [0, 60) closes at horizon = 60 + 15 = 75s (expires at 75s + 1us).
     ts = (
-        TestStream().advance_watermark_to(0).add_elements([
+        _TestStream().advance_watermark_to(0).add_elements([
             TimestampedValue(beam.Row(acct='a1', amt=10, ssn='111-11-1111'), 5),
             TimestampedValue(
                 beam.Row(acct='a1', amt=20, ssn='111-11-1111'), 12),
@@ -264,7 +264,7 @@ class CliWindowIntoTestStreamTest(unittest.TestCase):
         'late_action': 'drop',
     })
     ts = (
-        TestStream().advance_watermark_to(0).add_elements([
+        _TestStream().advance_watermark_to(0).add_elements([
             TimestampedValue(beam.Row(acct='a1', amt=10), 5),
             TimestampedValue(beam.Row(acct='a1', amt=20), 12),
         ]).advance_watermark_to(65).add_elements([

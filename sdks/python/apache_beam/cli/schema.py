@@ -22,7 +22,8 @@ dropped non-nullable fields, and unsafe type coercions before submitting compute
 to Google Cloud Dataflow or portable runners.
 """
 
-from typing import Any, Iterable, Optional
+from typing import Any
+from typing import Optional
 
 EXIT_OK = 0
 EXIT_PIPELINE_FAILED = 1

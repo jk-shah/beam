@@ -35,7 +35,7 @@ from apache_beam.cli import main as cli_main
 from apache_beam.cli import package as package_mod
 from apache_beam.options.pipeline_options import PipelineOptions
 from apache_beam.runners.portability.fn_api_runner import fn_runner
-from apache_beam.testing.test_stream import TestStream
+from apache_beam.testing.test_stream import TestStream as _TestStream
 from apache_beam.testing.util import assert_that
 from apache_beam.testing.util import equal_to
 from apache_beam.transforms.window import TimestampedValue
@@ -180,7 +180,7 @@ class CliAsofJoinTestStreamTest(unittest.TestCase):
     # 2. Quotes 10, 20, 30, 45 compact to latest anchor 45, which then expires
     #    before t_l=70 (70 - 45 = 25s > 20s tolerance -> NULL).
     mux = (
-        TestStream().advance_watermark_to(0).add_elements([
+        _TestStream().advance_watermark_to(0).add_elements([
             TimestampedValue(('L', beam.Row(sym='GOOG', t_ts=50, qty=5)), 50),
         ]).add_elements([
             TimestampedValue(('R', beam.Row(sym='GOOG', q_ts=10, price=201.0)),

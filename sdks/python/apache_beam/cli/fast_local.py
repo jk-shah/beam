@@ -41,7 +41,6 @@ Known differences from the runner path, all caused by Beam core:
 
 from __future__ import annotations
 
-import builtins
 import csv
 import json
 import os
@@ -305,6 +304,10 @@ _SAFE_FAST_BUILTINS: dict[str, Any] = {
 
 
 def _compile_callable(src: str):
+  from . import check_cmd
+  if not isinstance(src, str) or not check_cmd._is_safe_inline_callable(src):
+    raise FastPipeError(
+        'disallowed or unsafe inline callable in local fast path')
   namespace: dict[str, Any] = {'__builtins__': _SAFE_FAST_BUILTINS}
   exec(compile(src, '<beam-cli-fast-path>', 'exec'), namespace)  # pylint: disable=exec-used
   fns = [
@@ -317,7 +320,11 @@ def _compile_callable(src: str):
 
 
 def _compile_expression(expr: str):
-  code = compile(expr, '<beam-cli-fast-path>', 'eval')
+  from . import expect as expect_mod
+  try:
+    code = expect_mod.compile_expectation_expression(expr)
+  except ValueError as e:
+    raise FastPipeError(str(e)) from None
 
   def fn(row):
     return eval(code, {'__builtins__': _SAFE_FAST_BUILTINS}, row._asdict())  # pylint: disable=eval-used
