@@ -579,6 +579,44 @@ class CliWindowIntoEndToEndPipeTest(unittest.TestCase):
       ])
       self.assertEqual(rc_ok, 0, f'STDOUT: {out_ok}\nSTDERR: {err_ok}')
 
+  def test_sql_style_window_select_auto_lowers_to_combine(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      src = os.path.join(tmp, 'rev.jsonl')
+      dst = os.path.join(tmp, 'rollup.parquet')
+      with open(src, 'w', encoding='utf-8') as f:
+        f.write(
+            '{"dept": "shoes", "order_ts": "2026-06-01T12:00:05Z", "amount": 100.0}\n'
+            '{"dept": "shoes", "order_ts": "2026-06-01T12:00:25Z", "amount": 150.0}\n'
+            '{"dept": "hats", "order_ts": "2026-06-01T12:00:15Z", "amount": 40.0}\n'
+        )
+      rc, out, err = _run_cli([
+          'pipe',
+          '--from',
+          src,
+          '--to',
+          dst,
+          '--timestamp-col',
+          'order_ts',
+          '--window',
+          'fixed:1m',
+          '--allowed-lateness',
+          '10m',
+          '--emit-pane-info',
+          '--select',
+          'dept, SUM(amount) AS rev, COUNT(*) AS cnt',
+          '--json',
+      ])
+      self.assertEqual(rc, 0, f'STDOUT: {out}\nSTDERR: {err}')
+      rows = sorted(pq.read_table(dst).to_pylist(), key=lambda r: r['dept'])
+      self.assertEqual(len(rows), 2)
+      self.assertEqual(rows[0]['dept'], 'hats')
+      self.assertEqual(rows[0]['rev'], 40.0)
+      self.assertEqual(rows[0]['cnt'], 1)
+      self.assertEqual(rows[1]['dept'], 'shoes')
+      self.assertEqual(rows[1]['rev'], 250.0)
+      self.assertEqual(rows[1]['cnt'], 2)
+      self.assertIn('pane_timing', rows[1])
+
 
 if __name__ == '__main__':
   unittest.main()

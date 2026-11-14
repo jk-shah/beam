@@ -41,7 +41,6 @@ import decimal
 import hashlib
 import json
 import logging
-import math
 import os
 import re
 import tempfile
@@ -241,43 +240,9 @@ class EnrichConfig(NamedTuple):
   redis_password: str | None = None
 
 
-def _parse_bool(val: Any, flag_label: str) -> bool:
-  if isinstance(val, bool):
-    return val
-  s = str(val).strip().lower()
-  if s in ('1', 'true', 'yes', 'on'):
-    return True
-  if s in ('0', 'false', 'no', 'off'):
-    return False
-  raise ValueError(f'expected boolean for {flag_label}, got {val!r}')
-
-
-def _parse_positive_float(val: Any, label: str) -> float:
-  if isinstance(val, str) and any(c.isalpha() for c in val):
-    sec = interval_join.parse_interval_duration(val)
-  else:
-    try:
-      sec = float(val)
-    except (TypeError, ValueError):
-      raise ValueError(
-          f'{label} must be a positive number or duration, got {val!r}'
-      ) from None
-  if not math.isfinite(sec) or sec <= 0:
-    raise ValueError(f'{label} must be > 0, got {val!r}')
-  return sec
-
-
-def _parse_positive_int(val: Any, label: str) -> int:
-  if isinstance(val, bool):
-    raise ValueError(f'{label} must be a positive integer, got {val!r}')
-  try:
-    iv = int(val)
-  except (TypeError, ValueError):
-    raise ValueError(
-        f'{label} must be a positive integer, got {val!r}') from None
-  if iv < 1:
-    raise ValueError(f'{label} must be >= 1, got {val!r}')
-  return iv
+_parse_bool = interval_join.parse_bool_opt
+_parse_positive_float = interval_join.parse_positive_duration_opt
+_parse_positive_int = interval_join.parse_positive_int_opt
 
 
 def _validate_ident_list(cols: Iterable[str], label: str) -> tuple[str, ...]:
@@ -992,23 +957,13 @@ def _make_enrich_dlq_row(
     elem: Any,
     redact_fields: tuple[str, ...] = (),
 ) -> beam.Row:
-  try:
-    plain = interval_join._to_plain_dict(elem)
-    if isinstance(plain, dict) and redact_fields:
-      plain = {
-          k: ('<REDACTED>' if k in redact_fields else v)
-          for k, v in plain.items()
-      }
-    raw_json = json.dumps(plain, default=str, sort_keys=True)
-  except Exception:  # pylint: disable=broad-except
-    raw_json = '<unserializable_row>'
-  return beam.Row(
-      step=step,
-      error_type=err_type,
-      error=msg[:4096],
-      raw_payload=raw_json,
-      element=raw_json,
-  )
+  from . import dlq
+  return dlq.make_transform_dlq_row(
+      step,
+      err_type,
+      msg,
+      interval_join._to_plain_dict(elem),
+      redact_fields=redact_fields)
 
 
 def _infer_local_file_schema(

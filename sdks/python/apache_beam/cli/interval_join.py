@@ -225,6 +225,51 @@ def parse_interval_duration(raw: str | int | float) -> float:
   return sign * num * mult
 
 
+def parse_bool_opt(raw: Any, label: str) -> bool:
+  """Parses a CLI/YAML boolean option cleanly, rejecting ambiguous values."""
+  if isinstance(raw, bool):
+    return raw
+  s = str(raw).strip().lower()
+  if s in ('1', 'true', 'yes', 'on'):
+    return True
+  if s in ('0', 'false', 'no', 'off'):
+    return False
+  raise ValueError(f'expected boolean for {label}, got {raw!r}')
+
+
+def parse_positive_int_opt(raw: Any, label: str, *, min_val: int = 1) -> int:
+  """Parses an integer CLI/YAML option enforcing `>= min_val` and rejecting `bool`."""
+  if isinstance(raw, bool):
+    raise ValueError(f'{label} must be an integer >= {min_val}, got {raw!r}')
+  try:
+    iv = int(raw)
+  except (TypeError, ValueError):
+    raise ValueError(
+        f'{label} must be an integer >= {min_val}, got {raw!r}') from None
+  if iv < min_val:
+    raise ValueError(f'{label} must be >= {min_val}, got {raw!r}')
+  return iv
+
+
+def parse_positive_duration_opt(raw: Any, label: str) -> float:
+  """Parses a positive duration or numeric seconds value, rejecting <= 0 or NaN/Inf."""
+  if isinstance(raw, bool):
+    raise ValueError(
+        f'{label} must be a positive duration or number, got {raw!r}')
+  if isinstance(raw, str) and any(c.isalpha() for c in raw):
+    sec = parse_interval_duration(raw)
+  else:
+    try:
+      sec = float(raw)
+    except (TypeError, ValueError):
+      raise ValueError(
+          f'{label} must be a positive duration or number, got {raw!r}'
+      ) from None
+  if not math.isfinite(sec) or sec <= 0:
+    raise ValueError(f'{label} must be > 0, got {raw!r}')
+  return sec
+
+
 class IntervalJoinConfig(NamedTuple):
   left_alias: str
   right_alias: str

@@ -494,6 +494,60 @@ class Tier1Tier2SecurityAndAdversarialTest(unittest.TestCase):
     self.assertNotIn('ya29.a0AfH6SMBxSecretTokenValue12345', redacted)
     self.assertIn('<REDACTED_SECRET>', redacted)
 
+  def test_shared_transform_dlq_row_scrubs_nested_pii_and_inline_secrets(self):
+    from apache_beam.cli import enrich
+    from apache_beam.cli import infer
+    from apache_beam.cli import windowing
+    nested_rec = {
+        'id': 7,
+        'customer': {
+            'ssn': '123-45-6789',
+            'cards': [{
+                'card_token': 'tok_live_secret_999'
+            }],
+        },
+    }
+    err_with_secrets = (
+        'RPC failed: Authorization: Bearer ya29.a0AfH6SecretToken123456 '
+        'for ssn="123-45-6789" \x1b[31m\u202eEVIL')
+    rows = [
+        enrich._make_enrich_dlq_row(
+            'CliEnrich',
+            'LookupError',
+            err_with_secrets,
+            nested_rec,
+            redact_fields=('ssn', 'card_token')),
+        infer._make_infer_dlq_row(
+            'CliInfer',
+            'InferError',
+            err_with_secrets,
+            nested_rec,
+            redact_fields=('ssn', 'card_token')),
+        windowing._make_late_dlq_row(
+            nested_rec, err_with_secrets, redact_fields=('ssn', 'card_token')),
+        asof_join._make_asof_dlq_row(
+            'SkewError',
+            err_with_secrets,
+            nested_rec,
+            redact_fields=('ssn', 'card_token')),
+        cep._make_cep_dlq_row(
+            'OverflowError',
+            err_with_secrets,
+            nested_rec,
+            redact_fields=('ssn', 'card_token')),
+    ]
+    for r in rows:
+      self.assertNotIn('123-45-6789', r.raw_payload)
+      self.assertNotIn('tok_live_secret_999', r.raw_payload)
+      self.assertNotIn('123-45-6789', r.error)
+      self.assertNotIn('ya29.a0AfH6SecretToken123456', r.error)
+      self.assertNotIn('\x1b', r.error)
+      self.assertNotIn('\u202e', r.error)
+      parsed = json.loads(r.raw_payload)
+      self.assertEqual(parsed['customer']['ssn'], '<REDACTED>')
+      self.assertEqual(
+          parsed['customer']['cards'][0]['card_token'], '<REDACTED>')
+
 
 if __name__ == '__main__':
   unittest.main()

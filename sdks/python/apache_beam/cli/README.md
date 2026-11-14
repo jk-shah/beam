@@ -54,7 +54,14 @@ This package implements the `beam` (and `apache-beam`) command-line interface tr
 | `lakehouse.py` | Pure-Python Delta Lake `_delta_log` & Apache Iceberg v2 reader, Merge-on-Read writer, and `--zero-copy` Avro manifest synthesizer |
 | `cdc.py` | Cross-engine Debezium / Spanner / Lakehouse CDC normalizer, file-sink materializer, & BigQuery Storage Write API `_default` (`UPSERT`/`DELETE`) sink |
 | `jobs.py` | Detached job state (`~/.beam/jobs/`), 30m idempotency ledger, `beam wait` deferred post-checks, and `beam cancel` |
-| `check_cmd.py` | Static YAML, sandboxed `--jinja-variables`, and provider trust validator + optional `--plan` graph expansion |
+| `check_cmd.py` | Recursive static YAML, AST callable sandbox, Jinja2, and `--trust-providers` validator + `--plan` expansion |
+| `schema.py` / `expect.py` | `<100 ms` pre-flight schema compatibility guard (`beam schema diff`, `--check-schema`) and `--expect` quality rules |
+| `catalog.py` / `scheduler.py` | `<200 ms` zero-copy Lakehouse catalog sync (`beam catalog sync`) and Airflow/Cloud Scheduler exporter (`beam export-schedule`) |
+| `interval_join.py` / `asof_join.py` | Stateful event-time `CliIntervalJoin` (`--max-watermark-skew`) and leak-free point-in-time `CliAsofJoin` (`--asof-join`, SQL `ASOF JOIN`) |
+| `dedup.py` | Bounded-state event/processing-time `CliDeduplicate` (`--dedupe-by`, `--dedupe-keep`, `--dedupe-dlq`) |
+| `enrich.py` | Batched worker-side `CliEnrich` (parameterized BQ, Bigtable, VertexFS, Feast, `file:`, TLS `rediss://` cache, `AdaptiveThrottler`) |
+| `infer.py` | Lazy `RunInference`-backed `CliInfer` (Vertex AI `<1.4 MB` split, pinned HF `safetensors`, singleton poison-pill bisect) |
+| `windowing.py` / `cep.py` | Speculative/late triggers, sharded `_LateDataAuditDoFn` (`--late-data-dlq`), `CliExtractPaneInfo`, and bounded NFA `CliPatternMatch` (`--pattern`) |
 | `io_cmd.py` / `doctor.py` | Connector reference cards (`beam io`) and environment/SQL-engine/ADC pre-flight diagnostics (`beam doctor`) |
 | `sql.py` / `config.py` | Beam Calcite SQL runner (`beam sql`) and persistent `PipelineOptions` profiles (`beam config`) |
 | `llms_txt.py` | Self-contained Markdown agent reference (`beam --llms-txt`) |
@@ -77,13 +84,15 @@ This package implements the `beam` (and `apache-beam`) command-line interface tr
 
 ---
 
-## 5. Documentation & Running the Automated Test Suite (`209` Tests)
+## 5. Feature-Complete Status, Documentation & Test Suite (`408` Tests Across 25 Modules)
+
+The `beam-cli-preview` (`v0.2.0`) feature set is **Feature Complete** across Core ETL, Lakehouse/CDC, Governance, Tier 1 (Joins, Deduplication, Online Enrichment, ML Inference), and Tier 2 (Point-in-Time `ASOF JOIN`, Bounded CEP, Window Triggers & Late-Data Quarantine), with active engineering focused on incremental ~400-line upstream PRs into `apache/beam:master`.
 
 * **Preview Quickstart & Recipes**: [`sdks/python/cli-preview/README.md`](../../cli-preview/README.md)
 * **Website CLI Reference**: [`website/www/site/content/en/documentation/sdks/cli.md`](../../../../website/www/site/content/en/documentation/sdks/cli.md)
 * **AI Agent Skill**: [`.agents/skills/apache-beam-cli/SKILL.md`](../../../../.agents/skills/apache-beam-cli/SKILL.md)
 
-After installing the preview overlay (`sdks/python/cli-preview`) into a virtual environment, run the full `209`-test CLI unit, `<90 ms` startup-isolation, pipeline integration, Lakehouse/CDC, and input-validation/resource-bounds suite from the repository root:
+After installing the preview overlay (`sdks/python/cli-preview`) into a virtual environment, run the full `408`-test unit, `<90 ms` startup-isolation, stateful streaming, enrichment/ML, Lakehouse/CDC, and adversarial security/chaos suite from the repository root:
 
 ```bash
 python -m unittest discover -s sdks/python/apache_beam/cli -p '*_test.py'

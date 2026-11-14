@@ -161,6 +161,86 @@ def _parse_inline_aggregations(
   return combines, group_by, remaining
 
 
+_SQL_SELECT_AGG_RE = re.compile(
+    r'^(?:(?P<eq_alias>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*)?'
+    r'(?P<fn>sum|count|min|max|avg|mean)\s*\(\s*'
+    r'(?P<val>\*|[A-Za-z_][A-Za-z0-9_]*)?\s*\)'
+    r'(?:\s+[Aa][Ss]\s+(?P<as_alias>[A-Za-z_][A-Za-z0-9_]*))?$',
+    re.IGNORECASE,
+)
+
+
+def _extract_sql_select_window_aggs(
+    select_str: str | None) -> dict[str, Any] | None:
+  """Auto-lowers SQL-style `--select "dept, SUM(amount) AS rev, COUNT(*) AS cnt"` onto `Combine`."""
+  if not select_str or not isinstance(select_str, str):
+    return None
+  parts = _split_window_tokens(select_str)
+  if not parts:
+    return None
+  group_by: list[str] = []
+  combines: dict[str, Any] = {}
+  for p in parts:
+    m = _SQL_SELECT_AGG_RE.match(p)
+    if m:
+      fn = m.group('fn').lower()
+      fn_clean = 'mean' if fn == 'avg' else fn
+      val = (m.group('val') or '').strip()
+      alias = m.group('as_alias') or m.group('eq_alias')
+      if not alias:
+        alias = val if val and val != '*' else (fn if fn != 'mean' else 'avg')
+      if fn_clean == 'count':
+        # Lower `COUNT(*)` / `COUNT(col)` to plain-`int` `sum` so PyArrow Parquet
+        # writers never hit `CountCombineFn`'s numpy logical-type incompatibility.
+        if not val or val == '*':
+          c_src = 'lambda row: 1'
+        else:
+          c_src = f'lambda row: 0 if getattr(row, {val!r}, None) is None else 1'
+        combines[alias] = {
+            'value': {
+                'callable': c_src, 'output_type': 'integer'
+            },
+            'fn': 'sum',
+            '_needs_python': True,
+        }
+      else:
+        if not val or val == '*':
+          return None
+        combines[alias] = {'value': val, 'fn': fn_clean}
+    elif re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', p):
+      group_by.append(p)
+    else:
+      return None
+  if not combines:
+    return None
+  return {'group_by': group_by, 'combine': combines}
+
+
+def _build_combine_config(
+    window_aggs: dict[str, Any],
+    *,
+    force_python: bool = False,
+) -> dict[str, Any]:
+  raw_comb = window_aggs.get('combine') or {}
+  needs_py = force_python
+  clean_comb: dict[str, Any] = {}
+  for k, v in raw_comb.items():
+    if isinstance(v, dict):
+      vc = dict(v)
+      if vc.pop('_needs_python', False) or vc.get('value') == '1':
+        needs_py = True
+      clean_comb[k] = vc
+    else:
+      clean_comb[k] = v
+  out: dict[str, Any] = {
+      'group_by': window_aggs.get('group_by', []),
+      'combine': clean_comb,
+  }
+  if needs_py:
+    out['language'] = 'python'
+  return out
+
+
 def parse_window_spec(spec: str | dict[str, Any]) -> dict[str, Any]:
   """Parses a `--window` string into a Beam YAML windowing dict."""
   if isinstance(spec, dict):
@@ -565,6 +645,11 @@ def build_pipe_spec(
 
   window_spec = parse_window_spec(window) if window else None
   window_aggs = window_spec.pop('aggregations', None) if window_spec else None
+  if window_spec is not None and window_aggs is None and select:
+    inferred_aggs = _extract_sql_select_window_aggs(select)
+    if inferred_aggs is not None:
+      window_aggs = inferred_aggs
+      select = None
   clean_timestamp_col = str(timestamp_col).strip() if timestamp_col else None
   if clean_timestamp_col == '':
     raise PipeSpecError('--timestamp-col cannot be empty')
@@ -1440,12 +1525,8 @@ def build_pipe_spec(
             },
         })
       if window_aggs:
-        comb_cfg: dict[str, Any] = {
-            'group_by': window_aggs.get('group_by', []),
-            'combine': window_aggs.get('combine', {}),
-        }
-        if cli_window_yaml_cfg is not None:
-          comb_cfg['language'] = 'python'
+        comb_cfg = _build_combine_config(
+            window_aggs, force_python=cli_window_yaml_cfg is not None)
         chain_steps.append({
             'type': 'Combine',
             'config': comb_cfg,
@@ -1997,12 +2078,8 @@ def build_pipe_spec(
       })
       current_ref = 'WindowInto'
     if window_aggs:
-      comb_dag_cfg: dict[str, Any] = {
-          'group_by': window_aggs.get('group_by', []),
-          'combine': window_aggs.get('combine', {}),
-      }
-      if cli_window_yaml_cfg is not None:
-        comb_dag_cfg['language'] = 'python'
+      comb_dag_cfg = _build_combine_config(
+          window_aggs, force_python=cli_window_yaml_cfg is not None)
       dag_transforms.append({
           'name': 'WindowCombine',
           'type': 'Combine',

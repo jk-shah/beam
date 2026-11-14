@@ -140,6 +140,81 @@ def safe_json_dumps(value: Any) -> str:
     return json.dumps({'repr': repr(value)})
 
 
+TRANSFORM_DLQ_FIELDS = (
+    ('step', str),
+    ('error_type', str),
+    ('error', str),
+    ('raw_payload', str),
+    ('element', str),
+)
+
+
+def transform_dlq_row_type():
+  """Returns the standard 5-column `RowTypeConstraint` for transform DLQ outputs."""
+  from apache_beam.typehints.row_type import RowTypeConstraint
+  return RowTypeConstraint.from_fields(list(TRANSFORM_DLQ_FIELDS))
+
+
+def redact_nested_fields(
+    value: Any,
+    redact_fields: Iterable[str] = (),
+    *,
+    max_depth: int = 8,
+) -> Any:
+  """Recursively replaces keys in `redact_fields` with `'<REDACTED>'` across dicts/lists."""
+  rk = frozenset(str(f) for f in (redact_fields or ()) if str(f).strip())
+  if not rk or max_depth <= 0:
+    return value
+  if hasattr(value, '_asdict'):
+    value = dict(value._asdict())
+  if isinstance(value, dict):
+    return {
+        k: (
+            '<REDACTED>' if str(k) in rk else redact_nested_fields(
+                v, rk, max_depth=max_depth - 1))
+        for k, v in value.items()
+    }
+  if isinstance(value, (list, tuple)):
+    return [
+        redact_nested_fields(item, rk, max_depth=max_depth - 1)
+        for item in value
+    ]
+  return value
+
+
+def make_transform_dlq_row(
+    step: str,
+    error_type: str,
+    error_msg: str,
+    record: Any,
+    *,
+    redact_fields: Iterable[str] = (),
+):
+  """Constructs a sanitized, PII-scrubbed 5-column `beam.Row` for transform DLQs."""
+  import re
+  import apache_beam as beam
+  from . import output as out_mod
+  rk = tuple(str(f) for f in (redact_fields or ()) if str(f).strip())
+  clean_record = redact_nested_fields(record, rk) if rk else record
+  raw_json = safe_json_dumps(clean_record)
+  clean_err = out_mod.sanitize_untrusted_text(str(error_msg), max_chars=4096)
+  clean_err = out_mod.redact_inline_secrets(
+      clean_err, placeholder='<REDACTED_SECRET>')
+  for col in rk:
+    clean_err = re.sub(
+        r'([\'"]?' + re.escape(col) +
+        r'[\'"]?\s*[:=]\s*)(?:([\'"]).*?\2|[^,\s)\]}]+)',
+        r'\1<REDACTED>',
+        clean_err)
+  return beam.Row(
+      step=str(step),
+      error_type=str(error_type),
+      error=clean_err[:4096],
+      raw_payload=raw_json,
+      element=raw_json,
+  )
+
+
 def build_dlq_normalizer_transform(
     name: str,
     input_ref: str,

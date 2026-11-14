@@ -260,10 +260,48 @@ beam pipe \
 
 ---
 
-## 10. Architecture & Documentation Links
+## 10. Stateful Streaming, Online Enrichment, ML Inference & Triggers
+
+`beam pipe` includes production-hardened streaming, enrichment, and AI primitives with recursive PII redaction (`--dlq-redact-fields`) across dead-letter queues:
+
+```bash
+# 1. Event-time stream deduplication keeping highest seq_no + duplicate audit DLQ:
+beam pipe --from pubsub://projects/<PROJ>/subscriptions/payments \
+  --to bigquery://<PROJ>.fin.payments \
+  --timestamp-col event_ts --dedupe-by payment_id --dedupe-window 15m \
+  --dedupe-keep last --dedupe-order seq_no --dedupe-dlq --dlq gs://<BKT>/dup_dlq/ --json
+
+# 2. Online Bigtable / VertexFS / BigQuery enrichment + TLS Redis cache + PII-scrubbed DLQ:
+beam pipe --from pubsub://projects/<PROJ>/subscriptions/checkouts \
+  --to bigquery://<PROJ>.analytics.enriched_checkouts \
+  --pre-select "*, lower(strip(raw_uid)) AS user_id" \
+  --enrich "bigtable:project=<PROJ>,instance=prod-bt,table=risk,key=user_id,columns=[profile:tier:str],redis=rediss://10.0.0.5:6379,on_miss=dlq" \
+  --post-where "tier != 'BLOCKED'" \
+  --dlq gs://<BKT>/enrich_dlq/ --dlq-redact-fields email,card_token --json
+
+# 3. Streaming ML inference (Vertex AI or pinned HuggingFace safetensors) with poison-pill batch bisect:
+beam pipe --from pubsub://projects/<PROJ>/subscriptions/txns \
+  --to pubsub://projects/<PROJ>/topics/scored_txns \
+  --infer "vertexai:endpoint=projects/<PROJ>/locations/us-central1/endpoints/12345,max_batch_size=64,rate_limit=500" \
+  --infer-fields "amount, velocity_1h" --infer-flatten --dlq gs://<BKT>/infer_dlq/ --json
+
+# 4. Point-in-time SQL ASOF JOIN & early/late windowed rollups with late-data quarantine:
+beam pipe --from t=trades.jsonl --from q=quotes.jsonl --to priced.parquet \
+  --sql "SELECT t.symbol, t.trade_ts, t.qty, q.price FROM t ASOF LEFT JOIN q ON t.symbol = q.symbol AND t.trade_ts >= q.quote_ts" --json
+
+beam pipe --from pubsub://projects/<PROJ>/subscriptions/orders --to bigquery://<PROJ>.analytics.min_rev \
+  --timestamp-col order_ts --window fixed:1m --allowed-lateness 10m \
+  --trigger "watermark,early=every:10s,late=count:1" --accumulation accumulating \
+  --late-action dlq --late-data-dlq gs://<BKT>/late_dlq/ --emit-pane-info \
+  --select "dept, SUM(amount) AS rev, COUNT(*) AS cnt" --json
+```
+
+---
+
+## 11. Architecture & Documentation Links
 
 * **Official Beam Website CLI Reference**: [`website/www/site/content/en/documentation/sdks/cli.md`](../../../website/www/site/content/en/documentation/sdks/cli.md)
-* **CLI Module Map & Test Runner (`209` tests)**: [`sdks/python/apache_beam/cli/README.md`](../apache_beam/cli/README.md)
+* **CLI Module Map & Test Runner (`408` tests across 25 modules)**: [`sdks/python/apache_beam/cli/README.md`](../apache_beam/cli/README.md)
 * **AI Coding Agent Skill**: [`.agents/skills/apache-beam-cli/SKILL.md`](../../../.agents/skills/apache-beam-cli/SKILL.md)
 
-All CLI source modules live directly in their upstream target path [`sdks/python/apache_beam/cli/`](../apache_beam/cli/README.md) so individual PR slices cherry-pick cleanly onto `apache/beam:master` ([apache/beam#40891](https://github.com/apache/beam/issues/40891)). This `sdks/python/cli-preview/` package is a lightweight pure-Python overlay that lets anyone install and test the full future CLI experience against released PyPI `apache-beam` wheels in seconds.
+All CLI source modules live directly in their upstream target path [`sdks/python/apache_beam/cli/`](../apache_beam/cli/README.md) (**Feature Complete** at `v0.2.0`) so individual PR slices cherry-pick cleanly onto `apache/beam:master` ([apache/beam#40891](https://github.com/apache/beam/issues/40891)). This `sdks/python/cli-preview/` package is a lightweight pure-Python overlay that lets anyone install and test the complete CLI experience against released PyPI `apache-beam` wheels in seconds.

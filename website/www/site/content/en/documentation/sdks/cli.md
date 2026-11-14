@@ -218,11 +218,39 @@ beam pipe \
   For custom Python `.py` pipelines, `beam package pipeline.py --output-dir ./bundle --image <AR_IMAGE>`
   introspects `PipelineOptions.add_argument` via Python `ast` and generates the
   single-image `Dockerfile` and `metadata.json` automatically.
-- **Live Stream & Commit Follow (`beam tail -f`)**: Streams live records as
-  flushed NDJSON (`--json`) or formatted lines across Pub/Sub topics (via
-  auto-cleaned ephemeral subscriptions), shared subscriptions (never ACKing
-  messages), Kafka topics, newly landing GCS/local shards, and live Delta Lake
-  or Apache Iceberg snapshot commits.
+- **Live Stream & Commit Follow (`beam tail -f` / `-i`)**: Streams live records as
+  flushed NDJSON (`--json`), interactive TUI throughput cards (`-i`), or formatted
+  lines across Pub/Sub topics (via auto-cleaned ephemeral subscriptions), shared
+  subscriptions (never ACKing messages), Kafka topics, newly landing GCS/local
+  shards, and live Delta Lake or Apache Iceberg snapshot commits.
+- **Schema Contracts, Catalog Sync & Schedule Export**: Run zero-compute schema
+  compatibility checks (`beam schema diff <SRC> <DST> --mode BACKWARD`), register
+  partitioned Delta/Parquet tables in-place (`beam catalog sync`), or generate
+  native Cloud Composer / Airflow DAGs (`beam export-schedule pipeline.yaml --orchestrator composer`).
+
+### Stateful Streaming, Online Enrichment & ML Inference
+
+`beam pipe` exposes bounded-state streaming, online lookup, and ML inference
+transforms with recursive PII scrubbing (`--dlq-redact-fields`) on dead-letter
+outputs:
+
+- **Deduplication (`--dedupe-by`)**: Event-time or processing-time deduplication
+  (`--dedupe-window 15m --dedupe-keep last --dedupe-order seq_no`), optionally
+  routing suppressed duplicates to an audit DLQ (`--dedupe-dlq`).
+- **Online Enrichment (`--enrich`)**: Batched worker-side lookups across
+  parameterized BigQuery (`UNNEST(@keys)`), Cloud Bigtable, Vertex AI Feature
+  Store, Feast, and local/GCS files with optional TLS `rediss://` read-through
+  caching (`BEAM_REDIS_PASSWORD`), `AdaptiveThrottler`, and `on_miss=null|drop|dlq|fail`.
+- **ML Inference (`--infer`)**: `RunInference` integration for Vertex AI
+  Endpoints (`<1.4 MB` payload auto-split + `rate_limit`) and commit-pinned
+  HuggingFace `safetensors` models (`trust_remote_code=False`) with in-worker
+  singleton bisection so a single malformed record routes to `--dlq` without
+  failing the batch or reloading model weights.
+- **Temporal Joins, Bounded CEP & Window Triggers**: Point-in-time `ASOF JOIN`
+  (`--sql "... ASOF LEFT JOIN ..."` or `--asof-join`), event-time interval joins
+  with watermark skew circuit breakers (`--max-watermark-skew`), bounded
+  event-sequence/absence matching (`--pattern`), and speculative/late window
+  triggers with droppably-late quarantine (`--window fixed:1m --allowed-lateness 10m --trigger "watermark,early=every:10s,late=count:1" --late-data-dlq <URI> --emit-pane-info`).
 
 ---
 

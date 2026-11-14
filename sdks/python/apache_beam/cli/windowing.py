@@ -540,23 +540,13 @@ def _make_late_dlq_row(
     msg: str,
     redact_fields: tuple[str, ...] = (),
 ) -> beam.Row:
-  try:
-    plain = interval_join._to_plain_dict(elem)
-    if isinstance(plain, dict) and redact_fields:
-      plain = {
-          k: ('<REDACTED>' if k in redact_fields else v)
-          for k, v in plain.items()
-      }
-    raw_json = json.dumps(plain, default=str, sort_keys=True)
-  except Exception:  # pylint: disable=broad-except
-    raw_json = '<unserializable_row>'
-  return beam.Row(
-      step='CliWindowInto',
-      error_type='LateDataError',
-      error=msg[:4096],
-      raw_payload=raw_json,
-      element=raw_json,
-  )
+  from . import dlq
+  return dlq.make_transform_dlq_row(
+      'CliWindowInto',
+      'LateDataError',
+      msg,
+      interval_join._to_plain_dict(elem),
+      redact_fields=redact_fields)
 
 
 def _shard_key_bytes(elem: Any, num_shards: int) -> bytes:

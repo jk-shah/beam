@@ -717,23 +717,13 @@ def _make_cep_dlq_row(
     elem: Any,
     redact_fields: tuple[str, ...] = (),
 ) -> beam.Row:
-  try:
-    plain = interval_join._to_plain_dict(elem)
-    if isinstance(plain, dict) and redact_fields:
-      plain = {
-          k: ('<REDACTED>' if k in redact_fields else v)
-          for k, v in plain.items()
-      }
-    raw_json = json.dumps(plain, default=str, sort_keys=True)
-  except Exception:  # pylint: disable=broad-except
-    raw_json = '<unserializable_row>'
-  return beam.Row(
-      step='CliPatternMatch',
-      error_type=err_type,
-      error=msg[:4096],
-      raw_payload=raw_json,
-      element=raw_json,
-  )
+  from . import dlq
+  return dlq.make_transform_dlq_row(
+      'CliPatternMatch',
+      err_type,
+      msg,
+      interval_join._to_plain_dict(elem),
+      redact_fields=redact_fields)
 
 
 def _compile_step_matchers(
@@ -1279,13 +1269,8 @@ def cli_pattern_match(
     raise ValueError(
         'CliPatternMatch overflow_action="dlq" requires error_handling / --dlq')
 
-  dlq_row_type = RowTypeConstraint.from_fields([
-      ('step', str),
-      ('error_type', str),
-      ('error', str),
-      ('raw_payload', str),
-      ('element', str),
-  ])
+  from . import dlq
+  dlq_row_type = dlq.transform_dlq_row_type()
 
   class _TagKeyTsDoFn(beam.DoFn):
     def __init__(self, bounded_seq: bool):

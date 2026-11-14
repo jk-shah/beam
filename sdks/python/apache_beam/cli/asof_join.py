@@ -56,7 +56,6 @@ from apache_beam.transforms.userstate import TimerSpec
 from apache_beam.transforms.userstate import on_timer
 from apache_beam.transforms.window import GlobalWindows
 from apache_beam.transforms.window import TimestampedValue
-from apache_beam.typehints.row_type import RowTypeConstraint
 from apache_beam.utils import timestamp as beam_timestamp
 
 from . import enrich as enrich_mod
@@ -94,15 +93,7 @@ class AsofJoinConfig(NamedTuple):
   force_stateful: bool = False
 
 
-def _parse_bool(raw: Any, label: str) -> bool:
-  if isinstance(raw, bool):
-    return raw
-  s = str(raw).strip().lower()
-  if s in ('1', 'true', 'yes', 'on'):
-    return True
-  if s in ('0', 'false', 'no', 'off'):
-    return False
-  raise ValueError(f'{label} must be true or false, got {raw!r}')
+_parse_bool = interval_join.parse_bool_opt
 
 
 def _parse_opt_nonneg_duration(raw: Any,
@@ -472,23 +463,13 @@ def _make_asof_dlq_row(
     elem: Any,
     redact_fields: tuple[str, ...] = (),
 ) -> beam.Row:
-  try:
-    plain = interval_join._to_plain_dict(elem)
-    if isinstance(plain, dict) and redact_fields:
-      plain = {
-          k: ('<REDACTED>' if k in redact_fields else v)
-          for k, v in plain.items()
-      }
-    raw_json = json.dumps(plain, default=str, sort_keys=True)
-  except Exception:  # pylint: disable=broad-except
-    raw_json = '<unserializable_row>'
-  return beam.Row(
-      step='CliAsofJoin',
-      error_type=err_type,
-      error=msg[:4096],
-      raw_payload=raw_json,
-      element=raw_json,
-  )
+  from . import dlq
+  return dlq.make_transform_dlq_row(
+      'CliAsofJoin',
+      err_type,
+      msg,
+      interval_join._to_plain_dict(elem),
+      redact_fields=redact_fields)
 
 
 def _find_best_right_entry(
@@ -1057,13 +1038,8 @@ def cli_asof_join(
     raise ValueError(
         'CliAsofJoin skew_action="dlq" requires error_handling / --dlq')
 
-  dlq_row_type = RowTypeConstraint.from_fields([
-      ('step', str),
-      ('error_type', str),
-      ('error', str),
-      ('raw_payload', str),
-      ('element', str),
-  ])
+  from . import dlq
+  dlq_row_type = dlq.transform_dlq_row_type()
 
   class _StreamTagDoFn(beam.DoFn):
     def __init__(

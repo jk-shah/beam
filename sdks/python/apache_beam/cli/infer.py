@@ -273,29 +273,8 @@ class _InferErrorSentinel(NamedTuple):
   msg: str
 
 
-def _parse_bool(val: Any, label: str) -> bool:
-  if isinstance(val, bool):
-    return val
-  s = str(val).strip().lower()
-  if s in ('true', '1', 'yes'):
-    return True
-  if s in ('false', '0', 'no'):
-    return False
-  raise ValueError(
-      f'invalid boolean {val!r} for {label}; expected true or false')
-
-
-def _parse_positive_int(val: Any, label: str) -> int:
-  if isinstance(val, bool):
-    raise ValueError(f'{label} must be a positive integer, got {val!r}')
-  try:
-    iv = int(str(val).strip())
-  except (TypeError, ValueError):
-    raise ValueError(
-        f'{label} must be a positive integer, got {val!r}') from None
-  if iv <= 0:
-    raise ValueError(f'{label} must be > 0, got {iv}')
-  return iv
+_parse_bool = interval_join.parse_bool_opt
+_parse_positive_int = interval_join.parse_positive_int_opt
 
 
 def _parse_non_negative_float(val: Any, label: str) -> float:
@@ -1110,25 +1089,12 @@ def _make_infer_dlq_row(
     row_dict: Mapping[str, Any] | Any,
     redact_fields: tuple[str, ...] = (),
 ) -> beam.Row:
-  try:
-    plain = (
-        dict(row_dict) if isinstance(row_dict, Mapping) else
-        interval_join._to_plain_dict(row_dict))
-    if isinstance(plain, dict) and redact_fields:
-      plain = {
-          k: ('<REDACTED>' if k in redact_fields else v)
-          for k, v in plain.items()
-      }
-    raw_json = json.dumps(plain, default=str, sort_keys=True)
-  except Exception:  # pylint: disable=broad-except
-    raw_json = '<unserializable_row>'
-  return beam.Row(
-      step=step,
-      error_type=err_type,
-      error=msg[:4096],
-      raw_payload=raw_json,
-      element=raw_json,
-  )
+  from . import dlq
+  plain = (
+      dict(row_dict) if isinstance(row_dict, Mapping) else
+      interval_join._to_plain_dict(row_dict))
+  return dlq.make_transform_dlq_row(
+      step, err_type, msg, plain, redact_fields=redact_fields)
 
 
 def _normalize_prediction(
