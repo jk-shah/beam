@@ -174,6 +174,7 @@ _CLI_ZERO_FLAGS = {
         '--check-schema',
         '--schema-check',
         '--dedupe-dlq',
+        '--infer-flatten',
         '--verbose',
         '--no-config',
         '--help',
@@ -247,6 +248,11 @@ _CLI_ONE_FLAGS = {
         '--enrich',
         '--enrich-opt',
         '--enrich-opt-file',
+        '--infer',
+        '--infer-opt',
+        '--infer-opt-file',
+        '--infer-fields',
+        '--infer-tag',
         '--dlq',
         '--dead-letter',
         '--dead-letter-target',
@@ -925,6 +931,52 @@ def _build_parser():
       default=None,
       metavar='FILE',
       help='YAML/JSON file with --enrich options (chmod 0600 for credentials)')
+  pipe.add_argument(
+      '--infer',
+      dest='infer_specs',
+      action='append',
+      default=[],
+      metavar='SPEC',
+      help=(
+          'streaming/batch ML inference stage (repeatable; e.g. '
+          '"vertexai:endpoint_id=ID,project=P,location=us-central1", '
+          '"hf:task=text-classification,model=org/repo@SHA", or "mock:score=0.9")'
+      ))
+  pipe.add_argument(
+      '--infer-opt',
+      dest='infer_opts',
+      action='append',
+      default=[],
+      metavar='KEY=VAL',
+      help='additional --infer stage option (repeatable; e.g. rate_limit=50)')
+  pipe.add_argument(
+      '--infer-opt-file',
+      dest='infer_opt_file',
+      default=None,
+      metavar='FILE',
+      help='YAML/JSON file with --infer options (chmod 0600 for credentials)')
+  pipe.add_argument(
+      '--infer-fields',
+      dest='infer_fields',
+      default=None,
+      metavar='EXPR',
+      help=(
+          'SQL-style input feature mapping for --infer '
+          '(e.g. "amount AS feature_a, user.tier AS feature_b")'))
+  pipe.add_argument(
+      '--infer-tag',
+      dest='infer_tag',
+      default=None,
+      metavar='COL',
+      help=
+      'output column name/prefix for --infer predictions (default: prediction)')
+  pipe.add_argument(
+      '--infer-flatten',
+      dest='infer_flatten',
+      action='store_true',
+      help=(
+          'flatten --infer output into <tag>_score, <tag>_label, and '
+          '<tag>_model_id scalar columns'))
   pipe.add_argument(
       '--sql',
       dest='sql',
@@ -2942,11 +2994,14 @@ def _pipe(
   raw_joins = list(args.joins or [])
   has_interval_join_flag = bool(getattr(args, 'interval_join', None))
   if args.sink is None and args.sql is None and getattr(
-      args, 'select', None) and not (
-          args.cdc or args.zero_copy or args.window or args.timestamp_col or
-          args.dlq or has_interval_join_flag or getattr(args, 'dedupe_by', None)
-          or getattr(args, 'pre_select', None) or getattr(
-              args, 'post_where', None) or getattr(args, 'enrich_specs', None)):
+      args, 'select',
+      None) and not (args.cdc or args.zero_copy or args.window or
+                     args.timestamp_col or args.dlq or has_interval_join_flag or
+                     getattr(args, 'dedupe_by', None) or
+                     getattr(args, 'pre_select', None) or
+                     getattr(args, 'post_where', None) or
+                     getattr(args, 'enrich_specs', None) or
+                     getattr(args, 'infer_specs', None)):
     from . import pipe_sql as _ps_mod
     first_src = raw_sources[0] if raw_sources else ''
     m_alias = _ps_mod._ALIAS_PREFIX_RE.match(first_src)
@@ -2994,10 +3049,11 @@ def _pipe(
     if (args.where or getattr(args, 'pre_select', None) or
         getattr(args, 'post_where', None) or args.select or args.cdc or
         args.zero_copy or getattr(args, 'dedupe_by', None) or
-        getattr(args, 'enrich_specs', None)):
+        getattr(args, 'enrich_specs', None) or
+        getattr(args, 'infer_specs', None)):
       raise _CliError(
           '--sql cannot be combined with --where, --pre-select, --enrich, '
-          '--post-where, --select, --cdc, --dedupe-by, or --zero-copy; '
+          '--infer, --post-where, --select, --cdc, --dedupe-by, or --zero-copy; '
           'express filters and projections inside --sql (or omit --sql)',
           EXIT_USAGE)
     try:
@@ -3450,9 +3506,42 @@ def _pipe(
         enrich=getattr(args, 'enrich_specs', None),
         enrich_opts=getattr(args, 'enrich_opts', None),
         enrich_opt_file=getattr(args, 'enrich_opt_file', None),
+        infer=getattr(args, 'infer_specs', None),
+        infer_opts=getattr(args, 'infer_opts', None),
+        infer_opt_file=getattr(args, 'infer_opt_file', None),
+        infer_fields=getattr(args, 'infer_fields', None),
+        infer_tag=getattr(args, 'infer_tag', None),
+        infer_flatten=bool(getattr(args, 'infer_flatten', False)),
         dlq_redact_fields=getattr(args, 'dlq_redact_fields', None))
   except pipe_spec.PipeSpecError as e:
     raise _CliError(str(e), EXIT_USAGE) from None
+
+  if (getattr(args, 'infer_specs', None) and is_local_runner and
+      not args.dry_run):
+    import importlib.util
+    for t_node in pipe.spec.get('pipeline', {}).get('transforms', []):
+      if not isinstance(t_node, dict) or t_node.get('type') != 'CliInfer':
+        continue
+      prov = str((t_node.get('config') or {}).get('provider') or '').lower()
+      if prov == 'hf' and importlib.util.find_spec('transformers') is None:
+        raise _CliError(
+            'local HuggingFace --infer execution requires `transformers` '
+            '(and `torch` + `safetensors`); install them in this environment '
+            'or use `--infer mock:...` / `--dry-run` / `--runner=DataflowRunner`',
+            EXIT_MISSING_PACKAGE)
+      if prov == 'vertexai':
+        try:
+          has_aip = importlib.util.find_spec(
+              'google.cloud.aiplatform') is not None
+        except ModuleNotFoundError:
+          has_aip = False
+        if not has_aip:
+          raise _CliError(
+              'local Vertex AI --infer execution requires '
+              '`google-cloud-aiplatform`; install with '
+              '`pip install google-cloud-aiplatform` or use `--infer mock:...` '
+              '/ `--dry-run` / `--runner=DataflowRunner`',
+              EXIT_MISSING_PACKAGE)
 
   if pipe.is_unbounded and is_local_runner and not args.dry_run and not wait_timeout_sec:
     raise _CliError(
@@ -3723,6 +3812,37 @@ def _pipe(
       extra_warnings.append(note_pii)
       if not json_session.enabled:
         print(f'note: {note_pii}', file=sys.stderr)
+  if getattr(args, 'infer_specs', None):
+    from . import infer as infer_mod
+    infer_nodes = [
+        t for t in pipe.spec.get('pipeline', {}).get('transforms', [])
+        if isinstance(t, dict) and t.get('type') == 'CliInfer'
+    ]
+    for inode in infer_nodes:
+      icfg_raw = inode.get('config') or {}
+      try:
+        iparsed = infer_mod.parse_infer_config(
+            icfg_raw, default_project=default_proj)
+      except ValueError:
+        continue
+      if iparsed.provider == 'hf' and iparsed.model and not iparsed.is_pinned_revision:
+        warn_hf_pin = (
+            f'HuggingFace model {iparsed.model!r} is not pinned to an immutable '
+            '40-char commit SHA; prefer model=org/repo@<40-char-sha> or a '
+            'gs:// artifact path for supply-chain reproducibility')
+        if warn_hf_pin not in extra_warnings:
+          extra_warnings.append(warn_hf_pin)
+          if not json_session.enabled:
+            print(f'warning: {warn_hf_pin}', file=sys.stderr)
+    if (args.dry_run and args.dlq and
+        not getattr(args, 'dlq_redact_fields', None) and
+        not getattr(args, 'enrich_specs', None)):
+      note_inf_pii = (
+          '--dlq may record model input/output columns from --infer on stage '
+          'failures; pass --dlq-redact-fields <COLS> to scrub sensitive fields')
+      extra_warnings.append(note_inf_pii)
+      if not json_session.enabled:
+        print(f'note: {note_inf_pii}', file=sys.stderr)
 
   try:
     return _run_yaml(

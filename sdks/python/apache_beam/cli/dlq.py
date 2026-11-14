@@ -264,6 +264,8 @@ def cli_yaml_provider_spec() -> dict[str, Any]:
           'Deduplicate': 'apache_beam.cli.dedup.cli_deduplicate',
           'CliEnrich': 'apache_beam.cli.enrich.cli_enrich',
           'Enrich': 'apache_beam.cli.enrich.cli_enrich',
+          'CliInfer': 'apache_beam.cli.infer.cli_infer',
+          'Infer': 'apache_beam.cli.infer.cli_infer',
       },
   }
 

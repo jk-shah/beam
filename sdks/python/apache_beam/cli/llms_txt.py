@@ -73,7 +73,8 @@ def render_llms_txt() -> str:
     apply event-time windowing (`--window fixed:60s`, `sliding:5m,1m`, `session:30m` with `--timestamp-col COL`; `--window-size` is accepted),
     correlate event streams with declarative interval joins (`--from o=URI --join s=URI --interval-join "key=id,left_time=o_ts,right_time=s_ts,lower=0s,upper=15m,type=left"` or 2-source SQL `BETWEEN ... INTERVAL`) and watermark skew circuit breaking (`--max-watermark-skew 30m --skew-action dlq|drop|warn|fail`),
     deduplicate at-least-once streams or batches (`--dedupe-by COL[,COL2] [--dedupe-window 10m] [--dedupe-keep first|last] [--dedupe-order COL] [--dedupe-dlq]`),
-    hydrate external features or lookup tables (`--pre-select EXPR --enrich "bigquery|bigtable|vertexai|feast|file:..." [--enrich-opt K=V] [--post-where EXPR]`),
+    hydrate external features or lookup tables (`--pre-select EXPR --enrich "bigquery|bigtable|vertexai|feast|file:..." [--enrich-opt K=V]`),
+    run streaming or batch ML inference (`--infer "vertexai|hf|mock:..." [--infer-fields "col AS feat, nested.col AS feat2"] [--infer-tag prediction] [--infer-flatten] [--post-where EXPR]`),
     enforce data quality rules (`--expect "rule: expr -> dlq|drop|fail"`), run pre-flight
     schema contract comparison (`--check-schema`), quarantine dirty rows (`--dlq` or `--dead-letter-target`, scrubbing PII via `--dlq-redact-fields COLS`),
     drop invalid rows (`--drop-bad` / `--skip-errors`), enforce scan budget (`--max-bytes`), verify

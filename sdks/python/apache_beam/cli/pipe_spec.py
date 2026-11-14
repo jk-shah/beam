@@ -294,6 +294,12 @@ def build_pipe_spec(
     enrich: Iterable[str | dict[str, Any]] | str | dict[str, Any] | None = None,
     enrich_opts: Iterable[str] | None = None,
     enrich_opt_file: str | None = None,
+    infer: Iterable[str | dict[str, Any]] | str | dict[str, Any] | None = None,
+    infer_opts: Iterable[str] | None = None,
+    infer_opt_file: str | None = None,
+    infer_fields: str | None = None,
+    infer_tag: str | None = None,
+    infer_flatten: bool = False,
     dlq_redact_fields: Iterable[str] | str | None = None,
 ) -> PipeSpec:
   """Returns the `PipeSpec` for `beam pipe`."""
@@ -409,11 +415,11 @@ def build_pipe_spec(
   if zero_copy:
     if (cdc or where or pre_select or post_where or select or
         dlq_ep is not None or window or timestamp_col or expect or
-        interval_join or dedupe_by or enrich):
+        interval_join or dedupe_by or enrich or infer):
       raise PipeSpecError(
           '--zero-copy registers existing Parquet files in-place without '
           'rewriting data, so it cannot be combined with --cdc, --where, '
-          '--pre-select, --enrich, --post-where, --select, --window, '
+          '--pre-select, --enrich, --infer, --post-where, --select, --window, '
           '--timestamp-col, --expect, --interval-join, --dedupe-by, or --dlq')
     if dst_ep.kind != 'iceberg':
       raise PipeSpecError(
@@ -683,13 +689,76 @@ def build_pipe_spec(
             '(or use on_miss={null|drop|fail})')
       enrich_yaml_cfgs.append(e_yaml)
 
+  raw_infer_items: list[str | dict[str, Any]]
+  if infer is None:
+    raw_infer_items = []
+  elif isinstance(infer, (str, dict)):
+    raw_infer_items = [infer]
+  else:
+    raw_infer_items = list(infer)
+
+  infer_yaml_cfgs: list[dict[str, Any]] = []
+  if not raw_infer_items:
+    if (infer_opts or infer_opt_file or infer_fields is not None or
+        infer_tag is not None or infer_flatten):
+      raise PipeSpecError(
+          '--infer-opt / --infer-opt-file / --infer-fields / --infer-tag / '
+          '--infer-flatten requires --infer <SPEC>')
+  else:
+    from . import infer as infer_mod
+    try:
+      parsed_infer_opts = uris.parse_kv_options(
+          infer_opts, infer_opt_file, '--infer-opt')
+    except uris.UriError as e:
+      raise PipeSpecError(str(e)) from None
+    if parsed_dlq_redact:
+      parsed_infer_opts.setdefault('dlq_redact_fields', list(parsed_dlq_redact))
+    single_infer = len(raw_infer_items) == 1
+    seen_infer_tags: set[str] = set()
+    for i_item in raw_infer_items:
+      try:
+        if isinstance(i_item, str):
+          i_yaml = infer_mod.parse_infer_spec_str(
+              i_item,
+              extra_opts=parsed_infer_opts,
+              infer_fields=infer_fields,
+              infer_tag=infer_tag,
+              infer_flatten=infer_flatten,
+              default_project=default_project,
+              single_stage=single_infer)
+        elif isinstance(i_item, dict):
+          merged_icfg = {**parsed_infer_opts, **i_item}
+          if infer_fields is not None:
+            merged_icfg.setdefault('fields', infer_fields)
+          if infer_tag is not None:
+            merged_icfg.setdefault('tag', infer_tag)
+          if infer_flatten:
+            merged_icfg.setdefault('flatten', True)
+          i_yaml = infer_mod.infer_config_to_yaml_dict(
+              infer_mod.parse_infer_config(
+                  merged_icfg, default_project=default_project))
+        else:
+          raise ValueError(
+              f'unsupported --infer item type {type(i_item).__name__}')
+        i_parsed = infer_mod.parse_infer_config(
+            i_yaml, default_project=default_project)
+      except ValueError as e:
+        raise PipeSpecError(str(e)) from None
+      if i_parsed.tag in seen_infer_tags:
+        raise PipeSpecError(
+            f'duplicate inference output tag {i_parsed.tag!r} across multiple '
+            '--infer stages; specify a distinct tag=NAME on each stage')
+      seen_infer_tags.add(i_parsed.tag)
+      infer_yaml_cfgs.append(i_yaml)
+
   eff_where_cols = None if interval_join_cfg is not None else known_source_columns
   eff_pre_select_cols = (
       None if interval_join_cfg is not None else known_source_columns)
   eff_select_cols = (
       None if (
-          interval_join_cfg is not None or window_aggs is not None or pre_select
-          is not None or bool(enrich_yaml_cfgs)) else known_source_columns)
+          interval_join_cfg is not None or window_aggs is not None or
+          pre_select is not None or bool(enrich_yaml_cfgs) or
+          bool(infer_yaml_cfgs)) else known_source_columns)
 
   try:
     where_cfg = (
@@ -1057,12 +1126,13 @@ def build_pipe_spec(
       prefer_python_lakehouse_and_cdc and src_ep.kind == 'file' and
       src_ep.format in ('parquet', 'avro') and (
           where_cfg or pre_select_cfg or post_where_cfg or enrich_yaml_cfgs or
-          select_cfg or interval_join_cfg is not None))
+          infer_yaml_cfgs or select_cfg or interval_join_cfg is not None))
   right_rowify_nested = bool(
       prefer_python_lakehouse_and_cdc and right_ep is not None and
       right_ep.kind == 'file' and right_ep.format in ('parquet', 'avro'))
   if (rowify_nested or right_rowify_nested or interval_join_cfg is not None or
-      dedupe_yaml_cfg is not None or bool(enrich_yaml_cfgs)):
+      dedupe_yaml_cfg is not None or bool(enrich_yaml_cfgs) or
+      bool(infer_yaml_cfgs)):
     needs_cli_provider = True
 
   # Pure Java-to-Java fast path: skip Python counter stages unless explicitly
@@ -1070,8 +1140,8 @@ def build_pipe_spec(
   pure_java_pipe = (
       src_java and sink_java and cdc_norm_cfg is None and not where_cfg and
       not pre_select_cfg and not post_where_cfg and not enrich_yaml_cfgs and
-      not select_cfg and not dlq_ep and interval_join_cfg is None and
-      dedupe_yaml_cfg is None)
+      not infer_yaml_cfgs and not select_cfg and not dlq_ep and
+      interval_join_cfg is None and dedupe_yaml_cfg is None)
   inject_counters = bool(include_counters) and not pure_java_pipe
   if inject_counters:
     needs_cli_provider = True
@@ -1141,6 +1211,11 @@ def build_pipe_spec(
       chain_steps.append({
           'type': 'CliEnrich',
           'config': dict(e_cfg),
+      })
+    for i_cfg in infer_yaml_cfgs:
+      chain_steps.append({
+          'type': 'CliInfer',
+          'config': dict(i_cfg),
       })
     if post_where_cfg is not None:
       if inject_counters:
@@ -1556,6 +1631,28 @@ def build_pipe_spec(
       current_ref = f'{e_name}.good'
     else:
       current_ref = e_name
+
+  for i_idx, i_yaml_cfg in enumerate(infer_yaml_cfgs, start=1):
+    i_name = 'Infer' if len(infer_yaml_cfgs) == 1 else f'Infer_{i_idx}'
+    i_norm_name = (
+        'NormalizeInferDlq'
+        if len(infer_yaml_cfgs) == 1 else f'NormalizeInferDlq_{i_idx}')
+    i_cfg_copy = dict(i_yaml_cfg)
+    if has_dlq:
+      i_cfg_copy['error_handling'] = {'output': 'errors'}
+    dag_transforms.append({
+        'name': i_name,
+        'type': 'CliInfer',
+        'input': current_ref,
+        'config': i_cfg_copy,
+    })
+    if has_dlq:
+      dag_transforms.append(
+          _norm_dlq(i_norm_name, f'{i_name}.errors', 'CliInfer'))
+      dlq_norm_refs.append(i_norm_name)
+      current_ref = f'{i_name}.good'
+    else:
+      current_ref = i_name
 
   if post_where_cfg is not None:
     if inject_counters:
