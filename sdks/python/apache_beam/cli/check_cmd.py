@@ -172,6 +172,14 @@ def run_check(
       except ValueError as e:
         raise CheckError(
             f'{source_label}: invalid {t["type"]} config: {e}') from None
+    if t['type'] in ('CliPatternMatch', 'PatternMatch') and isinstance(
+        t.get('config'), dict):
+      from . import cep
+      try:
+        cep.parse_pattern_config(t['config'])
+      except ValueError as e:
+        raise CheckError(
+            f'{source_label}: invalid {t["type"]} config: {e}') from None
     stages.append({
         'index': idx,
         'name': t.get('name') or t['type'],

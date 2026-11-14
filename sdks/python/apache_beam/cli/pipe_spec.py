@@ -283,6 +283,7 @@ def build_pipe_spec(
     join_source: str | None = None,
     interval_join: str | dict[str, Any] | None = None,
     asof_join: str | dict[str, Any] | None = None,
+    pattern: str | dict[str, Any] | None = None,
     max_watermark_skew: str | None = None,
     skew_action: str | None = None,
     dedupe_by: Iterable[str] | str | None = None,
@@ -324,6 +325,8 @@ def build_pipe_spec(
   if interval_join and asof_join:
     raise PipeSpecError(
         '--interval-join and --asof-join are mutually exclusive')
+  if pattern and cdc:
+    raise PipeSpecError('--pattern cannot be combined with --cdc')
   has_two_stream_join = bool(interval_join or asof_join)
   join_flag_label = '--asof-join' if asof_join else '--interval-join'
   if has_two_stream_join and not join_source:
@@ -447,20 +450,21 @@ def build_pipe_spec(
   has_b23_window_opts = bool(
       (
           allowed_lateness is not None and
-          (window is not None or asof_join is None)) or trigger is not None or
+          (window is not None or
+           (asof_join is None and pattern is None))) or trigger is not None or
       accumulation is not None or late_action is not None or
       late_dlq_ep is not None or emit_pane_info or watermark_lag is not None)
 
   if zero_copy:
     if (cdc or where or pre_select or post_where or select or
         dlq_ep is not None or window or has_b23_window_opts or timestamp_col or
-        expect or interval_join or asof_join or allowed_lateness is not None or
-        dedupe_by or enrich or infer):
+        expect or interval_join or asof_join or pattern or
+        allowed_lateness is not None or dedupe_by or enrich or infer):
       raise PipeSpecError(
           '--zero-copy registers existing Parquet files in-place without '
           'rewriting data, so it cannot be combined with --cdc, --where, '
-          '--pre-select, --enrich, --infer, --post-where, --select, --window, '
-          '--allowed-lateness, --trigger, --timestamp-col, --expect, '
+          '--pre-select, --enrich, --infer, --post-where, --pattern, --select, '
+          '--window, --allowed-lateness, --trigger, --timestamp-col, --expect, '
           '--interval-join, --asof-join, --dedupe-by, or --dlq')
     if dst_ep.kind != 'iceberg':
       raise PipeSpecError(
@@ -888,6 +892,41 @@ def build_pipe_spec(
   two_stream_cfg = (
       interval_join_cfg if interval_join_cfg is not None else asof_join_cfg)
 
+  pattern_yaml_cfg: dict[str, Any] | None = None
+  if pattern is not None:
+    from . import cep as cep_mod
+    eff_pat_lat = allowed_lateness if window is None else None
+    try:
+      if isinstance(pattern, str):
+        pattern_yaml_cfg = cep_mod.parse_pattern_spec_str(
+            pattern,
+            timestamp_col=clean_timestamp_col,
+            allowed_lateness=eff_pat_lat,
+            dlq_redact_fields=parsed_dlq_redact)
+      elif isinstance(pattern, dict):
+        raw_pcfg = dict(pattern)
+        if clean_timestamp_col and 'timestamp_col' not in raw_pcfg:
+          raw_pcfg['timestamp_col'] = clean_timestamp_col
+        if eff_pat_lat is not None and 'allowed_lateness' not in raw_pcfg:
+          raw_pcfg['allowed_lateness'] = eff_pat_lat
+        if parsed_dlq_redact and 'dlq_redact_fields' not in raw_pcfg:
+          raw_pcfg['dlq_redact_fields'] = list(parsed_dlq_redact)
+        pattern_yaml_cfg = cep_mod.pattern_config_to_yaml_dict(
+            cep_mod.parse_pattern_config(raw_pcfg))
+      else:
+        raise ValueError(f'unsupported pattern type {type(pattern).__name__}')
+      parsed_pat = cep_mod.parse_pattern_config(pattern_yaml_cfg)
+    except ValueError as e:
+      raise PipeSpecError(str(e)) from None
+    if parsed_pat.overflow_action == 'dlq' and dlq_ep is None:
+      raise PipeSpecError(
+          'pattern overflow_action=dlq requires --dlq <SINK> '
+          '(or use overflow_action=drop|fail)')
+    if is_unbounded and not clean_timestamp_col and not parsed_pat.timestamp_col:
+      # Unbounded Pub/Sub carries message publish timestamps natively; file/other
+      # unbounded sources work with element timestamps too, so no hard error needed.
+      pass
+
   eff_where_cols = None if two_stream_cfg is not None else known_source_columns
   eff_pre_select_cols = (
       None if two_stream_cfg is not None else known_source_columns)
@@ -895,7 +934,8 @@ def build_pipe_spec(
       None if (
           two_stream_cfg is not None or window_aggs is not None or
           pre_select is not None or bool(enrich_yaml_cfgs) or
-          bool(infer_yaml_cfgs) or emit_pane_info) else known_source_columns)
+          bool(infer_yaml_cfgs) or pattern_yaml_cfg is not None or
+          emit_pane_info) else known_source_columns)
 
   try:
     where_cfg = (
@@ -1264,13 +1304,14 @@ def build_pipe_spec(
       src_ep.format in ('parquet', 'avro') and (
           where_cfg or pre_select_cfg or post_where_cfg or enrich_yaml_cfgs or
           infer_yaml_cfgs or select_cfg or two_stream_cfg is not None or
-          cli_window_yaml_cfg is not None))
+          pattern_yaml_cfg is not None or cli_window_yaml_cfg is not None))
   right_rowify_nested = bool(
       prefer_python_lakehouse_and_cdc and right_ep is not None and
       right_ep.kind == 'file' and right_ep.format in ('parquet', 'avro'))
   if (rowify_nested or right_rowify_nested or two_stream_cfg is not None or
       dedupe_yaml_cfg is not None or bool(enrich_yaml_cfgs) or
-      bool(infer_yaml_cfgs) or cli_window_yaml_cfg is not None):
+      bool(infer_yaml_cfgs) or pattern_yaml_cfg is not None or
+      cli_window_yaml_cfg is not None):
     needs_cli_provider = True
 
   # Pure Java-to-Java fast path: skip Python counter stages unless explicitly
@@ -1280,7 +1321,7 @@ def build_pipe_spec(
       not pre_select_cfg and not post_where_cfg and not enrich_yaml_cfgs and
       not infer_yaml_cfgs and not select_cfg and not dlq_ep and
       not late_dlq_ep and two_stream_cfg is None and dedupe_yaml_cfg is None and
-      cli_window_yaml_cfg is None)
+      pattern_yaml_cfg is None and cli_window_yaml_cfg is None)
   inject_counters = bool(include_counters) and not pure_java_pipe
   if inject_counters:
     needs_cli_provider = True
@@ -1307,7 +1348,7 @@ def build_pipe_spec(
           },
       })
     if clean_timestamp_col:
-      if cli_window_yaml_cfg is not None:
+      if cli_window_yaml_cfg is not None or pattern_yaml_cfg is not None:
         chain_steps.append({
             'type': 'CliAssignTimestamps',
             'config': {
@@ -1380,6 +1421,11 @@ def build_pipe_spec(
                 'counter': 'post_filter_rows'
             },
         })
+    if pattern_yaml_cfg is not None:
+      chain_steps.append({
+          'type': 'CliPatternMatch',
+          'config': dict(pattern_yaml_cfg),
+      })
     if window_spec is not None:
       if cli_window_yaml_cfg is not None:
         chain_steps.append({
@@ -1665,7 +1711,7 @@ def build_pipe_spec(
       current_ref = 'CountRead'
 
     if clean_timestamp_col:
-      if cli_window_yaml_cfg is not None:
+      if cli_window_yaml_cfg is not None or pattern_yaml_cfg is not None:
         ts_dag_cfg: dict[str, Any] = {'timestamp_col': clean_timestamp_col}
         if has_dlq:
           ts_dag_cfg['error_handling'] = {'output': 'errors'}
@@ -1896,6 +1942,25 @@ def build_pipe_spec(
           },
       })
       current_ref = 'CountPostPostFilter'
+
+  if pattern_yaml_cfg is not None:
+    pat_cfg_copy = dict(pattern_yaml_cfg)
+    if has_dlq:
+      pat_cfg_copy['error_handling'] = {'output': 'errors'}
+    dag_transforms.append({
+        'name': 'PatternMatch',
+        'type': 'CliPatternMatch',
+        'input': current_ref,
+        'config': pat_cfg_copy,
+    })
+    if has_dlq:
+      dag_transforms.append(
+          _norm_dlq(
+              'NormalizePatternDlq', 'PatternMatch.errors', 'CliPatternMatch'))
+      dlq_norm_refs.append('NormalizePatternDlq')
+      current_ref = 'PatternMatch.good'
+    else:
+      current_ref = 'PatternMatch'
 
   late_dlq_norm_ref: str | None = None
   if window_spec is not None:

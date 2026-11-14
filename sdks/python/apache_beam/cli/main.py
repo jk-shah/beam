@@ -226,6 +226,7 @@ _CLI_ONE_FLAGS = {
         '--sql',
         '--interval-join',
         '--asof-join',
+        '--pattern',
         '--max-watermark-skew',
         '--skew-action',
         '--dedupe-by',
@@ -911,6 +912,15 @@ def _build_parser():
           'point-in-time ASOF join across --from and --join '
           '(e.g. "key=symbol,left_time=trade_ts,right_time=quote_ts,'
           'direction=backward,tolerance=5m,type=left")'))
+  pipe.add_argument(
+      '--pattern',
+      dest='pattern',
+      default=None,
+      metavar='SPEC',
+      help=(
+          'ordered event sequence / absence CEP pattern '
+          '(e.g. "key=user_id,seq=login -> mfa -> purchase within 5m" or '
+          '"key=order_id,seq=checkout -> !payment within 15m")'))
   pipe.add_argument(
       '--max-watermark-skew',
       dest='max_watermark_skew',
@@ -3013,13 +3023,15 @@ def _pipe(
 
   if getattr(args, 'primary_keys', None) and not args.cdc:
     if (getattr(args, 'interval_join', None) or
-        getattr(args, 'asof_join', None) or getattr(args, 'dedupe_by', None) or
+        getattr(args, 'asof_join', None) or getattr(args, 'pattern', None) or
+        getattr(args, 'dedupe_by', None) or
         getattr(args, 'enrich_specs', None)):
       raise _CliError(
           '--key / --primary-key enables --cdc mode and cannot be implicitly '
-          'combined with --interval-join, --asof-join, --dedupe-by, or --enrich; '
-          'pass key=COL inside --interval-join/--asof-join/--enrich or '
-          '--dedupe-by COL (or pass --cdc explicitly if CDC is intended)',
+          'combined with --interval-join, --asof-join, --pattern, --dedupe-by, '
+          'or --enrich; pass key=COL inside --interval-join/--asof-join/'
+          '--pattern/--enrich or --dedupe-by COL (or pass --cdc explicitly if '
+          'CDC is intended)',
           EXIT_USAGE)
     args.cdc = True
 
@@ -3067,14 +3079,13 @@ def _pipe(
       getattr(args, 'late_data_dlq', None) or
       getattr(args, 'emit_pane_info', False))
   if args.sink is None and args.sql is None and getattr(
-      args, 'select',
-      None) and not (args.cdc or args.zero_copy or args.window or
-                     has_b23_flags or args.timestamp_col or args.dlq or
-                     has_interval_join_flag or getattr(args, 'dedupe_by', None)
-                     or getattr(args, 'pre_select', None) or
-                     getattr(args, 'post_where', None) or
-                     getattr(args, 'enrich_specs', None) or
-                     getattr(args, 'infer_specs', None)):
+      args, 'select', None) and not (
+          args.cdc or args.zero_copy or args.window or has_b23_flags or
+          args.timestamp_col or args.dlq or has_interval_join_flag or
+          getattr(args, 'pattern', None) or getattr(args, 'dedupe_by', None) or
+          getattr(args, 'pre_select', None) or getattr(args, 'post_where', None)
+          or getattr(args, 'enrich_specs', None) or
+          getattr(args, 'infer_specs', None)):
     from . import pipe_sql as _ps_mod
     first_src = raw_sources[0] if raw_sources else ''
     m_alias = _ps_mod._ALIAS_PREFIX_RE.match(first_src)
@@ -3089,6 +3100,9 @@ def _pipe(
     args.sql = f'SELECT {args.select} FROM {alias}{where_part}'
     args.where = None
     args.select = None
+
+  if args.sql is not None and getattr(args, 'pattern', None):
+    raise _CliError('--pattern cannot be combined with --sql', EXIT_USAGE)
 
   join_source_for_pipe: str | None = None
   if has_interval_join_flag:
@@ -3526,6 +3540,11 @@ def _pipe(
         f'--assert-counts cannot be combined with {join_flag_name} because '
         '2-stream joins sum rows_read across both left and right inputs',
         EXIT_USAGE)
+  if args.assert_counts and getattr(args, 'pattern', None):
+    raise _CliError(
+        '--assert-counts cannot be combined with --pattern because '
+        'multi-event pattern matching collapses sequences into 1 match row',
+        EXIT_USAGE)
 
   # Track row counters whenever `--json` or `--assert-counts` is active, except
   # when `--dry-run` is emitting clean minimal YAML without `--assert-counts`.
@@ -3576,6 +3595,7 @@ def _pipe(
         join_source=join_source_for_pipe,
         interval_join=getattr(args, 'interval_join', None),
         asof_join=getattr(args, 'asof_join', None),
+        pattern=getattr(args, 'pattern', None),
         max_watermark_skew=getattr(args, 'max_watermark_skew', None),
         skew_action=getattr(args, 'skew_action', None),
         dedupe_by=getattr(args, 'dedupe_by', None),

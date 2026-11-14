@@ -271,6 +271,8 @@ def cli_yaml_provider_spec() -> dict[str, Any]:
               'apache_beam.cli.windowing.cli_extract_pane_info'),
           'CliAsofJoin': 'apache_beam.cli.asof_join.cli_asof_join',
           'AsofJoin': 'apache_beam.cli.asof_join.cli_asof_join',
+          'CliPatternMatch': 'apache_beam.cli.cep.cli_pattern_match',
+          'PatternMatch': 'apache_beam.cli.cep.cli_pattern_match',
       },
   }
 
