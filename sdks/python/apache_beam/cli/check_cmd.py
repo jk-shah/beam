@@ -189,6 +189,12 @@ def run_check(
       except ValueError as e:
         raise CheckError(
             f'{source_label}: invalid {t["type"]} config: {e}') from None
+    if t['type'] == 'CliLimitRows' and isinstance(t.get('config'), dict):
+      lim = t['config'].get('limit')
+      if isinstance(lim, bool) or not isinstance(lim, int) or lim < 0:
+        raise CheckError(
+            f'{source_label}: invalid CliLimitRows limit {lim!r}; expected integer >= 0'
+        )
 
   def _walk_and_validate_cli_transforms(items: Any) -> None:
     if isinstance(items, dict):

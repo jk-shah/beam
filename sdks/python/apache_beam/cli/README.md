@@ -84,15 +84,15 @@ This package implements the `beam` (and `apache-beam`) command-line interface tr
 
 ---
 
-## 5. Feature-Complete Status, Documentation & Test Suite (`408` Tests Across 25 Modules)
+## 5. Feature-Complete Status, Documentation & Test Suite (`426` Tests Across 27 Modules)
 
-The `beam-cli-preview` (`v0.2.0`) feature set is **Feature Complete** across Core ETL, Lakehouse/CDC, Governance, Tier 1 (Joins, Deduplication, Online Enrichment, ML Inference), and Tier 2 (Point-in-Time `ASOF JOIN`, Bounded CEP, Window Triggers & Late-Data Quarantine), with active engineering focused on incremental ~400-line upstream PRs into `apache/beam:master`.
+The `beam-cli-preview` (`v0.2.0`) feature set is **Feature Complete** across Core ETL, Lakehouse/CDC, Governance, Tier 1 (Joins, Deduplication, Online Enrichment, ML Inference), Tier 2 (Point-in-Time `ASOF JOIN`, Bounded CEP, Window Triggers & Late-Data Quarantine), and cross-subcommand Human UX / Agent DX ergonomics, with active engineering focused on incremental ~400-line upstream PRs into `apache/beam:master`.
 
 * **Preview Quickstart & Recipes**: [`sdks/python/cli-preview/README.md`](../../cli-preview/README.md)
 * **Website CLI Reference**: [`website/www/site/content/en/documentation/sdks/cli.md`](../../../../website/www/site/content/en/documentation/sdks/cli.md)
 * **AI Agent Skill**: [`.agents/skills/apache-beam-cli/SKILL.md`](../../../../.agents/skills/apache-beam-cli/SKILL.md)
 
-After installing the preview overlay (`sdks/python/cli-preview`) into a virtual environment, run the full `408`-test unit, `<90 ms` startup-isolation, stateful streaming, enrichment/ML, Lakehouse/CDC, and adversarial security/chaos suite from the repository root:
+After installing the preview overlay (`sdks/python/cli-preview`) into a virtual environment, run the full `426`-test unit, `<90 ms` startup-isolation, stateful streaming, enrichment/ML, Lakehouse/CDC, ergonomics, and adversarial security/chaos suite from the repository root:
 
 ```bash
 python -m unittest discover -s sdks/python/apache_beam/cli -p '*_test.py'

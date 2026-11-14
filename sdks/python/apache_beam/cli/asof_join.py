@@ -212,17 +212,23 @@ def parse_asof_join_config(raw: Mapping[str, Any]) -> AsofJoinConfig:
       'right',
       'key',
       'keys',
+      'on',
       'left_key',
       'right_key',
       'time',
+      'ts',
       'timestamp',
+      'timestamp_col',
       'left_time',
       'right_time',
+      'left_ts',
+      'right_ts',
       'left_timestamp',
       'right_timestamp',
       'direction',
       'strict',
       'tolerance',
+      'within',
       'asof_tolerance',
       'type',
       'join_type',
@@ -240,12 +246,18 @@ def parse_asof_join_config(raw: Mapping[str, Any]) -> AsofJoinConfig:
       'force_stateful',
       'error_handling',
   }
-  unknown = [k for k in norm if k not in allowed]
+  unknown = sorted(k for k in norm if k not in allowed)
   if unknown:
-    raise ValueError(f'unknown option(s) {sorted(unknown)} in CliAsofJoin')
+    import difflib
+    close = difflib.get_close_matches(
+        unknown[0], sorted(allowed), n=1, cutoff=0.55)
+    hint = f' (did you mean {close[0]!r}?)' if close else ''
+    raise ValueError(f'unknown option(s) {unknown} in CliAsofJoin{hint}')
 
-  shared_key = interval_join.parse_column_list(
-      norm.get('key') if norm.get('key') is not None else norm.get('keys'))
+  shared_key_raw = (
+      norm.get('key') if norm.get('key') is not None else
+      (norm.get('keys') if norm.get('keys') is not None else norm.get('on')))
+  shared_key = interval_join.parse_column_list(shared_key_raw)
   l_key = interval_join.parse_column_list(norm.get('left_key')) or shared_key
   r_key = interval_join.parse_column_list(norm.get('right_key')) or shared_key
   if not l_key or not r_key:
@@ -260,9 +272,15 @@ def parse_asof_join_config(raw: Mapping[str, Any]) -> AsofJoinConfig:
     if not output.SAFE_IDENTIFIER_RE.match(col):
       raise ValueError(f'invalid join key identifier {col!r} in CliAsofJoin')
 
-  shared_ts = norm.get('time') or norm.get('timestamp')
-  l_ts_raw = norm.get('left_time') or norm.get('left_timestamp') or shared_ts
-  r_ts_raw = norm.get('right_time') or norm.get('right_timestamp') or shared_ts
+  shared_ts = (
+      norm.get('time') or norm.get('ts') or norm.get('timestamp') or
+      norm.get('timestamp_col'))
+  l_ts_raw = (
+      norm.get('left_time') or norm.get('left_ts') or
+      norm.get('left_timestamp') or shared_ts)
+  r_ts_raw = (
+      norm.get('right_time') or norm.get('right_ts') or
+      norm.get('right_timestamp') or shared_ts)
   l_ts = str(l_ts_raw).strip() if l_ts_raw else None
   r_ts = str(r_ts_raw).strip() if r_ts_raw else None
   for tc in (l_ts, r_ts):
@@ -282,7 +300,9 @@ def parse_asof_join_config(raw: Mapping[str, Any]) -> AsofJoinConfig:
     )
 
   tol_raw = (
-      norm['tolerance'] if 'tolerance' in norm else norm.get('asof_tolerance'))
+      norm['tolerance'] if 'tolerance' in norm else (
+          norm['asof_tolerance']
+          if 'asof_tolerance' in norm else norm.get('within')))
   tol_sec, tol_str = _parse_opt_nonneg_duration(tol_raw, 'tolerance')
 
   jtype = str(norm.get('join_type') or norm.get('type') or

@@ -251,11 +251,14 @@ def diff_schemas(
                   f"but it is missing from {source_label}."
               ),
           })
+          hint_def = f"--select \"'DEFAULT_VAL' AS {tgt_name}, *\""
           next_actions.append({
               'action': 'provide_default_column',
               'field': tgt_name,
-              'command_hint': f"--select \"'DEFAULT_VAL' AS {tgt_name}, *\"",
+              'command': f'beam pipe --from {source_label} --to {target_label} {hint_def}',
+              'command_hint': hint_def,
               'description': f"Supply a fallback or default value for required column '{tgt_name}'.",
+              'requires_human': False,
           })
         else:
           warnings.append({
@@ -287,14 +290,17 @@ def diff_schemas(
                   "Potential NULL values will violate target database constraints."
               ),
           })
+          hint_null = (
+              f"--where \"{tgt_name} IS NOT NULL\" or "
+              f"--select \"COALESCE({tgt_name}, 'DEFAULT') AS {tgt_name}, *\""
+          )
           next_actions.append({
               'action': 'filter_or_coalesce_nulls',
               'field': tgt_name,
-              'command_hint': (
-                  f"--where \"{tgt_name} IS NOT NULL\" or "
-                  f"--select \"COALESCE({tgt_name}, 'DEFAULT') AS {tgt_name}, *\""
-              ),
+              'command': f'beam pipe --from {source_label} --to {target_label} --where "{tgt_name} IS NOT NULL"',
+              'command_hint': hint_null,
               'description': f"Filter out null records or apply COALESCE() to column '{tgt_name}'.",
+              'requires_human': False,
           })
 
         # Type compatibility check
@@ -344,11 +350,14 @@ def diff_schemas(
                     f"without potential runtime cast failure or precision loss ({narrow_reason})."
                 ),
             })
+            hint_cast = f"--select \"CAST({tgt_name} AS {tt}) AS {tgt_name}, *\""
             next_actions.append({
                 'action': 'explicit_type_cast',
                 'field': tgt_name,
-                'command_hint': f"--select \"CAST({tgt_name} AS {tt}) AS {tgt_name}, *\"",
+                'command': f'beam pipe --from {source_label} --to {target_label} {hint_cast}',
+                'command_hint': hint_cast,
                 'description': f"Explicitly cast column '{tgt_name}' to {tt} before writing.",
+                'requires_human': False,
             })
           else:
             violations.append({

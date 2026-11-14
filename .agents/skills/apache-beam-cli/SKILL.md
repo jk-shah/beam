@@ -63,12 +63,16 @@ Always pass `--json`. `beam` emits **one** RFC-8259 JSON envelope on `stdout` (`
 ## Canonical Recipes
 
 ```bash
+# 0. Quick local preview (sinkless) & positional file conversion (<200ms)
+beam pipe orders.csv --where "amount >= 100 AND status <> 'cancelled'" -n 5 --json
+beam pipe orders.csv out/clean.parquet --sql-file transform.sql --verify --key order_id --json
+
 # 1. Pre-flight schema guard (<100ms) & cross-store migration diff (exit 6 on mismatch)
-beam schema diff gs://bkt/staging/orders.parquet bigquery://proj.ds.orders --mode BACKWARD --json
+beam schema gs://bkt/staging/orders.parquet bigquery://proj.ds.orders --mode backward --json
 beam diff delta://gs://bkt/delta/orders bigquery://proj.ds.orders --key order_id --json
 
 # 2. Zero-copy partitioned Delta Lake -> BigLake / BigQuery Managed Iceberg (<200ms, 0 bytes copied)
-beam catalog sync --from delta://gs://bkt/events --to "iceberg://proj.analytics.events?catalog=bigquery" --json
+beam catalog sync delta://gs://bkt/events "iceberg://proj.analytics.events?catalog=bigquery" --json
 
 # 3. At-least-once stream deduplication keeping highest seq_no + audit DLQ
 beam pipe --from pubsub://projects/p/subscriptions/payments-sub --to bigquery://p.fin.payments \

@@ -349,9 +349,10 @@ def finalize_cli_row_metrics(raw_counters: dict[str, int]) -> dict[str, int]:
   enrich_dropped = int(raw_counters.get('enrich_misses_dropped', 0))
   skew_dropped = int(raw_counters.get('skew_dropped', 0))
   late_dropped = int(raw_counters.get('late_rows_dropped', 0))
+  limit_dropped = int(raw_counters.get('stage_dropped_rows', 0))
   stage_drops = (
       cdc_skipped + cdc_superseded + exp_dropped + dupes_dropped +
-      enrich_dropped + skew_dropped + late_dropped)
+      enrich_dropped + skew_dropped + late_dropped + limit_dropped)
   if ('pre_filter_rows' in raw_counters or 'post_filter_rows' in raw_counters or
       stage_drops > 0):
     pre_f = int(raw_counters.get('pre_filter_rows', 0))

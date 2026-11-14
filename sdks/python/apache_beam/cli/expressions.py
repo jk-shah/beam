@@ -89,6 +89,9 @@ _SQL_CAST_TYPES: dict[str, str] = {
     'text': 'str',
     'bool': 'bool',
     'boolean': 'bool',
+    'timestamp': 'str',
+    'datetime': 'str',
+    'date': 'str',
 }
 
 # Python keywords that retain expression syntax meaning and must NOT be treated
@@ -444,6 +447,12 @@ def _lex_and_normalize_with_colmap(
         rewritten.append('False')
         i += 1
         continue
+      if upper in ('LIKE', 'ILIKE',
+                   'BETWEEN') and not (rewritten and rewritten[-1] == '.'):
+        raise ExpressionError(
+            f'SQL {upper} is not supported in row expressions; use --sql '
+            '"SELECT ... WHERE ..." or Python string/comparison operators '
+            '(.startswith/.endswith/in/and)')
       if keyword.iskeyword(tval) and tval not in _EXPR_KEYWORDS:
         placeholder = f'beam_colref__{len(colref_map)}'
         colref_map[placeholder] = tval
@@ -1323,10 +1332,10 @@ def compile_select(
   }
   if has_star:
     out_cfg['append'] = True
-    if known_columns is not None:
-      overwritten = [a for a in fields_cfg if a in known_columns]
-      if overwritten:
-        out_cfg['drop'] = overwritten
+    known_or_ref = set(known_columns or ()) | set(all_cols)
+    overwritten = [a for a in fields_cfg if a in known_or_ref]
+    if overwritten:
+      out_cfg['drop'] = overwritten
   return (out_cfg, frozenset(all_cols))
 
 

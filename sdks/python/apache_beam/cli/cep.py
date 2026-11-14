@@ -518,12 +518,16 @@ def parse_pattern_config(raw: Mapping[str, Any]) -> PatternConfig:
   allowed = {
       'key',
       'keys',
+      'on',
       'seq',
       'pattern',
       'within',
+      'window',
       'event_col',
       'timestamp_col',
+      'timestamp',
       'time',
+      'ts',
       'mode',
       'contiguity',
       'after_match',
@@ -537,12 +541,18 @@ def parse_pattern_config(raw: Mapping[str, Any]) -> PatternConfig:
       'force_stateful',
       'error_handling',
   }
-  unknown = [k for k in norm if k not in allowed]
+  unknown = sorted(k for k in norm if k not in allowed)
   if unknown:
-    raise ValueError(f'unknown option(s) {sorted(unknown)} in CliPatternMatch')
+    import difflib
+    close = difflib.get_close_matches(
+        unknown[0], sorted(allowed), n=1, cutoff=0.55)
+    hint = f' (did you mean {close[0]!r}?)' if close else ''
+    raise ValueError(f'unknown option(s) {unknown} in CliPatternMatch{hint}')
 
-  keys = interval_join.parse_column_list(
-      norm.get('key') if norm.get('key') is not None else norm.get('keys'))
+  key_src = (
+      norm.get('key') if norm.get('key') is not None else
+      (norm.get('keys') if norm.get('keys') is not None else norm.get('on')))
+  keys = interval_join.parse_column_list(key_src)
   if not keys:
     raise ValueError(
         'CliPatternMatch requires partition key column(s) via key=...')
@@ -551,7 +561,8 @@ def parse_pattern_config(raw: Mapping[str, Any]) -> PatternConfig:
       raise ValueError(f'invalid key column {col!r} in CliPatternMatch')
 
   raw_seq = str(norm.get('seq') or norm.get('pattern') or '').strip()
-  raw_within = str(norm['within']).strip() if norm.get('within') else None
+  raw_win = norm.get('within') or norm.get('window')
+  raw_within = str(raw_win).strip() if raw_win else None
   expanded_tuples, within_sec, within_str, seq_clean = _parse_seq_and_within(
       raw_seq, raw_within)
 
@@ -559,7 +570,8 @@ def parse_pattern_config(raw: Mapping[str, Any]) -> PatternConfig:
   if not output.SAFE_IDENTIFIER_RE.match(ev_col):
     raise ValueError(f'invalid event_col {ev_col!r} in CliPatternMatch')
 
-  ts_raw = norm.get('timestamp_col') or norm.get('time')
+  ts_raw = (
+      norm.get('timestamp_col') or norm.get('timestamp') or norm.get('time'))
   ts_col = str(ts_raw).strip() if ts_raw else None
   if ts_col is not None and not output.SAFE_IDENTIFIER_RE.match(ts_col):
     raise ValueError(f'invalid timestamp_col {ts_col!r} in CliPatternMatch')
@@ -1318,6 +1330,14 @@ def cli_pattern_match(
   class _CliPatternMatchTransform(beam.PTransform):
     def expand(self, pcoll):
       in_el_type = getattr(pcoll, 'element_type', None)
+      in_fields = getattr(in_el_type, '_fields', None)
+      needs_event_col = any(s.predicate_expr is None for s in cfg.steps)
+      if in_fields and needs_event_col:
+        col_names = [f[0] for f in in_fields]
+        if cfg.event_col not in col_names:
+          raise ValueError(
+              f"event_col {cfg.event_col!r} not found in input columns "
+              f"{col_names}; pass event_col=<COL> inside --pattern")
       out_row_type = _infer_cep_row_type(in_el_type, cfg)
       is_bounded = getattr(pcoll, 'is_bounded', True)
       win_pcoll = pcoll | 'GlobalWinPattern' >> beam.WindowInto(GlobalWindows())

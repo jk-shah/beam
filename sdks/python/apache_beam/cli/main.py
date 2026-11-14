@@ -153,6 +153,7 @@ _CLI_ZERO_FLAGS = {
         '--no-config',
         '--no-jinja',
         '--allow-stdin-jinja',
+        '--allow-unknown-options',
         '--dry-run',
         '--dry_run',
         '--help',
@@ -174,22 +175,41 @@ _CLI_ZERO_FLAGS = {
         '--check-schema',
         '--schema-check',
         '--dedupe-dlq',
+        '--dedup-dlq',
         '--infer-flatten',
         '--emit-pane-info',
+        '--allow-unknown-options',
         '--verbose',
         '--no-config',
         '--help',
     ]),
-    'diff': frozenset(['--exit-zero', '--verbose', '--no-config', '--help']),
+    'diff': frozenset([
+        '--exit-zero',
+        '--allow-unknown-options',
+        '--verbose',
+        '--no-config',
+        '--help',
+    ]),
     'check': frozenset([
         '--plan',
         '--trust-providers',
         '--portable',
         '--strict-beam',
+        '--allow-unknown-options',
         '--no-config',
         '--help',
     ]),
-    'tail': frozenset(['-f', '--follow', '-i', '--interactive', '--help']),
+    'inspect': frozenset(['--stats', '--no-config', '--help']),
+    'tail': frozenset([
+        '-f',
+        '--follow',
+        '-i',
+        '--interactive',
+        '--no-config',
+        '--help',
+    ]),
+    'wait': frozenset(['--no-config', '--help']),
+    'cancel': frozenset(['--drain', '--no-config', '--help']),
     'package': frozenset([
         '--no-use-public-ips',
         '--no_use_public_ips',
@@ -211,6 +231,7 @@ _CLI_ZERO_FLAGS = {
         '--dry-run',
         '--dry_run',
         '--zero-copy',
+        '--no-zero-copy',
         '--verbose',
         '--no-config',
         '--help',
@@ -218,26 +239,45 @@ _CLI_ZERO_FLAGS = {
 }
 _CLI_ONE_FLAGS = {
     None: frozenset(['--output']),
-    'run': frozenset(['--profile', '--wait-timeout']),
+    'run': frozenset([
+        '--profile',
+        '--wait-timeout',
+        '--jinja-variables',
+        '-p',
+        '--param',
+    ]),
     'pipe': frozenset([
         '--from',
+        '--source',
+        '-i',
         '--join',
         '--to',
+        '-o',
+        '--output-path',
         '--sql',
+        '--sql-file',
+        '-n',
+        '--limit',
         '--interval-join',
         '--asof-join',
         '--pattern',
         '--max-watermark-skew',
         '--skew-action',
         '--dedupe-by',
+        '--dedup-by',
         '--dedupe-window',
+        '--dedup-window',
         '--dedupe-keep',
+        '--dedup-keep',
         '--dedupe-order',
+        '--dedup-order',
         '--dedupe-time-domain',
+        '--dedup-time-domain',
         '--window',
         '--window-size',
         '--window_size',
         '--allowed-lateness',
+        '--allow-lateness',
         '--trigger',
         '--accumulation',
         '--late-action',
@@ -248,8 +288,10 @@ _CLI_ONE_FLAGS = {
         '--from-format',
         '--to-format',
         '--where',
+        '--filter',
         '--pre-select',
         '--post-where',
+        '--post-filter',
         '--select',
         '--columns',
         '--cols',
@@ -267,6 +309,8 @@ _CLI_ONE_FLAGS = {
         '--dead_letter_target',
         '--dlq-format',
         '--dlq-redact-fields',
+        '--redact-fields',
+        '--dlq-redact',
         '--null-values',
         '--sql-engine',
         '--if-exists',
@@ -289,33 +333,74 @@ _CLI_ONE_FLAGS = {
         '--on-violation',
     ]),
     'diff': frozenset([
+        '--left',
+        '--right',
+        '--from',
+        '--source',
+        '--target',
         '--key',
         '--primary-key',
         '--pk',
         '--cdc-pk',
         '--left-format',
         '--right-format',
+        '--source-format',
+        '--target-format',
         '--left-opt',
         '--right-opt',
+        '--source-opt',
+        '--target-opt',
+        '--left-opt-file',
+        '--right-opt-file',
+        '--source-opt-file',
+        '--target-opt-file',
         '--rtol',
         '--atol',
         '--columns',
         '--to',
+        '-o',
+        '--output-path',
         '--limit',
+        '-n',
         '--max-bytes',
         '--profile',
     ]),
-    'check': frozenset(['--jinja-variables', '--profile']),
-    'tail': frozenset([
+    'inspect': frozenset([
+        '--from',
+        '--source',
+        '-i',
+        '--format',
+        '--from-format',
+        '--sample',
         '-n',
         '--limit',
+        '--search',
+        '--max-scanned-bytes',
+        '--from-opt',
+        '--from-opt-file',
+        '--project',
+        '--profile',
+    ]),
+    'check': frozenset(['--jinja-variables', '-p', '--param', '--profile']),
+    'tail': frozenset([
+        '--from',
+        '--source',
+        '-n',
+        '--limit',
+        '--sample',
         '--duration',
         '--poll-interval',
         '--max-scanned-bytes',
         '--from-format',
+        '--format',
         '--from-opt',
+        '--from-opt-file',
         '--project',
+        '--profile',
     ]),
+    'wait': frozenset(
+        ['--timeout', '--poll-interval', '--project', '--region', '--profile']),
+    'cancel': frozenset(['--project', '--region', '--profile']),
     'package': frozenset([
         '--to',
         '-o',
@@ -355,25 +440,45 @@ _CLI_ONE_FLAGS = {
         '--subnetwork',
         '--network',
         '--parameter',
+        '--param',
+        '-p',
         '--max-active-runs',
         '--retries',
         '--retry-delay-min',
         '--profile',
     ]),
     'schema': frozenset([
+        '--from',
+        '--source',
+        '--left',
+        '-i',
+        '--to',
+        '--target',
+        '--right',
+        '-o',
         '--mode',
         '--source-format',
         '--target-format',
+        '--left-format',
+        '--right-format',
         '--source-opt',
         '--target-opt',
+        '--left-opt',
+        '--right-opt',
+        '--source-opt-file',
+        '--target-opt-file',
+        '--left-opt-file',
+        '--right-opt-file',
         '--project',
         '--profile',
     ]),
     'catalog': frozenset([
         '--from',
         '--source',
+        '-i',
         '--to',
         '--target',
+        '-o',
         '--table',
         '--table-name',
         '--catalog',
@@ -382,6 +487,7 @@ _CLI_ONE_FLAGS = {
         '--catalog-opt',
         '--profile',
     ]),
+    'config': frozenset(['--profile']),
 }
 
 
@@ -428,12 +534,16 @@ def _extract_global_flags(
       mode = tok.split('=', 1)[1].strip().lower()
       if mode == 'json':
         json_mode = True
-      elif mode == 'text':
+        i += 1
+        continue
+      if mode == 'text':
         json_mode = False
-      else:
-        cleaned.append(tok)  # Let argparse report invalid --output value.
-      i += 1
-      continue
+        i += 1
+        continue
+      if not seen_subcommand:
+        cleaned.append(tok)
+        i += 1
+        continue
     if tok == '--output' and i + 1 < len(raw_argv):
       mode = raw_argv[i + 1].strip().lower()
       if mode in ('json', 'text'):
@@ -444,7 +554,7 @@ def _extract_global_flags(
       llms_txt = True
       i += 1
       continue
-    if not seen_subcommand and tok == '--version':
+    if not seen_subcommand and tok in ('--version', 'version'):
       top_version = True
       i += 1
       continue
@@ -453,10 +563,91 @@ def _extract_global_flags(
   return cleaned, json_mode, top_version, llms_txt
 
 
+def _expand_pipe_dedupe_dlq_uri(tokens: list[str]) -> list[str]:
+  """Allows `--dedupe-dlq [URI]` symmetry alongside bare `--dedupe-dlq`."""
+  if 'pipe' not in tokens:
+    return tokens
+  has_explicit_dlq = any(
+      t in (
+          '--dlq',
+          '--dead-letter',
+          '--dead-letter-target',
+          '--dead_letter_target') or t.startswith((
+              '--dlq=',
+              '--dead-letter=',
+              '--dead-letter-target=',
+              '--dead_letter_target=')) for t in tokens)
+  out: list[str] = []
+  seen_pipe = False
+  i = 0
+  while i < len(tokens):
+    tok = tokens[i]
+    if tok == '--':
+      out.extend(tokens[i:])
+      break
+    if not seen_pipe:
+      if tok == 'pipe':
+        seen_pipe = True
+      out.append(tok)
+      i += 1
+      continue
+    if tok.startswith(('--dedupe-dlq=', '--dedup-dlq=')):
+      val = tok.split('=', 1)[1].strip()
+      low = val.lower()
+      if low in ('1', 'true', 'yes'):
+        out.append('--dedupe-dlq')
+      elif low in ('0', 'false', 'no'):
+        pass
+      elif not has_explicit_dlq:
+        out.extend(['--dedupe-dlq', '--dlq', val])
+        has_explicit_dlq = True
+      else:
+        out.append(f'--conflicting-dedupe-dlq-uri={val}')
+      i += 1
+      continue
+    if tok in ('--dedupe-dlq', '--dedup-dlq') and i + 1 < len(tokens):
+      nxt = tokens[i + 1]
+      if nxt and not nxt.startswith('-') and nxt not in _SUBCOMMANDS:
+        if not has_explicit_dlq:
+          out.extend(['--dedupe-dlq', '--dlq', nxt])
+          has_explicit_dlq = True
+        else:
+          out.extend(['--dedupe-dlq', f'--conflicting-dedupe-dlq-uri={nxt}'])
+        i += 2
+        continue
+    out.append(tok)
+    i += 1
+  return out
+
+
 def _normalize_cli_argv(argv: list[str]) -> list[str]:
-  res = list(argv)
-  if res and res[0] == 'schema' and len(res) > 1 and res[1] not in ('diff', 'check', '-h', '--help'):
-    res.insert(1, 'diff')
+  res = _expand_pipe_dedupe_dlq_uri(list(argv))
+  if res:
+    cmd0 = res[0]
+    if cmd0 == 'schema':
+      if len(res) == 1 or (res[1] in ('-h', '--help') or
+                           res[1] not in ('diff', 'check')):
+        res.insert(1, 'diff')
+    elif cmd0 == 'catalog':
+      if len(res) == 1 or res[1] != 'sync':
+        res.insert(1, 'sync')
+    elif cmd0 == 'io':
+      if len(res) == 1 or (res[1].startswith('-') and
+                           res[1] not in ('-h', '--help')):
+        res.insert(1, 'list')
+      elif len(res) > 1 and res[1] not in ('list', 'describe', '-h', '--help'):
+        res.insert(1, 'describe')
+    elif cmd0 == 'config':
+      if len(res) == 1 or (res[1].startswith('-') and
+                           res[1] not in ('-h', '--help')):
+        res.insert(1, 'list')
+      elif (len(res) >= 3 and res[1] == 'set' and '=' in res[2] and
+            not res[2].startswith('-')):
+        k_part, v_part = res[2].split('=', 1)
+        res[2:3] = [k_part, v_part]
+      elif len(res) > 1 and res[1] not in (
+          'set', 'get', 'unset', 'list', 'use', '-h', '--help'):
+        res.insert(1, 'get')
   return _option_arity.normalize_argv(
       res,
       subcommands=_SUBCOMMANDS,
@@ -471,12 +662,19 @@ def main(argv=None) -> int:
   os.environ.setdefault('GRPC_ENABLE_FORK_SUPPORT', '0')
   t0 = time.monotonic()
   raw_argv = list(sys.argv[1:] if argv is None else argv)
-  output.DLQ_REQUESTED = any(
-      a in ('--dlq', '--dead-letter', '--dead-letter-target', '--dead_letter_target') or
-      a.startswith(('--dlq=', '--dead-letter=', '--dead-letter-target=', '--dead_letter_target='))
-      for a in raw_argv)
   stripped_argv, json_mode, top_version, llms_txt = _extract_global_flags(
       raw_argv)
+  norm_preview = _expand_pipe_dedupe_dlq_uri(stripped_argv)
+  output.DLQ_REQUESTED = any(
+      a in (
+          '--dlq',
+          '--dead-letter',
+          '--dead-letter-target',
+          '--dead_letter_target') or a.startswith((
+              '--dlq=',
+              '--dead-letter=',
+              '--dead-letter-target=',
+              '--dead_letter_target=')) for a in norm_preview)
 
   with output.JsonOutputSession(enabled=json_mode) as json_session:
     if llms_txt:
@@ -515,16 +713,28 @@ def main(argv=None) -> int:
 
     try:
       if json_mode:
-        # Capture argparse stderr so `--json` usage errors emit a clean JSON
-        # envelope on stdout instead of exiting with empty stdout.
+        # Capture argparse stdout/stderr so `--json` help and usage errors emit
+        # a single valid JSON envelope on stdout instead of empty stdout.
+        help_buf = io.StringIO()
         err_buf = io.StringIO()
         try:
           import contextlib
-          with contextlib.redirect_stderr(err_buf):
+          with contextlib.redirect_stdout(help_buf), contextlib.redirect_stderr(
+              err_buf):
             args, extra_args = parser.parse_known_args(norm_argv)
         except SystemExit as sys_exc:
           exit_c = int(sys_exc.code) if isinstance(sys_exc.code, int) else 2
           if exit_c == 0:
+            help_cmd = (
+                norm_argv[0]
+                if norm_argv and norm_argv[0] in _SUBCOMMANDS else 'help')
+            json_session.emit(
+                output.build_envelope(
+                    ok=True,
+                    command=help_cmd,
+                    exit_code=EXIT_OK,
+                    duration_ms=int((time.monotonic() - t0) * 1000),
+                    outputs={'help': help_buf.getvalue()}))
             return EXIT_OK
           msg = err_buf.getvalue().strip() or 'invalid command-line arguments'
           raise _CliError(msg, exit_c) from None
@@ -635,45 +845,237 @@ def _add_config_selection_args(parser):
       help='ignore saved options in ~/.beam/config.yaml')
 
 
-def _reject_extra_args(extra_args: list[str]) -> None:
-  if extra_args:
-    raise _CliError(
-        f'unrecognized arguments: {" ".join(extra_args)}', EXIT_USAGE)
+def _format_flag_suggestions(flag: str, candidates: Iterable[str]) -> str:
+  import difflib
+  pool = sorted({c for c in candidates if c.startswith('-') and c != '-h'})
+  matches = difflib.get_close_matches(flag, pool, n=3, cutoff=0.58)
+  if not matches and len(flag) > 3:
+    bare = flag.lstrip('-').replace('_', '-')
+    sub_matches = [
+        c for c in pool if len(c) > 3 and (
+            bare in c.lstrip('-').replace('_', '-') or
+            c.lstrip('-').replace('_', '-') in bare)
+    ][:3]
+    matches = sub_matches
+  if not matches:
+    return ''
+  if len(matches) == 1:
+    return f' (did you mean {matches[0]!r}?)'
+  return f" (did you mean {', '.join(repr(m) for m in matches)}?)"
+
+
+def _candidate_flags_for_cmd(
+    subcommand: str | None, *, include_pipeline: bool = False) -> set[str]:
+  cands = set(_CLI_ZERO_FLAGS.get(None, ())) | set(_CLI_ONE_FLAGS.get(None, ()))
+  if subcommand:
+    cands |= set(_CLI_ZERO_FLAGS.get(subcommand, ()))
+    cands |= set(_CLI_ONE_FLAGS.get(subcommand, ()))
+  if include_pipeline:
+    if subcommand == 'run':
+      cands |= set(_option_arity.KNOWN_RUN_ZERO_FLAGS)
+      cands |= set(_option_arity.KNOWN_RUN_ONE_FLAGS)
+    else:
+      cands |= set(_option_arity.KNOWN_PIPE_ZERO_FLAGS)
+      cands |= set(_option_arity.KNOWN_PIPE_ONE_FLAGS)
+  return cands
+
+
+def _reject_extra_args(
+    extra_args: list[str], *, subcommand: str | None = None) -> None:
+  if not extra_args:
+    return
+  first_flag = next(
+      (t.split('=', 1)[0] for t in extra_args if t.startswith('-')), None)
+  hint = ''
+  if first_flag:
+    hint = _format_flag_suggestions(
+        first_flag,
+        _candidate_flags_for_cmd(subcommand, include_pipeline=False))
+  raise _CliError(
+      f'unrecognized arguments: {" ".join(extra_args)}{hint}', EXIT_USAGE)
+
+
+def _extract_dynamic_jinja_flags(extra_args: list[str]) -> set[str]:
+  dyn: set[str] = set()
+  for i, tok in enumerate(extra_args):
+    raw_val = None
+    if tok.startswith(('--jinja_variable_flags=', '--jinja-variable-flags=')):
+      raw_val = tok.split('=', 1)[1]
+    elif tok in ('--jinja_variable_flags',
+                 '--jinja-variable-flags') and i + 1 < len(extra_args):
+      raw_val = extra_args[i + 1]
+    if raw_val:
+      cleaned = raw_val.strip().strip('[]')
+      for item in cleaned.split(','):
+        nm = item.strip().strip('\'"')
+        if nm:
+          dyn.add(f'--{nm}')
+          dyn.add(f'--{nm.replace("_", "-")}')
+  return dyn
+
+
+def _validate_passthrough_extra_args(
+    extra_args: list[str],
+    *,
+    subcommand: str,
+    allow_unknown: bool = False,
+) -> None:
+  if not extra_args:
+    return
+  for tok in extra_args:
+    if tok.startswith('--conflicting-dedupe-dlq-uri='):
+      uri_v = tok.split('=', 1)[1]
+      raise _CliError(
+          f'cannot pass both --dlq and --dedupe-dlq {uri_v!r}; '
+          'pass --dlq <URI> --dedupe-dlq to share the DLQ destination',
+          EXIT_USAGE)
+  if allow_unknown:
+    return
+  if subcommand == 'run':
+    known_zero = set(_option_arity.KNOWN_RUN_ZERO_FLAGS)
+    known_one = set(_option_arity.KNOWN_RUN_ONE_FLAGS
+                    ) | _extract_dynamic_jinja_flags(extra_args)
+  else:
+    known_zero = set(_option_arity.KNOWN_PIPE_ZERO_FLAGS)
+    known_one = set(_option_arity.KNOWN_PIPE_ONE_FLAGS)
+  cands = _candidate_flags_for_cmd(subcommand, include_pipeline=True)
+
+  i = 0
+  while i < len(extra_args):
+    tok = extra_args[i]
+    if tok == '--':
+      break
+    if tok.startswith('-') and tok != '-':
+      flag, has_eq, eq_val = tok.partition('=')
+      if flag in known_zero:
+        if has_eq and eq_val.strip().lower() not in ('1', '0', 'true', 'false'):
+          raise _CliError(
+              f'boolean flag {flag!r} does not take value {eq_val!r}',
+              EXIT_USAGE)
+        i += 1
+        continue
+      if flag in known_one:
+        if not has_eq:
+          if i + 1 >= len(extra_args):
+            raise _CliError(f'option {flag!r} requires an argument', EXIT_USAGE)
+          i += 2
+        else:
+          i += 1
+        continue
+      hint = _format_flag_suggestions(flag, cands)
+      raise _CliError(
+          f'unrecognized option {flag!r}{hint}; pass --allow-unknown-options '
+          'for custom PipelineOptions subclasses',
+          EXIT_USAGE)
+    if subcommand == 'pipe':
+      raise _CliError(
+          f"unexpected positional argument {tok!r} (did you mean "
+          f"--to {tok!r} or --from {tok!r}?)",
+          EXIT_USAGE)
+    raise _CliError(f'unrecognized argument {tok!r}', EXIT_USAGE)
+
+
+def _merge_jinja_variables(
+    jinja_json: str | None, params: list[str] | None) -> str | None:
+  if not jinja_json and not params:
+    return None
+  merged: dict[str, Any] = {}
+  if jinja_json:
+    try:
+      parsed = json.loads(jinja_json)
+    except ValueError as e:
+      raise _CliError(
+          f'invalid --jinja-variables JSON: {e}', EXIT_USAGE) from None
+    if not isinstance(parsed, dict):
+      raise _CliError('--jinja-variables must be a JSON object', EXIT_USAGE)
+    merged.update(parsed)
+  for raw_p in params or ():
+    if '=' not in raw_p:
+      raise _CliError(
+          f'invalid --param {raw_p!r}; expected KEY=VALUE', EXIT_USAGE)
+    k, v = raw_p.split('=', 1)
+    key = k.strip()
+    if not key or not output.SAFE_IDENTIFIER_RE.match(key):
+      raise _CliError(
+          f'invalid template parameter name {key!r} in --param {raw_p!r}',
+          EXIT_USAGE)
+    val_s = v.strip()
+    parsed_v: Any = val_s
+    if val_s in ('true', 'false', 'null'):
+      parsed_v = json.loads(val_s)
+    elif val_s and not (len(val_s) > 1 and val_s.startswith('0') and
+                        val_s[1:].isdigit()):
+      try:
+        cand = json.loads(val_s)
+        if isinstance(cand, (int, float, list, dict, bool)):
+          parsed_v = cand
+      except ValueError:
+        parsed_v = val_s
+    merged[key] = parsed_v
+  return json.dumps(merged)
+
+
+def _merge_opt_file_into_kv_list(
+    opts: list[str] | None, opt_file: str | None, flag_name: str) -> list[str]:
+  if not opt_file:
+    return list(opts or [])
+  from . import uris
+  parsed = uris.parse_kv_options(opts or [], opt_file, flag_name)
+  out: list[str] = []
+  for k, v in parsed.items():
+    if isinstance(v, (dict, list, bool)):
+      out.append(f'{k}={json.dumps(v)}')
+    else:
+      out.append(f'{k}={v}')
+  return out
 
 
 _TOP_LEVEL_EPILOG = """\
-what you can do (beam --llms-txt prints the full agent manual):
-  convert/filter files    beam pipe --from in.csv --to out.parquet \\
-                            --where "amount > 100" --select "id, amount"
-  small local jobs        run in-process in well under a second; larger or
-                          remote jobs use a Beam runner (or pass --runner)
-  bad records             --dlq bad.jsonl routes unparseable or failing rows
-                          instead of failing the run; --assert-counts checks
-                          rows_read = written + filtered + dlq
-  nested fields           --where "user.tier == 'gold'" on JSON/Parquet/Avro
-  NULLs                   SQL rules: --where "state != 'CA'" drops rows with
-                          no state; empty CSV cells are NULL (--null-values
-                          NA,NULL adds markers); test with IS [NOT] NULL
-  SQL                     beam pipe --from t=in.csv --sql "SELECT ... FROM t"
-                          (local SQLite with median/percentile/stddev; or
-                          --sql-engine duckdb if installed, see beam doctor)
-  CDC                     --cdc --primary-key id applies change events
-                          (files keep the latest row per key)
-  compare datasets        beam diff left.parquet right.parquet --key id
-                          (schema drift, differing keys, value mismatches)
-  look before moving      beam inspect FILE_OR_TABLE (schema, rows, sample)
-  export for production   beam pipe ... --emit-yaml > pipeline.yaml, then
-                          beam check pipeline.yaml and beam package
-  machine-readable        add --json for one structured envelope on stdout
+command groups:
+  data & inspection   pipe, inspect, tail, diff, schema
+  pipelines & sql     run, check, sql
+  deploy & env        package, export-schedule, catalog, wait, cancel, config, io, doctor
+
+quick start (beam --llms-txt prints the compact agent manual):
+  preview / filter    beam pipe in.csv --where "amount > 100" -n 20
+  convert & audit     beam pipe in.csv out.parquet --dlq bad.jsonl --assert-counts
+  multi-source SQL    beam pipe --from o=orders.parquet --from u=users.csv \\
+                        --sql "SELECT u.tier, SUM(o.amount) FROM o JOIN u USING (uid) GROUP BY 1"
+  enrich & infer      beam pipe events.jsonl out.parquet --enrich "dims.jsonl,on=uid" \\
+                        --infer "hf:distilbert/sst2,task=text-classification,fields=text"
+  inspect & diff      beam inspect data.parquet          beam diff a.parquet b.parquet --key id
+  productionize       beam pipe in.csv out.parquet --emit-yaml > p.yaml && beam package p.yaml -o spec.json
+  machine-readable    add --json to any command for one structured JSON envelope on stdout
 """
+
+
+class _CleanHelpFormatter(argparse.RawDescriptionHelpFormatter):
+  """Shows at most [-s, --canonical] per flag while keeping all aliases active."""
+  def _format_action_invocation(self, action):
+    if not action.option_strings:
+      default = self._get_default_metavar_for_positional(action)
+      (metavar, ) = self._metavar_formatter(action, default)(1)
+      return metavar
+    shorts = [
+        s for s in action.option_strings if len(s) == 2 and s.startswith('-')
+    ]
+    longs = [s for s in action.option_strings if s.startswith('--')]
+    shown = (shorts[:1] + longs[:1]) or list(action.option_strings[:1])
+    parts = ', '.join(shown)
+    if action.nargs != 0:
+      default = self._get_default_metavar_for_optional(action)
+      args_str = self._format_args(action, default)
+      return f'{parts} {args_str}'
+    return parts
 
 
 def _build_parser():
   parser = argparse.ArgumentParser(
       prog='beam',
+      usage='beam COMMAND [options] [--json]',
       description='Apache Beam command-line tool for humans and AI agents.',
       epilog=_TOP_LEVEL_EPILOG,
-      formatter_class=argparse.RawDescriptionHelpFormatter,
+      formatter_class=_CleanHelpFormatter,
       allow_abbrev=False)
   parser.add_argument(
       '--json',
@@ -683,7 +1085,7 @@ def _build_parser():
       '--output',
       choices=['text', 'json'],
       default='text',
-      help='output format: text (default) or json')
+      help=argparse.SUPPRESS)
   parser.add_argument(
       '--version', action='store_true', help='print installed Beam version')
   parser.add_argument(
@@ -697,17 +1099,32 @@ def _build_parser():
   # 1. `beam run`
   run = commands.add_parser(
       'run',
+      usage='beam run FILE [options]',
       help='run a Beam YAML pipeline file (or - for stdin)',
       description=(
           'Run a Beam YAML pipeline file or stdin (-), passing any extra '
           '--flags through as Beam PipelineOptions.'),
       epilog=_RUN_EPILOG,
-      formatter_class=argparse.RawDescriptionHelpFormatter,
+      formatter_class=_CleanHelpFormatter,
       allow_abbrev=False)
   run.add_argument(
       'file',
       metavar='FILE',
       help='pipeline YAML file (local path, gs://..., or - for stdin)')
+  run.add_argument(
+      '-p',
+      '--param',
+      dest='jinja_params',
+      action='append',
+      default=[],
+      metavar='KEY=VAL',
+      help='Jinja2 template variable (repeatable; e.g. -p env=prod)')
+  run.add_argument(
+      '--jinja-variables',
+      dest='jinja_variables',
+      default=None,
+      metavar='JSON',
+      help='JSON mapping of Jinja2 template variables')
   run.add_argument(
       '--no-jinja',
       action='store_true',
@@ -726,421 +1143,291 @@ def _build_parser():
       metavar='DURATION',
       help='max wait time (e.g. 30s, 5m); detaches remote jobs with exit 7')
   run.add_argument(
+      '--allow-unknown-options',
+      dest='allow_unknown_options',
+      action='store_true',
+      help='pass unrecognized --flags through to custom PipelineOptions')
+  run.add_argument(
       '--verbose', action='store_true', help='show tracebacks for errors')
   _add_config_selection_args(run)
 
-  # 2. `beam pipe`
+  # 2. `beam pipe` — organized into 7 scannable help groups!
   pipe = commands.add_parser(
       'pipe',
+      usage='beam pipe [SOURCE] [SINK] [options]',
       help='move, filter, project, clean, and verify data across URIs',
       description=(
-          'Move, convert, filter, project, dead-letter, and verify data across '
+          'Move, convert, filter, enrich, score, and verify data across '
           'local files, cloud object stores, BigQuery, Postgres, Pub/Sub, '
-          'Kafka, and Iceberg.'),
+          'Kafka, Delta, and Iceberg. Omit --to locally to preview rows.'),
       epilog=_PIPE_EPILOG,
-      formatter_class=argparse.RawDescriptionHelpFormatter,
+      formatter_class=_CleanHelpFormatter,
       allow_abbrev=False)
   pipe.add_argument(
+      'pos_source', nargs='?', default=None, help=argparse.SUPPRESS)
+  pipe.add_argument('pos_sink', nargs='?', default=None, help=argparse.SUPPRESS)
+
+  g_io = pipe.add_argument_group('endpoints & formats')
+  g_io.add_argument(
       '--from',
+      '--source',
+      '-i',
       dest='sources',
       action='append',
-      required=True,
+      required=False,
       metavar='[ALIAS=]SOURCE',
       help=(
-          'source path, glob, or URI (gs://, bigquery://, delta://, '
-          'iceberg://, ...); repeat --from alias=URI to bind multiple '
-          'named sources for --sql'))
-  pipe.add_argument(
+          'source path, glob, or URI (bq://, gs://, delta://, iceberg://, ...); '
+          'repeat --from alias=URI for multi-source --sql'))
+  g_io.add_argument(
       '--join',
       dest='joins',
       action='append',
       default=[],
       metavar='[ALIAS=]SOURCE',
-      help=(
-          'second input stream for --interval-join or alias for repeating '
-          '--from [ALIAS=]SOURCE in multi-source --sql queries'))
-  pipe.add_argument(
+      help='second input stream for --interval-join/--asof-join or --sql')
+  g_io.add_argument(
       '--to',
+      '-o',
+      '--output-path',
       dest='sink',
       required=False,
       default=None,
       metavar='SINK',
-      help='destination path or URI (optional when running --sql queries)')
-  pipe.add_argument(
+      help='destination path or URI (omit locally to preview rows on stdout)')
+  g_io.add_argument(
       '--format',
       metavar='FMT',
       help='format of both sides; overridden by --from-format / --to-format')
-  pipe.add_argument(
+  g_io.add_argument(
       '--from-format',
       metavar='FMT',
       help='source format (csv, json, text, parquet, avro)')
-  pipe.add_argument(
+  g_io.add_argument(
       '--to-format',
       metavar='FMT',
       help='sink format (csv, json, text, parquet, avro)')
-  pipe.add_argument(
-      '--where',
-      metavar='EXPR',
-      help='safe SQL/Python row filter (e.g. "amount > 0 AND status = \'OK\'")')
-  pipe.add_argument(
-      '--pre-select',
-      dest='pre_select',
-      default=None,
-      metavar='EXPR',
-      help=(
-          'pre-enrichment/inference projection & key normalization '
-          '(e.g. "*, lower(raw_uid) AS user_id")'))
-  pipe.add_argument(
-      '--post-where',
-      dest='post_where',
-      default=None,
-      metavar='EXPR',
-      help=(
-          'post-enrichment/inference SQL 3-valued filter over hydrated columns '
-          '(e.g. "user_tier = \'VIP\'")'))
-  pipe.add_argument(
-      '--select',
-      '--columns',
-      '--cols',
-      dest='select',
-      metavar='EXPR',
-      help=(
-          'projection / scalar expressions (e.g. '
-          '"CAST(id AS INT) AS id, lower(email) AS email")'))
-  pipe.add_argument(
-      '--expect',
-      action='append',
-      metavar='EXPR',
-      help=(
-          'data quality expectation rule (repeatable; e.g. "amount > 0" or '
-          '"valid_amt: amount > 0 -> dlq|drop|fail")'))
-  pipe.add_argument(
-      '--on-violation',
-      choices=['dlq', 'drop', 'fail'],
-      default='dlq',
-      help='default action when an --expect rule is violated (default: dlq)')
-  pipe.add_argument(
-      '--drop-bad',
-      '--skip-errors',
-      '--ignore-errors',
-      dest='drop_bad',
-      action='store_true',
-      help='drop corrupt or violating records instead of failing the pipeline')
-  pipe.add_argument(
-      '--check-schema',
-      '--schema-check',
-      dest='check_schema',
-      action='store_true',
-      help='run pre-flight schema contract check (beam schema diff) before executing pipeline')
-  pipe.add_argument(
-      '--window',
-      '--window-size',
-      '--window_size',
-      dest='window',
-      metavar='SPEC',
-      help=(
-          'windowing specification for event-time processing: '
-          'fixed:DURATION (or plain DURATION, e.g. 60s), '
-          'sliding:SIZE,PERIOD (e.g. sliding:5m,1m), or '
-          'session:GAP (e.g. session:30m)'))
-  pipe.add_argument(
-      '--allowed-lateness',
-      dest='allowed_lateness',
-      default=None,
-      metavar='DUR',
-      help=
-      'horizon past window end during which late data is still accepted (e.g. 10m)'
-  )
-  pipe.add_argument(
-      '--trigger',
-      dest='trigger',
-      default=None,
-      metavar='SPEC',
-      help=(
-          'pane firing trigger for --window (e.g. '
-          '"watermark,early=every:10s,late=count:1", "every:10s", "count:50")'))
-  pipe.add_argument(
-      '--accumulation',
-      dest='accumulation',
-      choices=('discarding', 'accumulating'),
-      default=None,
-      help='window pane accumulation mode when --trigger fires multiple panes')
-  pipe.add_argument(
-      '--late-action',
-      dest='late_action',
-      choices=('allow', 'drop', 'dlq'),
-      default=None,
-      help=
-      'action for droppably-late records arriving after window.end + allowed_lateness'
-  )
-  pipe.add_argument(
-      '--late-data-dlq',
-      dest='late_data_dlq',
-      default=None,
-      metavar='URI',
-      help=
-      'quarantine sink URI for droppably-late records (implies --late-action=dlq)'
-  )
-  pipe.add_argument(
-      '--emit-pane-info',
-      dest='emit_pane_info',
-      action='store_true',
-      help=(
-          'append typed window_start, window_end, pane_timing, pane_index, '
-          'pane_is_first, and pane_is_last columns'))
-  pipe.add_argument(
-      '--timestamp-col',
-      '--timestamp_col',
-      dest='timestamp_col',
-      metavar='COL',
-      help='source column to assign timestamps from (e.g. ts, event_time)')
-  pipe.add_argument(
-      '--interval-join',
-      dest='interval_join',
-      default=None,
-      metavar='SPEC',
-      help=(
-          'event-time interval join across --from and --join '
-          '(e.g. "key=order_id,left_time=order_ts,right_time=ship_ts,'
-          'lower=0s,upper=15m,type=left")'))
-  pipe.add_argument(
-      '--asof-join',
-      dest='asof_join',
-      default=None,
-      metavar='SPEC',
-      help=(
-          'point-in-time ASOF join across --from and --join '
-          '(e.g. "key=symbol,left_time=trade_ts,right_time=quote_ts,'
-          'direction=backward,tolerance=5m,type=left")'))
-  pipe.add_argument(
-      '--pattern',
-      dest='pattern',
-      default=None,
-      metavar='SPEC',
-      help=(
-          'ordered event sequence / absence CEP pattern '
-          '(e.g. "key=user_id,seq=login -> mfa -> purchase within 5m" or '
-          '"key=order_id,seq=checkout -> !payment within 15m")'))
-  pipe.add_argument(
-      '--max-watermark-skew',
-      dest='max_watermark_skew',
-      default=None,
-      metavar='DUR',
-      help='maximum inter-stream watermark skew duration (e.g. 30m)')
-  pipe.add_argument(
-      '--skew-action',
-      dest='skew_action',
-      choices=['drop', 'warn', 'dlq', 'fail'],
-      default=None,
-      help='action when watermark skew exceeds --max-watermark-skew')
-  pipe.add_argument(
-      '--dedupe-by',
-      dest='dedupe_by',
-      default=None,
-      metavar='COLS',
-      help=
-      'key column(s) for deduplication (e.g. event_id or "[tenant_id,event_id]")'
-  )
-  pipe.add_argument(
-      '--dedupe-window',
-      dest='dedupe_window',
-      default=None,
-      metavar='DUR',
-      help='TTL deduplication horizon (required on unbounded streams, e.g. 10m)'
-  )
-  pipe.add_argument(
-      '--dedupe-keep',
-      dest='dedupe_keep',
-      choices=['first', 'last'],
-      default='first',
-      help=
-      'winner policy per deduplication key: first (default) or last (bounded only)'
-  )
-  pipe.add_argument(
-      '--dedupe-order',
-      dest='dedupe_order',
-      default=None,
-      metavar='COL',
-      help=
-      'ordering column for bounded --dedupe-keep tie-breaking (e.g. seq_num)')
-  pipe.add_argument(
-      '--dedupe-time-domain',
-      dest='dedupe_time_domain',
-      choices=['auto', 'event', 'processing'],
-      default='auto',
-      help=
-      'TTL clock domain for streaming deduplication: auto, event, or processing'
-  )
-  pipe.add_argument(
-      '--dedupe-dlq',
-      dest='dedupe_dlq',
-      action='store_true',
-      help=
-      'route suppressed duplicate records to --dlq instead of dropping silently'
-  )
-  pipe.add_argument(
-      '--enrich',
-      dest='enrich_specs',
-      action='append',
-      default=[],
-      metavar='SPEC',
-      help=(
-          'online feature/table enrichment stage (repeatable; e.g. '
-          '"file:path=dims.jsonl,key=user_id,columns=[tier]" or '
-          '"bigquery:project=P,table=P.D.T,fields=[user_id],columns=[tier]")'))
-  pipe.add_argument(
-      '--enrich-opt',
-      dest='enrich_opts',
-      action='append',
-      default=[],
-      metavar='KEY=VAL',
-      help='additional --enrich stage option (repeatable; e.g. redis=host:6379)'
-  )
-  pipe.add_argument(
-      '--enrich-opt-file',
-      dest='enrich_opt_file',
-      default=None,
-      metavar='FILE',
-      help='YAML/JSON file with --enrich options (chmod 0600 for credentials)')
-  pipe.add_argument(
-      '--infer',
-      dest='infer_specs',
-      action='append',
-      default=[],
-      metavar='SPEC',
-      help=(
-          'streaming/batch ML inference stage (repeatable; e.g. '
-          '"vertexai:endpoint_id=ID,project=P,location=us-central1", '
-          '"hf:task=text-classification,model=org/repo@SHA", or "mock:score=0.9")'
-      ))
-  pipe.add_argument(
-      '--infer-opt',
-      dest='infer_opts',
-      action='append',
-      default=[],
-      metavar='KEY=VAL',
-      help='additional --infer stage option (repeatable; e.g. rate_limit=50)')
-  pipe.add_argument(
-      '--infer-opt-file',
-      dest='infer_opt_file',
-      default=None,
-      metavar='FILE',
-      help='YAML/JSON file with --infer options (chmod 0600 for credentials)')
-  pipe.add_argument(
-      '--infer-fields',
-      dest='infer_fields',
-      default=None,
-      metavar='EXPR',
-      help=(
-          'SQL-style input feature mapping for --infer '
-          '(e.g. "amount AS feature_a, user.tier AS feature_b")'))
-  pipe.add_argument(
-      '--infer-tag',
-      dest='infer_tag',
-      default=None,
-      metavar='COL',
-      help=
-      'output column name/prefix for --infer predictions (default: prediction)')
-  pipe.add_argument(
-      '--infer-flatten',
-      dest='infer_flatten',
-      action='store_true',
-      help=(
-          'flatten --infer output into <tag>_score, <tag>_label, and '
-          '<tag>_model_id scalar columns'))
-  pipe.add_argument(
-      '--sql',
-      dest='sql',
-      default=None,
-      metavar='QUERY',
-      help=(
-          'read-only SQL SELECT/JOIN/GROUP BY query across one or more '
-          '--from [ALIAS=]SOURCE inputs'))
-  pipe.add_argument(
-      '--dlq',
-      '--dead-letter',
-      '--dead-letter-target',
-      '--dead_letter_target',
-      dest='dlq',
-      metavar='SINK',
-      help='dead-letter destination URI/path for corrupt or failing records')
-  pipe.add_argument(
-      '--dlq-format',
-      metavar='FMT',
-      help='dead-letter file format (default: json or inferred from extension)')
-  pipe.add_argument(
-      '--dlq-redact-fields',
-      dest='dlq_redact_fields',
-      default=None,
-      metavar='COLS',
-      help='sensitive column(s) scrubbed to <REDACTED> in --dlq raw_payload')
-  pipe.add_argument(
-      '--sql-engine',
-      choices=['sqlite', 'duckdb'],
-      default='sqlite',
-      help='local engine for --sql: sqlite (default, built in) or duckdb '
-      '(optional, pip install duckdb; adds PERCENTILE_CONT ... WITHIN GROUP, '
-      'QUALIFY, struct fields). beam doctor shows which are installed')
-  pipe.add_argument(
-      '--null-values',
-      metavar='LIST',
-      help='comma-separated CSV cell values to read as NULL in addition to '
-      'empty cells, for example NA,NULL,N/A')
-  pipe.add_argument(
+  g_io.add_argument(
       '--if-exists',
       choices=['fail', 'append', 'replace'],
       default='fail',
       help='behavior if destination exists: fail (default), append, or replace')
-  pipe.add_argument(
+  g_io.add_argument(
+      '--null-values',
+      metavar='LIST',
+      help='comma-separated CSV cell values read as NULL (e.g. NA,NULL,N/A)')
+  g_io.add_argument(
       '--from-opt',
       dest='from_opts',
       action='append',
       default=[],
       metavar='KEY=VAL',
-      help=(
-          'additional source connector option (repeatable; e.g. '
-          'fields=col:type, sample_rows=100)'))
-  pipe.add_argument(
+      help='source option or @file.yaml (repeatable; e.g. fields=col:type)')
+  g_io.add_argument(
       '--to-opt',
       dest='to_opts',
       action='append',
       default=[],
       metavar='KEY=VAL',
-      help=(
-          'additional sink connector option (repeatable; e.g. key=COL '
-          'writes one JSON object indexed by COL instead of JSONL)'))
-  pipe.add_argument(
-      '--from-opt-file',
-      metavar='FILE',
-      help='YAML/JSON file with source connector options (for credentials)')
-  pipe.add_argument(
-      '--to-opt-file',
-      metavar='FILE',
-      help='YAML/JSON file with sink connector options (for credentials)')
-  pipe.add_argument(
-      '--max-bytes',
-      metavar='SIZE',
-      help='abort with exit code 8 if estimated source scan exceeds SIZE')
-  pipe.add_argument(
-      '--assert-counts',
+      help='sink option or @file.yaml (repeatable; e.g. key=COL for keyed JSON)'
+  )
+  g_io.add_argument('--from-opt-file', metavar='FILE', help=argparse.SUPPRESS)
+  g_io.add_argument('--to-opt-file', metavar='FILE', help=argparse.SUPPRESS)
+  g_io.add_argument(
+      '--zero-copy',
       action='store_true',
-      help='fail if rows_read != rows_written + rows_filtered_out + dlq_rows')
-  pipe.add_argument(
-      '--verify',
-      action='store_true',
-      help='run distributed beam diff reconciliation after writing')
-  pipe.add_argument(
-      '--verify-key',
-      dest='verify_keys',
-      action='append',
-      default=[],
+      help='register Parquet or delta:// files into iceberg:// without copying')
+
+  g_xform = pipe.add_argument_group('sql, filtering & projection')
+  g_xform.add_argument(
+      '--sql',
+      dest='sql',
+      default=None,
+      metavar='QUERY',
+      help='SQL SELECT/JOIN/GROUP BY across --from [ALIAS=]SOURCE inputs')
+  g_xform.add_argument(
+      '--sql-file',
+      dest='sql_file',
+      default=None,
+      metavar='FILE',
+      help='path to a .sql query file (alternative to inline --sql)')
+  g_xform.add_argument(
+      '--sql-engine',
+      choices=['sqlite', 'duckdb'],
+      default='sqlite',
+      help='local engine for --sql: sqlite (default) or duckdb')
+  g_xform.add_argument(
+      '--where',
+      '--filter',
+      dest='where',
+      metavar='EXPR',
+      help='row filter before enrichment/windowing (e.g. "amount > 0")')
+  g_xform.add_argument(
+      '--pre-select',
+      dest='pre_select',
+      default=None,
+      metavar='EXPR',
+      help='pre-enrichment/inference projection (e.g. "*, lower(uid) AS uid")')
+  g_xform.add_argument(
+      '--post-where',
+      '--post-filter',
+      dest='post_where',
+      default=None,
+      metavar='EXPR',
+      help='post-enrichment/inference filter over hydrated columns')
+  g_xform.add_argument(
+      '--select',
+      '--columns',
+      '--cols',
+      dest='select',
+      metavar='EXPR',
+      help='projection / scalar or windowed aggregate expressions')
+  g_xform.add_argument(
+      '-n',
+      '--limit',
+      dest='limit',
+      type=int,
+      default=None,
+      metavar='N',
+      help='maximum output rows to emit (requires --window on streams)')
+
+  g_stream = pipe.add_argument_group(
+      'streaming windows, triggers & temporal joins')
+  g_stream.add_argument(
+      '--timestamp-col',
+      '--timestamp_col',
+      dest='timestamp_col',
       metavar='COL',
-      help='primary key column for --verify reconciliation (repeatable)')
-  pipe.add_argument(
+      help='source column to assign event-time timestamps from')
+  g_stream.add_argument(
+      '--window',
+      '--window-size',
+      '--window_size',
+      dest='window',
+      metavar='SPEC',
+      help='window spec: fixed:60s (or 60s), sliding:5m,1m, or session:30m')
+  g_stream.add_argument(
+      '--allowed-lateness',
+      '--allow-lateness',
+      dest='allowed_lateness',
+      default=None,
+      metavar='DUR',
+      help=
+      'horizon past window end during which late data is accepted (e.g. 10m)')
+  g_stream.add_argument(
+      '--trigger',
+      dest='trigger',
+      default=None,
+      metavar='SPEC',
+      help='pane trigger (e.g. "watermark,early=every:10s,late=count:1")')
+  g_stream.add_argument(
+      '--accumulation',
+      dest='accumulation',
+      choices=('discarding', 'accumulating'),
+      default=None,
+      help='pane accumulation mode when --trigger fires multiple panes')
+  g_stream.add_argument(
+      '--late-action',
+      dest='late_action',
+      choices=('allow', 'drop', 'dlq'),
+      default=None,
+      help='action for droppably-late records: allow, drop, or dlq')
+  g_stream.add_argument(
+      '--late-data-dlq',
+      dest='late_data_dlq',
+      default=None,
+      metavar='URI',
+      help='quarantine sink URI for droppably-late records')
+  g_stream.add_argument(
+      '--emit-pane-info',
+      dest='emit_pane_info',
+      action='store_true',
+      help='append window_start, window_end, and pane_* metadata columns')
+  g_stream.add_argument(
+      '--interval-join',
+      dest='interval_join',
+      default=None,
+      metavar='SPEC',
+      help=
+      'interval join spec (e.g. "on=order_id,left_time=t1,right_time=t2,between=0s..15m")'
+  )
+  g_stream.add_argument(
+      '--asof-join',
+      dest='asof_join',
+      default=None,
+      metavar='SPEC',
+      help=
+      'point-in-time ASOF join spec (e.g. "on=symbol,left_time=t1,right_time=t2,within=5m")'
+  )
+  g_stream.add_argument(
+      '--pattern',
+      dest='pattern',
+      default=None,
+      metavar='SPEC',
+      help=
+      'ordered event sequence / absence CEP spec (e.g. "on=user_id,seq=a -> b within 5m")'
+  )
+  g_stream.add_argument(
+      '--max-watermark-skew',
+      dest='max_watermark_skew',
+      default=None,
+      metavar='DUR',
+      help='maximum inter-stream watermark skew duration (e.g. 30m)')
+  g_stream.add_argument(
+      '--skew-action',
+      dest='skew_action',
+      choices=['drop', 'warn', 'dlq', 'fail'],
+      default=None,
+      help='action when watermark skew exceeds --max-watermark-skew')
+
+  g_dedup = pipe.add_argument_group('deduplication & change data capture (cdc)')
+  g_dedup.add_argument(
+      '--dedupe-by',
+      '--dedup-by',
+      dest='dedupe_by',
+      default=None,
+      metavar='COLS',
+      help='key column(s) for deduplication (e.g. event_id or "[tenant,id]")')
+  g_dedup.add_argument(
+      '--dedupe-window',
+      '--dedup-window',
+      dest='dedupe_window',
+      default=None,
+      metavar='DUR',
+      help='TTL deduplication horizon (required on streams, e.g. 10m)')
+  g_dedup.add_argument(
+      '--dedupe-keep',
+      '--dedup-keep',
+      dest='dedupe_keep',
+      choices=['first', 'last'],
+      default='first',
+      help='winner policy per deduplication key: first (default) or last')
+  g_dedup.add_argument(
+      '--dedupe-order',
+      '--dedup-order',
+      dest='dedupe_order',
+      default=None,
+      metavar='COL',
+      help='ordering column for bounded --dedupe-keep tie-breaking')
+  g_dedup.add_argument(
+      '--dedupe-time-domain',
+      '--dedup-time-domain',
+      dest='dedupe_time_domain',
+      choices=['auto', 'event', 'processing'],
+      default='auto',
+      help=
+      'TTL clock domain for streaming deduplication: auto, event, processing')
+  g_dedup.add_argument(
+      '--dedupe-dlq',
+      '--dedup-dlq',
+      dest='dedupe_dlq',
+      action='store_true',
+      help='route duplicates to --dlq (or pass --dedupe-dlq URI directly)')
+  g_dedup.add_argument(
       '--cdc',
       action='store_true',
-      help='enable cross-engine Change Data Capture (UPSERT + DELETE propagation)')
-  pipe.add_argument(
+      help='enable Change Data Capture (UPSERT + DELETE propagation)')
+  g_dedup.add_argument(
       '--primary-key',
       '--key',
       '--cdc-pk',
@@ -1149,60 +1436,213 @@ def _build_parser():
       action='append',
       default=[],
       metavar='COL',
-      help='primary key column(s) for --cdc upserts/deletes (repeatable or comma-separated)')
-  pipe.add_argument(
+      help='primary key column(s) for --cdc upserts/deletes')
+  g_dedup.add_argument(
       '--cdc-format',
       choices=['auto', 'debezium', 'flat'],
       default='auto',
       help='CDC envelope format: auto (default), debezium, or flat')
-  pipe.add_argument(
+  g_dedup.add_argument(
       '--cdc-op-col',
       metavar='COL',
-      help='operation column name for flat CDC events (default: _change_type or op)')
-  pipe.add_argument(
+      help='operation column name for flat CDC events')
+  g_dedup.add_argument(
       '--cdc-seq-col',
       metavar='COL',
       help='sequence/version column name for flat CDC events')
-  pipe.add_argument(
-      '--zero-copy',
+
+  g_ai = pipe.add_argument_group('enrichment & ml inference')
+  g_ai.add_argument(
+      '--enrich',
+      dest='enrich_specs',
+      action='append',
+      default=[],
+      metavar='SPEC',
+      help=
+      'enrichment stage (repeatable; e.g. "dims.jsonl,on=uid" or "bq://p.d.t,on=uid")'
+  )
+  g_ai.add_argument(
+      '--enrich-opt',
+      dest='enrich_opts',
+      action='append',
+      default=[],
+      metavar='KEY=VAL',
+      help='additional --enrich option or @file.yaml (repeatable)')
+  g_ai.add_argument(
+      '--enrich-opt-file',
+      dest='enrich_opt_file',
+      default=None,
+      metavar='FILE',
+      help=argparse.SUPPRESS)
+  g_ai.add_argument(
+      '--infer',
+      dest='infer_specs',
+      action='append',
+      default=[],
+      metavar='SPEC',
+      help='ML inference stage (repeatable; vertexai:..., hf:..., or mock:...)')
+  g_ai.add_argument(
+      '--infer-opt',
+      dest='infer_opts',
+      action='append',
+      default=[],
+      metavar='KEY=VAL',
+      help='additional --infer option or @file.yaml (repeatable)')
+  g_ai.add_argument(
+      '--infer-opt-file',
+      dest='infer_opt_file',
+      default=None,
+      metavar='FILE',
+      help=argparse.SUPPRESS)
+  g_ai.add_argument(
+      '--infer-fields',
+      dest='infer_fields',
+      action='append',
+      default=[],
+      metavar='EXPR',
+      help=argparse.SUPPRESS)
+  g_ai.add_argument(
+      '--infer-tag',
+      dest='infer_tag',
+      action='append',
+      default=[],
+      metavar='COL',
+      help=argparse.SUPPRESS)
+  g_ai.add_argument(
+      '--infer-flatten',
+      dest='infer_flatten',
       action='store_true',
-      help='register existing Parquet or delta:// files into iceberg:// without copying data')
-  pipe.add_argument(
-      '--preview',
+      help=argparse.SUPPRESS)
+
+  g_qual = pipe.add_argument_group('data quality, dlq & guardrails')
+  g_qual.add_argument(
+      '--expect',
+      action='append',
+      metavar='EXPR',
+      help='data quality rule (repeatable; e.g. "valid_amt: amount > 0 -> dlq")'
+  )
+  g_qual.add_argument(
+      '--on-violation',
+      choices=['dlq', 'drop', 'fail'],
+      default='dlq',
+      help='default action when an --expect rule is violated (default: dlq)')
+  g_qual.add_argument(
+      '--dlq',
+      '--dead-letter',
+      '--dead-letter-target',
+      '--dead_letter_target',
+      dest='dlq',
+      metavar='SINK',
+      help='dead-letter destination URI/path for corrupt or failing records')
+  g_qual.add_argument(
+      '--dlq-format',
+      metavar='FMT',
+      help='dead-letter file format (default: json or inferred from extension)')
+  g_qual.add_argument(
+      '--dlq-redact-fields',
+      '--redact-fields',
+      '--dlq-redact',
+      dest='dlq_redact_fields',
+      default=None,
+      metavar='COLS',
+      help='sensitive column(s) scrubbed to <REDACTED> in --dlq payloads')
+  g_qual.add_argument(
+      '--drop-bad',
+      '--skip-errors',
+      '--ignore-errors',
+      dest='drop_bad',
       action='store_true',
-      help='include sampled output rows in --json even when --to writes to a destination')
-  pipe.add_argument(
-      '--portable',
-      '--strict-beam',
-      dest='portable',
+      help='drop corrupt or violating records instead of failing')
+  g_qual.add_argument(
+      '--check-schema',
+      '--schema-check',
+      dest='check_schema',
       action='store_true',
-      help=(
-          'require SQL, options, and execution to be 100%% portable to '
-          'distributed Beam runners (Dataflow/Flink/Spark); bypasses '
-          'local-only shortcuts'))
-  pipe.add_argument(
+      help='run pre-flight schema contract check before executing')
+  g_qual.add_argument(
+      '--max-bytes',
+      metavar='SIZE',
+      help='abort with exit code 8 if estimated source scan exceeds SIZE')
+  g_qual.add_argument(
+      '--assert-counts',
+      action='store_true',
+      help='fail if rows_read != rows_written + rows_filtered_out + dlq_rows')
+  g_qual.add_argument(
+      '--verify',
+      action='store_true',
+      help='run distributed beam diff reconciliation after writing (uses --key)'
+  )
+  g_qual.add_argument(
+      '--verify-key',
+      dest='verify_keys',
+      action='append',
+      default=[],
+      metavar='COL',
+      help=argparse.SUPPRESS)
+
+  g_exec = pipe.add_argument_group('execution, packaging & config')
+  g_exec.add_argument(
       '--dry-run',
       '--dry_run',
       '--emit-yaml',
       dest='dry_run',
       action='store_true',
       help='check the pipeline and print it as YAML instead of running it')
-  pipe.add_argument(
+  g_exec.add_argument(
+      '--portable',
+      '--strict-beam',
+      dest='portable',
+      action='store_true',
+      help='require 100%% portable distributed Beam transforms and SQL dialect')
+  g_exec.add_argument(
+      '--preview',
+      action='store_true',
+      help='include sampled output rows in --json even when writing to --to')
+  g_exec.add_argument(
       '--wait-timeout',
       metavar='DURATION',
       help='max wait time (e.g. 30s, 5m); detaches remote jobs with exit 7')
-  pipe.add_argument(
+  g_exec.add_argument(
+      '--allow-unknown-options',
+      dest='allow_unknown_options',
+      action='store_true',
+      help='pass unrecognized --flags through to custom PipelineOptions')
+  g_exec.add_argument(
       '--verbose', action='store_true', help='show tracebacks for errors')
-  _add_config_selection_args(pipe)
+  _add_config_selection_args(g_exec)
 
   # 3. `beam diff`
   diff_p = commands.add_parser(
       'diff',
+      usage='beam diff LEFT_URI RIGHT_URI [options]',
       help='reconcile two datasets by primary key or row multiset hash',
+      formatter_class=_CleanHelpFormatter,
       allow_abbrev=False)
-  diff_p.add_argument('left', metavar='LEFT_URI', help='left dataset URI/path')
   diff_p.add_argument(
-      'right', metavar='RIGHT_URI', help='right dataset URI/path')
+      'left',
+      nargs='?',
+      default=None,
+      metavar='LEFT_URI',
+      help='left dataset URI/path')
+  diff_p.add_argument(
+      'right',
+      nargs='?',
+      default=None,
+      metavar='RIGHT_URI',
+      help='right dataset URI/path')
+  diff_p.add_argument(
+      '--left',
+      '--from',
+      '--source',
+      dest='left_opt_uri',
+      default=None,
+      help=argparse.SUPPRESS)
+  diff_p.add_argument(
+      '--right',
+      '--target',
+      dest='right_opt_uri',
+      default=None,
+      help=argparse.SUPPRESS)
   diff_p.add_argument(
       '--key',
       '--primary-key',
@@ -1213,22 +1653,48 @@ def _build_parser():
       default=[],
       metavar='COL',
       help='key column(s) to join on (repeatable; omit for multiset hash diff)')
-  diff_p.add_argument('--left-format', metavar='FMT', help='left file format')
-  diff_p.add_argument('--right-format', metavar='FMT', help='right file format')
+  diff_p.add_argument(
+      '--left-format',
+      '--source-format',
+      dest='left_format',
+      metavar='FMT',
+      help='left/source file format')
+  diff_p.add_argument(
+      '--right-format',
+      '--target-format',
+      dest='right_format',
+      metavar='FMT',
+      help='right/target file format')
   diff_p.add_argument(
       '--left-opt',
+      '--source-opt',
       dest='left_opts',
       action='append',
       default=[],
       metavar='KEY=VAL',
-      help='left endpoint connector option (repeatable)')
+      help='left/source option or @file.yaml (repeatable)')
   diff_p.add_argument(
       '--right-opt',
+      '--target-opt',
       dest='right_opts',
       action='append',
       default=[],
       metavar='KEY=VAL',
-      help='right endpoint connector option (repeatable)')
+      help='right/target option or @file.yaml (repeatable)')
+  diff_p.add_argument(
+      '--left-opt-file',
+      '--source-opt-file',
+      dest='left_opt_file',
+      default=None,
+      metavar='FILE',
+      help=argparse.SUPPRESS)
+  diff_p.add_argument(
+      '--right-opt-file',
+      '--target-opt-file',
+      dest='right_opt_file',
+      default=None,
+      metavar='FILE',
+      help=argparse.SUPPRESS)
   diff_p.add_argument(
       '--rtol',
       type=float,
@@ -1249,11 +1715,15 @@ def _build_parser():
           'col1,col2,...: compare only the listed columns'))
   diff_p.add_argument(
       '--to',
+      '-o',
+      '--output-path',
       dest='sink',
       metavar='FILE',
       help='write the structured JSON reconciliation report to FILE')
   diff_p.add_argument(
       '--limit',
+      '-n',
+      dest='limit',
       default=None,
       metavar='N_OR_ALL',
       help=(
@@ -1268,18 +1738,45 @@ def _build_parser():
       metavar='SIZE',
       help='abort with exit code 8 if combined scan exceeds SIZE')
   diff_p.add_argument(
+      '--allow-unknown-options',
+      dest='allow_unknown_options',
+      action='store_true',
+      help='pass unrecognized --flags through to custom PipelineOptions')
+  diff_p.add_argument(
       '--verbose', action='store_true', help='show tracebacks for errors')
   _add_config_selection_args(diff_p)
 
   # 4. `beam inspect`
   insp = commands.add_parser(
       'inspect',
+      usage='beam inspect URI [options]',
       help='inspect schema, row count, byte size, and sample rows (<200ms)',
+      formatter_class=_CleanHelpFormatter,
       allow_abbrev=False)
-  insp.add_argument('uri', metavar='URI', help='file path, glob, or URI')
-  insp.add_argument('--format', metavar='FMT', help='explicit file format')
+  insp.add_argument(
+      'uri',
+      nargs='?',
+      default=None,
+      metavar='URI',
+      help='file path, glob, or URI')
+  insp.add_argument(
+      '--from',
+      '--source',
+      '-i',
+      dest='from_uri',
+      default=None,
+      help=argparse.SUPPRESS)
+  insp.add_argument(
+      '--format',
+      '--from-format',
+      dest='format',
+      metavar='FMT',
+      help='explicit source file format')
   insp.add_argument(
       '--sample',
+      '-n',
+      '--limit',
+      dest='sample',
       type=int,
       default=5,
       metavar='N',
@@ -1303,14 +1800,17 @@ def _build_parser():
       action='append',
       default=[],
       metavar='KEY=VAL',
-      help='source connector option (repeatable)')
-  insp.add_argument('--from-opt-file', metavar='FILE', help='options YAML/JSON')
+      help='source option or @file.yaml (repeatable)')
+  insp.add_argument('--from-opt-file', metavar='FILE', help=argparse.SUPPRESS)
   insp.add_argument('--project', metavar='PROJECT', help='default GCP project')
+  _add_config_selection_args(insp)
 
   # 5. `beam check`
   chk = commands.add_parser(
       'check',
+      usage='beam check FILE [options]',
       help='validate Beam YAML syntax/structure offline & compute plan_hash',
+      formatter_class=_CleanHelpFormatter,
       allow_abbrev=False)
   chk.add_argument(
       'file', metavar='FILE', help='Beam YAML file path or - for stdin')
@@ -1323,6 +1823,14 @@ def _build_parser():
       action='store_true',
       help='allow custom providers: code execution during --plan expansion')
   chk.add_argument(
+      '-p',
+      '--param',
+      dest='jinja_params',
+      action='append',
+      default=[],
+      metavar='KEY=VAL',
+      help='Jinja2 template variable (repeatable; e.g. -p env=prod)')
+  chk.add_argument(
       '--jinja-variables',
       metavar='JSON',
       help='JSON mapping of Jinja variables when explicitly expanding templates')
@@ -1334,6 +1842,11 @@ def _build_parser():
       help=(
           'validate that pipeline uses only cross-runner portable transforms '
           'and portable SQL dialect'))
+  chk.add_argument(
+      '--allow-unknown-options',
+      dest='allow_unknown_options',
+      action='store_true',
+      help='pass unrecognized --flags through to custom PipelineOptions')
   _add_config_selection_args(chk)
 
   # 6. `beam io`
@@ -1356,9 +1869,22 @@ def _build_parser():
   # 8. `beam tail`
   tail_p = commands.add_parser(
       'tail',
+      usage='beam tail URI [options]',
       help='non-destructively peek or follow (-f) a stream or dataset',
+      formatter_class=_CleanHelpFormatter,
       allow_abbrev=False)
-  tail_p.add_argument('uri', metavar='URI', help='stream or dataset URI')
+  tail_p.add_argument(
+      'uri',
+      nargs='?',
+      default=None,
+      metavar='URI',
+      help='stream or dataset URI')
+  tail_p.add_argument(
+      '--from',
+      '--source',
+      dest='from_uri',
+      default=None,
+      help=argparse.SUPPRESS)
   tail_p.add_argument(
       '-f',
       '--follow',
@@ -1373,6 +1899,7 @@ def _build_parser():
   tail_p.add_argument(
       '-n',
       '--limit',
+      '--sample',
       dest='limit',
       type=int,
       default=None,
@@ -1396,6 +1923,8 @@ def _build_parser():
       help='byte cap for sampled payloads (default: 64MB)')
   tail_p.add_argument(
       '--from-format',
+      '--format',
+      dest='from_format',
       metavar='FMT',
       help='source file format override (csv, json, jsonl, parquet, avro, text)'
   )
@@ -1405,8 +1934,15 @@ def _build_parser():
       action='append',
       default=[],
       metavar='KEY=VAL',
-      help='source connector option (repeatable)')
+      help='source option or @file.yaml (repeatable)')
+  tail_p.add_argument(
+      '--from-opt-file',
+      dest='from_opt_file',
+      default=None,
+      metavar='FILE',
+      help=argparse.SUPPRESS)
   tail_p.add_argument('--project', metavar='PROJECT', help='default GCP project')
+  _add_config_selection_args(tail_p)
 
   # 9. `beam wait`
   wait_p = commands.add_parser(
@@ -1426,6 +1962,7 @@ def _build_parser():
       help='seconds between status polls (default: 3.0)')
   wait_p.add_argument('--project', metavar='PROJECT', help='GCP project')
   wait_p.add_argument('--region', metavar='REGION', help='GCP region')
+  _add_config_selection_args(wait_p)
 
   # 10. `beam cancel`
   cancel_p = commands.add_parser(
@@ -1439,6 +1976,7 @@ def _build_parser():
       help='drain in-flight windows cleanly instead of immediate hard cancel')
   cancel_p.add_argument('--project', metavar='PROJECT', help='GCP project')
   cancel_p.add_argument('--region', metavar='REGION', help='GCP region')
+  _add_config_selection_args(cancel_p)
 
   # 11. `beam sql`
   sql_parser = commands.add_parser(
@@ -1522,105 +2060,121 @@ def _build_parser():
   use_p.add_argument(
       'profile_name', metavar='PROFILE', help='profile name to make active')
 
-  # 13. `beam package`
+  # 13. `beam package` — organized into 3 clean groups!
   pkg_p = commands.add_parser(
       'package',
-      help='package a .yaml or .py pipeline as a Dataflow Flex Template (<1s for YAML)',
+      usage='beam package FILE_OR_STDIN -o SPEC_URI [options]',
+      help=
+      'package a .yaml or .py pipeline as a Dataflow Flex Template (<1s for YAML)',
+      formatter_class=_CleanHelpFormatter,
       allow_abbrev=False)
   pkg_p.add_argument(
       'source',
       metavar='FILE_OR_STDIN',
       help='pipeline .yaml/.py path, gs:// URI, or - for stdin YAML')
-  pkg_p.add_argument(
+  g_pkg_spec = pkg_p.add_argument_group('template spec & image build')
+  g_pkg_spec.add_argument(
       '--to',
       '-o',
       '--output',
       dest='to_location',
       metavar='SPEC_URI',
       help='destination Flex Template spec JSON (gs://... or local path)')
-  pkg_p.add_argument('--name', metavar='NAME', help='template name')
-  pkg_p.add_argument(
+  g_pkg_spec.add_argument('--name', metavar='NAME', help='template name')
+  g_pkg_spec.add_argument(
       '--description', metavar='TEXT', help='template description')
-  pkg_p.add_argument(
+  g_pkg_spec.add_argument(
       '--sdk',
       default='auto',
       type=str.lower,
       choices=['auto', 'yaml', 'python'],
       help='Flex Template SDK mode (default: auto)')
-  pkg_p.add_argument(
+  g_pkg_spec.add_argument(
       '--image',
       metavar='IMAGE_URI',
-      help='container image URI (optional for YAML; Artifact Registry URI for Python)')
-  pkg_p.add_argument(
+      help=
+      'container image URI (optional for YAML; Artifact Registry URI for Python)'
+  )
+  g_pkg_spec.add_argument(
       '--base-image',
       default=None,
       metavar='BASE_IMAGE',
       help='launcher base image for Python templates')
-  pkg_p.add_argument(
+  g_pkg_spec.add_argument(
+      '--requirements',
+      dest='requirements_file',
+      metavar='FILE',
+      help='requirements.txt to bake into Python Flex Template image')
+  g_pkg_spec.add_argument(
+      '--output-dir',
+      metavar='DIR',
+      help=
+      'local directory to write generated Dockerfile, metadata.json, and spec')
+  g_pkg_spec.add_argument(
+      '--build-image',
+      action='store_true',
+      help='build and push Python Flex Template container via Cloud Build')
+
+  g_pkg_env = pkg_p.add_argument_group('default worker environment')
+  g_pkg_env.add_argument(
       '--region',
       default='us-central1',
       metavar='REGION',
       help='default GCP region (default: us-central1)')
-  pkg_p.add_argument('--project', metavar='PROJECT', help='GCP project')
-  pkg_p.add_argument(
+  g_pkg_env.add_argument('--project', metavar='PROJECT', help='GCP project')
+  g_pkg_env.add_argument(
       '--subnetwork', metavar='SUBNET', help='default worker GCE subnetwork')
-  pkg_p.add_argument(
+  g_pkg_env.add_argument(
       '--network', metavar='NETWORK', help='default worker GCE network')
-  pkg_p.add_argument(
+  g_pkg_env.add_argument(
       '--no-use-public-ips',
       '--no_use_public_ips',
       dest='no_use_public_ips',
       action='store_true',
       help='set WORKER_IP_PRIVATE in template defaultEnvironment')
-  pkg_p.add_argument(
+  g_pkg_env.add_argument(
       '--staging-location',
       metavar='GCS_URI',
       help='default staging location in template defaultEnvironment')
-  pkg_p.add_argument(
+  g_pkg_env.add_argument(
       '--temp-location',
       metavar='GCS_URI',
       help='default temp location in template defaultEnvironment')
-  pkg_p.add_argument(
+  g_pkg_env.add_argument(
       '--service-account-email',
       metavar='EMAIL',
       help='default worker service account email')
-  pkg_p.add_argument(
+  g_pkg_env.add_argument(
       '--worker-machine-type',
       metavar='TYPE',
       help='default worker machine type')
-  pkg_p.add_argument(
+  g_pkg_env.add_argument(
       '--max-workers', type=int, metavar='N', help='default max workers')
-  pkg_p.add_argument(
+  g_pkg_env.add_argument(
       '--num-workers', type=int, metavar='N', help='default initial workers')
-  pkg_p.add_argument(
+  g_pkg_env.add_argument(
       '--enable-streaming-engine',
       action='store_true',
       help='enable Streaming Engine in template defaultEnvironment')
-  pkg_p.add_argument(
-      '--requirements',
-      dest='requirements_file',
-      metavar='FILE',
-      help='requirements.txt to bake into Python Flex Template image')
-  pkg_p.add_argument(
-      '--output-dir',
-      metavar='DIR',
-      help='local directory to write generated Dockerfile, metadata.json, and spec')
-  pkg_p.add_argument(
-      '--build-image',
-      action='store_true',
-      help='build and push Python Flex Template container via Cloud Build')
-  pkg_p.add_argument(
+
+  g_pkg_exec = pkg_p.add_argument_group('execution & config')
+  g_pkg_exec.add_argument(
       '--dry-run',
       '--dry_run',
       dest='dry_run',
       action='store_true',
-      help='validate and preview ContainerSpec without writing files or building images')
-  _add_config_selection_args(pkg_p)
+      help=
+      'validate and preview ContainerSpec without writing files or building images'
+  )
+  _add_config_selection_args(g_pkg_exec)
 
   # 14. `beam export-schedule`
   sched_p = commands.add_parser(
       'export-schedule',
-      help='export pipeline as a Cloud Composer (Airflow) DAG or Cloud Scheduler trigger',
+      usage='beam export-schedule FILE_OR_STDIN [options]',
+      help=
+      'export pipeline as a Cloud Composer (Airflow) DAG or Cloud Scheduler trigger',
+      formatter_class=_CleanHelpFormatter,
       allow_abbrev=False)
   sched_p.add_argument(
       'source',
@@ -1679,10 +2233,14 @@ def _build_parser():
       help='VPC network for Dataflow workers')
   sched_p.add_argument(
       '--parameter',
+      '--param',
+      '-p',
       action='append',
       dest='parameters',
       metavar='KEY=VAL',
-      help='Flex Template runtime parameters (repeatable; e.g. input_path=gs://...)')
+      help=
+      'Flex Template runtime parameters (repeatable; e.g. -p input_path=gs://...)'
+  )
   sched_p.add_argument(
       '--catchup',
       action='store_true',
@@ -1705,88 +2263,158 @@ def _build_parser():
       default=5,
       metavar='MINUTES',
       help='delay in minutes between retries (default: 5)')
+  sched_p.add_argument(
+      '--verbose', action='store_true', help='show tracebacks for errors')
   _add_config_selection_args(sched_p)
 
   # 15. `beam schema`
+  def _populate_schema_sub(sp):
+    sp.add_argument(
+        'source',
+        nargs='?',
+        default=None,
+        metavar='SOURCE_URI',
+        help='source dataset URI or file path')
+    sp.add_argument(
+        'target',
+        nargs='?',
+        default=None,
+        metavar='TARGET_URI',
+        help='target dataset URI or file path')
+    sp.add_argument(
+        '--from',
+        '--source',
+        '--left',
+        '-i',
+        dest='from_uri',
+        default=None,
+        help=argparse.SUPPRESS)
+    sp.add_argument(
+        '--to',
+        '--target',
+        '--right',
+        '-o',
+        dest='to_uri',
+        default=None,
+        help=argparse.SUPPRESS)
+    sp.add_argument(
+        '--mode',
+        type=str.upper,
+        choices=['BACKWARD', 'FORWARD', 'FULL'],
+        default='BACKWARD',
+        help='schema compatibility mode (default: BACKWARD)')
+    sp.add_argument(
+        '--strict',
+        action='store_true',
+        help='reject safe type widening and extra source columns')
+    sp.add_argument(
+        '--source-format',
+        '--left-format',
+        dest='source_format',
+        metavar='FMT',
+        help='explicit source/left format')
+    sp.add_argument(
+        '--target-format',
+        '--right-format',
+        dest='target_format',
+        metavar='FMT',
+        help='explicit target/right format')
+    sp.add_argument(
+        '--source-opt',
+        '--left-opt',
+        action='append',
+        dest='source_opts',
+        metavar='KEY=VAL',
+        help='source/left option or @file.yaml (repeatable)')
+    sp.add_argument(
+        '--target-opt',
+        '--right-opt',
+        action='append',
+        dest='target_opts',
+        metavar='KEY=VAL',
+        help='target/right option or @file.yaml (repeatable)')
+    sp.add_argument(
+        '--source-opt-file',
+        '--left-opt-file',
+        dest='source_opt_file',
+        default=None,
+        help=argparse.SUPPRESS)
+    sp.add_argument(
+        '--target-opt-file',
+        '--right-opt-file',
+        dest='target_opt_file',
+        default=None,
+        help=argparse.SUPPRESS)
+    sp.add_argument(
+        '--project',
+        metavar='PROJECT',
+        help='default GCP project for BigQuery/BigLake')
+    sp.add_argument(
+        '--verbose', action='store_true', help='show tracebacks for errors')
+    _add_config_selection_args(sp)
+
   schema_p = commands.add_parser(
       'schema',
-      help='pre-flight schema contract and compatibility comparison across endpoints',
+      usage='beam schema SOURCE_URI TARGET_URI [options]',
+      help=
+      'pre-flight schema contract and compatibility comparison across endpoints',
+      formatter_class=_CleanHelpFormatter,
       allow_abbrev=False)
   schema_sub = schema_p.add_subparsers(dest='schema_action', required=False)
-
-  # `beam schema diff <source> <target>`
   schema_diff_p = schema_sub.add_parser(
       'diff',
+      usage='beam schema SOURCE_URI TARGET_URI [options]',
       help='compare source and target schemas for compatibility and drift',
+      formatter_class=_CleanHelpFormatter,
       allow_abbrev=False)
-  schema_diff_p.add_argument('source', help='source dataset URI or file path')
-  schema_diff_p.add_argument('target', help='target dataset URI or file path')
-  schema_diff_p.add_argument(
-      '--mode',
-      choices=['backward', 'forward', 'full', 'BACKWARD', 'FORWARD', 'FULL'],
-      default='BACKWARD',
-      help='schema compatibility mode (default: BACKWARD)')
-  schema_diff_p.add_argument(
-      '--strict',
-      action='store_true',
-      help='reject safe type widening and extra source columns')
-  schema_diff_p.add_argument('--source-format', help='explicit source format')
-  schema_diff_p.add_argument('--target-format', help='explicit target format')
-  schema_diff_p.add_argument(
-      '--source-opt', action='append', dest='source_opts', help='key=val option for source')
-  schema_diff_p.add_argument(
-      '--target-opt', action='append', dest='target_opts', help='key=val option for target')
-  schema_diff_p.add_argument('--project', help='default GCP project for BigQuery/BigLake')
-  _add_config_selection_args(schema_diff_p)
-
-  # `beam schema check <source> <target>` (alias for diff)
+  _populate_schema_sub(schema_diff_p)
   schema_check_p = schema_sub.add_parser(
       'check',
+      usage='beam schema check SOURCE_URI TARGET_URI [options]',
       help='alias for schema diff; validates schema contract pre-flight',
+      formatter_class=_CleanHelpFormatter,
       allow_abbrev=False)
-  schema_check_p.add_argument('source', help='source dataset URI or file path')
-  schema_check_p.add_argument('target', help='target dataset URI or file path')
-  schema_check_p.add_argument(
-      '--mode',
-      choices=['backward', 'forward', 'full', 'BACKWARD', 'FORWARD', 'FULL'],
-      default='BACKWARD',
-      help='schema compatibility mode (default: BACKWARD)')
-  schema_check_p.add_argument(
-      '--strict',
-      action='store_true',
-      help='reject safe type widening and extra source columns')
-  schema_check_p.add_argument('--source-format', help='explicit source format')
-  schema_check_p.add_argument('--target-format', help='explicit target format')
-  schema_check_p.add_argument(
-      '--source-opt', action='append', dest='source_opts', help='key=val option for source')
-  schema_check_p.add_argument(
-      '--target-opt', action='append', dest='target_opts', help='key=val option for target')
-  schema_check_p.add_argument('--project', help='default GCP project for BigQuery/BigLake')
-  _add_config_selection_args(schema_check_p)
+  _populate_schema_sub(schema_check_p)
   _add_config_selection_args(schema_p)
 
-  # 15. `beam catalog`
+  # 16. `beam catalog`
   catalog_p = commands.add_parser(
       'catalog',
+      usage='beam catalog [sync] SOURCE_URI TARGET_URI [options]',
       help='manage and synchronize Lakehouse metadata catalogs',
+      formatter_class=_CleanHelpFormatter,
       allow_abbrev=False)
   cat_sub = catalog_p.add_subparsers(dest='catalog_action', required=True)
   sync_p = cat_sub.add_parser(
       'sync',
-      help='zero-copy synchronize Lakehouse (Delta/Iceberg/Parquet) metadata to BigLake/BigQuery',
+      usage='beam catalog [sync] SOURCE_URI TARGET_URI [options]',
+      help=
+      'zero-copy synchronize Lakehouse (Delta/Iceberg/Parquet) metadata to BigLake/BigQuery',
+      formatter_class=_CleanHelpFormatter,
       allow_abbrev=False)
+  sync_p.add_argument(
+      'pos_from', nargs='?', default=None, help=argparse.SUPPRESS)
+  sync_p.add_argument('pos_to', nargs='?', default=None, help=argparse.SUPPRESS)
   sync_p.add_argument(
       '--from',
       '--source',
+      '-i',
       dest='from_uri',
-      required=True,
+      required=False,
+      default=None,
+      metavar='SOURCE',
       help='source lakehouse or parquet URI')
   sync_p.add_argument(
       '--to',
       '--target',
+      '-o',
       dest='to_uri',
-      required=True,
-      help='target catalog or table (e.g. bigquery://project.dataset.table or biglake://...)')
+      required=False,
+      default=None,
+      metavar='TARGET',
+      help=
+      'target catalog or table (e.g. bq://project.dataset.table or biglake://...)'
+  )
   sync_p.add_argument(
       '--table',
       '--table-name',
@@ -1810,6 +2438,11 @@ def _build_parser():
       default=True,
       help='use zero-copy metadata conversion (default: True)')
   sync_p.add_argument(
+      '--no-zero-copy',
+      dest='zero_copy',
+      action='store_false',
+      help='disable zero-copy metadata conversion')
+  sync_p.add_argument(
       '--dry-run',
       '--dry_run',
       dest='dry_run',
@@ -1828,6 +2461,8 @@ def _build_parser():
       default=[],
       metavar='KEY=VAL',
       help='catalog option (repeatable)')
+  sync_p.add_argument(
+      '--verbose', action='store_true', help='show tracebacks for errors')
   _add_config_selection_args(sync_p)
   _add_config_selection_args(catalog_p)
 
@@ -1865,7 +2500,7 @@ def _extract_runner_from_args(resolved_args: list[str]) -> str | None:
 
 def _config(args, extra_args, *, json_session, t0: float) -> int:
   from . import config
-  _reject_extra_args(extra_args)
+  _reject_extra_args(extra_args, subcommand='config')
   buf = io.StringIO()
   try:
     if json_session.enabled:
@@ -1929,7 +2564,7 @@ def _sql(args, sqlline_args, *, json_session, t0: float) -> int:
 
 def _io(args, extra_args, *, json_session, t0: float) -> int:
   from . import io_cmd
-  _reject_extra_args(extra_args)
+  _reject_extra_args(extra_args, subcommand='io')
   try:
     if args.io_action == 'list':
       items = io_cmd.list_connectors()
@@ -1970,7 +2605,7 @@ def _io(args, extra_args, *, json_session, t0: float) -> int:
 def _doctor(args, extra_args, *, json_session, t0: float) -> int:
   del args
   from . import doctor
-  _reject_extra_args(extra_args)
+  _reject_extra_args(extra_args, subcommand='doctor')
   report = doctor.run_doctor()
   rc = EXIT_OK if report['healthy'] else EXIT_MISSING_PACKAGE
   doc_warnings = list(report.pop('warnings', None) or [])
@@ -2008,7 +2643,17 @@ def _inspect(args, extra_args, *, json_session, t0: float) -> int:
   from . import cost_guard
   from . import inspect_cmd
   from . import uris
-  _reject_extra_args(extra_args)
+  _reject_extra_args(extra_args, subcommand='inspect')
+  if args.uri and getattr(args, 'from_uri', None):
+    raise _CliError(
+        'cannot pass both positional URI and --from URI to beam inspect',
+        EXIT_USAGE)
+  args.uri = args.uri or getattr(args, 'from_uri', None)
+  if not args.uri:
+    raise _CliError(
+        'the following arguments are required: URI (or --from URI)', EXIT_USAGE)
+  cfg_args = _resolve_config_args(args, [])
+  eff_proj = args.project or _extract_opt_from_resolved(cfg_args, '--project')
   try:
     info = inspect_cmd.run_inspect(
         args.uri,
@@ -2019,7 +2664,7 @@ def _inspect(args, extra_args, *, json_session, t0: float) -> int:
         max_scanned_bytes=args.max_scanned_bytes,
         from_opts=args.from_opts,
         from_opt_file=args.from_opt_file,
-        default_project=args.project)
+        default_project=eff_proj)
   except (uris.UriError, ValueError, FileNotFoundError) as e:
     raise _CliError(str(e), EXIT_USAGE) from None
   except ImportError as e:
@@ -2062,7 +2707,23 @@ def _inspect(args, extra_args, *, json_session, t0: float) -> int:
 
 def _tail(args, extra_args, *, json_session, t0: float) -> int:
   from . import tail
-  _reject_extra_args(extra_args)
+  from . import uris
+  _reject_extra_args(extra_args, subcommand='tail')
+  if args.uri and getattr(args, 'from_uri', None):
+    raise _CliError(
+        'cannot pass both positional URI and --from URI to beam tail',
+        EXIT_USAGE)
+  args.uri = args.uri or getattr(args, 'from_uri', None)
+  if not args.uri:
+    raise _CliError(
+        'the following arguments are required: URI (or --from URI)', EXIT_USAGE)
+  cfg_args = _resolve_config_args(args, [])
+  eff_proj = args.project or _extract_opt_from_resolved(cfg_args, '--project')
+  try:
+    merged_from_opts = _merge_opt_file_into_kv_list(
+        args.from_opts, getattr(args, 'from_opt_file', None), '--from-opt')
+  except uris.UriError as e:
+    raise _CliError(str(e), EXIT_USAGE) from None
   follow = bool(getattr(args, 'follow', False))
   eff_limit = args.limit if args.limit is not None else (None if follow else 5)
   eff_duration = (
@@ -2115,8 +2776,8 @@ def _tail(args, extra_args, *, json_session, t0: float) -> int:
         poll_interval=args.poll_interval,
         max_scanned_bytes=args.max_scanned_bytes,
         explicit_format=args.from_format,
-        from_opts=args.from_opts,
-        default_project=args.project,
+        from_opts=merged_from_opts,
+        default_project=eff_proj,
         on_record=on_record)
   except tail.TailError as e:
     raise _CliError(str(e), e.exit_code) from None
@@ -2178,7 +2839,7 @@ def _extract_opt_from_resolved(resolved: list[str], *keys: str) -> str | None:
 
 def _package(args, extra_args, *, json_session, t0: float) -> int:
   from . import package as pkg_mod
-  _reject_extra_args(extra_args)
+  _reject_extra_args(extra_args, subcommand='package')
   cfg_args = _resolve_config_args(args, [])
   eff_project = args.project or _extract_opt_from_resolved(
       cfg_args, '--project')
@@ -2271,7 +2932,7 @@ def _package(args, extra_args, *, json_session, t0: float) -> int:
 
 def _export_schedule(args, extra_args, *, json_session, t0: float) -> int:
   from . import scheduler as sched_mod
-  _reject_extra_args(extra_args)
+  _reject_extra_args(extra_args, subcommand='export-schedule')
   cfg_args = _resolve_config_args(args, [])
   eff_project = args.project or _extract_opt_from_resolved(cfg_args, '--project')
   eff_region = args.location or _extract_opt_from_resolved(cfg_args, '--region')
@@ -2331,12 +2992,13 @@ def _export_schedule(args, extra_args, *, json_session, t0: float) -> int:
 
 def _schema(args, extra_args, *, json_session, t0: float) -> int:
   from . import schema as schema_mod
-  _reject_extra_args(extra_args)
-  source = getattr(args, 'source', None)
-  target = getattr(args, 'target', None)
+  from . import uris
+  _reject_extra_args(extra_args, subcommand='schema')
+  source = getattr(args, 'source', None) or getattr(args, 'from_uri', None)
+  target = getattr(args, 'target', None) or getattr(args, 'to_uri', None)
   if not source or not target:
     raise _CliError(
-        'usage: beam schema diff <SOURCE> <TARGET> [--mode=backward|forward|full] [--strict]',
+        'usage: beam schema <SOURCE> <TARGET> [--mode=BACKWARD|FORWARD|FULL] [--strict]',
         EXIT_USAGE)
 
   cfg_args = _resolve_config_args(args, [])
@@ -2346,8 +3008,17 @@ def _schema(args, extra_args, *, json_session, t0: float) -> int:
   strict = bool(getattr(args, 'strict', False))
   source_fmt = getattr(args, 'source_format', None)
   target_fmt = getattr(args, 'target_format', None)
-  source_opts = getattr(args, 'source_opts', None)
-  target_opts = getattr(args, 'target_opts', None)
+  try:
+    source_opts = _merge_opt_file_into_kv_list(
+        getattr(args, 'source_opts', None),
+        getattr(args, 'source_opt_file', None),
+        '--source-opt')
+    target_opts = _merge_opt_file_into_kv_list(
+        getattr(args, 'target_opts', None),
+        getattr(args, 'target_opt_file', None),
+        '--target-opt')
+  except uris.UriError as e:
+    raise _CliError(str(e), EXIT_USAGE) from None
 
   try:
     res = schema_mod.run_schema_diff(
@@ -2357,8 +3028,8 @@ def _schema(args, extra_args, *, json_session, t0: float) -> int:
         strict=strict,
         source_format=source_fmt,
         target_format=target_fmt,
-        source_opts=source_opts,
-        target_opts=target_opts,
+        source_opts=source_opts or None,
+        target_opts=target_opts or None,
         default_project=eff_project)
   except ValueError as e:
     raise _CliError(str(e), EXIT_USAGE) from None
@@ -2369,6 +3040,14 @@ def _schema(args, extra_args, *, json_session, t0: float) -> int:
   exit_code = EXIT_OK if is_compat else EXIT_USAGE
 
   if json_session.enabled:
+    env_next = list(res.pop('next_actions', None) or [])
+    err_obj = None if is_compat else {
+        'type': 'SchemaContractViolationError',
+        'message': (
+            f"Schema contract check failed ({res['compatibility_mode']}) "
+            f"with {res['violation_count']} violation(s)"),
+        'needs_human': False,
+    }
     json_session.emit(
         output.build_envelope(
             ok=is_compat,
@@ -2376,7 +3055,8 @@ def _schema(args, extra_args, *, json_session, t0: float) -> int:
             exit_code=exit_code,
             duration_ms=int((time.monotonic() - t0) * 1000),
             outputs=res,
-            next_actions=res.get('next_actions') or []))
+            error=err_obj,
+            next_actions=env_next))
   else:
     status_label = 'COMPATIBLE' if is_compat else 'INCOMPATIBLE'
     print(f"Schema Contract Status: {status_label} (mode: {res['compatibility_mode']})")
@@ -2409,37 +3089,33 @@ def _catalog(
     json_session: output.JsonOutputSession,
     t0: float,
 ) -> int:
-  """Handles `beam catalog sync` execution with deterministic JSON envelopes or terminal summary.
-
-  Args:
-    args: Parsed arguments from argparse containing source, target, catalog, and flags.
-    extra_args: Unparsed trailing arguments (must be empty).
-    json_session: JSON envelope emitter session.
-    t0: Start timestamp for duration tracking.
-
-  Returns:
-    Exit code integer (0 on success).
-
-  Raises:
-    _CliError: If arguments or catalog synchronization fails.
-  """
+  """Handles `beam catalog sync` execution with deterministic JSON envelopes or terminal summary."""
   from . import lakehouse
-  _reject_extra_args(extra_args)
+  _reject_extra_args(extra_args, subcommand='catalog')
   if getattr(args, 'catalog_action', None) != 'sync':
     raise _CliError(
         f"unsupported catalog action: {getattr(args, 'catalog_action', None)!r}; supported: sync",
         EXIT_USAGE)
+  eff_from = args.from_uri or getattr(args, 'pos_from', None)
+  eff_to = args.to_uri or getattr(args, 'pos_to', None)
+  if not eff_from or not eff_to:
+    raise _CliError(
+        'the following arguments are required: SOURCE_URI TARGET_URI '
+        '(or --from SOURCE --to TARGET)',
+        EXIT_USAGE)
 
+  cfg_args = _resolve_config_args(args, [])
+  eff_proj = args.project or _extract_opt_from_resolved(cfg_args, '--project')
   try:
     res = lakehouse.sync_lakehouse_catalog(
-        args.from_uri,
-        args.to_uri,
+        eff_from,
+        eff_to,
         table=args.table,
         catalog=args.catalog,
         mode=args.mode,
         zero_copy=args.zero_copy,
         dry_run=args.dry_run,
-        default_project=args.project,
+        default_project=eff_proj,
         catalog_opts=args.catalog_opts)
   except lakehouse.LakehouseError as e:
     raise _CliError(str(e), EXIT_USAGE) from None
@@ -2471,15 +3147,23 @@ def _catalog(
 
 def _check(args, extra_args, *, json_session, t0: float) -> int:
   from . import check_cmd
-  resolved = _resolve_config_args(args, extra_args) if args.plan else extra_args
-  if not args.plan:
-    _reject_extra_args(extra_args)
+  if args.plan:
+    _validate_passthrough_extra_args(
+        extra_args,
+        subcommand='check',
+        allow_unknown=bool(getattr(args, 'allow_unknown_options', False)))
+    resolved = _resolve_config_args(args, extra_args)
+  else:
+    _reject_extra_args(extra_args, subcommand='check')
+    resolved = extra_args
+  eff_jinja_json = _merge_jinja_variables(
+      args.jinja_variables, getattr(args, 'jinja_params', None))
   try:
     report = check_cmd.run_check(
         args.file,
         expand_plan=args.plan,
         trust_providers=args.trust_providers,
-        jinja_variables_json=args.jinja_variables,
+        jinja_variables_json=eff_jinja_json,
         pipeline_args=resolved,
         portable=bool(getattr(args, 'portable', False)),
         verbose=bool(getattr(args, 'verbose', False)))
@@ -2498,7 +3182,7 @@ def _check(args, extra_args, *, json_session, t0: float) -> int:
   except Exception as e:  # pylint: disable=broad-except
     raise _CliError(f'could not validate pipeline: {e}', EXIT_USAGE) from None
 
-  check_warnings = list(report.get('warnings') or [])
+  check_warnings = list(report.pop('warnings', None) or [])
   if report.get('plan_skipped_reason'):
     check_warnings.append(report['plan_skipped_reason'])
   if json_session.enabled:
@@ -2523,19 +3207,40 @@ def _diff(args, extra_args, *, json_session, t0: float) -> int:
   from . import cost_guard
   from . import diff
   from . import uris
+  _validate_passthrough_extra_args(
+      extra_args,
+      subcommand='diff',
+      allow_unknown=bool(getattr(args, 'allow_unknown_options', False)))
+  left_uri = args.left or getattr(args, 'left_opt_uri', None)
+  right_uri = args.right or getattr(args, 'right_opt_uri', None)
+  if not right_uri and getattr(args, 'left_opt_uri', None) and args.sink:
+    # Support `beam diff --from A --to B` without clobbering B as a report file!
+    right_uri = args.sink
+    args.sink = None
+  if not left_uri or not right_uri:
+    raise _CliError(
+        'the following arguments are required: LEFT_URI RIGHT_URI '
+        '(or --left LEFT_URI --right RIGHT_URI)',
+        EXIT_USAGE)
+  args.left = left_uri
+  args.right = right_uri
   resolved_args = _maybe_stage_preview_worker_args(
       _resolve_config_args(args, extra_args))
   proj = _extract_project_from_args(resolved_args)
   diff_runner = _extract_runner_from_args(resolved_args) or 'FnApiRunner'
   try:
+    eff_left_opts = _merge_opt_file_into_kv_list(
+        args.left_opts, getattr(args, 'left_opt_file', None), '--left-opt')
+    eff_right_opts = _merge_opt_file_into_kv_list(
+        args.right_opts, getattr(args, 'right_opt_file', None), '--right-opt')
     rc, report = diff.run_diff(
         args.left,
         args.right,
         keys=args.keys,
         left_format=args.left_format,
         right_format=args.right_format,
-        left_opts=args.left_opts,
-        right_opts=args.right_opts,
+        left_opts=eff_left_opts,
+        right_opts=eff_right_opts,
         rtol=args.rtol,
         atol=args.atol,
         columns=args.columns,
@@ -2625,7 +3330,10 @@ def _diff(args, extra_args, *, json_session, t0: float) -> int:
 
 def _wait(args, extra_args, *, json_session, t0: float) -> int:
   from . import jobs
-  _reject_extra_args(extra_args)
+  _reject_extra_args(extra_args, subcommand='wait')
+  cfg_args = _resolve_config_args(args, [])
+  eff_proj = args.project or _extract_opt_from_resolved(cfg_args, '--project')
+  eff_reg = args.region or _extract_opt_from_resolved(cfg_args, '--region')
   try:
     timeout_sec = (
         jobs.parse_duration_seconds(args.timeout) if args.timeout else None)
@@ -2633,8 +3341,8 @@ def _wait(args, extra_args, *, json_session, t0: float) -> int:
         args.job_id,
         timeout_seconds=timeout_sec,
         poll_interval=args.poll_interval,
-        project=args.project,
-        region=args.region,
+        project=eff_proj,
+        region=eff_reg,
         show_progress=True)
   except (jobs.JobError, ValueError) as e:
     raise _CliError(str(e), getattr(e, 'exit_code', EXIT_USAGE)) from None
@@ -2675,13 +3383,13 @@ def _wait(args, extra_args, *, json_session, t0: float) -> int:
 
 def _cancel_cmd(args, extra_args, *, json_session, t0: float) -> int:
   from . import jobs
-  _reject_extra_args(extra_args)
+  _reject_extra_args(extra_args, subcommand='cancel')
+  cfg_args = _resolve_config_args(args, [])
+  eff_proj = args.project or _extract_opt_from_resolved(cfg_args, '--project')
+  eff_reg = args.region or _extract_opt_from_resolved(cfg_args, '--region')
   try:
     res = jobs.cancel_job(
-        args.job_id,
-        drain=args.drain,
-        project=args.project,
-        region=args.region)
+        args.job_id, drain=args.drain, project=eff_proj, region=eff_reg)
   except jobs.JobError as e:
     raise _CliError(str(e), e.exit_code) from None
   except Exception as e:  # pylint: disable=broad-except
@@ -2742,7 +3450,18 @@ def _run(args, pipeline_args, *, json_session, t0: float) -> int:
       if 'node budget' in str(e) or 'maximum' in str(e) or 'cyclic' in str(e):
         raise _CliError(str(e), EXIT_USAGE) from None
 
+  eff_jinja_json = _merge_jinja_variables(
+      getattr(args, 'jinja_variables', None),
+      getattr(args, 'jinja_params', None))
+
   if file == '-':
+    _validate_passthrough_extra_args(
+        pipeline_args,
+        subcommand='run',
+        allow_unknown=bool(getattr(args, 'allow_unknown_options', False)))
+    eff_p_args = list(pipeline_args)
+    if eff_jinja_json is not None:
+      eff_p_args.append(f'--jinja_variables={eff_jinja_json}')
     try:
       stdin_yaml = output.read_bounded_text(sys.stdin, label='stdin YAML')
     except ValueError as e:
@@ -2752,7 +3471,7 @@ def _run(args, pipeline_args, *, json_session, t0: float) -> int:
     stdin_jinja = bool(args.allow_stdin_jinja and not args.no_jinja)
     _guard_yaml_budget(stdin_yaml, jinja_active=stdin_jinja)
     resolved_args = _maybe_stage_preview_worker_args(
-        _resolve_config_args(args, pipeline_args), dry_run=bool(args.dry_run))
+        _resolve_config_args(args, eff_p_args), dry_run=bool(args.dry_run))
     if stdin_jinja:
       return _run_yaml(
           ['--yaml_pipeline=' + stdin_yaml] + resolved_args,
@@ -2778,6 +3497,14 @@ def _run(args, pipeline_args, *, json_session, t0: float) -> int:
       hint = '\n  custom pipeline options go after FILE, written as --flag=value'
     raise _CliError(f'no such file: {file!r}{hint}', EXIT_USAGE)
 
+  _validate_passthrough_extra_args(
+      pipeline_args,
+      subcommand='run',
+      allow_unknown=bool(getattr(args, 'allow_unknown_options', False)))
+  eff_p_args = list(pipeline_args)
+  if eff_jinja_json is not None:
+    eff_p_args.append(f'--jinja_variables={eff_jinja_json}')
+
   if '://' not in file:
     try:
       file_yaml = output.read_bounded_text(file, label=file)
@@ -2788,7 +3515,7 @@ def _run(args, pipeline_args, *, json_session, t0: float) -> int:
     file_yaml = None
 
   resolved_args = _maybe_stage_preview_worker_args(
-      _resolve_config_args(args, pipeline_args), dry_run=bool(args.dry_run))
+      _resolve_config_args(args, eff_p_args), dry_run=bool(args.dry_run))
   if args.no_jinja and file_yaml is not None:
     return _run_yaml(
         resolved_args,
@@ -2988,6 +3715,46 @@ def _cleanup_empty_beam_temp_dirs(prefix: str | None) -> None:
         pass
 
 
+def _resolve_sql_file_arg(args) -> None:
+  """Resolves `--sql-file FILE` or `--sql @FILE` into `args.sql` (<1 MB cap)."""
+  sql_file = getattr(args, 'sql_file', None)
+  raw_sql = getattr(args, 'sql', None)
+  if sql_file and raw_sql:
+    raise _CliError(
+        'cannot combine --sql and --sql-file; pass one or the other',
+        EXIT_USAGE)
+  target_path: str | None = None
+  if sql_file:
+    target_path = str(sql_file).strip()
+  elif isinstance(raw_sql,
+                  str) and raw_sql.startswith('@') and len(raw_sql) > 1:
+    target_path = raw_sql[1:].strip()
+  if not target_path:
+    return
+  if not os.path.isfile(target_path):
+    raise _CliError(
+        f'SQL file {target_path!r} does not exist or is not a regular file',
+        EXIT_USAGE)
+  try:
+    st_size = os.path.getsize(target_path)
+  except OSError as e:
+    raise _CliError(
+        f'cannot stat SQL file {target_path!r}: {e}', EXIT_USAGE) from None
+  if st_size > 1_048_576:
+    raise _CliError(
+        f'SQL file {target_path!r} exceeds 1 MB limit ({st_size} bytes)',
+        EXIT_USAGE)
+  try:
+    with open(target_path, encoding='utf-8') as fh:
+      loaded = fh.read().strip()
+  except OSError as e:
+    raise _CliError(
+        f'cannot read SQL file {target_path!r}: {e}', EXIT_USAGE) from None
+  if not loaded:
+    raise _CliError(f'SQL file {target_path!r} is empty', EXIT_USAGE)
+  args.sql = loaded
+
+
 def _pipe(
     args,
     pipeline_args,
@@ -2997,13 +3764,69 @@ def _pipe(
     json_session,
     t0: float,
 ) -> int:
+  cleanup_dirs: list[str] = []
+  try:
+    return _pipe_impl(
+        args,
+        pipeline_args,
+        pipe_argv,
+        raw_argv=raw_argv,
+        json_session=json_session,
+        t0=t0,
+        cleanup_dirs=cleanup_dirs)
+  finally:
+    for d in cleanup_dirs:
+      shutil.rmtree(d, ignore_errors=True)
+
+
+def _pipe_impl(
+    args,
+    pipeline_args,
+    pipe_argv,
+    *,
+    raw_argv: list[str],
+    json_session,
+    t0: float,
+    cleanup_dirs: list[str],
+) -> int:
   """Runs `beam pipe`; `pipe_argv` is its command line, for `--dry-run`."""
+  _resolve_sql_file_arg(args)
+  pos_src = getattr(args, 'pos_source', None)
+  pos_snk = getattr(args, 'pos_sink', None)
+  if args.sources:
+    if pos_src is not None:
+      hint = '' if args.sink else f' (did you mean --to {pos_src!r}?)'
+      raise _CliError(
+          f'unexpected positional argument {pos_src!r} for beam pipe{hint}',
+          EXIT_USAGE)
+  elif pos_src is not None:
+    args.sources = [pos_src]
+    if pos_snk is not None:
+      if args.sink is not None:
+        raise _CliError(
+            f'unexpected positional argument {pos_snk!r} alongside --to '
+            f'{args.sink!r}',
+            EXIT_USAGE)
+      args.sink = pos_snk
+  else:
+    raise _CliError(
+        'the following arguments are required: --from/--source/-i '
+        '(or positional SOURCE)',
+        EXIT_USAGE)
+
   if args.sink == '-':
     raise _CliError(
-        '--to - (standard output) is not supported: write to a file instead '
-        '(for example --to out.jsonl) and preview it with beam inspect '
-        'out.jsonl --sample 20; with --sql, omit --to to print the result '
-        'rows', EXIT_USAGE)
+        '--to - (standard output) is not supported: simply omit --to to '
+        'preview result rows on stdout (or in untrusted_data.rows with --json), '
+        'or write to a file such as --to out.jsonl',
+        EXIT_USAGE)
+  _validate_passthrough_extra_args(
+      pipeline_args,
+      subcommand='pipe',
+      allow_unknown=bool(getattr(args, 'allow_unknown_options', False)))
+  if getattr(args, 'limit', None) is not None and int(args.limit) < 0:
+    raise _CliError(
+        f'--limit must be an integer >= 0, got {args.limit!r}', EXIT_USAGE)
   from . import cost_guard
   from . import jobs
   from . import pipe_spec
@@ -3022,10 +3845,16 @@ def _pipe(
   is_local_runner = _runner_name(explicit_runner) in _LOCAL_RUNNERS
 
   if getattr(args, 'primary_keys', None) and not args.cdc:
-    if (getattr(args, 'interval_join', None) or
-        getattr(args, 'asof_join', None) or getattr(args, 'pattern', None) or
-        getattr(args, 'dedupe_by', None) or
-        getattr(args, 'enrich_specs', None)):
+    if getattr(args, 'verify', False) or getattr(args, 'zero_copy', False):
+      # `--verify --key id` (or `--zero-copy --verify --key id`) reconciles by
+      # primary key without implicitly turning non-CDC data into a CDC stream!
+      args.verify_keys = list(getattr(args, 'verify_keys', None) or []) + list(
+          args.primary_keys)
+      args.primary_keys = []
+    elif (getattr(args, 'interval_join', None) or
+          getattr(args, 'asof_join', None) or getattr(args, 'pattern', None) or
+          getattr(args, 'dedupe_by', None) or
+          getattr(args, 'enrich_specs', None)):
       raise _CliError(
           '--key / --primary-key enables --cdc mode and cannot be implicitly '
           'combined with --interval-join, --asof-join, --pattern, --dedupe-by, '
@@ -3033,7 +3862,11 @@ def _pipe(
           '--pattern/--enrich or --dedupe-by COL (or pass --cdc explicitly if '
           'CDC is intended)',
           EXIT_USAGE)
-    args.cdc = True
+    else:
+      args.cdc = True
+  if args.cdc and getattr(args, 'verify', False) and not getattr(
+      args, 'verify_keys', None) and getattr(args, 'primary_keys', None):
+    args.verify_keys = list(args.primary_keys)
 
   if getattr(args, 'drop_bad', False):
     if getattr(args, 'on_violation',
@@ -3145,6 +3978,10 @@ def _pipe(
           '--select, --cdc, --dedupe-by, or --zero-copy; '
           'express filters and projections inside --sql (or omit --sql)',
           EXIT_USAGE)
+    if getattr(args, 'limit', None) is not None:
+      base_q = args.sql.strip().rstrip(';').strip()
+      args.sql = f'SELECT * FROM ({base_q}) AS _beam_lim LIMIT {int(args.limit)}'
+      args.limit = None
     try:
       parsed_from_opts = uris.parse_kv_options(
           args.from_opts, args.from_opt_file, '--from-opt')
@@ -3515,8 +4352,25 @@ def _pipe(
           print(json.dumps(r, default=str))
     return EXIT_OK
 
+  ephemeral_sink_dir: str | None = None
+  ephemeral_preview = False
   if not args.sink:
-    raise _CliError('the following arguments are required: --to', EXIT_USAGE)
+    if args.dry_run:
+      raise _CliError(
+          '--dry-run / --emit-yaml requires --to <SINK> '
+          '(or omit --dry-run to preview rows locally)',
+          EXIT_USAGE)
+    if args.zero_copy:
+      raise _CliError('--zero-copy requires --to <ICEBERG_URI>', EXIT_USAGE)
+    if not is_local_runner:
+      raise _CliError(
+          'the following arguments are required: --to '
+          '(sinkless preview is supported on local runs only)',
+          EXIT_USAGE)
+    ephemeral_sink_dir = tempfile.mkdtemp(prefix='.beam_preview_')
+    cleanup_dirs.append(ephemeral_sink_dir)
+    args.sink = os.path.join(ephemeral_sink_dir, 'preview.jsonl')
+    ephemeral_preview = True
 
   raw_left_source = raw_sources[0]
   source_uri = raw_left_source
@@ -3560,6 +4414,28 @@ def _pipe(
       args.from_format or args.format or args.cdc or has_interval_join_flag)
                   else uris_mod.local_format_groups(source_uri))
   mixed_from_format = next(iter(mixed_groups), None)
+
+  known_src_cols: set[str] | None = None
+  if ((args.where or getattr(args, 'pre_select', None) or args.select) and
+      not args.cdc and not has_interval_join_flag and not mixed_groups and
+      '://' not in source_uri and '{{' not in source_uri):
+    try:
+      from . import inspect_cmd as _insp_pre
+      pre_info = _insp_pre.run_inspect(
+          source_uri,
+          explicit_format=args.from_format or args.format,
+          sample_count=0,
+          from_opts=args.from_opts,
+          from_opt_file=args.from_opt_file,
+          default_project=default_proj)
+      if pre_info.get('format') in ('csv', 'parquet',
+                                    'avro') and pre_info.get('schema'):
+        known_src_cols = {
+            str(c['name'])
+            for c in pre_info['schema'] if c.get('name')
+        } or None
+    except Exception:  # pylint: disable=broad-except
+      known_src_cols = None
 
   try:
     pipe = pipe_spec.build_pipe_spec(
@@ -3621,7 +4497,9 @@ def _pipe(
         late_action=getattr(args, 'late_action', None),
         late_data_dlq=getattr(args, 'late_data_dlq', None),
         emit_pane_info=bool(getattr(args, 'emit_pane_info', False)),
-        dlq_redact_fields=getattr(args, 'dlq_redact_fields', None))
+        dlq_redact_fields=getattr(args, 'dlq_redact_fields', None),
+        known_source_columns=known_src_cols,
+        limit=getattr(args, 'limit', None))
   except pipe_spec.PipeSpecError as e:
     raise _CliError(str(e), EXIT_USAGE) from None
 
@@ -3688,7 +4566,12 @@ def _pipe(
         '--wait-timeout <DURATION> for a bounded local run, use `beam tail` '
         'for a non-destructive stream peek, or specify a remote runner '
         '(--runner=DataflowRunner)',
-        EXIT_USAGE)
+        EXIT_USAGE,
+        next_actions=[{
+            'command': f'beam tail {source_uri} --json',
+            'description': 'Non-destructively peek sample records from the stream.',
+            'requires_human': False,
+        }])
   if args.assert_counts and pipe.is_unbounded and not args.dry_run:
     raise _CliError(
         '--assert-counts requires a bounded source; unbounded streaming '
@@ -3842,7 +4725,8 @@ def _pipe(
         args,
         json_session=json_session,
         t0=t0,
-        mixed_groups=mixed_groups)
+        mixed_groups=mixed_groups,
+        ephemeral_preview=ephemeral_preview)
     if fast_rc is not None:
       return fast_rc
 
@@ -4027,7 +4911,7 @@ def _pipe(
         dry_run_yaml=pipe_spec.to_yaml(pipe.spec, pipe_argv)
         if args.dry_run else None,
         output_prefix=sink_stage_prefix or orig_out_prefix,
-        destination=args.sink,
+        destination=None if ephemeral_preview else args.sink,
         replace_commit_target=orig_out_prefix if sink_stage_prefix else None,
         if_exists=args.if_exists,
         dlq_prefix=dlq_stage_prefix or orig_dlq_prefix,
@@ -4039,6 +4923,8 @@ def _pipe(
         post_checks=post_checks,
         explicit_sharding=explicit_sharding,
         extra_warnings=extra_warnings,
+        ephemeral_preview=ephemeral_preview,
+        preview_rows=bool(getattr(args, 'preview', False)),
         json_session=json_session,
         t0=t0)
     if (rc_out == EXIT_OK and secondary_late_dlq_prefix and is_local_runner and
@@ -4156,8 +5042,53 @@ def _split_null_values(raw: str | None) -> list[str] | None:
   return [v.strip() for v in raw.split(',') if v.strip()]
 
 
+def _read_local_preview_rows(
+    files: Iterable[str],
+    limit: int = 500) -> tuple[list[dict[str, Any]], bool]:
+  """Reads up to `limit` local output rows for sinkless preview or `--preview`."""
+  rows: list[dict[str, Any]] = []
+  truncated = False
+  for path in files:
+    if not path or '://' in path or not os.path.isfile(path):
+      continue
+    if path.lower().endswith(('.jsonl', '.ndjson')):
+      with open(path, encoding='utf-8') as fh:
+        for line in fh:
+          line = line.strip()
+          if not line:
+            continue
+          if len(rows) >= limit:
+            truncated = True
+            break
+          rows.append(json.loads(line))
+    else:
+      try:
+        from . import inspect_cmd
+        rem = limit - len(rows) + 1
+        info = inspect_cmd.run_inspect(path, sample_count=max(rem, 1))
+        batch = list((info.get('untrusted_data') or {}).get('rows') or [])
+        if len(rows) + len(batch) > limit:
+          rows.extend(batch[:limit - len(rows)])
+          truncated = True
+        else:
+          rows.extend(batch)
+      except Exception:  # pylint: disable=broad-except
+        pass
+    if truncated:
+      break
+  return rows, truncated
+
+
 def _run_fast_local_pipe(
-    pipe, files, args, *, json_session, t0, mixed_groups=None) -> int | None:
+    pipe,
+    files,
+    args,
+    *,
+    json_session,
+    t0,
+    mixed_groups=None,
+    ephemeral_preview: bool = False,
+) -> int | None:
   """Runs a qualifying `beam pipe` in-process; None falls back to Beam."""
   from . import fast_local
   canonical_spec = json.dumps(pipe.spec, sort_keys=True, separators=(',', ':'))
@@ -4184,28 +5115,36 @@ def _run_fast_local_pipe(
     raise _CliError(
         f'pipeline failed: {_summarize(e)}', EXIT_PIPELINE_FAILED) from None
 
-  if args.if_exists == 'replace':
+  if args.if_exists == 'replace' and not ephemeral_preview:
     # The inputs were read before the new output replaced the old one.
     _remove_existing_output_for_replace(pipe.output_prefix, keep=res.files)
 
   # Same housekeeping as the runner path: drop empty `.temp*` dirs left by
   # earlier Beam runs next to the outputs.
-  for prefix in (pipe.output_prefix,
-                 pipe.dlq_endpoint.output_prefix if pipe.dlq_endpoint else None):
-    if prefix:
-      _cleanup_empty_beam_temp_dirs(prefix)
+  if not ephemeral_preview:
+    for prefix in (pipe.output_prefix,
+                   pipe.dlq_endpoint.output_prefix
+                   if pipe.dlq_endpoint else None):
+      if prefix:
+        _cleanup_empty_beam_temp_dirs(prefix)
+
+  want_rows = bool(ephemeral_preview or getattr(args, 'preview', False))
+  preview_rows_data, preview_trunc = (
+      _read_local_preview_rows(res.files) if want_rows else ([], False))
 
   has_key_opt = bool(
       pipe.sink_endpoint is not None and
       'key' in (pipe.sink_endpoint.config or {}))
+  shown_files = [] if ephemeral_preview else res.files
   outputs: dict[str, Any] = {
-      'files': res.files,
-      'file_count': len(res.files),
+      'files': shown_files,
+      'file_count': len(shown_files),
       'plan_hash': plan_hash,
       'portable_to_runner': bool(not mixed_groups and not has_key_opt),
   }
   if pipe.dlq_endpoint is not None:
     outputs['dlq_files'] = res.dlq_files
+  dur_ms = int((time.monotonic() - t0) * 1000)
   if json_session.enabled:
     json_session.emit(
         output.build_envelope(
@@ -4214,20 +5153,29 @@ def _run_fast_local_pipe(
             exit_code=EXIT_OK,
             runner=fast_local.RUNNER_NAME,
             state='DONE',
-            duration_ms=int((time.monotonic() - t0) * 1000),
+            duration_ms=dur_ms,
             metrics=res.metrics,
             outputs=outputs,
-            warnings=list(res.warnings)))
+            warnings=list(res.warnings),
+            untrusted_data=output.wrap_untrusted_rows(
+                preview_rows_data, truncated=preview_trunc)
+            if want_rows else None))
   else:
     for warning in res.warnings:
       print(f'warning: {warning}', file=sys.stderr)
-    print(
-        'Done. Ran locally in-process (small local job; set '
-        f'{fast_local.DISABLE_ENV_VAR}=1 or pass --runner to use a Beam '
-        'runner).')
-    print(f'Wrote {len(res.files)} file{"" if len(res.files) == 1 else "s"}:')
-    for path in res.files:
-      print('  ' + path)
+    if ephemeral_preview:
+      for r in preview_rows_data:
+        print(json.dumps(r, default=str))
+    else:
+      m = res.metrics
+      print(
+          f"Done in {dur_ms}ms (read={m.get('rows_read', 0)}, "
+          f"written={m.get('rows_written', 0)}, "
+          f"filtered={m.get('rows_filtered_out', 0)}, "
+          f"dlq={m.get('dlq_rows', 0)}).")
+      print(f'Wrote {len(res.files)} file{"" if len(res.files) == 1 else "s"}:')
+      for path in res.files:
+        print('  ' + path)
   return EXIT_OK
 
 
@@ -4272,6 +5220,8 @@ def _run_yaml(
     post_checks: dict[str, Any] | None = None,
     explicit_sharding: bool = False,
     extra_warnings: list[str] | None = None,
+    ephemeral_preview: bool = False,
+    preview_rows: bool = False,
     json_session=None,
     t0: float = 0.0,
 ) -> int:
@@ -4710,10 +5660,18 @@ def _run_yaml(
           remove_stale_replace=True)
       outputs_dict['files'] = written
       outputs_dict['file_count'] = len(written)
-    if is_local and local_paths:
+    if is_local and local_paths and not ephemeral_preview:
       for lp in local_paths:
         _cleanup_empty_beam_temp_dirs(lp)
 
+    want_preview = bool(is_local and (ephemeral_preview or preview_rows))
+    yaml_preview_rows, yaml_preview_trunc = (
+        _read_local_preview_rows(written) if want_preview else ([], False))
+    if ephemeral_preview:
+      outputs_dict['files'] = []
+      outputs_dict['file_count'] = 0
+
+    dur_ms = int((time.monotonic() - t0) * 1000)
     if json_session is not None and json_session.enabled:
       json_session.emit(
           output.build_envelope(
@@ -4723,10 +5681,16 @@ def _run_yaml(
               runner=_describe_runner(options, result),
               job_id=job_id,
               state=str(state),
-              duration_ms=int((time.monotonic() - t0) * 1000),
+              duration_ms=dur_ms,
               metrics=row_metrics,
               outputs=outputs_dict,
-              warnings=warnings_list))
+              warnings=warnings_list,
+              untrusted_data=output.wrap_untrusted_rows(
+                  yaml_preview_rows, truncated=yaml_preview_trunc)
+              if want_preview else None))
+    elif ephemeral_preview:
+      for r in yaml_preview_rows:
+        print(json.dumps(r, default=str))
     else:
       print(f'Done. Ran {_describe_runner(options, result)}.')
       if output_prefix is not None:
@@ -4949,7 +5913,14 @@ def _format_existing_output_error(prefix, existing):
       f'data:\n{shown}{more}\n'
       '  remove these files, choose another --to path, or pass '
       '--if-exists=replace',
-      EXIT_USAGE)
+      EXIT_USAGE,
+      next_actions=[{
+          'command': '--if-exists=replace',
+          'description': (
+              f'Re-run with --if-exists=replace to atomically overwrite '
+              f'{prefix!r} (or --if-exists=append to append).'),
+          'requires_human': True,
+      }])
 
 
 def _refuse_existing_local_output(prefix):

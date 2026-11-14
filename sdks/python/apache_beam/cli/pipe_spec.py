@@ -82,35 +82,9 @@ _AGG_CALL_RE = re.compile(
 
 
 def _split_window_tokens(s: str) -> list[str]:
-  """Splits window specification tokens by commas outside nested delimiters.
-
-  Respects grouping delimiters `()`, `[]`, and `{}` so that embedded lists
-  (e.g. `group_by=[region, dept]`) or composite arguments (e.g. `sum(metric)`)
-  are not prematurely split across commas.
-  """
-  tokens: list[str] = []
-  cur: list[str] = []
-  depth = 0
-  for ch in s:
-    if ch in '([{':
-      depth += 1
-      cur.append(ch)
-    elif ch in ')]}':
-      if depth > 0:
-        depth -= 1
-      cur.append(ch)
-    elif ch == ',' and depth == 0:
-      tok = ''.join(cur).strip()
-      if tok:
-        tokens.append(tok)
-      cur = []
-    else:
-      cur.append(ch)
-  if cur:
-    tok = ''.join(cur).strip()
-    if tok:
-      tokens.append(tok)
-  return tokens
+  """Splits window specification tokens by commas outside brackets and quotes."""
+  from . import interval_join as ij_mod
+  return ij_mod.split_bracket_tokens(s)
 
 
 def _parse_inline_aggregations(
@@ -262,21 +236,9 @@ def parse_window_spec(spec: str | dict[str, Any]) -> dict[str, Any]:
     except Exception as e:
       raise PipeSpecError(f'malformed JSON in --window: {e}') from None
 
-  if '=' in s and ':' not in s.split('=', 1)[0] and not _AGG_CALL_RE.search(s):
-    parts = [p.strip() for p in s.split(',') if p.strip()]
-    kv: dict[str, Any] = {}
-    for p in parts:
-      if '=' in p:
-        k, v = p.split('=', 1)
-        kv[k.strip().lower()] = v.strip()
-    if 'type' in kv:
-      if kv['type'] == 'session':
-        kv['type'] = 'sessions'
-      return kv
-
   prefix = ''
   rest = s
-  if ':' in s:
+  if ':' in s and '=' not in s.split(':', 1)[0]:
     cand_prefix, cand_rest = s.split(':', 1)
     if cand_prefix.lower() in ('fixed', 'sliding', 'session', 'sessions', 'global'):
       prefix = cand_prefix.lower()
@@ -285,28 +247,51 @@ def parse_window_spec(spec: str | dict[str, Any]) -> dict[str, Any]:
   tokens = _split_window_tokens(rest)
   combines, group_by, rem_tokens = _parse_inline_aggregations(tokens)
 
+  kv_tokens: dict[str, str] = {}
+  pos_tokens: list[str] = []
+  for rt in rem_tokens:
+    if '=' in rt:
+      rk, rv = rt.split('=', 1)
+      kv_tokens[rk.strip().lower()] = rv.strip()
+    else:
+      pos_tokens.append(rt)
+
   if not prefix:
-    prefix = 'fixed'
+    prefix = kv_tokens.pop('type', 'fixed').lower()
+  else:
+    kv_tokens.pop('type', None)
 
   if prefix == 'fixed':
-    if not rem_tokens:
+    size_val = kv_tokens.pop('size',
+                             None) or (pos_tokens[0] if pos_tokens else None)
+    if not size_val:
       raise PipeSpecError(
           f"invalid fixed window specification {s!r}; expected fixed:DURATION (e.g. 'fixed:60s')")
-    out: dict[str, Any] = {'type': 'fixed', 'size': rem_tokens[0]}
-    if len(rem_tokens) > 1:
-      out['offset'] = rem_tokens[1]
+    out: dict[str, Any] = {'type': 'fixed', 'size': size_val}
+    off_val = kv_tokens.pop(
+        'offset', None) or (pos_tokens[1] if len(pos_tokens) > 1 else None)
+    if off_val is not None:
+      out['offset'] = off_val
   elif prefix == 'sliding':
-    if len(rem_tokens) < 2:
+    size_val = kv_tokens.pop('size',
+                             None) or (pos_tokens[0] if pos_tokens else None)
+    period_val = kv_tokens.pop(
+        'period', None) or (pos_tokens[1] if len(pos_tokens) > 1 else None)
+    if not size_val or not period_val:
       raise PipeSpecError(
           f"invalid sliding window specification {s!r}; expected sliding:SIZE,PERIOD (e.g. 'sliding:5m,1m')")
-    out = {'type': 'sliding', 'size': rem_tokens[0], 'period': rem_tokens[1]}
-    if len(rem_tokens) > 2:
-      out['offset'] = rem_tokens[2]
+    out = {'type': 'sliding', 'size': size_val, 'period': period_val}
+    off_val = kv_tokens.pop(
+        'offset', None) or (pos_tokens[2] if len(pos_tokens) > 2 else None)
+    if off_val is not None:
+      out['offset'] = off_val
   elif prefix in ('session', 'sessions'):
-    if not rem_tokens:
+    gap_val = kv_tokens.pop('gap',
+                            None) or (pos_tokens[0] if pos_tokens else None)
+    if not gap_val:
       raise PipeSpecError(
           f"invalid session window specification {s!r}; expected session:GAP (e.g. 'session:30m')")
-    out = {'type': 'sessions', 'gap': rem_tokens[0]}
+    out = {'type': 'sessions', 'gap': gap_val}
   elif prefix == 'global':
     out = {'type': 'global'}
   else:
@@ -314,6 +299,7 @@ def parse_window_spec(spec: str | dict[str, Any]) -> dict[str, Any]:
         f"unknown window type in --window {s!r}; expected fixed:DURATION, "
         "sliding:SIZE,PERIOD, or session:GAP")
 
+  out.update(kv_tokens)
   if combines:
     out['aggregations'] = {'group_by': group_by, 'combine': combines}
   return out
@@ -391,8 +377,13 @@ def build_pipe_spec(
     emit_pane_info: bool = False,
     watermark_lag: str | None = None,
     dlq_redact_fields: Iterable[str] | str | None = None,
+    limit: int | None = None,
 ) -> PipeSpec:
   """Returns the `PipeSpec` for `beam pipe`."""
+  if limit is not None:
+    if isinstance(limit, bool) or int(limit) < 0:
+      raise PipeSpecError(f'--limit must be an integer >= 0, got {limit!r}')
+    limit = int(limit)
   if if_exists not in ('fail', 'append', 'replace'):
     raise PipeSpecError(
         f'invalid --if-exists mode {if_exists!r}; use fail, append, or replace')
@@ -663,14 +654,21 @@ def build_pipe_spec(
         (dlq_ep is not None and max_watermark_skew is not None) else None)
     try:
       if isinstance(interval_join, str):
+        ij_str = interval_join
+        if clean_timestamp_col and not re.search(
+            r'\b(?:left_|right_)?time(?:stamp)?(?:_col)?\s*=', ij_str, re.I):
+          ij_str = f'{ij_str},timestamp={clean_timestamp_col}'
         interval_join_cfg = ij_mod.parse_interval_join_spec_str(
-            interval_join,
+            ij_str,
             max_watermark_skew=max_watermark_skew,
             skew_action=eff_skew_act,
             left_alias=left_alias_hint,
             right_alias=right_alias_hint)
       elif isinstance(interval_join, dict):
         interval_join_cfg = dict(interval_join)
+        if clean_timestamp_col and not any(k in interval_join_cfg for k in (
+            'time', 'timestamp', 'timestamp_col', 'left_time', 'right_time')):
+          interval_join_cfg['timestamp'] = clean_timestamp_col
         if left_alias_hint and 'left_alias' not in interval_join_cfg:
           interval_join_cfg['left_alias'] = left_alias_hint
         if right_alias_hint and 'right_alias' not in interval_join_cfg:
@@ -700,8 +698,12 @@ def build_pipe_spec(
     eff_asof_lateness = allowed_lateness if window is None else None
     try:
       if isinstance(asof_join, str):
+        aj_str = asof_join
+        if clean_timestamp_col and not re.search(
+            r'\b(?:left_|right_)?time(?:stamp)?(?:_col)?\s*=', aj_str, re.I):
+          aj_str = f'{aj_str},timestamp={clean_timestamp_col}'
         asof_join_cfg = aj_mod.parse_asof_join_spec_str(
-            asof_join,
+            aj_str,
             max_watermark_skew=max_watermark_skew,
             skew_action=eff_skew_act,
             left_alias=left_alias_hint,
@@ -709,6 +711,9 @@ def build_pipe_spec(
             allowed_lateness=eff_asof_lateness)
       elif isinstance(asof_join, dict):
         asof_join_cfg = dict(asof_join)
+        if clean_timestamp_col and not any(k in asof_join_cfg for k in (
+            'time', 'timestamp', 'timestamp_col', 'left_time', 'right_time')):
+          asof_join_cfg['timestamp'] = clean_timestamp_col
         if left_alias_hint and 'left_alias' not in asof_join_cfg:
           asof_join_cfg['left_alias'] = left_alias_hint
         if right_alias_hint and 'right_alias' not in asof_join_cfg:
@@ -875,10 +880,15 @@ def build_pipe_spec(
   else:
     raw_infer_items = list(infer)
 
+  infer_fields_list: list[str] = ([] if infer_fields is None else (
+      [infer_fields] if isinstance(infer_fields, str) else list(infer_fields)))
+  infer_tags_list: list[str] = ([] if infer_tag is None else (
+      [infer_tag] if isinstance(infer_tag, str) else list(infer_tag)))
+
   infer_yaml_cfgs: list[dict[str, Any]] = []
   if not raw_infer_items:
-    if (infer_opts or infer_opt_file or infer_fields is not None or
-        infer_tag is not None or infer_flatten):
+    if (infer_opts or infer_opt_file or infer_fields_list or infer_tags_list or
+        infer_flatten):
       raise PipeSpecError(
           '--infer-opt / --infer-opt-file / --infer-fields / --infer-tag / '
           '--infer-flatten requires --infer <SPEC>')
@@ -893,23 +903,36 @@ def build_pipe_spec(
       parsed_infer_opts.setdefault('dlq_redact_fields', list(parsed_dlq_redact))
     single_infer = len(raw_infer_items) == 1
     seen_infer_tags: set[str] = set()
-    for i_item in raw_infer_items:
+    for idx_inf, i_item in enumerate(raw_infer_items):
+      stage_fields = (
+          infer_fields_list[idx_inf] if idx_inf < len(infer_fields_list) else
+          (infer_fields_list[0] if len(infer_fields_list) == 1 else None))
+      stage_tag = (
+          infer_tags_list[idx_inf] if idx_inf < len(infer_tags_list) else None)
+      has_explicit_tag = stage_tag is not None or (
+          isinstance(i_item, str) and
+          bool(re.search(r'\b(?:inference_)?tag\s*=', i_item, re.I))) or (
+              isinstance(i_item, dict) and
+              ('tag' in i_item or 'inference_tag' in i_item))
+      if (not has_explicit_tag and not single_infer and idx_inf > 0 and
+          'tag' not in parsed_infer_opts):
+        stage_tag = f'prediction_{idx_inf + 1}'
       try:
         if isinstance(i_item, str):
           i_yaml = infer_mod.parse_infer_spec_str(
               i_item,
               extra_opts=parsed_infer_opts,
-              infer_fields=infer_fields,
-              infer_tag=infer_tag,
+              infer_fields=stage_fields,
+              infer_tag=stage_tag,
               infer_flatten=infer_flatten,
               default_project=default_project,
               single_stage=single_infer)
         elif isinstance(i_item, dict):
           merged_icfg = {**parsed_infer_opts, **i_item}
-          if infer_fields is not None:
-            merged_icfg.setdefault('fields', infer_fields)
-          if infer_tag is not None:
-            merged_icfg.setdefault('tag', infer_tag)
+          if stage_fields is not None:
+            merged_icfg.setdefault('fields', stage_fields)
+          if stage_tag is not None:
+            merged_icfg.setdefault('tag', stage_tag)
           if infer_flatten:
             merged_icfg.setdefault('flatten', True)
           i_yaml = infer_mod.infer_config_to_yaml_dict(
@@ -1546,6 +1569,18 @@ def build_pipe_spec(
               ],
           },
       })
+    if limit is not None:
+      if is_unbounded and window_spec is None:
+        raise PipeSpecError(
+            '--limit on an unbounded stream requires --window <SPEC> '
+            '(or use beam tail -n N to sample live messages)')
+      needs_cli_provider = True
+      chain_steps.append({
+          'type': 'CliLimitRows',
+          'config': {
+              'limit': limit,
+          },
+      })
     if inject_counters:
       chain_steps.append({
           'type': 'CliCountRows',
@@ -2137,6 +2172,24 @@ def build_pipe_spec(
       current_ref = 'ValidateExpect.good'
     else:
       current_ref = 'ValidateExpect'
+
+  if limit is not None:
+    if is_unbounded and window_spec is None:
+      raise PipeSpecError(
+          '--limit on an unbounded stream requires --window <SPEC> '
+          '(or use beam tail -n N to sample live messages)')
+    if zero_copy:
+      raise PipeSpecError('--limit cannot be combined with --zero-copy')
+    needs_cli_provider = True
+    dag_transforms.append({
+        'name': 'LimitRows',
+        'type': 'CliLimitRows',
+        'input': current_ref,
+        'config': {
+            'limit': limit,
+        },
+    })
+    current_ref = 'LimitRows'
 
   if inject_counters:
     dag_transforms.append({

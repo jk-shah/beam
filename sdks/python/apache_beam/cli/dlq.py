@@ -371,6 +371,7 @@ def cli_yaml_provider_spec() -> dict[str, Any]:
           'AsofJoin': 'apache_beam.cli.asof_join.cli_asof_join',
           'CliPatternMatch': 'apache_beam.cli.cep.cli_pattern_match',
           'PatternMatch': 'apache_beam.cli.cep.cli_pattern_match',
+          'CliLimitRows': 'apache_beam.cli.dlq.cli_limit_rows',
       },
   }
 
@@ -1485,6 +1486,55 @@ def cli_count_rows(counter: str = 'rows_read'):
           _CountDoFn()).with_output_types(elem_type)
 
   return _CliCountRowsTransform()
+
+
+def cli_limit_rows(limit: int):
+  """Caps output at `limit` rows per window while tracking `stage_dropped_rows`."""
+  import apache_beam as beam
+  from apache_beam.metrics import Metrics
+
+  n = int(limit)
+  if isinstance(limit, bool) or n < 0:
+    raise ValueError(
+        f'CliLimitRows limit must be an integer >= 0, got {limit!r}')
+
+  class _LimitCombineFn(beam.CombineFn):
+    def create_accumulator(self):
+      return (0, [])
+
+    def add_input(self, acc, element):
+      cnt, kept = acc
+      new_kept = kept if len(kept) >= n else kept + [element]
+      return (cnt + 1, new_kept)
+
+    def merge_accumulators(self, accumulators):
+      total_cnt = 0
+      merged_kept = []
+      for cnt, kept in accumulators:
+        total_cnt += cnt
+        if len(merged_kept) < n and kept:
+          need = n - len(merged_kept)
+          merged_kept.extend(kept[:need])
+      return (total_cnt, merged_kept)
+
+    def extract_output(self, acc):
+      cnt, kept = acc
+      dropped = max(0, cnt - len(kept))
+      if dropped:
+        Metrics.counter('beam_cli', 'stage_dropped_rows').inc(dropped)
+      return kept
+
+  class _CliLimitRowsTransform(beam.PTransform):
+    def expand(self, pcoll):
+      elem_type = pcoll.element_type
+      return (
+          pcoll
+          | 'CombineLimit' >> beam.CombineGlobally(
+              _LimitCombineFn()).without_defaults()
+          | 'UnpackLimit' >>
+          beam.FlatMap(lambda items: items).with_output_types(elem_type))
+
+  return _CliLimitRowsTransform()
 
 
 def _beam_row_type_to_bq_schema_dict(element_type) -> dict[str, Any]:

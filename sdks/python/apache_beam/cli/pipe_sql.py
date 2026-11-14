@@ -1885,6 +1885,16 @@ def _normalize_sqlite_param(v: Any) -> Any:
 
 def _register_scalar_functions(conn: sqlite3.Connection) -> None:
   conn.create_function(
+      'LEN',
+      1,
+      lambda x: None if x is None else len(str(x)),
+      deterministic=True)
+  conn.create_function(
+      'STRIP',
+      1,
+      lambda x: None if x is None else str(x).strip(),
+      deterministic=True)
+  conn.create_function(
       'CONCAT',
       -1,
       lambda *args: ''.join('' if a is None else str(a) for a in args),

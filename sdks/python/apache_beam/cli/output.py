@@ -180,7 +180,9 @@ def _keep_quoted(literal: str) -> bool:
       '/' in literal and not literal.startswith('/') and
       not re.search(r'[A-Za-z0-9+/]{40,}', literal)):
     return True  # A step label such as ReadCsvWithDlq/ParseShards/ParDo(...)
-  if re.fullmatch(r'(gs|s3|azfs|hdfs|file)://[^\s@?#]+', literal):
+  if re.fullmatch(
+      r'(gs|s3|azfs|hdfs|file|bigquery|bq|delta|iceberg|pubsub|kafka|'
+      r'postgres|postgresql|mysql|spanner)://[^\s@?#]+', literal):
     return True
   # Safe local file/glob path (even when missing, e.g. "no such file: '...'"):
   # contains a directory separator or known file extension, only path/glob
@@ -235,11 +237,16 @@ def redact_inline_secrets(
   return _KNOWN_TOKEN_RE.sub(placeholder, clean)
 
 
-def scrub_error_message(message: str, verbose: bool = False) -> str:
+def scrub_error_message(
+    message: str,
+    verbose: bool = False,
+    *,
+    redact_long_quotes: bool = True,
+) -> str:
   """Strips terminal escapes/BiDi chars and scrubs credentials & long literals."""
   clean = sanitize_untrusted_text(message, max_chars=16384 if verbose else 4096)
   clean = redact_inline_secrets(clean, placeholder='<redacted-value>')
-  if verbose:
+  if verbose or not redact_long_quotes:
     return clean
 
   def _redact(m):
@@ -411,7 +418,10 @@ def classify_error(
     verbose: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
   """Builds a structured `(error_dict, next_actions)` pair from safe templates."""
-  scrubbed = scrub_error_message(message, verbose=verbose)
+  # Static CLI usage/validation errors (exit 2) never contain raw dataset cells;
+  # preserve CLI syntax examples while still scrubbing any inline secrets.
+  scrubbed = scrub_error_message(
+      message, verbose=verbose, redact_long_quotes=(exit_code != 2))
   needs_human = False
   error_type = 'CliError'
   next_actions: list[dict[str, Any]] = []
@@ -433,16 +443,44 @@ def classify_error(
     })
   elif exit_code == 6:
     error_type = 'DiffMismatchError'
+    next_actions.append({
+        'command': 'beam diff <LEFT> <RIGHT> --key <PK_COL> -n all -o diff_report.json --json',
+        'description': 'Inspect full key-level mismatches or pass --rtol 1e-6 for float tolerance.',
+        'requires_human': False,
+    })
   elif exit_code == 7:
     error_type = 'TimeoutError'
+    next_actions.append({
+        'command': 'beam wait <JOB_ID> --json',
+        'description': 'Poll a detached remote job or increase --wait-timeout.',
+        'requires_human': False,
+    })
   elif exit_code == 8:
     error_type = 'CostLimitExceededError'
+    next_actions.extend([
+        {
+            'command': 'beam pipe ... --from-opt row_restriction="<FILTER>" --json',
+            'description': 'Narrow scanned partitions/rows to stay within --max-bytes.',
+            'requires_human': False,
+        },
+        {
+            'command': 'beam pipe ... --max-bytes <HIGHER_SIZE> --json',
+            'description': 'Raise --max-bytes scan cap with explicit human approval.',
+            'requires_human': True,
+        },
+    ])
   elif exit_code == 2:
     error_type = 'UsageOrValidationError'
     if command:
       next_actions.append({
           'command': f'beam {command} --help',
           'description': f'Review valid flags and examples for beam {command}.',
+          'requires_human': False,
+      })
+    else:
+      next_actions.append({
+          'command': 'beam --llms-txt',
+          'description': 'Read compact CLI reference and subcommand overview.',
           'requires_human': False,
       })
   elif exit_code == 130:
@@ -464,8 +502,26 @@ def classify_error(
               'public IPs for enterprise GCP org policies.'),
           'requires_human': False,
       })
+    elif re.search(
+        r'(temp_location|staging_location|--region\b|project\s+id|No project specified)',
+        message,
+        re.IGNORECASE):
+      next_actions.append({
+          'command': (
+              f'beam {command or "pipe"} ... --project=<PROJECT> '
+              '--region=us-central1 --temp_location=gs://<BUCKET>/tmp'),
+          'description': 'Provide required GCP project, region, and GCS temp location.',
+          'requires_human': False,
+      })
+    elif 'SchemaDriftError' in message:
+      next_actions.append({
+          'command': 'beam pipe ... --from-opt sample_rows=all --dlq ./dlq/errors.json',
+          'description': 'Scan all local JSONL rows for sparse fields or route drift to --dlq.',
+          'requires_human': False,
+      })
     elif command == 'pipe' and not DLQ_REQUESTED and not (
-        '--cdc:' in message and 'share the latest sequence value' in message):
+        '--cdc:' in message and 'share the latest sequence value' in message
+    ) and '--assert-counts failed' not in message:
       next_actions.append({
           'command': 'beam pipe ... --dlq ./dlq/errors.json',
           'description': 'Route malformed or failing records to a dead-letter sink.',

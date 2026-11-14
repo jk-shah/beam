@@ -235,11 +235,23 @@ def _transform_configs(spec: dict[str, Any]):
   where_cfg = None
   select_cfg = None
   expect_cfg = None
+  limit_cfg = None
   known = {
-      'ReadFromCsv', 'ReadCsvWithDlq', 'ReadFromJson', 'ReadJsonWithDlq',
-      'ReadFromText', 'ReadFromParquet', 'ReadFromAvro', 'CliRowifyNested',
-      'CliCountRows', 'WriteToCsv', 'WriteToJson', 'WriteToParquet', 'Flatten',
+      'ReadFromCsv',
+      'ReadCsvWithDlq',
+      'ReadFromJson',
+      'ReadJsonWithDlq',
+      'ReadFromText',
+      'ReadFromParquet',
+      'ReadFromAvro',
+      'CliRowifyNested',
+      'CliCountRows',
+      'WriteToCsv',
+      'WriteToJson',
+      'WriteToParquet',
+      'Flatten',
       'CliExpect',
+      'CliLimitRows',
   }
   for t in spec.get('pipeline', {}).get('transforms', []):
     t_type = t.get('type')
@@ -259,11 +271,13 @@ def _transform_configs(spec: dict[str, Any]):
         return None
       continue
     elif t_type == 'MapToFields':
-      if select_cfg is not None or (t.get('config') or {}).get('append'):
+      if select_cfg is not None:
         return None
       select_cfg = t.get('config', {})
     elif t_type == 'CliExpect':
       expect_cfg = t.get('config', {})
+    elif t_type == 'CliLimitRows':
+      limit_cfg = t.get('config', {})
     elif t_type not in known:
       return None
   if (cdc_norm_cfg is not None) != (cdc_mat_cfg is not None):
@@ -271,7 +285,7 @@ def _transform_configs(spec: dict[str, Any]):
   for cfg in (where_cfg, select_cfg):
     if cfg is not None and cfg.get('language', 'python') != 'python':
       return None
-  return cdc_norm_cfg, cdc_mat_cfg, where_cfg, select_cfg, expect_cfg
+  return cdc_norm_cfg, cdc_mat_cfg, where_cfg, select_cfg, expect_cfg, limit_cfg
 
 
 def _safe_row_getattr(obj: Any, attr: str):
@@ -726,8 +740,14 @@ def run(
   formats, each file with its own reader. Existing outputs are kept untouched
   until every transform, count assertion, and staged write succeeds.
   """
-  cdc_norm_cfg, cdc_mat_cfg, where_cfg, select_cfg, expect_cfg = _transform_configs(
-      pipe.spec)
+  (
+      cdc_norm_cfg,
+      cdc_mat_cfg,
+      where_cfg,
+      select_cfg,
+      expect_cfg,
+      limit_cfg,
+  ) = _transform_configs(pipe.spec)
   route_errors = pipe.dlq_endpoint is not None
   dlq_records: list[dict[str, Any]] = []
   drift_state: dict[str, Any] = {'count': 0, 'fields': set()}
@@ -837,19 +857,34 @@ def run(
     rows = kept
 
   if select_cfg is not None:
-    fields = {
-        name: _compile_field(spec)
-        for name, spec in select_cfg.get('fields', {}).items()
-    }
-    out_types = {
-        name: types[str(spec)]
-        for name, spec in select_cfg.get('fields', {}).items()
-        if not isinstance(spec, dict) and str(spec) in types
-    }
+    raw_fields = select_cfg.get('fields', {})
+    fields = {name: _compile_field(spec) for name, spec in raw_fields.items()}
+    is_append = bool(select_cfg.get('append'))
+    drop_set = set(select_cfg.get('drop') or ())
+    base_cols = (
+        [c for c in columns if c not in drop_set and c not in fields]
+        if is_append else [])
+    out_types: dict[str, str] = {}
+    for c in base_cols:
+      if c in types:
+        out_types[c] = types[c]
+    for name, spec in raw_fields.items():
+      if isinstance(spec, dict):
+        ot = spec.get('output_type')
+        if isinstance(ot, str) and ot in ('int', 'float', 'str', 'bool'):
+          out_types[name] = ot
+      elif str(spec) in types:
+        out_types[name] = types[str(spec)]
     projected = []
     for row in rows:
       try:
-        projected.append(Row(**{name: fn(row) for name, fn in fields.items()}))
+        computed = {name: fn(row) for name, fn in fields.items()}
+        if is_append:
+          merged = {c: getattr(row, c, None) for c in base_cols}
+          merged.update(computed)
+          projected.append(Row(**merged))
+        else:
+          projected.append(Row(**computed))
       except Exception as exc:  # pylint: disable=broad-except
         if not route_errors:
           raise FastPipeError(
@@ -857,7 +892,7 @@ def run(
           ) from None
         dlq_records.append(_error_record('MapToFields', exc, row))
     rows = projected
-    columns = list(fields)
+    columns = base_cols + list(fields)
     types = out_types
 
   exp_metrics: dict[str, int] = {}
@@ -913,11 +948,18 @@ def run(
         filtered_out += 1
     rows = kept_exp
 
+  if limit_cfg is not None:
+    lim_n = int(limit_cfg.get('limit', 0))
+    if len(rows) > lim_n:
+      filtered_out += len(rows) - lim_n
+      rows = rows[:lim_n]
+
   out_rows = [_plain(r) for r in rows]
   metrics: dict[str, int] = {'rows_read': rows_read, 'rows_written': len(out_rows), **exp_metrics}
   if cdc_superseded:
     metrics['cdc_superseded_rows'] = cdc_superseded
-  if (where_cfg is not None or cdc_superseded > 0 or cdc_preimage_skipped > 0 or expect_cfg is not None):
+  if (where_cfg is not None or cdc_superseded > 0 or cdc_preimage_skipped > 0 or
+      expect_cfg is not None or limit_cfg is not None):
     metrics['rows_filtered_out'] = (
         filtered_out + cdc_superseded + cdc_preimage_skipped)
   if route_errors:

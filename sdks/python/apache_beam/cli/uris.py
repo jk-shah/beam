@@ -242,50 +242,58 @@ def _mapping_has_secret_key(obj: Any) -> str | None:
   return None
 
 
+def _load_checked_opt_file(opt_file: str) -> dict[str, Any]:
+  from . import output as out_mod
+  if not os.path.isfile(opt_file):
+    raise UriError(f'options file not found: {opt_file!r}')
+  import yaml
+  try:
+    raw_text = out_mod.read_bounded_text(opt_file, label=opt_file)
+    loaded = out_mod.safe_yaml_load(raw_text) or {}
+  except (OSError, ValueError, yaml.YAMLError) as e:
+    raise UriError(f'could not parse {opt_file!r}: {e}') from None
+  if not isinstance(loaded, dict):
+    raise UriError(f'expected key/value mapping in {opt_file!r}')
+  secret_key = _mapping_has_secret_key(loaded)
+  if secret_key and os.name == 'posix':
+    if os.path.islink(opt_file):
+      raise UriError(
+          f'options file {opt_file!r} contains secret key {secret_key!r} '
+          'and cannot be a symbolic link; pass a regular 0600 file')
+    try:
+      mode = os.stat(opt_file).st_mode & 0o777
+    except OSError:
+      mode = 0
+    if mode & 0o077:
+      raise UriError(
+          f'options file {opt_file!r} contains secret key {secret_key!r} '
+          f'with overly permissive mode {oct(mode)}; restrict permissions '
+          f'first with: chmod 0600 {opt_file}')
+  return loaded
+
+
 def parse_kv_options(
     opt_items: Iterable[str] | None,
     opt_file: str | None = None,
     flag_name: str = '--from-opt',
 ) -> dict[str, Any]:
-  """Parses repeatable `KEY=VALUE` flags + optional YAML/JSON `--*-opt-file`."""
-  from . import output as out_mod
+  """Parses repeatable `KEY=VALUE` / `@file.yaml` flags + optional `--*-opt-file`."""
   merged: dict[str, Any] = {}
   if opt_file:
-    if not os.path.isfile(opt_file):
-      raise UriError(f'options file not found: {opt_file!r}')
-    import yaml
-    try:
-      raw_text = out_mod.read_bounded_text(opt_file, label=opt_file)
-      loaded = out_mod.safe_yaml_load(raw_text) or {}
-    except (OSError, ValueError, yaml.YAMLError) as e:
-      raise UriError(f'could not parse {opt_file!r}: {e}') from None
-    if not isinstance(loaded, dict):
-      raise UriError(f'expected key/value mapping in {opt_file!r}')
-    secret_key = _mapping_has_secret_key(loaded)
-    if secret_key and os.name == 'posix':
-      if os.path.islink(opt_file):
-        raise UriError(
-            f'options file {opt_file!r} contains secret key {secret_key!r} '
-            'and cannot be a symbolic link; pass a regular 0600 file')
-      try:
-        mode = os.stat(opt_file).st_mode & 0o777
-      except OSError:
-        mode = 0
-      if mode & 0o077:
-        raise UriError(
-            f'options file {opt_file!r} contains secret key {secret_key!r} '
-            f'with overly permissive mode {oct(mode)}; restrict permissions '
-            f'first with: chmod 0600 {opt_file}')
-    merged.update(loaded)
+    merged.update(_load_checked_opt_file(opt_file))
 
   if isinstance(opt_items, dict):
     merged.update(opt_items)
     return merged
 
   for raw in opt_items or ():
+    if isinstance(raw, str) and raw.startswith('@') and len(raw) > 1 and '=' not in raw:
+      merged.update(_load_checked_opt_file(raw[1:]))
+      continue
     if '=' not in raw:
       shown = raw if re.fullmatch(r'[A-Za-z0-9_.-]{1,32}', raw) else '<redacted>'
-      raise UriError(f'expected KEY=VALUE for {flag_name}, got {shown!r}')
+      raise UriError(
+          f'expected KEY=VALUE (or @file.yaml) for {flag_name}, got {shown!r}')
     key, val = raw.split('=', 1)
     key = key.strip()
     if not key:
@@ -293,14 +301,14 @@ def parse_kv_options(
     if _SECRET_KEY_RE.search(key):
       raise UriError(
           f'refusing secret option {key!r} on the command line ({flag_name}); '
-          f'place secrets in {flag_name}-file (chmod 0600) or environment '
+          f'place secrets in {flag_name} @file.yaml (chmod 0600) or environment '
           'variables')
     coerced = _coerce_opt_value(val)
     nested_secret = _mapping_has_secret_key(coerced)
     if nested_secret:
       raise UriError(
           f'refusing nested secret key {nested_secret!r} in {flag_name} '
-          f'{key}=...; place secrets in {flag_name}-file (chmod 0600) or '
+          f'{key}=...; place secrets in {flag_name} @file.yaml (chmod 0600) or '
           'environment variables')
     merged[key] = coerced
   return merged
@@ -490,6 +498,8 @@ def normalize_bq_table_spec(
   body = raw_uri_or_spec
   if body.lower().startswith('bigquery://'):
     body = body[len('bigquery://'):]
+  elif body.lower().startswith('bq://'):
+    body = body[len('bq://'):]
   body = body.strip('/')
   if allow_jinja and _has_jinja_syntax(body):
     _validate_jinja_uri(raw_uri_or_spec)
@@ -683,6 +693,22 @@ def parse_endpoint(
   flag_hint = '--from-format' if is_read else '--to-format'
 
   scheme = location.split('://', 1)[0].lower() if '://' in location else ''
+  _SCHEME_ALIASES = {
+      'bq': 'bigquery',
+      'gcs': 'gs',
+      's3a': 's3',
+      's3n': 's3',
+      'pg': 'postgres',
+      'mariadb': 'mysql',
+  }
+  if scheme in _SCHEME_ALIASES:
+    canon_scheme = _SCHEME_ALIASES[scheme]
+    location = canon_scheme + '://' + location.split('://', 1)[1]
+    scheme = canon_scheme
+  elif scheme == 'biglake':
+    location = 'iceberg://' + location.split('://', 1)[1]
+    scheme = 'iceberg'
+    opts.setdefault('catalog', 'biglake')
   if scheme and scheme not in ALL_SCHEMES:
     supported = ', '.join(sorted(s + '://' for s in ALL_SCHEMES))
     raise UriError(

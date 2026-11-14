@@ -318,21 +318,35 @@ def parse_interval_join_spec_str(
     v = v_raw.strip()
     if not k or not v:
       raise ValueError(f'empty key or value in --interval-join token {token!r}')
-    if k in ('key', 'left_key', 'right_key'):
+    if k in ('key', 'keys', 'on', 'left_key', 'right_key'):
       cols = list(parse_column_list(v))
-      cfg[k] = cols[0] if len(cols) == 1 else cols
+      dst_k = 'key' if k in ('key', 'keys', 'on') else k
+      cfg[dst_k] = cols[0] if len(cols) == 1 else cols
+    elif k == 'within':
+      cfg['lower_bound'] = '0s'
+      cfg['upper_bound'] = v
+    elif k in ('between', 'window'):
+      if '..' not in v:
+        raise ValueError(
+            f'invalid {k_raw.strip()}={v!r} in --interval-join; expected '
+            'LOWER..UPPER (e.g. between=-5m..5m or between=0s..15m)')
+      lb_s, ub_s = [p.strip() for p in v.split('..', 1)]
+      cfg['lower_bound'] = lb_s
+      cfg['upper_bound'] = ub_s
     elif k in ('lower', 'lower_bound'):
       cfg['lower_bound'] = v
     elif k in ('upper', 'upper_bound'):
       cfg['upper_bound'] = v
     elif k in ('type', 'join_type'):
       cfg['join_type'] = v
-    elif k in ('left_time', 'left_timestamp'):
+    elif k in ('left_time', 'left_timestamp', 'left_ts'):
       cfg['left_time'] = v
-    elif k in ('right_time', 'right_timestamp'):
+    elif k in ('right_time', 'right_timestamp', 'right_ts'):
       cfg['right_time'] = v
-    elif k == 'timestamp':
+    elif k in ('timestamp', 'time', 'timestamp_col', 'ts'):
       cfg['timestamp'] = v
+    elif k in ('select', 'left_fields', 'right_fields'):
+      cfg[k] = list(parse_column_list(v))
     elif k in ('left', 'left_alias'):
       cfg['left_alias'] = v
     elif k in ('right', 'right_alias'):
@@ -344,7 +358,33 @@ def parse_interval_join_spec_str(
     elif k == 'force_stateful':
       cfg['force_stateful'] = v.lower() in ('1', 'true', 'yes')
     else:
-      raise ValueError(f'unknown --interval-join option {k_raw.strip()!r}')
+      import difflib
+      valid_ij = [
+          'key',
+          'on',
+          'left_key',
+          'right_key',
+          'between',
+          'within',
+          'window',
+          'lower',
+          'upper',
+          'type',
+          'left_time',
+          'right_time',
+          'left_ts',
+          'right_ts',
+          'timestamp',
+          'select',
+          'left_fields',
+          'right_fields',
+          'max_skew',
+          'skew_action'
+      ]
+      close = difflib.get_close_matches(k, valid_ij, n=1, cutoff=0.55)
+      hint = f' (did you mean {close[0]!r}?)' if close else ''
+      raise ValueError(
+          f'unknown --interval-join option {k_raw.strip()!r}{hint}')
 
   if left_alias and 'left_alias' not in cfg:
     cfg['left_alias'] = left_alias
@@ -365,7 +405,7 @@ def parse_interval_join_config(cfg: dict[str, Any]) -> IntervalJoinConfig:
   right_alias = str(cfg.get('right_alias') or cfg.get('right') or
                     'right').strip()
 
-  key_raw = cfg.get('key')
+  key_raw = cfg.get('key') if cfg.get('key') is not None else cfg.get('on')
   left_key_raw = cfg.get('left_key') if cfg.get(
       'left_key') is not None else key_raw
   right_key_raw = cfg.get('right_key') if cfg.get(
@@ -382,15 +422,25 @@ def parse_interval_join_config(cfg: dict[str, Any]) -> IntervalJoinConfig:
         f'mismatched join key lengths: left has {len(left_key)} key(s) {left_key}, '
         f'right has {len(right_key)} key(s) {right_key}')
 
-  left_ts = cfg.get('left_timestamp') or cfg.get('timestamp') or cfg.get('left_time')
-  right_ts = cfg.get('right_timestamp') or cfg.get('timestamp') or cfg.get('right_time')
+  left_ts = (
+      cfg.get('left_timestamp') or cfg.get('timestamp') or cfg.get('time') or
+      cfg.get('left_time'))
+  right_ts = (
+      cfg.get('right_timestamp') or cfg.get('timestamp') or cfg.get('time') or
+      cfg.get('right_time'))
   if not left_ts or not right_ts:
     raise ValueError(
         'interval join requires timestamp column(s); specify left_time and right_time or timestamp'
     )
 
-  lower_raw = cfg.get('lower_bound', cfg.get('lower', 0.0))
-  upper_raw = cfg.get('upper_bound', cfg.get('upper'))
+  between_raw = cfg.get('between') or cfg.get('window')
+  if between_raw and '..' in str(between_raw):
+    b_lo, b_hi = [p.strip() for p in str(between_raw).split('..', 1)]
+  else:
+    b_lo, b_hi = None, None
+  lower_raw = cfg.get(
+      'lower_bound', cfg.get('lower', b_lo if b_lo is not None else 0.0))
+  upper_raw = cfg.get('upper_bound', cfg.get('upper', b_hi))
   if upper_raw is None:
     raise ValueError(
         'interval join requires upper_bound (e.g. upper_bound: "15m")')

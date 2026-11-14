@@ -144,6 +144,9 @@ _COMMON_ENRICH_KEYS = frozenset([
     'enrichment_handler',
     'provider',
     'key',
+    'keys',
+    'on',
+    'left_key',
     'row_key',
     'fields',
     'entity_id',
@@ -479,31 +482,89 @@ def parse_enrich_spec_str(
   if not isinstance(spec_str, str) or not spec_str.strip():
     raise ValueError('--enrich specification cannot be empty')
   s = spec_str.strip()
-  if ':' not in s:
-    raise ValueError(
-        f'invalid --enrich specification {spec_str!r}; expected '
-        'HANDLER:key=val,... (handlers: file, bigquery, bigtable, vertexai, feast)'
-    )
-  raw_handler, rest = s.split(':', 1)
-  if len(raw_handler.strip()) == 1 and raw_handler.strip().isalpha() and (
-      rest.startswith(('\\', '/'))):
-    raise ValueError(
-        f'invalid --enrich specification {spec_str!r}; expected '
-        f'HANDLER:key=val,... (for example: file:path={spec_str},key=...)')
-  h_key = raw_handler.strip().lower().replace('-', '_')
-  handler = _HANDLER_ALIASES.get(h_key)
-  if handler is None:
-    raise ValueError(
-        f'unknown --enrich handler {raw_handler!r}; supported handlers are '
-        'file, bigquery, bigtable, vertexai, and feast')
+  kv: dict[str, Any] = {}
+  first_tok = split_bracket_tokens(s)[0] if s else ''
+  first_low = first_tok.lower()
+  if first_low.startswith(('bigquery://', 'bq://')):
+    handler = 'bigquery'
+    raw_handler = 'bigquery'
+    tbl = first_tok.split('://', 1)[1].strip('/')
+    kv = {'handler': 'bigquery', 'table': tbl}
+    rem_toks = split_bracket_tokens(s)[1:]
+    rest = ','.join(rem_toks)
+  elif first_low.startswith(
+      ('gs://', 's3://', 'azfs://', 'hdfs://', 'file://')):
+    handler = 'file'
+    raw_handler = 'file'
+    kv = {'handler': 'file', 'path': first_tok}
+    rem_toks = split_bracket_tokens(s)[1:]
+    rest = ','.join(rem_toks)
+  elif ':' not in first_tok and '=' not in first_tok and first_low.endswith(
+      ('.csv', '.json', '.jsonl', '.parquet')):
+    handler = 'file'
+    raw_handler = 'file'
+    kv = {'handler': 'file', 'path': first_tok}
+    rem_toks = split_bracket_tokens(s)[1:]
+    rest = ','.join(rem_toks)
+  else:
+    if ':' not in s:
+      raise ValueError(
+          f'invalid --enrich specification {spec_str!r}; expected '
+          'HANDLER:key=val,... (handlers: file, bigquery, bigtable, vertexai, feast)'
+      )
+    raw_handler, rest = s.split(':', 1)
+    if len(raw_handler.strip()) == 1 and raw_handler.strip().isalpha() and (
+        rest.startswith(('\\', '/'))):
+      raise ValueError(
+          f'invalid --enrich specification {spec_str!r}; expected '
+          f'HANDLER:key=val,... (for example: file:path={spec_str},key=...)')
+    h_key = raw_handler.strip().lower().replace('-', '_')
+    handler = _HANDLER_ALIASES.get(h_key)
+    if handler is None:
+      raise ValueError(
+          f'unknown --enrich handler {raw_handler!r}; supported handlers are '
+          'file, bigquery, bigtable, vertexai, and feast')
+    kv = {'handler': handler}
 
-  kv: dict[str, Any] = {'handler': handler}
+  _LIST_KEYS = frozenset([
+      'key',
+      'keys',
+      'on',
+      'left_key',
+      'right_key',
+      'row_key',
+      'fields',
+      'lookup_key',
+      'table_fields',
+      'columns',
+      'column_names',
+      'features',
+      'feature_ids',
+  ])
   if rest.strip():
-    for tok in split_bracket_tokens(rest.strip()):
+    last_list_key: str | None = None
+    for idx, tok in enumerate(split_bracket_tokens(rest.strip())):
       if '=' not in tok:
+        if idx == 0 and handler == 'file' and 'path' not in kv:
+          kv['path'] = tok.strip().strip("'\"")
+          continue
+        if idx == 0 and handler == 'bigquery' and 'table' not in kv:
+          kv['table'] = tok.strip().strip("'\"")
+          continue
+        if last_list_key is not None and output.SAFE_IDENTIFIER_RE.match(
+            tok.strip().split(':', 1)[0]):
+          prev = kv[last_list_key]
+          prev_items = (
+              list(prev) if isinstance(prev, list) else [
+                  x.strip() for x in str(prev).strip('[]').split(',')
+                  if x.strip()
+              ])
+          prev_items.append(tok.strip())
+          kv[last_list_key] = prev_items
+          continue
         raise ValueError(
-            f'expected key=value token in --enrich {raw_handler}:..., got {tok!r}'
-        )
+            f'expected key=value token in --enrich {raw_handler}:..., got {tok!r} '
+            '(wrap multi-column lists in brackets, e.g. columns=[a,b])')
       k, v = tok.split('=', 1)
       key = k.strip().lower().replace('-', '_')
       val = v.strip()
@@ -514,6 +575,7 @@ def parse_enrich_spec_str(
             f'refusing inline secret option {key!r} in --enrich; '
             'use environment variables (e.g. BEAM_REDIS_PASSWORD) or ADC')
       kv[key] = val
+      last_list_key = key if key in _LIST_KEYS else None
 
   if extra_opts:
     allowed_for_handler = _COMMON_ENRICH_KEYS | _HANDLER_SPECIFIC_KEYS[handler]
@@ -573,13 +635,19 @@ def parse_enrich_config(
   allowed_keys = _COMMON_ENRICH_KEYS | _HANDLER_SPECIFIC_KEYS[handler]
   unknown = sorted(set(norm_cfg) - allowed_keys)
   if unknown:
+    import difflib
+    close = difflib.get_close_matches(
+        unknown[0], sorted(allowed_keys), n=1, cutoff=0.55)
+    hint = f' (did you mean {close[0]!r}?)' if close else ''
     raise ValueError(
-        f'unknown option(s) for CliEnrich ({handler}): {", ".join(unknown)}')
+        f'unknown option(s) for CliEnrich ({handler}): '
+        f'{", ".join(unknown)}{hint}')
 
   # Input join fields.
   raw_key = (
       norm_cfg.get('fields') or norm_cfg.get('row_key') or
-      norm_cfg.get('key') or norm_cfg.get('entity_id'))
+      norm_cfg.get('key') or norm_cfg.get('keys') or norm_cfg.get('on') or
+      norm_cfg.get('left_key') or norm_cfg.get('entity_id'))
   fields = _validate_ident_list(
       parse_column_list(raw_key), 'CliEnrich key/fields')
   if not fields:

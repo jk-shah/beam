@@ -50,39 +50,42 @@ def render_llms_txt() -> str:
    `beam tail -f` with `-n <LIMIT>` or `--duration <SEC>` in synchronous tools.
 
 ## 2. Subcommands
-- `beam inspect <URI> [--sample N] [--stats] [--search STR] [--json]`
+- `beam inspect [<URI> | --from <URI>] [-n|--sample|--limit N] [--format|--from-format FMT] [--stats] [--search STR] [--profile P] [--json]`
     Zero-runner `<200ms` schema, row count, byte estimate, and sanitized preview.
-- `beam tail [-f] [-n N] [-i|--interactive] [--from-format FMT] <URI> [--duration 5s] [--max-scanned-bytes 64MB] [--json]`
+- `beam tail [<URI> | --from <URI>] [-f] [-n|--limit|--sample N] [-i|--interactive] [--format|--from-format FMT] [--duration 5s] [--max-scanned-bytes 64MB] [--from-opt-file FILE] [--profile P] [--json]`
     Non-destructive bounded stream peek (default `5s` / `-n 5` for agents) or live
     follow (`-f` / `--follow` like Unix `tail -f`, streaming NDJSON across
     `pubsub://`, `kafka://`, `delta://`, `iceberg://`, and local/`gs://` files
     including append-only `.log` / extensionless plain-text logs such as `/var/log/messages`;
     for continuous production `beam pipe` pipelines, ingest via `pubsub://` or `kafka://`).
     Pass `-i` / `--interactive` for terminal TUI with live msg/s throughput and field highlighting.
-- `beam catalog sync --from URI --to URI [--format parquet|delta|iceberg] [--table-name NAME] [--partition-col COL] [--dry-run] [--json]`
+- `beam catalog sync [<SRC> <TGT> | --from URI --to URI] [--zero-copy|--no-zero-copy] [--table NAME] [--dry-run] [--profile P] [--json]`
     Zero-copy Lakehouse catalog synchronization in `<200ms`. Translates Delta Lake transaction
     logs, Apache Iceberg metadata, or Parquet directory partition structures directly into target
     Lakehouse catalogs (Google Cloud Lakehouse / BigLake REST, BigQuery managed Iceberg, or generic
     Iceberg REST catalogs) with 0 data bytes copied.
-- `beam pipe --from [ALIAS=]URI [--from [ALIAS=]URI ...] [--to URI] [flags]`
-    Move, convert, filter (`--where`), project (`--select`), run multi-input
-    SQL joins & aggregations (`--sql "SELECT ..."` across CSV, Parquet, JSONL,
+- `beam pipe [<SOURCE> [<SINK>] | --from|-i [ALIAS=]URI [--to|-o URI]] [-n|--limit N] [flags]`
+    Move, convert, filter (`--where` / `--filter`, SQL `AND`/`OR`/`=`/`IS NOT NULL`/`IN (...)` auto-normalized),
+    project (`--select`), cap output rows (`-n` / `--limit N`), omit `--to` locally to preview result rows on `stdout`
+    (or `untrusted_data.rows` with `--json`), run multi-input
+    SQL joins & aggregations (`--sql "SELECT ..."` or `--sql-file query.sql` / `--sql @query.sql` across CSV, Parquet, JSONL,
     text `.txt` (`Row(line: str)`), mixed-format directory globs like `data/*`,
     `delta://`, and `iceberg://` in `<100ms` locally or `type: Sql` on Dataflow;
     `--join` is accepted as an alias for repeating `--from` or as the right stream for `--interval-join`),
     apply event-time windowing, speculative/late triggers & late-data quarantine (`--window fixed:60s`, `sliding:5m,1m`, `session:30m` with `--timestamp-col COL` and optional `--allowed-lateness 10m --trigger "watermark,early=every:10s,late=count:1" --accumulation accumulating|discarding --late-action dlq|drop --late-data-dlq URI --emit-pane-info`; `--window-size` is accepted),
-    correlate event streams with declarative interval or point-in-time ASOF joins (`--from o=URI --join s=URI --interval-join "key=id,left_time=o_ts,right_time=s_ts,lower=0s,upper=15m,type=left"` or `--asof-join "key=sym,left_time=t_ts,right_time=q_ts,direction=backward|forward|nearest,tolerance=5m"`, or 2-source SQL `BETWEEN ... INTERVAL` / `ASOF [LEFT|INNER] JOIN`) and watermark skew circuit breaking (`--max-watermark-skew 30m --skew-action dlq|drop|warn|fail`),
-    detect ordered event sequences, bounded repetitions, and missing follow-up events (`--pattern "key=user_id,seq=login -> mfa -> purchase within 5m"` or `--pattern "key=order_id,seq=checkout -> !payment within 15m"`),
-    deduplicate at-least-once streams or batches (`--dedupe-by COL[,COL2] [--dedupe-window 10m] [--dedupe-keep first|last] [--dedupe-order COL] [--dedupe-dlq]`),
+    correlate event streams with declarative interval or point-in-time ASOF joins (`--from o=URI --join s=URI --interval-join "on=id,left_time=o_ts,right_time=s_ts,between=0s..15m,type=left"` or `--asof-join "on=sym,left_time=t_ts,right_time=q_ts,direction=backward|forward|nearest,within=5m"`, or 2-source SQL `BETWEEN ... INTERVAL` / `ASOF [LEFT|INNER] JOIN`) and watermark skew circuit breaking (`--max-watermark-skew 30m --skew-action dlq|drop|warn|fail`),
+    detect ordered event sequences, bounded repetitions, and missing follow-up events (`--pattern "on=user_id,seq=login -> mfa -> purchase within 5m"` or `--pattern "on=order_id,seq=checkout -> !payment within 15m"`),
+    deduplicate at-least-once streams or batches (`--dedupe-by|--dedup-by COL[,COL2] [--dedupe-window 10m] [--dedupe-keep first|last] [--dedupe-order COL] [--dedupe-dlq [URI]]`),
     hydrate external features or lookup tables (`--pre-select EXPR --enrich "bigquery|bigtable|vertexai|feast|file:..." [--enrich-opt K=V]`),
-    run streaming or batch ML inference (`--infer "vertexai|hf|mock:..." [--infer-fields "col AS feat, nested.col AS feat2"] [--infer-tag prediction] [--infer-flatten] [--post-where EXPR]`),
+    run streaming or batch ML inference (`--infer "vertexai|hf|mock:..." [--infer-fields "col AS feat, nested.col AS feat2"] [--infer-tag prediction] [--infer-flatten] [--post-where|--post-filter EXPR]`),
     enforce data quality rules (`--expect "rule: expr -> dlq|drop|fail"`), run pre-flight
-    schema contract comparison (`--check-schema`), quarantine dirty rows (`--dlq` or `--dead-letter-target`, scrubbing PII via `--dlq-redact-fields COLS`),
+    schema contract comparison (`--check-schema`), quarantine dirty rows (`--dlq` or `--dead-letter-target`, scrubbing PII via `--dlq-redact-fields|--redact-fields COLS`),
     drop invalid rows (`--drop-bad` / `--skip-errors`), enforce scan budget (`--max-bytes`), verify
-    conservation (`--assert-counts`), reconcile output (`--verify`), apply
+    conservation (`--assert-counts`), reconcile output (`--verify [--key COL]`), apply
     cross-engine CDC (`--cdc --primary-key COL`), or register existing Parquet /
     `delta://` files into `iceberg://` in `<100ms` with `0` bytes copied
-    (`--zero-copy`). Pass `--portable` (`--strict-beam`) to enforce Beam Calcite
+    (`--zero-copy`). Unknown `--flags` fail fast with *"did you mean ...?"* hints (pass `--allow-unknown-options` for custom `PipelineOptions` subclasses).
+    Pass `--portable` (`--strict-beam`) to enforce Beam Calcite
     SQL & runner portability (also reported via `outputs.portable_to_runner`);
     pass `--preview` to include sampled `untrusted_data.rows` when `--to` writes
     a file. Pass `--emit-yaml` (alias `--dry-run`) to emit portable Beam YAML
@@ -93,13 +96,12 @@ def render_llms_txt() -> str:
     exact CSV/JSONL/Parquet/Text file out, no `--runner`) run in-process in
     ~0.1-0.4 s with the same typing, DLQ records and metrics (`runner:
     "local_fast"`); `BEAM_CLI_NO_FAST_PATH=1`, `--portable`, or `--runner` uses a Beam runner.
-- `beam schema diff <SRC> <TGT> [--mode backward|forward|full] [--strict] [--json]`
-    Pre-flight schema contract and compatibility guard (<100ms, zero-runner).
+- `beam schema [diff|check] <SRC> <TGT> [--mode backward|forward|full] [--strict] [--source-format|--left-format FMT] [--target-format|--right-format FMT] [--json]`
+    Pre-flight schema contract and compatibility guard (<100ms, zero-runner; accepts positional `<SRC> <TGT>` or `--from SRC --to TGT`).
     Detects dropped required columns, type narrowing (FLOAT64 -> INT32), and
     nullability mismatches between source and target datasets before launching compute,
     emitting actionable SQL remediation hints (`next_actions`) with `CAST(...)` syntax.
-    `beam schema check` is an alias.
-- `beam export-schedule <FILE.yaml> --orchestrator composer|scheduler [--schedule CRON] [--json]`
+- `beam export-schedule <FILE.yaml> --orchestrator composer|cloud-scheduler [-p|--param K=V] [--schedule CRON] [--json]`
     Export a validated declarative pipeline to a production-grade orchestrator:
     generates Google Cloud Composer (Airflow) DAGs using `DataflowStartFlexTemplateOperator`
     or serverless Cloud Scheduler HTTP triggers invoking `flexTemplates:launch`.
@@ -109,7 +111,7 @@ def render_llms_txt() -> str:
     Flex Template bundle generator for Python pipelines (no handwritten
     `Dockerfile` or `metadata.json`). Accepts case-insensitive `--sdk` (`yaml`/`YAML`)
     and `--to`, `-o`, `--output` destination flags.
-- `beam diff <LEFT_URI> <RIGHT_URI> [--key COL ...] [--columns shared|all|col1,col2] [--limit 100|all] [--to FILE] [--exit-zero] [--rtol F] [--atol F] [--json]`
+- `beam diff [<LEFT_URI> <RIGHT_URI> | --left URI --right URI] [--key COL ...] [--columns shared|all|col1,col2] [-n|--limit 100|all] [--to|-o FILE] [--exit-zero] [--rtol F] [--atol F] [--json]`
     In-process (`local_fast` `<= 64 MB`) or distributed O(1)-memory key/multiset
     reconciliation across files, `delta://`, `iceberg://`, and `bigquery://` (`0`
     match, `6` drift). Compares shared columns (or `--columns all`, or an explicit
@@ -118,14 +120,14 @@ def render_llms_txt() -> str:
     `--limit` keys (default 100 with an explicit `warnings` entry if truncated, or
     `--limit all` up to 100,000) each for `only_in_left`, `only_in_right`,
     `value_mismatches`, `duplicate_keys` (`truncated` flag; values are untrusted data).
-- `beam check <FILE.yaml | -> [--plan [--trust-providers]] [--json]`
+- `beam check <FILE.yaml | -> [--plan [--trust-providers]] [-p|--param K=V] [--jinja-variables JSON] [--json]`
     Offline SafeLoader YAML validator + deterministic `plan_hash` (`sha256`).
     Detects untyped Python expressions preceding `WriteToParquet` and warns statically.
     `--plan` falls back to the static check, with a warning, if expansion needs cloud access;
     expansion logs are hidden unless `--verbose`.
-- `beam run <FILE.yaml | -> [--no-jinja] [--wait-timeout DUR] [--json]`
+- `beam run <FILE.yaml | -> [-p|--param K=V] [--jinja-variables JSON] [--no-jinja] [--wait-timeout DUR] [--json]`
     Execute a Beam YAML pipeline locally or on Dataflow / Flink / Spark.
-- `beam wait <JOB_ID> [--timeout DUR] [--json]` / `beam cancel <JOB_ID> [--drain]`
+- `beam wait <JOB_ID> [--timeout DUR] [--profile P] [--json]` / `beam cancel <JOB_ID> [--drain] [--profile P]`
     Poll or cancel/drain detached remote jobs (`~/.beam/jobs/<job_id>.json`).
 - `beam io list [--json]` / `beam io describe <CONNECTOR | TRANSFORM> [--json]`
     Offline catalog of connectors and options; also describes Beam YAML

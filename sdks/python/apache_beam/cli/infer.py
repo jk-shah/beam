@@ -482,12 +482,19 @@ def parse_infer_config(
         f'unknown --infer provider {raw_prov!r}; supported providers are '
         'vertexai, hf, and mock')
 
-  allowed_keys = _COMMON_INFER_KEYS | _PROVIDER_SPECIFIC_KEYS[provider]
-  unknown = [k for k in norm if k not in allowed_keys]
+  allowed_keys = _COMMON_INFER_KEYS | _PROVIDER_SPECIFIC_KEYS[provider] | {
+      'batch_size'
+  }
+  unknown = sorted(k for k in norm if k not in allowed_keys)
   if unknown:
+    import difflib
+    bad_k = unknown[0]
+    close = difflib.get_close_matches(
+        bad_k, sorted(allowed_keys), n=1, cutoff=0.55)
+    hint = f' (did you mean {close[0]!r}?)' if close else ''
     raise ValueError(
-        f'unknown option(s) {sorted(unknown)} for --infer provider {provider!r}'
-    )
+        f'unknown option(s) {unknown} for --infer provider '
+        f'{provider!r}{hint}')
 
   tag = str(norm.get('tag') or norm.get('inference_tag') or
             'prediction').strip()
@@ -529,8 +536,9 @@ def parse_infer_config(
   fields = parse_infer_fields(raw_fields, '--infer-fields')
 
   default_max_batch = 64 if provider == 'vertexai' else 32
-  max_batch_size = _parse_positive_int(
-      norm.get('max_batch_size', default_max_batch), 'max_batch_size')
+  raw_max_batch = norm.get(
+      'max_batch_size', norm.get('batch_size', default_max_batch))
+  max_batch_size = _parse_positive_int(raw_max_batch, 'max_batch_size')
   if max_batch_size > _MAX_INFER_BATCH_SIZE:
     raise ValueError(
         f'max_batch_size={max_batch_size} exceeds maximum {_MAX_INFER_BATCH_SIZE}'
@@ -572,6 +580,13 @@ def parse_infer_config(
   if provider == 'vertexai':
     endpoint_id = str(norm.get('endpoint_id') or norm.get('endpoint') or
                       '').strip()
+    m_res = re.match(
+        r'^projects/(?P<proj>[^/]+)/locations/(?P<loc>[^/]+)/endpoints/(?P<ep>[^/]+)$',
+        endpoint_id)
+    inferred_proj = m_res.group('proj') if m_res else ''
+    inferred_loc = m_res.group('loc') if m_res else ''
+    if m_res:
+      endpoint_id = m_res.group('ep')
     if not endpoint_id:
       raise ValueError(
           '--infer vertexai:... requires endpoint_id=<ID> (plus project and location)'
@@ -583,14 +598,17 @@ def parse_infer_config(
     if '://' in endpoint_id or not _SAFE_ENDPOINT_ID_RE.match(endpoint_id):
       raise ValueError(f'invalid Vertex AI endpoint_id {endpoint_id!r}')
 
-    project = str(norm.get('project') or default_project or '').strip()
+    project = str(
+        norm.get('project') or inferred_proj or default_project or '').strip()
     if not project:
       raise ValueError(
           '--infer vertexai:... requires project=<GCP_PROJECT> (or --project)')
     if not _SAFE_GCP_TOKEN_RE.match(project):
       raise ValueError(f'invalid GCP project {project!r} in --infer vertexai')
 
-    location = str(norm.get('location') or norm.get('region') or '').strip()
+    location = str(
+        norm.get('location') or norm.get('region') or inferred_loc or
+        '').strip()
     if not location:
       raise ValueError(
           '--infer vertexai:... requires location=<REGION> (e.g. us-central1)')
@@ -956,10 +974,21 @@ def parse_infer_spec_str(
 
   kv: dict[str, Any] = {'provider': provider}
   if rest.strip():
-    for tok in enrich_mod.split_bracket_tokens(rest.strip()):
+    last_key: str | None = None
+    for idx, tok in enumerate(enrich_mod.split_bracket_tokens(rest.strip())):
       if '=' not in tok:
+        if idx == 0 and provider == 'hf' and 'model' not in kv:
+          kv['model'] = tok.strip().strip("'\"")
+          continue
+        if idx == 0 and provider == 'vertexai' and 'endpoint_id' not in kv:
+          kv['endpoint_id'] = tok.strip().strip("'\"")
+          continue
+        if last_key in ('fields', 'infer_fields'):
+          kv[last_key] = f"{kv[last_key]}, {tok.strip()}"
+          continue
         raise ValueError(
-            f'expected key=value token in --infer {raw_prov}:..., got {tok!r}')
+            f'expected key=value token in --infer {raw_prov}:..., got {tok!r} '
+            '(wrap multi-field lists in brackets, e.g. fields=[a,b])')
       k, v = tok.split('=', 1)
       key = k.strip().lower().replace('-', '_')
       val = v.strip()
@@ -968,9 +997,10 @@ def parse_infer_spec_str(
       if uris._SECRET_KEY_RE.search(key):
         raise ValueError(
             f'refusing inline secret option {key!r} in --infer; '
-            'use environment variables (e.g. HF_TOKEN), ADC, or a 0600 '
-            '--infer-opt-file')
+            'use environment variables (e.g. HF_TOKEN), ADC, or '
+            '--infer-opt @file.yaml (chmod 0600)')
       kv[key] = val
+      last_key = key
 
   if infer_fields is not None and 'fields' not in kv and 'infer_fields' not in kv:
     kv['fields'] = infer_fields

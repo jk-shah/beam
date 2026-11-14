@@ -188,20 +188,168 @@ class ExpectationRule(NamedTuple):
   on_violation: str = 'dlq'
 
 
+def _sql_like_fn(val: Any, pattern: Any) -> bool:
+  if val is None or pattern is None:
+    return False
+  parts = re.split(r'([%_])', str(pattern))
+  rx = ['^']
+  for p in parts:
+    if p == '%':
+      rx.append('.*')
+    elif p == '_':
+      rx.append('.')
+    else:
+      rx.append(re.escape(p))
+  rx.append('$')
+  return bool(re.match(''.join(rx), str(val), flags=re.DOTALL))
+
+
+_SAFE_BUILTINS.update({
+    'ifnull': _SAFE_BUILTINS['coalesce'],
+    'trim': _SAFE_BUILTINS['strip'],
+    'length': len,
+    'sql_like': _sql_like_fn,
+})
+_SAFE_CALL_NAMES = _SAFE_CALL_NAMES | frozenset(
+    ['ifnull', 'trim', 'length', 'sql_like'])
+
+_EXPECT_CAST_MAP: dict[str, str] = {
+    'int': 'int',
+    'integer': 'int',
+    'int64': 'int',
+    'int32': 'int',
+    'bigint': 'int',
+    'float': 'float',
+    'float64': 'float',
+    'float32': 'float',
+    'double': 'float',
+    'numeric': 'float',
+    'decimal': 'float',
+    'str': 'str',
+    'string': 'str',
+    'varchar': 'str',
+    'text': 'str',
+    'timestamp': 'str',
+    'datetime': 'str',
+    'date': 'str',
+    'bool': 'bool',
+    'boolean': 'bool',
+}
+
+
 def normalize_expectation_expression(expr: str) -> str:
-  """Normalizes common SQL comparison syntax into valid Python expressions."""
+  """Token-safely normalizes SQL syntax (`=`, `<>`, `LIKE`, `CAST`, `IS NULL`) into Python."""
+  import io
+  import tokenize
   cleaned = expr.strip()
-  cleaned = re.sub(
-      r'\bIS\s+NOT\s+NULL\b', 'is not None', cleaned, flags=re.IGNORECASE)
-  cleaned = re.sub(r'\bIS\s+NULL\b', 'is None', cleaned, flags=re.IGNORECASE)
+  if not cleaned:
+    return cleaned
+  # Replace backticked identifiers `` `col` `` outside quotes before tokenizing.
+  cleaned = re.sub(r'`([A-Za-z_][A-Za-z0-9_]*)`', r'\1', cleaned)
   cleaned = re.sub(r'<>', '!=', cleaned)
-  cleaned = re.sub(r'\bTRUE\b', 'True', cleaned)
-  cleaned = re.sub(r'\bFALSE\b', 'False', cleaned)
-  cleaned = re.sub(r'\bNULL\b', 'None', cleaned)
-  cleaned = re.sub(r'\bAND\b', 'and', cleaned)
-  cleaned = re.sub(r'\bOR\b', 'or', cleaned)
-  cleaned = re.sub(r'\bNOT\b', 'not', cleaned)
-  return cleaned
+  try:
+    raw_toks = [
+        (t.type, t.string)
+        for t in tokenize.generate_tokens(io.StringIO(cleaned).readline)
+        if t.type not in (
+            tokenize.ENCODING, tokenize.ENDMARKER, tokenize.NL, tokenize.NEWLINE)
+    ]
+  except tokenize.TokenError as exc:
+    raise ValueError(f'Invalid expectation syntax in {expr!r}: {exc}') from None
+
+  def _norm_tokens(toks: list[tuple[int, str]]) -> list[str]:
+    out: list[str] = []
+    i = 0
+    n = len(toks)
+    while i < n:
+      tt, tv = toks[i]
+      tu = tv.upper() if tt == tokenize.NAME else ''
+      # `IS NOT NULL` / `IS NULL`
+      if tt == tokenize.NAME and tu == 'IS':
+        if (i + 2 < n and toks[i + 1][0] == tokenize.NAME and
+            toks[i + 1][1].upper() == 'NOT' and toks[i + 2][0] == tokenize.NAME
+            and toks[i + 2][1].upper() == 'NULL'):
+          out.extend(['is', 'not', 'None'])
+          i += 3
+          continue
+        if (i + 1 < n and toks[i + 1][0] == tokenize.NAME and
+            toks[i + 1][1].upper() == 'NULL'):
+          out.extend(['is', 'None'])
+          i += 2
+          continue
+      # `CAST(inner AS TYPE)`
+      if (tt == tokenize.NAME and tu == 'CAST' and i + 1 < n and
+          toks[i + 1] == (tokenize.OP, '(')):
+        depth = 1
+        j = i + 2
+        as_idx = -1
+        while j < n and depth > 0:
+          jt, jv = toks[j]
+          if jt == tokenize.OP and jv in ('(', '[', '{'):
+            depth += 1
+          elif jt == tokenize.OP and jv in (')', ']', '}'):
+            depth -= 1
+            if depth == 0:
+              break
+          elif depth == 1 and jt == tokenize.NAME and jv.upper() == 'AS':
+            as_idx = j
+          j += 1
+        if depth == 0 and as_idx != -1 and as_idx + 1 < j:
+          tname = toks[as_idx + 1][1].lower()
+          py_fn = _EXPECT_CAST_MAP.get(tname)
+          if py_fn is None:
+            raise ValueError(
+                f'Unsupported CAST type {toks[as_idx + 1][1]!r} in expectation')
+          inner_str = ' '.join(_norm_tokens(toks[i + 2:as_idx]))
+          out.append(f'{py_fn}({inner_str})')
+          i = j + 1
+          continue
+      # `[NOT] LIKE <pattern>` (rewrites preceding atom + pattern into `sql_like(a, pat)`)
+      if (tt == tokenize.NAME and tu == 'NOT' and i + 2 < n and
+          toks[i + 1][0] == tokenize.NAME and
+          toks[i + 1][1].upper() == 'LIKE' and out):
+        lhs = out.pop()
+        pat = toks[i + 2][1]
+        out.append(f'(not sql_like({lhs}, {pat}))')
+        i += 3
+        continue
+      if tt == tokenize.NAME and tu == 'LIKE' and i + 1 < n and out:
+        lhs = out.pop()
+        pat = toks[i + 1][1]
+        out.append(f'sql_like({lhs}, {pat})')
+        i += 2
+        continue
+      if tt == tokenize.OP and tv == '=':
+        out.append('==')
+      elif tt == tokenize.NAME and tu == 'AND':
+        out.append('and')
+      elif tt == tokenize.NAME and tu == 'OR':
+        out.append('or')
+      elif tt == tokenize.NAME and tu == 'NOT':
+        out.append('not')
+      elif tt == tokenize.NAME and tu == 'IN':
+        out.append('in')
+      elif tt == tokenize.NAME and tu == 'TRUE':
+        out.append('True')
+      elif tt == tokenize.NAME and tu == 'FALSE':
+        out.append('False')
+      elif tt == tokenize.NAME and tu == 'NULL':
+        out.append('None')
+      else:
+        out.append(tv)
+      i += 1
+    return out
+
+  pieces = _norm_tokens(raw_toks)
+  joined: list[str] = []
+  for idx, piece in enumerate(pieces):
+    if idx > 0:
+      prev = pieces[idx - 1]
+      if prev != '.' and piece not in ('.', ',', ')', ']') and prev not in (
+          '(', '['):
+        joined.append(' ')
+    joined.append(piece)
+  return ''.join(joined)
 
 
 def parse_expectation_rule(

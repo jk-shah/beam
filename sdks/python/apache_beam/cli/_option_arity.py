@@ -245,6 +245,11 @@ def _build_canonical_map(flags: frozenset[str]) -> dict[str, str]:
 _CANONICAL_ZERO = _build_canonical_map(_ALL_ZERO_ARG)
 _CANONICAL_ONE = _build_canonical_map(_ALL_ONE_ARG)
 
+KNOWN_PIPE_ZERO_FLAGS = frozenset(_build_canonical_map(PIPELINE_ZERO_ARG_FLAGS))
+KNOWN_PIPE_ONE_FLAGS = frozenset(_build_canonical_map(PIPELINE_ONE_ARG_FLAGS))
+KNOWN_RUN_ZERO_FLAGS = frozenset(_CANONICAL_ZERO)
+KNOWN_RUN_ONE_FLAGS = frozenset(_CANONICAL_ONE)
+
 
 def normalize_argv(
     argv: Iterable[str],
