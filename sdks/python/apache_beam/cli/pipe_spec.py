@@ -289,6 +289,12 @@ def build_pipe_spec(
     dedupe_order: str | None = None,
     dedupe_time_domain: str = 'auto',
     dedupe_dlq: bool = False,
+    pre_select: str | None = None,
+    post_where: str | None = None,
+    enrich: Iterable[str | dict[str, Any]] | str | dict[str, Any] | None = None,
+    enrich_opts: Iterable[str] | None = None,
+    enrich_opt_file: str | None = None,
+    dlq_redact_fields: Iterable[str] | str | None = None,
 ) -> PipeSpec:
   """Returns the `PipeSpec` for `beam pipe`."""
   if if_exists not in ('fail', 'append', 'replace'):
@@ -401,13 +407,14 @@ def build_pipe_spec(
           "specify --dlq <PATH> or use --on-violation {fail|drop}")
 
   if zero_copy:
-    if (cdc or where or select or dlq_ep is not None or window or
-        timestamp_col or expect or interval_join or dedupe_by):
+    if (cdc or where or pre_select or post_where or select or
+        dlq_ep is not None or window or timestamp_col or expect or
+        interval_join or dedupe_by or enrich):
       raise PipeSpecError(
           '--zero-copy registers existing Parquet files in-place without '
           'rewriting data, so it cannot be combined with --cdc, --where, '
-          '--select, --window, --timestamp-col, --expect, --interval-join, '
-          '--dedupe-by, or --dlq')
+          '--pre-select, --enrich, --post-where, --select, --window, '
+          '--timestamp-col, --expect, --interval-join, --dedupe-by, or --dlq')
     if dst_ep.kind != 'iceberg':
       raise PipeSpecError(
           f'--zero-copy requires an iceberg:// destination, got {dst_ep.raw!r}')
@@ -613,16 +620,94 @@ def build_pipe_spec(
     if parsed_dedup.force_stateful:
       dedupe_yaml_cfg['force_stateful'] = True
 
+  parsed_dlq_redact: tuple[str, ...] = ()
+  if dlq_redact_fields:
+    if dlq_ep is None:
+      raise PipeSpecError('--dlq-redact-fields requires --dlq <SINK>')
+    from . import interval_join as ij_mod
+    from . import output as out_mod
+    raw_rf = ij_mod.parse_column_list(dlq_redact_fields)
+    for rf in raw_rf:
+      if not out_mod.SAFE_IDENTIFIER_RE.match(rf):
+        raise PipeSpecError(
+            f'invalid column identifier {rf!r} in --dlq-redact-fields')
+    parsed_dlq_redact = raw_rf
+
+  raw_enrich_items: list[str | dict[str, Any]]
+  if enrich is None:
+    raw_enrich_items = []
+  elif isinstance(enrich, (str, dict)):
+    raw_enrich_items = [enrich]
+  else:
+    raw_enrich_items = list(enrich)
+
+  enrich_yaml_cfgs: list[dict[str, Any]] = []
+  if not raw_enrich_items:
+    if enrich_opts or enrich_opt_file:
+      raise PipeSpecError(
+          '--enrich-opt / --enrich-opt-file requires --enrich <SPEC>')
+  else:
+    from . import enrich as enrich_mod
+    try:
+      parsed_enrich_opts = uris.parse_kv_options(
+          enrich_opts, enrich_opt_file, '--enrich-opt')
+    except uris.UriError as e:
+      raise PipeSpecError(str(e)) from None
+    if parsed_dlq_redact:
+      parsed_enrich_opts.setdefault(
+          'dlq_redact_fields', list(parsed_dlq_redact))
+    single_stage = len(raw_enrich_items) == 1
+    for e_item in raw_enrich_items:
+      try:
+        if isinstance(e_item, str):
+          e_yaml = enrich_mod.parse_enrich_spec_str(
+              e_item,
+              extra_opts=parsed_enrich_opts,
+              default_project=default_project,
+              single_stage=single_stage)
+        elif isinstance(e_item, dict):
+          merged_ecfg = {**parsed_enrich_opts, **e_item}
+          e_yaml = enrich_mod.enrich_config_to_yaml_dict(
+              enrich_mod.parse_enrich_config(
+                  merged_ecfg, default_project=default_project))
+        else:
+          raise ValueError(
+              f'unsupported --enrich item type {type(e_item).__name__}')
+        e_parsed = enrich_mod.parse_enrich_config(
+            e_yaml, default_project=default_project)
+      except ValueError as e:
+        raise PipeSpecError(str(e)) from None
+      if e_parsed.on_miss == 'dlq' and dlq_ep is None:
+        raise PipeSpecError(
+            '--enrich on_miss=dlq requires --dlq <SINK> '
+            '(or use on_miss={null|drop|fail})')
+      enrich_yaml_cfgs.append(e_yaml)
+
   eff_where_cols = None if interval_join_cfg is not None else known_source_columns
+  eff_pre_select_cols = (
+      None if interval_join_cfg is not None else known_source_columns)
   eff_select_cols = (
-      None if (interval_join_cfg is not None or window_aggs is not None) else
-      known_source_columns)
+      None if (
+          interval_join_cfg is not None or window_aggs is not None or pre_select
+          is not None or bool(enrich_yaml_cfgs)) else known_source_columns)
 
   try:
     where_cfg = (
         expressions.compile_where(
             where, known_columns=eff_where_cols, allow_jinja=allow_jinja)[0]
         if where else None)
+    pre_select_cfg = (
+        expressions.compile_select(
+            pre_select,
+            known_columns=eff_pre_select_cols,
+            allow_jinja=allow_jinja,
+            flag_name='--pre-select')[0] if pre_select else None)
+    post_where_cfg = (
+        expressions.compile_where(
+            post_where,
+            known_columns=None,
+            allow_jinja=allow_jinja,
+            flag_name='--post-where')[0] if post_where else None)
     select_cfg = (
         expressions.compile_select(
             select, known_columns=eff_select_cols, allow_jinja=allow_jinja)[0]
@@ -970,18 +1055,21 @@ def build_pipe_spec(
   # expressions like address.city need rows, so convert them locally.
   rowify_nested = bool(
       prefer_python_lakehouse_and_cdc and src_ep.kind == 'file' and
-      src_ep.format in ('parquet', 'avro') and
-      (where_cfg or select_cfg or interval_join_cfg is not None))
+      src_ep.format in ('parquet', 'avro') and (
+          where_cfg or pre_select_cfg or post_where_cfg or enrich_yaml_cfgs or
+          select_cfg or interval_join_cfg is not None))
   right_rowify_nested = bool(
       prefer_python_lakehouse_and_cdc and right_ep is not None and
       right_ep.kind == 'file' and right_ep.format in ('parquet', 'avro'))
-  if rowify_nested or right_rowify_nested or interval_join_cfg is not None or dedupe_yaml_cfg is not None:
+  if (rowify_nested or right_rowify_nested or interval_join_cfg is not None or
+      dedupe_yaml_cfg is not None or bool(enrich_yaml_cfgs)):
     needs_cli_provider = True
 
   # Pure Java-to-Java fast path: skip Python counter stages unless explicitly
   # requested (`include_counters=True` when `--assert-counts` or Python stage).
   pure_java_pipe = (
       src_java and sink_java and cdc_norm_cfg is None and not where_cfg and
+      not pre_select_cfg and not post_where_cfg and not enrich_yaml_cfgs and
       not select_cfg and not dlq_ep and interval_join_cfg is None and
       dedupe_yaml_cfg is None)
   inject_counters = bool(include_counters) and not pure_java_pipe
@@ -1040,6 +1128,29 @@ def build_pipe_spec(
             },
         })
       chain_steps.append({'type': 'Filter', 'config': where_cfg})
+      if inject_counters:
+        chain_steps.append({
+            'type': 'CliCountRows',
+            'config': {
+                'counter': 'post_filter_rows'
+            },
+        })
+    if pre_select_cfg is not None:
+      chain_steps.append({'type': 'MapToFields', 'config': pre_select_cfg})
+    for e_cfg in enrich_yaml_cfgs:
+      chain_steps.append({
+          'type': 'CliEnrich',
+          'config': dict(e_cfg),
+      })
+    if post_where_cfg is not None:
+      if inject_counters:
+        chain_steps.append({
+            'type': 'CliCountRows',
+            'config': {
+                'counter': 'pre_filter_rows'
+            },
+        })
+      chain_steps.append({'type': 'Filter', 'config': post_where_cfg})
       if inject_counters:
         chain_steps.append({
             'type': 'CliCountRows',
@@ -1112,6 +1223,10 @@ def build_pipe_spec(
   dag_transforms: list[dict[str, Any]] = []
   dlq_norm_refs: list[str] = []
 
+  def _norm_dlq(name: str, input_ref: str, step_label: str) -> dict[str, Any]:
+    return dlq.build_dlq_normalizer_transform(
+        name, input_ref, step_label, redact_fields=parsed_dlq_redact)
+
   def _attach_source_node(
       node_name: str,
       ep: uris.ParsedEndpoint,
@@ -1157,8 +1272,7 @@ def build_pipe_spec(
     if 'error_handling' in cfg_copy:
       out_ref = f'{node_name}.good' if counts_internally else node_name
       dag_transforms.append(
-          dlq.build_dlq_normalizer_transform(
-              norm_dlq_name, f'{node_name}.errors', s_type))
+          _norm_dlq(norm_dlq_name, f'{node_name}.errors', s_type))
       dlq_norm_refs.append(norm_dlq_name)
     else:
       out_ref = node_name
@@ -1229,12 +1343,12 @@ def build_pipe_spec(
       ij_l_in = 'AssignTimestampsLeft.good'
       ij_r_in = 'AssignTimestampsRight.good'
       dag_transforms.append(
-          dlq.build_dlq_normalizer_transform(
+          _norm_dlq(
               'NormalizeAssignTsLeftDlq',
               'AssignTimestampsLeft.errors',
               'CliAssignTimestamps'))
       dag_transforms.append(
-          dlq.build_dlq_normalizer_transform(
+          _norm_dlq(
               'NormalizeAssignTsRightDlq',
               'AssignTimestampsRight.errors',
               'CliAssignTimestamps'))
@@ -1259,7 +1373,7 @@ def build_pipe_spec(
     if has_dlq:
       current_ref = 'IntervalJoin.good'
       dag_transforms.append(
-          dlq.build_dlq_normalizer_transform(
+          _norm_dlq(
               'NormalizeIntervalJoinDlq',
               'IntervalJoin.errors',
               'CliIntervalJoin'))
@@ -1324,8 +1438,7 @@ def build_pipe_spec(
     })
     if has_dlq:
       dag_transforms.append(
-          dlq.build_dlq_normalizer_transform(
-              'NormalizeCdcDlq', 'NormalizeCdc.errors', 'NormalizeCdc'))
+          _norm_dlq('NormalizeCdcDlq', 'NormalizeCdc.errors', 'NormalizeCdc'))
       dlq_norm_refs.append('NormalizeCdcDlq')
       current_ref = 'NormalizeCdc.good'
     else:
@@ -1351,7 +1464,7 @@ def build_pipe_spec(
     })
     if has_dlq:
       dag_transforms.append(
-          dlq.build_dlq_normalizer_transform(
+          _norm_dlq(
               'NormalizeDedupeDlq', 'Deduplicate.errors', 'CliDeduplicate'))
       dlq_norm_refs.append('NormalizeDedupeDlq')
       current_ref = 'Deduplicate.good'
@@ -1380,8 +1493,7 @@ def build_pipe_spec(
     })
     if has_dlq:
       dag_transforms.append(
-          dlq.build_dlq_normalizer_transform(
-              'NormalizeFilterDlq', 'FilterWhere.errors', 'Filter'))
+          _norm_dlq('NormalizeFilterDlq', 'FilterWhere.errors', 'Filter'))
       filter_dlq_ref = 'NormalizeFilterDlq'
       if inject_counters:
         dag_transforms.append({
@@ -1405,6 +1517,93 @@ def build_pipe_spec(
           },
       })
       current_ref = 'CountPostFilter'
+
+  if pre_select_cfg is not None:
+    ps_cfg = dict(pre_select_cfg)
+    if has_dlq:
+      ps_cfg['error_handling'] = {'output': 'errors'}
+    dag_transforms.append({
+        'name': 'PreSelectFields',
+        'type': 'MapToFields',
+        'input': current_ref,
+        'config': ps_cfg,
+    })
+    if has_dlq:
+      dag_transforms.append(
+          _norm_dlq(
+              'NormalizePreSelectDlq', 'PreSelectFields.errors', 'MapToFields'))
+      dlq_norm_refs.append('NormalizePreSelectDlq')
+    current_ref = 'PreSelectFields'
+
+  for e_idx, e_yaml_cfg in enumerate(enrich_yaml_cfgs, start=1):
+    e_name = 'Enrich' if len(enrich_yaml_cfgs) == 1 else f'Enrich_{e_idx}'
+    e_norm_name = (
+        'NormalizeEnrichDlq'
+        if len(enrich_yaml_cfgs) == 1 else f'NormalizeEnrichDlq_{e_idx}')
+    e_cfg_copy = dict(e_yaml_cfg)
+    if has_dlq:
+      e_cfg_copy['error_handling'] = {'output': 'errors'}
+    dag_transforms.append({
+        'name': e_name,
+        'type': 'CliEnrich',
+        'input': current_ref,
+        'config': e_cfg_copy,
+    })
+    if has_dlq:
+      dag_transforms.append(
+          _norm_dlq(e_norm_name, f'{e_name}.errors', 'CliEnrich'))
+      dlq_norm_refs.append(e_norm_name)
+      current_ref = f'{e_name}.good'
+    else:
+      current_ref = e_name
+
+  if post_where_cfg is not None:
+    if inject_counters:
+      dag_transforms.append({
+          'name': 'CountPrePostFilter',
+          'type': 'CliCountRows',
+          'input': current_ref,
+          'config': {
+              'counter': 'pre_filter_rows'
+          },
+      })
+      current_ref = 'CountPrePostFilter'
+    pw_cfg = dict(post_where_cfg)
+    if has_dlq:
+      pw_cfg['error_handling'] = {'output': 'errors'}
+    dag_transforms.append({
+        'name': 'FilterPostWhere',
+        'type': 'Filter',
+        'input': current_ref,
+        'config': pw_cfg,
+    })
+    if has_dlq:
+      dag_transforms.append(
+          _norm_dlq(
+              'NormalizePostFilterDlq', 'FilterPostWhere.errors', 'Filter'))
+      post_f_dlq_ref = 'NormalizePostFilterDlq'
+      if inject_counters:
+        dag_transforms.append({
+            'name': 'CountPostFilterDlq',
+            'type': 'CliCountRows',
+            'input': post_f_dlq_ref,
+            'config': {
+                'counter': 'filter_dlq_rows'
+            },
+        })
+        post_f_dlq_ref = 'CountPostFilterDlq'
+      dlq_norm_refs.append(post_f_dlq_ref)
+    current_ref = 'FilterPostWhere'
+    if inject_counters:
+      dag_transforms.append({
+          'name': 'CountPostPostFilter',
+          'type': 'CliCountRows',
+          'input': current_ref,
+          'config': {
+              'counter': 'post_filter_rows'
+          },
+      })
+      current_ref = 'CountPostPostFilter'
 
   if window_spec is not None:
     dag_transforms.append({
@@ -1440,8 +1639,7 @@ def build_pipe_spec(
     })
     if has_dlq:
       dag_transforms.append(
-          dlq.build_dlq_normalizer_transform(
-              'NormalizeSelectDlq', 'SelectFields.errors', 'MapToFields'))
+          _norm_dlq('NormalizeSelectDlq', 'SelectFields.errors', 'MapToFields'))
       dlq_norm_refs.append('NormalizeSelectDlq')
     current_ref = 'SelectFields'
 
@@ -1464,7 +1662,7 @@ def build_pipe_spec(
     })
     if has_dlq:
       dag_transforms.append(
-          dlq.build_dlq_normalizer_transform(
+          _norm_dlq(
               'NormalizeExpectDlq', 'ValidateExpect.errors', 'CliExpect'))
       dlq_norm_refs.append('NormalizeExpectDlq')
       current_ref = 'ValidateExpect.good'
@@ -1493,8 +1691,7 @@ def build_pipe_spec(
         'config': dst_cfg,
     })
     dag_transforms.append(
-        dlq.build_dlq_normalizer_transform(
-            'NormalizeSinkDlq', 'WriteSink.errors', dst_ep.yaml_type))
+        _norm_dlq('NormalizeSinkDlq', 'WriteSink.errors', dst_ep.yaml_type))
     dlq_norm_refs.append('NormalizeSinkDlq')
   else:
     dag_transforms.append({

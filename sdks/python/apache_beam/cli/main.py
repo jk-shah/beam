@@ -239,14 +239,20 @@ _CLI_ONE_FLAGS = {
         '--from-format',
         '--to-format',
         '--where',
+        '--pre-select',
+        '--post-where',
         '--select',
         '--columns',
         '--cols',
+        '--enrich',
+        '--enrich-opt',
+        '--enrich-opt-file',
         '--dlq',
         '--dead-letter',
         '--dead-letter-target',
         '--dead_letter_target',
         '--dlq-format',
+        '--dlq-redact-fields',
         '--null-values',
         '--sql-engine',
         '--if-exists',
@@ -763,6 +769,22 @@ def _build_parser():
       metavar='EXPR',
       help='safe SQL/Python row filter (e.g. "amount > 0 AND status = \'OK\'")')
   pipe.add_argument(
+      '--pre-select',
+      dest='pre_select',
+      default=None,
+      metavar='EXPR',
+      help=(
+          'pre-enrichment/inference projection & key normalization '
+          '(e.g. "*, lower(raw_uid) AS user_id")'))
+  pipe.add_argument(
+      '--post-where',
+      dest='post_where',
+      default=None,
+      metavar='EXPR',
+      help=(
+          'post-enrichment/inference SQL 3-valued filter over hydrated columns '
+          '(e.g. "user_tier = \'VIP\'")'))
+  pipe.add_argument(
       '--select',
       '--columns',
       '--cols',
@@ -880,6 +902,30 @@ def _build_parser():
       'route suppressed duplicate records to --dlq instead of dropping silently'
   )
   pipe.add_argument(
+      '--enrich',
+      dest='enrich_specs',
+      action='append',
+      default=[],
+      metavar='SPEC',
+      help=(
+          'online feature/table enrichment stage (repeatable; e.g. '
+          '"file:path=dims.jsonl,key=user_id,columns=[tier]" or '
+          '"bigquery:project=P,table=P.D.T,fields=[user_id],columns=[tier]")'))
+  pipe.add_argument(
+      '--enrich-opt',
+      dest='enrich_opts',
+      action='append',
+      default=[],
+      metavar='KEY=VAL',
+      help='additional --enrich stage option (repeatable; e.g. redis=host:6379)'
+  )
+  pipe.add_argument(
+      '--enrich-opt-file',
+      dest='enrich_opt_file',
+      default=None,
+      metavar='FILE',
+      help='YAML/JSON file with --enrich options (chmod 0600 for credentials)')
+  pipe.add_argument(
       '--sql',
       dest='sql',
       default=None,
@@ -899,6 +945,12 @@ def _build_parser():
       '--dlq-format',
       metavar='FMT',
       help='dead-letter file format (default: json or inferred from extension)')
+  pipe.add_argument(
+      '--dlq-redact-fields',
+      dest='dlq_redact_fields',
+      default=None,
+      metavar='COLS',
+      help='sensitive column(s) scrubbed to <REDACTED> in --dlq raw_payload')
   pipe.add_argument(
       '--sql-engine',
       choices=['sqlite', 'duckdb'],
@@ -2847,49 +2899,54 @@ def _pipe(
   is_local_runner = _runner_name(explicit_runner) in _LOCAL_RUNNERS
 
   if getattr(args, 'primary_keys', None) and not args.cdc:
-    if getattr(args, 'interval_join', None) or getattr(args, 'dedupe_by', None):
+    if (getattr(args, 'interval_join', None) or
+        getattr(args, 'dedupe_by', None) or
+        getattr(args, 'enrich_specs', None)):
       raise _CliError(
           '--key / --primary-key enables --cdc mode and cannot be implicitly '
-          'combined with --interval-join or --dedupe-by; pass key=COL inside '
-          '--interval-join or --dedupe-by COL (or pass --cdc explicitly if CDC '
-          'is intended)',
+          'combined with --interval-join, --dedupe-by, or --enrich; pass '
+          'key=COL inside --interval-join/--enrich or --dedupe-by COL '
+          '(or pass --cdc explicitly if CDC is intended)',
           EXIT_USAGE)
     args.cdc = True
 
   if getattr(args, 'drop_bad', False):
-    if getattr(args, 'on_violation', 'dlq') == 'dlq' and not getattr(args, 'dlq', None):
+    if getattr(args, 'on_violation',
+               'dlq') == 'dlq' and not getattr(args, 'dlq', None):
       args.on_violation = 'drop'
 
-  if getattr(args, 'check_schema', False) and (args.sources or []) and args.sink:
+  if getattr(args, 'check_schema', False) and (args.sources or
+                                               []) and args.sink:
     from . import schema as schema_mod
     first_src = (args.sources or [])[0]
     if '=' in first_src and not os.path.exists(first_src):
       first_src = first_src.split('=', 1)[1]
     try:
       sch_diff = schema_mod.run_schema_diff(
-          first_src,
-          args.sink,
-          mode='BACKWARD',
-          default_project=default_proj)
+          first_src, args.sink, mode='BACKWARD', default_project=default_proj)
       if not sch_diff['compatible']:
         err_msg = (
             f"Pre-flight schema contract check failed with {sch_diff['violation_count']} violation(s):\n"
-            + "\n".join(f"  * {v['field']}: {v['issue']} - {v['description']}" for v in sch_diff['violations'])
-        )
-        raise _CliError(err_msg, EXIT_USAGE, next_actions=sch_diff.get('next_actions'))
+            + "\n".join(
+                f"  * {v['field']}: {v['issue']} - {v['description']}"
+                for v in sch_diff['violations']))
+        raise _CliError(
+            err_msg, EXIT_USAGE, next_actions=sch_diff.get('next_actions'))
     except Exception as e:
       if isinstance(e, _CliError):
         raise
-      logging.getLogger('apache_beam.cli').warning('Could not execute pre-flight schema check: %s', e)
+      logging.getLogger('apache_beam.cli').warning(
+          'Could not execute pre-flight schema check: %s', e)
 
   raw_sources = list(args.sources or [])
   raw_joins = list(args.joins or [])
   has_interval_join_flag = bool(getattr(args, 'interval_join', None))
   if args.sink is None and args.sql is None and getattr(
-      args, 'select',
-      None) and not (args.cdc or args.zero_copy or args.window or
-                     args.timestamp_col or args.dlq or has_interval_join_flag or
-                     getattr(args, 'dedupe_by', None)):
+      args, 'select', None) and not (
+          args.cdc or args.zero_copy or args.window or args.timestamp_col or
+          args.dlq or has_interval_join_flag or getattr(args, 'dedupe_by', None)
+          or getattr(args, 'pre_select', None) or getattr(
+              args, 'post_where', None) or getattr(args, 'enrich_specs', None)):
     from . import pipe_sql as _ps_mod
     first_src = raw_sources[0] if raw_sources else ''
     m_alias = _ps_mod._ALIAS_PREFIX_RE.match(first_src)
@@ -2934,12 +2991,14 @@ def _pipe(
           'multiple --from sources or --join requires --sql "SELECT ..." '
           'or --interval-join <SPEC>',
           EXIT_USAGE)
-    if (args.where or args.select or args.cdc or args.zero_copy or
-        getattr(args, 'dedupe_by', None)):
+    if (args.where or getattr(args, 'pre_select', None) or
+        getattr(args, 'post_where', None) or args.select or args.cdc or
+        args.zero_copy or getattr(args, 'dedupe_by', None) or
+        getattr(args, 'enrich_specs', None)):
       raise _CliError(
-          '--sql cannot be combined with --where, --select, --cdc, '
-          '--dedupe-by, or --zero-copy; express filters and projections '
-          'inside --sql (or use --interval-join without --sql)',
+          '--sql cannot be combined with --where, --pre-select, --enrich, '
+          '--post-where, --select, --cdc, --dedupe-by, or --zero-copy; '
+          'express filters and projections inside --sql (or omit --sql)',
           EXIT_USAGE)
     try:
       parsed_from_opts = uris.parse_kv_options(
@@ -3385,7 +3444,13 @@ def _pipe(
         dedupe_keep=getattr(args, 'dedupe_keep', 'first'),
         dedupe_order=getattr(args, 'dedupe_order', None),
         dedupe_time_domain=getattr(args, 'dedupe_time_domain', 'auto'),
-        dedupe_dlq=bool(getattr(args, 'dedupe_dlq', False)))
+        dedupe_dlq=bool(getattr(args, 'dedupe_dlq', False)),
+        pre_select=getattr(args, 'pre_select', None),
+        post_where=getattr(args, 'post_where', None),
+        enrich=getattr(args, 'enrich_specs', None),
+        enrich_opts=getattr(args, 'enrich_opts', None),
+        enrich_opt_file=getattr(args, 'enrich_opt_file', None),
+        dlq_redact_fields=getattr(args, 'dlq_redact_fields', None))
   except pipe_spec.PipeSpecError as e:
     raise _CliError(str(e), EXIT_USAGE) from None
 
@@ -3623,6 +3688,41 @@ def _pipe(
     extra_warnings.append(warn_dedup_pt)
     if not json_session.enabled:
       print(f'warning: {warn_dedup_pt}', file=sys.stderr)
+  if getattr(args, 'enrich_specs', None):
+    enrich_nodes = [
+        t for t in pipe.spec.get('pipeline', {}).get('transforms', [])
+        if isinstance(t, dict) and t.get('type') == 'CliEnrich'
+    ]
+    for enode in enrich_nodes:
+      ecfg = enode.get('config') or {}
+      if pipe.is_unbounded and ecfg.get('handler') == 'bigquery' and not (
+          ecfg.get('redis') or ecfg.get('redis_host')):
+        warn_bq_finops = (
+            'streaming BigQuery --enrich without redis= executes live BigQuery '
+            'queries per micro-batch; configure redis=HOST:PORT (TLS) to '
+            'reduce BigQuery slot/query costs')
+        if warn_bq_finops not in extra_warnings:
+          extra_warnings.append(warn_bq_finops)
+          if not json_session.enabled:
+            print(f'warning: {warn_bq_finops}', file=sys.stderr)
+      om = str(ecfg.get('on_miss') or 'null')
+      if om in ('null', 'drop') and not args.dlq:
+        warn_om = (
+            f'--enrich with on_miss={om} and no --dlq will '
+            f'{"pad missing lookup columns with NULL" if om == "null" else "drop unmatched rows"}; '
+            'pass --dlq <SINK> with on_miss=dlq to quarantine lookup misses')
+        if warn_om not in extra_warnings:
+          extra_warnings.append(warn_om)
+          if not json_session.enabled:
+            print(f'warning: {warn_om}', file=sys.stderr)
+    if args.dry_run and args.dlq and not getattr(
+        args, 'dlq_redact_fields', None):
+      note_pii = (
+          '--dlq may record hydrated columns from --enrich on downstream stage '
+          'failures; pass --dlq-redact-fields <COLS> to scrub sensitive fields')
+      extra_warnings.append(note_pii)
+      if not json_session.enabled:
+        print(f'note: {note_pii}', file=sys.stderr)
 
   try:
     return _run_yaml(

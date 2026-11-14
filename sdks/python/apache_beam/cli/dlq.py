@@ -141,9 +141,15 @@ def safe_json_dumps(value: Any) -> str:
 
 
 def build_dlq_normalizer_transform(
-    name: str, input_ref: str, step_label: str) -> dict[str, Any]:
+    name: str,
+    input_ref: str,
+    step_label: str,
+    *,
+    redact_fields: Iterable[str] = (),
+) -> dict[str, Any]:
   """Builds a Beam YAML `MapToFields` stage normalizing error rows for Flatten."""
   step_lit = repr(step_label)
+  redact_tuple = tuple(str(f) for f in (redact_fields or ()) if str(f).strip())
   err_type_src = (
       'def normalize_dlq(err_row):\n'
       f"  t = getattr(err_row, 'error_type', None)\n"
@@ -161,15 +167,41 @@ def build_dlq_normalizer_transform(
       "getattr(err_row, 'msg', None) or "
       "getattr(err_row, 'error_message', None) or str(err_row))\n"
       '  return str(msg)[:4096]\n')
-  payload_src = (
-      'def normalize_dlq(err_row):\n' + _SAFE_JSON_HELPERS_SRC +
-      "  raw = getattr(err_row, 'raw_payload', None)\n"
-      '  if isinstance(raw, str):\n'
-      '    return raw\n'
-      "  for attr in ('element', 'failed_row', 'record'):\n"
-      '    if hasattr(err_row, attr):\n'
-      '      return _safe_json_str(getattr(err_row, attr))\n'
-      '  return _safe_json_str(err_row)\n')
+  if redact_tuple:
+    redact_lit = repr(redact_tuple)
+    redact_tail = (
+        f'  _rk = {redact_lit}\n'
+        '  try:\n'
+        '    _obj = json.loads(_out)\n'
+        '    if isinstance(_obj, dict):\n'
+        "      _obj = {k: ('<REDACTED>' if k in _rk else v) for k, v in _obj.items()}\n"
+        '      return json.dumps(_obj, allow_nan=False, sort_keys=True)\n'
+        '  except Exception:\n'
+        '    pass\n'
+        '  return _out\n')
+    payload_src = (
+        'def normalize_dlq(err_row):\n' + _SAFE_JSON_HELPERS_SRC +
+        "  raw = getattr(err_row, 'raw_payload', None)\n"
+        '  if isinstance(raw, str):\n'
+        '    _out = raw\n'
+        '  else:\n'
+        '    _out = None\n'
+        "    for attr in ('element', 'failed_row', 'record'):\n"
+        '      if hasattr(err_row, attr):\n'
+        '        _out = _safe_json_str(getattr(err_row, attr))\n'
+        '        break\n'
+        '    if _out is None:\n'
+        '      _out = _safe_json_str(err_row)\n' + redact_tail)
+  else:
+    payload_src = (
+        'def normalize_dlq(err_row):\n' + _SAFE_JSON_HELPERS_SRC +
+        "  raw = getattr(err_row, 'raw_payload', None)\n"
+        '  if isinstance(raw, str):\n'
+        '    return raw\n'
+        "  for attr in ('element', 'failed_row', 'record'):\n"
+        '    if hasattr(err_row, attr):\n'
+        '      return _safe_json_str(getattr(err_row, attr))\n'
+        '  return _safe_json_str(err_row)\n')
 
   return {
       'name': name,
@@ -230,6 +262,8 @@ def cli_yaml_provider_spec() -> dict[str, Any]:
               'apache_beam.cli.interval_join.cli_assign_timestamps'),
           'CliDeduplicate': 'apache_beam.cli.dedup.cli_deduplicate',
           'Deduplicate': 'apache_beam.cli.dedup.cli_deduplicate',
+          'CliEnrich': 'apache_beam.cli.enrich.cli_enrich',
+          'Enrich': 'apache_beam.cli.enrich.cli_enrich',
       },
   }
 

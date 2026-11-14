@@ -962,8 +962,9 @@ def compile_where(
     known_columns: set[str] | None = None,
     *,
     allow_jinja: bool = False,
+    flag_name: str = '--where',
 ) -> tuple[dict[str, Any], frozenset[str]]:
-  """Compiles `--where EXPR` into `(Filter config dict, referenced_columns)`."""
+  """Compiles `--where` / `--post-where` into `(Filter config, cols)`."""
   jinja_map: dict[str, str] = {}
   expr_input = (
       _extract_jinja_placeholders(raw_expr, jinja_map)
@@ -972,19 +973,19 @@ def compile_where(
   try:
     parsed = ast.parse(normalized, mode='eval')
   except SyntaxError as e:
-    raise ExpressionError(f'invalid --where expression {raw_expr!r}: {e.msg}'
-                          ) from None
+    raise ExpressionError(
+        f'invalid {flag_name} expression {raw_expr!r}: {e.msg}') from None
 
   nodes, depth = _ast_stats(parsed)
   if nodes > MAX_AST_NODES or depth > MAX_AST_DEPTH:
     raise ExpressionError(
-        f'--where expression is too complex ({nodes} AST nodes, depth {depth}; '
-        f'max {MAX_AST_NODES} nodes, depth {MAX_AST_DEPTH})')
+        f'{flag_name} expression is too complex ({nodes} AST nodes, depth '
+        f'{depth}; max {MAX_AST_NODES} nodes, depth {MAX_AST_DEPTH})')
 
   compiler = _RowExprCompiler(colref_map, frozenset(jinja_map))
   rewritten = ast.fix_missing_locations(compiler.visit(parsed))
   if known_columns is not None:
-    _check_known_columns(compiler.columns, known_columns, '--where')
+    _check_known_columns(compiler.columns, known_columns, flag_name)
 
   native = _native_expression(normalized, colref_map, jinja_map, known_columns)
   if native is not None:
@@ -1200,32 +1201,38 @@ def compile_select(
     known_columns: set[str] | None = None,
     *,
     allow_jinja: bool = False,
+    flag_name: str = '--select',
 ) -> tuple[dict[str, Any], frozenset[str]]:
-  """Compiles `--select` into `(MapToFields config dict, referenced_columns)`."""
+  """Compiles `--select` / `--pre-select` into `(MapToFields config, cols)`."""
   if not raw_select or not raw_select.strip():
-    raise ExpressionError('--select cannot be empty')
+    raise ExpressionError(f'{flag_name} cannot be empty')
   jinja_map: dict[str, str] = {}
   select_input = (
       _extract_jinja_placeholders(raw_select, jinja_map)
       if allow_jinja else raw_select)
   parts = _split_top_level_commas(select_input)
   if not parts or any(not p for p in parts):
-    raise ExpressionError(f'invalid --select specification {raw_select!r}')
+    raise ExpressionError(f'invalid {flag_name} specification {raw_select!r}')
 
   fields_cfg: dict[str, Any] = {}
   all_cols: set[str] = set()
+  has_star = False
 
   for part in parts:
+    if part.strip() == '*':
+      has_star = True
+      continue
+
     plain_col = _unwrap_plain_col(part)
     # Plain column name (`id`, `user_email`, `class`, `` `order-id` ``) preserves
     # upstream Beam schema type!
     if plain_col is not None and plain_col not in jinja_map:
       if plain_col in fields_cfg:
         raise ExpressionError(
-            f'duplicate output column {plain_col!r} in --select')
+            f'duplicate output column {plain_col!r} in {flag_name}')
       all_cols.add(plain_col)
       if known_columns is not None:
-        _check_known_columns({plain_col}, known_columns, '--select')
+        _check_known_columns({plain_col}, known_columns, flag_name)
       fields_cfg[plain_col] = plain_col
       continue
 
@@ -1246,22 +1253,22 @@ def compile_select(
       for tok, raw_jinja in jinja_map.items():
         shown_part = shown_part.replace(tok, raw_jinja)
       raise ExpressionError(
-          f'computed --select expression {shown_part!r} requires an alias, for '
-          'example: "amount * 1.08 AS total"')
+          f'computed {flag_name} expression {shown_part!r} requires an alias, '
+          'for example: "amount * 1.08 AS total"')
 
     if alias in jinja_map or not _IDENT_RE.match(alias):
       raise ExpressionError(
           f'invalid output column alias {alias!r}; must start with a letter '
           'and contain only letters, digits, or underscores')
     if alias in fields_cfg:
-      raise ExpressionError(f'duplicate output column {alias!r} in --select')
+      raise ExpressionError(f'duplicate output column {alias!r} in {flag_name}')
 
     # Alias of an existing plain column (`user_id AS id` or `` `class` AS tier ``).
     plain_expr_col = _unwrap_plain_col(expr_raw)
     if plain_expr_col is not None and plain_expr_col not in jinja_map:
       all_cols.add(plain_expr_col)
       if known_columns is not None:
-        _check_known_columns({plain_expr_col}, known_columns, '--select')
+        _check_known_columns({plain_expr_col}, known_columns, flag_name)
       fields_cfg[alias] = plain_expr_col
       continue
 
@@ -1270,12 +1277,12 @@ def compile_select(
       parsed = ast.parse(normalized, mode='eval')
     except SyntaxError as e:
       raise ExpressionError(
-          f'invalid --select expression {expr_raw!r}: {e.msg}') from None
+          f'invalid {flag_name} expression {expr_raw!r}: {e.msg}') from None
 
     nodes, depth = _ast_stats(parsed)
     if nodes > MAX_AST_NODES or depth > MAX_AST_DEPTH:
       raise ExpressionError(
-          f'--select expression for {alias!r} is too complex '
+          f'{flag_name} expression for {alias!r} is too complex '
           f'({nodes} AST nodes, depth {depth})')
 
     inferred_type = _infer_json_schema_type(parsed.body)
@@ -1284,14 +1291,14 @@ def compile_select(
     rewritten = ast.fix_missing_locations(compiler.visit(parsed))
     all_cols.update(compiler.columns)
     if known_columns is not None:
-      _check_known_columns(compiler.columns, known_columns, '--select')
+      _check_known_columns(compiler.columns, known_columns, flag_name)
 
     native = _native_expression(
         normalized, colref_map, jinja_map, known_columns, for_select=True)
     if native is not None:
-      fields_cfg[alias] = (
-          {'expression': native, 'output_type': inferred_type}
-          if inferred_type is not None else native)
+      fields_cfg[alias] = ({
+          'expression': native, 'output_type': inferred_type
+      } if inferred_type is not None else native)
       continue
 
     expr_code = ast.unparse(rewritten.body)
@@ -1307,13 +1314,20 @@ def compile_select(
       field_entry['output_type'] = inferred_type
     fields_cfg[alias] = field_entry
 
-  return (
-      {
-          'language': 'python',
-          'fields': fields_cfg,
-      },
-      frozenset(all_cols),
-  )
+  if has_star and not fields_cfg:
+    raise ExpressionError(
+        f'{flag_name} "*" must include at least one computed or renamed column')
+  out_cfg: dict[str, Any] = {
+      'language': 'python',
+      'fields': fields_cfg,
+  }
+  if has_star:
+    out_cfg['append'] = True
+    if known_columns is not None:
+      overwritten = [a for a in fields_cfg if a in known_columns]
+      if overwritten:
+        out_cfg['drop'] = overwritten
+  return (out_cfg, frozenset(all_cols))
 
 
 def _check_known_columns(

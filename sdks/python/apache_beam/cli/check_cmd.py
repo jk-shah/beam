@@ -142,6 +142,14 @@ def run_check(
       except ValueError as e:
         raise CheckError(
             f'{source_label}: invalid {t["type"]} config: {e}') from None
+    if t['type'] in ('CliEnrich', 'Enrich') and isinstance(t.get('config'),
+                                                           dict):
+      from . import enrich
+      try:
+        enrich.parse_enrich_config(t['config'])
+      except ValueError as e:
+        raise CheckError(
+            f'{source_label}: invalid {t["type"]} config: {e}') from None
     stages.append({
         'index': idx,
         'name': t.get('name') or t['type'],

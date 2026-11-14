@@ -250,10 +250,18 @@ def _transform_configs(spec: dict[str, Any]):
     elif t_type == 'CliMaterializeCdc':
       cdc_mat_cfg = t.get('config', {})
     elif t_type == 'Filter':
+      if where_cfg is not None or select_cfg is not None:
+        return None
       where_cfg = t.get('config', {})
     elif t_type == 'MapToFields' and name.startswith('Normalize'):
+      raw_p = ((t.get('config') or {}).get('fields') or {}).get('raw_payload')
+      if isinstance(raw_p, dict) and '_rk =' in str(raw_p.get('callable') or
+                                                    ''):
+        return None
       continue
     elif t_type == 'MapToFields':
+      if select_cfg is not None or (t.get('config') or {}).get('append'):
+        return None
       select_cfg = t.get('config', {})
     elif t_type == 'CliExpect':
       expect_cfg = t.get('config', {})
