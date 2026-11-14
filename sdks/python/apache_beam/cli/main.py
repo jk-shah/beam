@@ -225,6 +225,7 @@ _CLI_ONE_FLAGS = {
         '--to',
         '--sql',
         '--interval-join',
+        '--asof-join',
         '--max-watermark-skew',
         '--skew-action',
         '--dedupe-by',
@@ -901,6 +902,15 @@ def _build_parser():
           'event-time interval join across --from and --join '
           '(e.g. "key=order_id,left_time=order_ts,right_time=ship_ts,'
           'lower=0s,upper=15m,type=left")'))
+  pipe.add_argument(
+      '--asof-join',
+      dest='asof_join',
+      default=None,
+      metavar='SPEC',
+      help=(
+          'point-in-time ASOF join across --from and --join '
+          '(e.g. "key=symbol,left_time=trade_ts,right_time=quote_ts,'
+          'direction=backward,tolerance=5m,type=left")'))
   pipe.add_argument(
       '--max-watermark-skew',
       dest='max_watermark_skew',
@@ -3003,13 +3013,13 @@ def _pipe(
 
   if getattr(args, 'primary_keys', None) and not args.cdc:
     if (getattr(args, 'interval_join', None) or
-        getattr(args, 'dedupe_by', None) or
+        getattr(args, 'asof_join', None) or getattr(args, 'dedupe_by', None) or
         getattr(args, 'enrich_specs', None)):
       raise _CliError(
           '--key / --primary-key enables --cdc mode and cannot be implicitly '
-          'combined with --interval-join, --dedupe-by, or --enrich; pass '
-          'key=COL inside --interval-join/--enrich or --dedupe-by COL '
-          '(or pass --cdc explicitly if CDC is intended)',
+          'combined with --interval-join, --asof-join, --dedupe-by, or --enrich; '
+          'pass key=COL inside --interval-join/--asof-join/--enrich or '
+          '--dedupe-by COL (or pass --cdc explicitly if CDC is intended)',
           EXIT_USAGE)
     args.cdc = True
 
@@ -3043,7 +3053,13 @@ def _pipe(
 
   raw_sources = list(args.sources or [])
   raw_joins = list(args.joins or [])
-  has_interval_join_flag = bool(getattr(args, 'interval_join', None))
+  if getattr(args, 'interval_join', None) and getattr(args, 'asof_join', None):
+    raise _CliError(
+        '--interval-join and --asof-join are mutually exclusive', EXIT_USAGE)
+  has_interval_join_flag = bool(
+      getattr(args, 'interval_join', None) or getattr(args, 'asof_join', None))
+  join_flag_name = (
+      '--asof-join' if getattr(args, 'asof_join', None) else '--interval-join')
   has_b23_flags = bool(
       getattr(args, 'allowed_lateness', None) or
       getattr(args, 'trigger', None) or getattr(args, 'accumulation', None) or
@@ -3078,13 +3094,13 @@ def _pipe(
   if has_interval_join_flag:
     if args.sql is not None:
       raise _CliError(
-          '--interval-join cannot be combined with --sql; either express the '
+          f'{join_flag_name} cannot be combined with --sql; either express the '
           'temporal join inside --sql or omit --sql',
           EXIT_USAGE)
     combined_ij_inputs = raw_sources + raw_joins
     if len(combined_ij_inputs) != 2:
       raise _CliError(
-          '--interval-join requires exactly 2 input sources '
+          f'{join_flag_name} requires exactly 2 input sources '
           f'(e.g. --from left=A --join right=B), got {len(combined_ij_inputs)}',
           EXIT_USAGE)
     raw_sources = [combined_ij_inputs[0]]
@@ -3153,6 +3169,12 @@ def _pipe(
               if_exists='append' if args.if_exists == 'append' else 'fail',
               default_project=default_proj,
               allow_jinja=allow_jinja) if args.dlq else None)
+      will_run_local_sql = bool(
+          is_local_runner and not args.dry_run and
+          not getattr(args, 'portable', False) and
+          not any(ns.endpoint.is_unbounded for ns in named_sources) and
+          not any(ns.endpoint.kind != 'file' for ns in named_sources) and
+          (sink_ep is None or sink_ep.kind == 'file'))
       sql_spec = pipe_sql.build_sql_yaml_spec(
           named_sources,
           args.sql,
@@ -3160,7 +3182,8 @@ def _pipe(
           allow_jinja=allow_jinja,
           max_watermark_skew=getattr(args, 'max_watermark_skew', None),
           skew_action=getattr(args, 'skew_action', None),
-          dlq_ep=dlq_ep)
+          dlq_ep=dlq_ep,
+          for_local_only=will_run_local_sql)
     except (uris.UriError, pipe_sql.SqlPipeError) as e:
       raise _CliError(str(e), EXIT_USAGE) from None
     sql_null_values = _split_null_values(args.null_values)
@@ -3500,8 +3523,8 @@ def _pipe(
 
   if args.assert_counts and has_interval_join_flag:
     raise _CliError(
-        '--assert-counts cannot be combined with --interval-join because '
-        '2-stream M:N joins change row cardinality across left and right inputs',
+        f'--assert-counts cannot be combined with {join_flag_name} because '
+        '2-stream joins sum rows_read across both left and right inputs',
         EXIT_USAGE)
 
   # Track row counters whenever `--json` or `--assert-counts` is active, except
@@ -3552,6 +3575,7 @@ def _pipe(
         on_violation=getattr(args, 'on_violation', 'dlq'),
         join_source=join_source_for_pipe,
         interval_join=getattr(args, 'interval_join', None),
+        asof_join=getattr(args, 'asof_join', None),
         max_watermark_skew=getattr(args, 'max_watermark_skew', None),
         skew_action=getattr(args, 'skew_action', None),
         dedupe_by=getattr(args, 'dedupe_by', None),
@@ -3891,6 +3915,21 @@ def _pipe(
     extra_warnings.append(warn_acc)
     if not json_session.enabled:
       print(f'warning: {warn_acc}', file=sys.stderr)
+  if pipe.is_unbounded and getattr(args, 'asof_join', None):
+    for t_node in pipe.spec.get('pipeline', {}).get('transforms', []):
+      if isinstance(t_node, dict) and t_node.get('type') == 'CliAsofJoin':
+        acfg = t_node.get('config') or {}
+        if (acfg.get('direction', 'backward') == 'backward' and
+            acfg.get('tolerance') is None and acfg.get('state_ttl') is None):
+          warn_asof_mem = (
+              'unbounded backward --asof-join without tolerance= or state_ttl= '
+              'retains 1 latest right-side anchor per unique key; pass '
+              'tolerance=<DUR> or state_ttl=<DUR> when key cardinality is unbounded'
+          )
+          extra_warnings.append(warn_asof_mem)
+          if not json_session.enabled:
+            print(f'warning: {warn_asof_mem}', file=sys.stderr)
+        break
   if getattr(args, 'enrich_specs', None):
     enrich_nodes = [
         t for t in pipe.spec.get('pipeline', {}).get('transforms', [])

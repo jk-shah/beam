@@ -774,6 +774,588 @@ def _lower_temporal_interval_join_sql(
   return spec_out
 
 
+class _ParsedAsofSql(NamedTuple):
+  left_ns: NamedSource
+  right_ns: NamedSource
+  left_sql_alias: str
+  right_sql_alias: str
+  join_type: str
+  left_keys: list[str]
+  right_keys: list[str]
+  left_time: str
+  right_time: str
+  direction: str
+  strict: bool
+  tolerance: float | None
+  select_raw: str
+  extra_on_filters: list[str]
+  where_body: str | None
+  tail_sql: str
+
+
+def _parse_asof_sql_join(
+    clean_q: str,
+    named_sources: list[NamedSource],
+    *,
+    allow_post_clauses: bool,
+) -> _ParsedAsofSql:
+  """Parses a 2-source DuckDB/Snowflake `ASOF JOIN` SQL query."""
+  hint_suffix = (
+      '; supported form: SELECT ... FROM a [ASOF [LEFT|INNER] JOIN | '
+      '[LEFT|INNER] ASOF JOIN] b [MATCH_CONDITION (a.ts >= b.ts)] '
+      'ON a.k = b.k [AND a.ts >= b.ts] [AND a.ts - b.ts <= INTERVAL ...], '
+      'or use --asof-join "key=k,left_time=ts,right_time=ts,tolerance=5m"')
+
+  rewritten_q = _rewrite_source_uri_table_refs(clean_q, named_sources)
+  code_only = ' '.join(
+      seg for is_c, seg in _scan_sql_outside_literals(rewritten_q) if is_c)
+  lead = code_only.lstrip('(').lstrip().split(
+      None, 1)[0].upper() if code_only.strip() else ''
+  if lead == 'WITH':
+    raise SqlPipeError(
+        'SQL ASOF JOIN lowering does not support CTEs (WITH ...)' + hint_suffix)
+  if re.search(
+      r'\b(?:RIGHT|FULL)\s+(?:OUTER\s+)?ASOF\b|\bASOF\s+(?:RIGHT|FULL)\b',
+      code_only,
+      re.I):
+    raise SqlPipeError(
+        'ASOF JOIN only supports INNER or LEFT join semantics '
+        '(not RIGHT or FULL)' + hint_suffix)
+  if len(named_sources) != 2 or len(re.findall(r'\bJOIN\b', code_only,
+                                               re.I)) != 1:
+    raise SqlPipeError(
+        f'SQL ASOF JOIN requires exactly 2 sources and 1 JOIN '
+        f'(got {len(named_sources)} source(s))' + hint_suffix)
+  if not allow_post_clauses and re.search(
+      r'\b(?:GROUP\s+BY|HAVING|UNION|INTERSECT|EXCEPT|OVER|QUALIFY|ORDER\s+BY|LIMIT)\b',
+      code_only,
+      re.I):
+    raise SqlPipeError(
+        'distributed SQL ASOF JOIN cannot combine ASOF JOIN with '
+        'GROUP BY / ORDER BY / LIMIT / window analytics in one SQL step; '
+        'use --asof-join followed by --window / --select' + hint_suffix)
+
+  asof_re = re.compile(
+      r'^\s*SELECT\s+(?P<select>.+?)\s+FROM\s+(?P<from_tbl>[A-Za-z0-9_"`]+)'
+      r'(?:\s+(?:AS\s+)?(?P<from_alias>(?!(?:ASOF|INNER|LEFT|OUTER|JOIN)\b)[A-Za-z0-9_"`]+))?'
+      r'\s+(?P<j_spec>(?:ASOF(?:\s+(?:INNER|LEFT(?:\s+OUTER)?))?|(?:INNER|LEFT(?:\s+OUTER)?)\s+ASOF))\s+JOIN\s+'
+      r'(?P<join_tbl>[A-Za-z0-9_"`]+)'
+      r'(?:\s+(?:AS\s+)?(?P<join_alias>(?!(?:MATCH_CONDITION|ON|WHERE|GROUP|ORDER|LIMIT)\b)[A-Za-z0-9_"`]+))?'
+      r'(?:\s+MATCH_CONDITION\s*\((?P<match_cond>[^)]+)\))?'
+      r'\s+ON\s+(?P<after_on>.+?)\s*$',
+      re.I | re.S)
+  m = asof_re.match(rewritten_q)
+  if not m:
+    raise SqlPipeError('could not parse SQL ASOF JOIN safely' + hint_suffix)
+
+  # Split `after_on` cleanly at top-level WHERE / GROUP BY / ORDER BY / LIMIT
+  after_on = m.group('after_on')
+  tail_kw_re = re.compile(
+      r'\b(?:WHERE|GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT)\b', re.I)
+  # Locate earliest top-level clause boundary outside parens/literals
+  depth = 0
+  pos = 0
+  split_where_start: int | None = None
+  split_tail_start: int | None = None
+  for is_c, seg in _scan_sql_outside_literals(after_on):
+    if not is_c:
+      pos += len(seg)
+      continue
+    idx_in_seg = 0
+    while idx_in_seg < len(seg):
+      ch = seg[idx_in_seg]
+      if ch == '(':
+        depth += 1
+        idx_in_seg += 1
+        continue
+      if ch == ')':
+        depth = max(0, depth - 1)
+        idx_in_seg += 1
+        continue
+      if depth == 0:
+        km = tail_kw_re.match(seg[idx_in_seg:])
+        if km and (idx_in_seg == 0 or not (seg[idx_in_seg - 1].isalnum() or
+                                           seg[idx_in_seg - 1] == '_')):
+          kw_up = km.group(0).upper()
+          abs_p = pos + idx_in_seg
+          if kw_up == 'WHERE' and split_where_start is None and split_tail_start is None:
+            split_where_start = abs_p
+            idx_in_seg += len(km.group(0))
+            continue
+          if kw_up != 'WHERE' and split_tail_start is None:
+            split_tail_start = abs_p
+            break
+      idx_in_seg += 1
+    if split_tail_start is not None:
+      break
+    pos += len(seg)
+
+  if split_where_start is not None:
+    on_body = after_on[:split_where_start].strip()
+    where_end = split_tail_start if split_tail_start is not None else len(
+        after_on)
+    where_slice = after_on[split_where_start:where_end].strip()
+    where_body = re.sub(
+        r'^WHERE\s+', '', where_slice, count=1, flags=re.I).strip()
+    tail_sql = after_on[split_tail_start:].strip(
+    ) if split_tail_start is not None else ''
+  elif split_tail_start is not None:
+    on_body = after_on[:split_tail_start].strip()
+    where_body = None
+    tail_sql = after_on[split_tail_start:].strip()
+  else:
+    on_body = after_on.strip()
+    where_body = None
+    tail_sql = ''
+
+  by_alias_low = {ns.alias.lower(): ns for ns in named_sources}
+  from_tbl = _unquote_sql_ident(m.group('from_tbl'))
+  join_tbl = _unquote_sql_ident(m.group('join_tbl'))
+  left_ns = by_alias_low.get(from_tbl.lower())
+  right_ns = by_alias_low.get(join_tbl.lower())
+  if left_ns is None or right_ns is None or left_ns.alias == right_ns.alias:
+    raise SqlPipeError(
+        f'SQL ASOF JOIN tables ({from_tbl!r}, {join_tbl!r}) must match the two '
+        f'distinct input aliases {[ns.alias for ns in named_sources]}' +
+        hint_suffix)
+
+  left_sql_alias = _unquote_sql_ident(m.group('from_alias') or left_ns.alias)
+  right_sql_alias = _unquote_sql_ident(m.group('join_alias') or right_ns.alias)
+  l_low = left_sql_alias.lower()
+  r_low = right_sql_alias.lower()
+
+  j_spec_up = m.group('j_spec').upper()
+  join_type = 'left' if 'LEFT' in j_spec_up else (
+      'inner' if 'INNER' in j_spec_up else 'left')
+  # Note: bare `ASOF JOIN` in DuckDB defaults to INNER, whereas `ASOF LEFT JOIN` is LEFT:
+  if 'LEFT' not in j_spec_up:
+    join_type = 'inner'
+
+  all_conds: list[str] = []
+  if m.group('match_cond'):
+    all_conds.extend(_split_top_level_sql_and(m.group('match_cond')))
+  all_conds.extend(_split_top_level_sql_and(on_body))
+
+  cmp_re = re.compile(
+      r'^\s*(?P<lhs>.+?)\s*(?P<op><=|>=|<>|!=|=|<|>)\s*(?P<rhs>.+?)\s*$', re.S)
+  diff_interval_re = re.compile(
+      r'^\s*(?P<a1>[A-Za-z0-9_"`]+)\s*\.\s*(?P<c1>[A-Za-z0-9_"`]+)\s*-\s*'
+      r'(?P<a2>[A-Za-z0-9_"`]+)\s*\.\s*(?P<c2>[A-Za-z0-9_"`]+)\s*<=\s*'
+      r'(?:INTERVAL\s+(?:\'(?P<qnum>[0-9.]+)\'\s*(?P<qunit>[A-Za-z]+)|'
+      r'\'(?P<qnum2>[0-9.]+)\s+(?P<qunit2>[A-Za-z]+)\'|'
+      r'(?P<num>[0-9.]+)\s+(?P<unit>[A-Za-z]+))|(?P<sec>[0-9.]+))\s*$',
+      re.I | re.S)
+
+  left_keys: list[str] = []
+  right_keys: list[str] = []
+  left_time: str | None = None
+  right_time: str | None = None
+  direction: str | None = None
+  strict = False
+  tolerance: float | None = None
+  extra_on_filters: list[str] = []
+
+  for raw_c in all_conds:
+    conj = raw_c.strip()
+    while conj.startswith('(') and conj.endswith(')'):
+      inner_c = conj[1:-1].strip()
+      if len(_split_top_level_sql_and(inner_c)) == 1:
+        conj = inner_c
+      else:
+        break
+
+    mdiff = diff_interval_re.match(conj)
+    if mdiff:
+      a1 = _unquote_sql_ident(mdiff.group('a1')).lower()
+      c1 = _unquote_sql_ident(mdiff.group('c1'))
+      a2 = _unquote_sql_ident(mdiff.group('a2')).lower()
+      c2 = _unquote_sql_ident(mdiff.group('c2'))
+      if {a1, a2} == {l_low, r_low}:
+        if mdiff.group('sec'):
+          tol_val = float(mdiff.group('sec'))
+        else:
+          n_s = mdiff.group('qnum') or mdiff.group('qnum2') or mdiff.group(
+              'num')
+          u_s = mdiff.group('qunit') or mdiff.group('qunit2') or mdiff.group(
+              'unit')
+          tol_val = _interval_unit_to_seconds(n_s, u_s)
+        tolerance = tol_val if tolerance is None else min(tolerance, tol_val)
+        l_col = c1 if a1 == l_low else c2
+        r_col = c2 if a2 == r_low else c1
+        left_time = left_time or l_col
+        right_time = right_time or r_col
+        continue
+
+    mc = cmp_re.match(conj)
+    if not mc:
+      extra_on_filters.append(conj)
+      continue
+    op = mc.group('op')
+    p_lhs = _parse_ts_offset_expr(mc.group('lhs'))
+    p_rhs = _parse_ts_offset_expr(mc.group('rhs'))
+    if (p_lhs and p_rhs and
+        {p_lhs[0].lower(), p_rhs[0].lower()} == {l_low, r_low}):
+      if p_lhs[0].lower() == l_low:
+        l_col, l_off = p_lhs[1], p_lhs[2]
+        r_col, r_off = p_rhs[1], p_rhs[2]
+        eff_op = op
+      else:
+        r_col, r_off = p_lhs[1], p_lhs[2]
+        l_col, l_off = p_rhs[1], p_rhs[2]
+        eff_op = {'<=': '>=', '>=': '<=', '<': '>', '>': '<'}.get(op, op)
+
+      if eff_op == '=' and l_off == 0.0 and r_off == 0.0:
+        left_keys.append(l_col)
+        right_keys.append(r_col)
+        continue
+
+      # Point-in-time ASOF inequality (zero offset): e.g. `l.ts >= r.ts`
+      if l_off == 0.0 and r_off == 0.0 and eff_op in ('>=', '>', '<=', '<'):
+        left_time = left_time or l_col
+        right_time = right_time or r_col
+        if eff_op in ('>=', '>'):
+          direction = 'backward'
+          strict = eff_op == '>'
+        else:
+          direction = 'forward'
+          strict = eff_op == '<'
+        continue
+
+      # Offset tolerance inequality: e.g. `r.ts >= l.ts - INTERVAL '5' MINUTE`
+      # (`l.ts + l_off <= r.ts + r_off` -> `r.ts >= l.ts + (l_off - r_off)`)
+      shift = r_off - l_off
+      left_time = left_time or l_col
+      right_time = right_time or r_col
+      if eff_op in ('<=', '<') and shift > 0:
+        # `l.ts <= r.ts + tol` -> `t_l - t_r <= tol` (backward tolerance!)
+        tolerance = shift if tolerance is None else min(tolerance, shift)
+        continue
+      if eff_op in ('>=', '>') and shift < 0:
+        # `l.ts >= r.ts - tol` -> `t_r - t_l <= tol` (forward tolerance!)
+        tolerance = (-shift) if tolerance is None else min(tolerance, -shift)
+        continue
+
+    extra_on_filters.append(conj)
+
+  if not left_keys or not left_time or not right_time or direction is None:
+    raise SqlPipeError(
+        'SQL ASOF JOIN requires both an equi-join key (a.id = b.id) and a '
+        'temporal inequality (e.g. a.ts >= b.ts or MATCH_CONDITION(a.ts >= b.ts))'
+        + hint_suffix)
+  if join_type == 'left' and extra_on_filters:
+    raise SqlPipeError(
+        f'unsupported non-key ON predicate(s) {extra_on_filters} in LEFT ASOF JOIN; '
+        'move post-join filters to WHERE')
+
+  return _ParsedAsofSql(
+      left_ns=left_ns,
+      right_ns=right_ns,
+      left_sql_alias=left_sql_alias,
+      right_sql_alias=right_sql_alias,
+      join_type=join_type,
+      left_keys=left_keys,
+      right_keys=right_keys,
+      left_time=left_time,
+      right_time=right_time,
+      direction=direction,
+      strict=strict,
+      tolerance=tolerance,
+      select_raw=m.group('select').strip(),
+      extra_on_filters=extra_on_filters,
+      where_body=where_body,
+      tail_sql=tail_sql,
+  )
+
+
+def _lower_asof_join_sql(
+    named_sources: list[NamedSource],
+    clean_q: str,
+    read_transforms: list[dict[str, Any]],
+    sql_inputs: dict[str, str],
+    sink_ep: uris.ParsedEndpoint | None,
+    *,
+    has_unbounded: bool,
+    max_watermark_skew: str | None = None,
+    skew_action: str | None = None,
+    dlq_ep: uris.ParsedEndpoint | None = None,
+    allow_jinja: bool = False,
+) -> dict[str, Any]:
+  """Fail-closed lowering of 2-source SQL `ASOF JOIN` onto `CliAsofJoin`."""
+  from . import asof_join
+  from . import dlq
+  from . import expressions
+  from . import interval_join
+  from . import output
+
+  parsed = _parse_asof_sql_join(
+      clean_q, named_sources, allow_post_clauses=False)
+  if has_unbounded and parsed.direction == 'forward' and parsed.tolerance is None:
+    raise SqlPipeError(
+        'unbounded streaming forward SQL ASOF JOIN (a.ts <= b.ts) requires a '
+        "finite tolerance bound (e.g. AND b.ts <= a.ts + INTERVAL '5' MINUTE)")
+
+  select_raw = parsed.select_raw
+  if re.match(r'^DISTINCT\b', select_raw, re.I):
+    raise SqlPipeError(
+        'distributed SQL ASOF JOIN does not support SELECT DISTINCT; '
+        'use --asof-join with --dedupe-by instead')
+
+  select_map: dict[str, str] | None = None
+  if select_raw != '*':
+    select_map = {}
+    as_re = re.compile(
+        r'^(?P<expr>.+?)\s+AS\s+(?P<alias>[A-Za-z0-9_"`]+)\s*$', re.I | re.S)
+    bare_alias_re = re.compile(
+        r'^(?P<expr>[A-Za-z0-9_"`]+\.[A-Za-z0-9_"`]+)\s+(?P<alias>(?!(?:AND|OR)\b)[A-Za-z_][A-Za-z0-9_]*)\s*$',
+        re.I)
+    for item in interval_join.split_bracket_tokens(select_raw):
+      tok = item.strip()
+      if tok.endswith('.*') or tok == '*':
+        raise SqlPipeError(
+            f'SELECT wildcard {tok!r} cannot be mixed with explicit columns in '
+            'distributed SQL ASOF JOIN; use SELECT * or list columns explicitly'
+        )
+      if re.search(r'\b(?:COUNT|SUM|AVG|MIN|MAX)\s*\(', tok, re.I):
+        raise SqlPipeError(
+            f'aggregate expression {tok!r} in distributed SQL ASOF JOIN '
+            'requires a separate --window aggregation stage')
+      ma = as_re.match(tok) or bare_alias_re.match(tok)
+      if ma:
+        expr_s = ma.group('expr').strip()
+        out_name = _unquote_sql_ident(ma.group('alias'))
+      else:
+        expr_s = tok
+        out_name = _unquote_sql_ident(
+            tok.rsplit('.', 1)[-1] if '.' in tok else tok)
+      if not output.SAFE_IDENTIFIER_RE.match(out_name):
+        raise SqlPipeError(
+            f'SELECT expression {tok!r} requires an explicit AS <column_name> alias'
+        )
+      if out_name in select_map:
+        raise SqlPipeError(
+            f'duplicate output column name {out_name!r} in SELECT; disambiguate with AS'
+        )
+      expr_norm = re.sub(r'([`"])([A-Za-z_][A-Za-z0-9_]*)\1', r'\2',
+                         expr_s).strip()
+      select_map[out_name] = expr_norm
+
+  where_parts: list[str] = list(parsed.extra_on_filters)
+  if parsed.where_body:
+    where_parts.append(f'({parsed.where_body})')
+  combined_where = ' AND '.join(where_parts) if where_parts else None
+
+  temp_where_cols: list[str] = []
+  final_user_cols: list[str] = list(select_map.keys()) if select_map else []
+  compiled_where_cfg: dict[str, Any] | None = None
+  l_low = parsed.left_sql_alias.lower()
+  r_low = parsed.right_sql_alias.lower()
+
+  if combined_where:
+    qual_ref_re = re.compile(
+        r'\b(?P<a>[A-Za-z_][A-Za-z0-9_]*)\s*\.\s*(?P<c>[A-Za-z_][A-Za-z0-9_]*)\b'
+    )
+    norm_where = re.sub(
+        r'([`"])([A-Za-z_][A-Za-z0-9_]*)\1', r'\2', combined_where)
+    if select_map is not None:
+      rev_map = {v: k for k, v in select_map.items()}
+
+      def _sub_qual(qm: re.Match) -> str:
+        qa = qm.group('a')
+        qc = qm.group('c')
+        if qa.lower() not in (l_low, r_low):
+          return qm.group(0)
+        canon_ref = (
+            f'{parsed.left_sql_alias if qa.lower() == l_low else parsed.right_sql_alias}.{qc}'
+        )
+        if canon_ref in rev_map:
+          return rev_map[canon_ref]
+        tmp_col = f'beam_sql_w{len(temp_where_cols)}'
+        temp_where_cols.append(tmp_col)
+        select_map[tmp_col] = canon_ref
+        rev_map[canon_ref] = tmp_col
+        return tmp_col
+
+      norm_where = ''.join(
+          qual_ref_re.sub(_sub_qual, seg) if is_c else seg
+          for is_c, seg in _scan_sql_outside_literals(norm_where))
+    else:
+
+      def _sub_star_qual(qm: re.Match) -> str:
+        qa = qm.group('a')
+        qc = qm.group('c')
+        return qc if qa.lower() in (l_low, r_low) else qm.group(0)
+
+      norm_where = ''.join(
+          qual_ref_re.sub(_sub_star_qual, seg) if is_c else seg
+          for is_c, seg in _scan_sql_outside_literals(norm_where))
+    try:
+      compiled_where_cfg = expressions.compile_where(
+          norm_where, known_columns=None, allow_jinja=allow_jinja)[0]
+    except expressions.ExpressionError as e:
+      raise SqlPipeError(
+          f'unsupported WHERE filter in SQL ASOF JOIN: {e}') from None
+
+  eff_skew_action = skew_action or (
+      'dlq' if
+      (dlq_ep is not None and max_watermark_skew is not None) else 'drop')
+  if eff_skew_action == 'dlq' and dlq_ep is None:
+    raise SqlPipeError('--skew-action=dlq requires --dlq <SINK>')
+
+  aj_cfg: dict[str, Any] = {
+      'left_alias': parsed.left_sql_alias,
+      'right_alias': parsed.right_sql_alias,
+      'left_key': (
+          parsed.left_keys[0]
+          if len(parsed.left_keys) == 1 else parsed.left_keys),
+      'right_key': (
+          parsed.right_keys[0]
+          if len(parsed.right_keys) == 1 else parsed.right_keys),
+      'left_time': parsed.left_time,
+      'right_time': parsed.right_time,
+      'direction': parsed.direction,
+      'join_type': parsed.join_type,
+      'skew_action': eff_skew_action,
+  }
+  if parsed.strict:
+    aj_cfg['strict'] = True
+  if parsed.tolerance is not None:
+    aj_cfg['tolerance'] = _format_seconds_duration(parsed.tolerance)
+  if select_map is not None:
+    aj_cfg['select'] = select_map
+  if max_watermark_skew is not None:
+    aj_cfg['max_watermark_skew'] = max_watermark_skew
+
+  try:
+    asof_join.parse_asof_join_config(aj_cfg)
+  except ValueError as e:
+    raise SqlPipeError(str(e)) from None
+
+  transforms = list(read_transforms)
+  dlq_norm_refs: list[str] = []
+  left_read_ref = sql_inputs[parsed.left_ns.alias]
+  right_read_ref = sql_inputs[parsed.right_ns.alias]
+  ts_l_name = f'AssignTimestamps_{parsed.left_ns.alias}'
+  ts_r_name = f'AssignTimestamps_{parsed.right_ns.alias}'
+  ts_l_cfg: dict[str, Any] = {'timestamp_col': parsed.left_time}
+  ts_r_cfg: dict[str, Any] = {'timestamp_col': parsed.right_time}
+  if dlq_ep is not None:
+    ts_l_cfg['error_handling'] = {'output': 'errors'}
+    ts_r_cfg['error_handling'] = {'output': 'errors'}
+  transforms.append({
+      'name': ts_l_name,
+      'type': 'CliAssignTimestamps',
+      'input': left_read_ref,
+      'config': ts_l_cfg,
+  })
+  transforms.append({
+      'name': ts_r_name,
+      'type': 'CliAssignTimestamps',
+      'input': right_read_ref,
+      'config': ts_r_cfg,
+  })
+  if dlq_ep is not None:
+    aj_left_ref = f'{ts_l_name}.good'
+    aj_right_ref = f'{ts_r_name}.good'
+    n_l = f'NormalizeTsLeftDlq_{parsed.left_ns.alias}'
+    n_r = f'NormalizeTsRightDlq_{parsed.right_ns.alias}'
+    transforms.append(
+        dlq.build_dlq_normalizer_transform(
+            n_l, f'{ts_l_name}.errors', ts_l_name))
+    transforms.append(
+        dlq.build_dlq_normalizer_transform(
+            n_r, f'{ts_r_name}.errors', ts_r_name))
+    dlq_norm_refs.extend([n_l, n_r])
+    aj_cfg['error_handling'] = {'output': 'errors'}
+  else:
+    aj_left_ref = ts_l_name
+    aj_right_ref = ts_r_name
+
+  transforms.append({
+      'name': 'AsofJoin',
+      'type': 'CliAsofJoin',
+      'input': {
+          'left': aj_left_ref,
+          'right': aj_right_ref,
+      },
+      'config': aj_cfg,
+  })
+  if dlq_ep is not None:
+    current_ref = 'AsofJoin.good'
+    transforms.append(
+        dlq.build_dlq_normalizer_transform(
+            'NormalizeAsofJoinDlq', 'AsofJoin.errors', 'CliAsofJoin'))
+    dlq_norm_refs.append('NormalizeAsofJoinDlq')
+  else:
+    current_ref = 'AsofJoin'
+
+  if compiled_where_cfg is not None:
+    w_cfg = dict(compiled_where_cfg)
+    if dlq_ep is not None:
+      w_cfg['error_handling'] = {'output': 'errors'}
+    transforms.append({
+        'name': 'FilterWhere',
+        'type': 'Filter',
+        'input': current_ref,
+        'config': w_cfg,
+    })
+    if dlq_ep is not None:
+      transforms.append(
+          dlq.build_dlq_normalizer_transform(
+              'NormalizeFilterDlq', 'FilterWhere.errors', 'Filter'))
+      dlq_norm_refs.append('NormalizeFilterDlq')
+    current_ref = 'FilterWhere'
+
+  if temp_where_cols and final_user_cols:
+    transforms.append({
+        'name': 'SelectFields',
+        'type': 'MapToFields',
+        'input': current_ref,
+        'config': {
+            'language': 'generic',
+            'fields': {
+                c: c
+                for c in final_user_cols
+            },
+        },
+    })
+    current_ref = 'SelectFields'
+
+  if sink_ep is not None:
+    transforms.append({
+        'name': 'WriteSink',
+        'type': sink_ep.yaml_type,
+        'input': current_ref,
+        'config': dict(sink_ep.config),
+    })
+
+  if dlq_ep is not None and dlq_norm_refs:
+    if len(dlq_norm_refs) == 1:
+      dlq_in = dlq_norm_refs[0]
+    else:
+      transforms.append({
+          'name': 'MergeDlq',
+          'type': 'Flatten',
+          'input': dlq_norm_refs,
+      })
+      dlq_in = 'MergeDlq'
+    transforms.append({
+        'name': 'WriteDlq',
+        'type': dlq_ep.yaml_type,
+        'input': dlq_in,
+        'config': dict(dlq_ep.config),
+    })
+
+  spec_out: dict[str, Any] = {
+      'pipeline': {
+          'transforms': transforms,
+      },
+      'providers': [dlq.cli_yaml_provider_spec()],
+  }
+  if has_unbounded:
+    spec_out['options'] = {'streaming': True}
+  return spec_out
+
+
 def build_sql_yaml_spec(
     named_sources: list[NamedSource],
     sql_query: str,
@@ -783,8 +1365,9 @@ def build_sql_yaml_spec(
     max_watermark_skew: str | None = None,
     skew_action: str | None = None,
     dlq_ep: uris.ParsedEndpoint | None = None,
+    for_local_only: bool = False,
 ) -> dict[str, Any]:
-  """Builds portable Beam YAML spec (`type: Sql` or lowered `CliIntervalJoin`)."""
+  """Builds portable Beam YAML spec (`type: Sql` or lowered `CliIntervalJoin`/`CliAsofJoin`)."""
   clean_q = validate_readonly_select_sql(sql_query, allow_jinja=allow_jinja)
   has_unbounded = any(ns.endpoint.is_unbounded for ns in named_sources)
   transforms: list[dict[str, Any]] = []
@@ -827,13 +1410,34 @@ def build_sql_yaml_spec(
 
   code_only = ' '.join(
       seg for is_c, seg in _scan_sql_outside_literals(clean_q) if is_c)
+  has_asof = bool(re.search(r'\bASOF\b', code_only, re.I))
   has_join = bool(re.search(r'\bJOIN\b', code_only, re.I))
   has_interval = bool(re.search(r'\bINTERVAL\b', code_only, re.I))
   if (max_watermark_skew is not None or
       skew_action is not None) and not has_join:
     raise SqlPipeError(
         '--max-watermark-skew / --skew-action with --sql requires a 2-source '
-        'temporal JOIN (or use --interval-join without --sql)')
+        'temporal JOIN (or use --interval-join / --asof-join without --sql)')
+  if has_asof:
+    if for_local_only:
+      _parse_asof_sql_join(clean_q, named_sources, allow_post_clauses=True)
+      return {
+          'pipeline': {
+              'transforms': transforms,
+              'local_asof_sql': clean_q,
+          }
+      }
+    return _lower_asof_join_sql(
+        named_sources,
+        clean_q,
+        transforms,
+        sql_inputs,
+        sink_ep,
+        has_unbounded=has_unbounded,
+        max_watermark_skew=max_watermark_skew,
+        skew_action=skew_action,
+        dlq_ep=dlq_ep,
+        allow_jinja=allow_jinja)
   if has_join and (has_interval or max_watermark_skew is not None or
                    skew_action is not None or
                    (has_unbounded and len(named_sources) >= 2)):
@@ -2227,6 +2831,15 @@ def run_in_memory_sql(
         dlq_records=dlq_records,
         warnings=warnings)
     return out_cols, out_rows, (dlq_records or []), total_read
+
+  code_for_asof = ' '.join(
+      seg for is_c, seg in _scan_sql_outside_literals(clean_q) if is_c)
+  is_sqlite_asof = bool(re.search(r'\bASOF\b', code_for_asof, re.I))
+  parsed_asof: _ParsedAsofSql | None = None
+  if is_sqlite_asof:
+    parsed_asof = _parse_asof_sql_join(
+        clean_q, named_sources, allow_post_clauses=True)
+
   clean_q = _normalize_sqlite_interval_expressions(
       _normalize_sqlite_cast_types(
           _rewrite_source_uri_table_refs(clean_q, named_sources)))
@@ -2240,41 +2853,215 @@ def run_in_memory_sql(
     bool_cols: set[str] = set()
     non_bool_cols: set[str] = set()
 
-    for ns in named_sources:
-      cols, rows, raw_cnt = load_endpoint_rows(
-          ns.endpoint,
+    if parsed_asof is not None:
+      from . import asof_join
+      l_cols, l_rows, l_raw = load_endpoint_rows(
+          parsed_asof.left_ns.endpoint,
           default_project=default_project,
           dlq_records=dlq_records,
           warnings=warnings)
-      total_read += raw_cnt
-      if not cols and rows:
-        cols = [(k, 'TEXT') for k in rows[0].keys()]
-      if not cols:
-        # Empty dataset with no schema columns -> dummy placeholder column
-        cols = [('_empty', 'TEXT')]
-      col_defs = ', '.join(f'{_quote_ident(cn)} {ct}' for cn, ct in cols)
-      t_ident = _quote_ident(ns.alias)
-      conn.execute(f'CREATE TABLE {t_ident} ({col_defs})')
-      if rows:
-        col_names = [cn for cn, _ in cols]
-        for cn in col_names:
-          non_null_vals = [r.get(cn) for r in rows if r.get(cn) is not None]
-          if non_null_vals and all(isinstance(v, bool) for v in non_null_vals):
-            bool_cols.add(cn.lower())
-          elif non_null_vals:
-            non_bool_cols.add(cn.lower())
-        placeholders = ', '.join('?' for _ in col_names)
-        col_list_sql = ', '.join(_quote_ident(cn) for cn in col_names)
+      r_cols, r_rows, r_raw = load_endpoint_rows(
+          parsed_asof.right_ns.endpoint,
+          default_project=default_project,
+          dlq_records=dlq_records,
+          warnings=warnings)
+      total_read = l_raw + r_raw
+      if not l_cols and l_rows:
+        l_cols = [(k, 'TEXT') for k in l_rows[0].keys()]
+      if not r_cols and r_rows:
+        r_cols = [(k, 'TEXT') for k in r_rows[0].keys()]
+
+      l_names = [cn for cn, _ in l_cols]
+      r_names = [cn for cn, _ in r_cols]
+      synth_select: dict[str, str] = {}
+      synth_cols: list[tuple[str, str]] = []
+      for cn, ct in l_cols:
+        sk = f'__l__{cn}'
+        synth_select[sk] = f'{parsed_asof.left_sql_alias}.{cn}'
+        synth_cols.append((sk, ct))
+      for cn, ct in r_cols:
+        sk = f'__r__{cn}'
+        synth_select[sk] = f'{parsed_asof.right_sql_alias}.{cn}'
+        synth_cols.append((sk, ct))
+
+      aj_cfg = asof_join.parse_asof_join_config({
+          'left_alias': parsed_asof.left_sql_alias,
+          'right_alias': parsed_asof.right_sql_alias,
+          'left_key': parsed_asof.left_keys,
+          'right_key': parsed_asof.right_keys,
+          'left_time': parsed_asof.left_time,
+          'right_time': parsed_asof.right_time,
+          'direction': parsed_asof.direction,
+          'strict': parsed_asof.strict,
+          'tolerance': (
+              _format_seconds_duration(parsed_asof.tolerance)
+              if parsed_asof.tolerance is not None else None),
+          'join_type': parsed_asof.join_type,
+          'left_fields': l_names,
+          'right_fields': r_names,
+          'select': synth_select or None,
+      })
+      joined_rows, _, _ = asof_join.join_bounded_asof(l_rows, r_rows, aj_cfg)
+
+      if not synth_cols:
+        synth_cols = [('_empty', 'TEXT')]
+      col_defs = ', '.join(f'{_quote_ident(cn)} {ct}' for cn, ct in synth_cols)
+      conn.execute(f'CREATE TABLE "_asof_joined" ({col_defs})')
+      if joined_rows:
+        s_names = [cn for cn, _ in synth_cols]
+        for sn in s_names:
+          orig_c = sn[5:] if sn.startswith(('__l__', '__r__')) else sn
+          non_null = [
+              jr.get(sn) for jr in joined_rows if jr.get(sn) is not None
+          ]
+          if non_null and all(isinstance(v, bool) for v in non_null):
+            bool_cols.add(orig_c.lower())
+          elif non_null:
+            non_bool_cols.add(orig_c.lower())
+        placeholders = ', '.join('?' for _ in s_names)
+        col_list_sql = ', '.join(_quote_ident(sn) for sn in s_names)
         batch = [
-            tuple(_normalize_sqlite_param(r.get(cn)) for cn in col_names)
-            for r in rows
+            tuple(_normalize_sqlite_param(jr.get(sn)) for sn in s_names)
+            for jr in joined_rows
         ]
         conn.executemany(
-            f'INSERT INTO {t_ident} ({col_list_sql}) VALUES ({placeholders})',
+            f'INSERT INTO "_asof_joined" ({col_list_sql}) VALUES ({placeholders})',
             batch)
-      used_lower.add(ns.alias.lower())
-      if first_alias is None:
-        first_alias = ns.alias
+
+      l_low = parsed_asof.left_sql_alias.lower()
+      r_low = parsed_asof.right_sql_alias.lower()
+      l_set = {c.lower(): c for c in l_names}
+      r_set = {c.lower(): c for c in r_names}
+      qual_re = re.compile(
+          r'(?:`|")?(?P<a>[A-Za-z_][A-Za-z0-9_]*)(?:`|")?\s*\.\s*(?:`|")?(?P<c>[A-Za-z_][A-Za-z0-9_]*)(?:`|")?'
+      )
+
+      def _rewrite_asof_fragment(
+          frag: str, *, auto_alias_select: bool = False) -> str:
+        if auto_alias_select and frag.strip() == '*':
+          star_items: list[str] = []
+          for lk in parsed_asof.left_keys:
+            star_items.append(
+                f'{_quote_ident("__l__" + lk)} AS {_quote_ident(lk)}')
+          conflicts = (set(l_names) & set(r_names)) - set(parsed_asof.left_keys)
+          for cn in l_names:
+            if cn in parsed_asof.left_keys:
+              continue
+            out_n = f'{parsed_asof.left_sql_alias}_{cn}' if cn in conflicts else cn
+            star_items.append(
+                f'{_quote_ident("__l__" + cn)} AS {_quote_ident(out_n)}')
+          for cn in r_names:
+            if cn in parsed_asof.right_keys:
+              continue
+            out_n = f'{parsed_asof.right_sql_alias}_{cn}' if cn in conflicts else cn
+            star_items.append(
+                f'{_quote_ident("__r__" + cn)} AS {_quote_ident(out_n)}')
+          return ', '.join(star_items) or '1'
+
+        def _rep_qual(qm: re.Match) -> str:
+          qa = qm.group('a').lower()
+          qc = qm.group('c')
+          if qa == l_low and qc.lower() in l_set:
+            return _quote_ident(f'__l__{l_set[qc.lower()]}')
+          if qa == r_low and qc.lower() in r_set:
+            return _quote_ident(f'__r__{r_set[qc.lower()]}')
+          return qm.group(0)
+
+        def _rep_unqual(seg_s: str) -> str:
+          # Rewrite bare column identifiers that unambiguously belong to L or R
+          ident_re = re.compile(
+              r'(?<![A-Za-z0-9_."`])([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_."`(])'
+          )
+
+          def _u_cb(um: re.Match) -> str:
+            tok = um.group(1)
+            tl = tok.lower()
+            if tl in l_set and tl not in r_set:
+              return _quote_ident(f'__l__{l_set[tl]}')
+            if tl in r_set and tl not in l_set:
+              return _quote_ident(f'__r__{r_set[tl]}')
+            return tok
+
+          return ident_re.sub(_u_cb, seg_s)
+
+        if auto_alias_select:
+          from . import interval_join as _ij
+          out_toks: list[str] = []
+          as_chk = re.compile(r'\s+AS\s+[A-Za-z0-9_"`]+\s*$', re.I)
+          bare_q_re = re.compile(
+              r'^\s*(?:`|")?[A-Za-z_][A-Za-z0-9_]*(?:`|")?\s*\.\s*(?:`|")?(?P<c>[A-Za-z_][A-Za-z0-9_]*)(?:`|")?\s*$'
+          )
+          bare_id_re = re.compile(r'^\s*(?P<c>[A-Za-z_][A-Za-z0-9_]*)\s*$')
+          for raw_tok in _ij.split_bracket_tokens(frag):
+            rt = raw_tok.strip()
+            rw = ''.join(
+                _rep_unqual(qual_re.sub(_rep_qual, s)) if ic else s
+                for ic, s in _scan_sql_outside_literals(rt))
+            if not as_chk.search(rt):
+              mq = bare_q_re.match(rt) or bare_id_re.match(rt)
+              if mq:
+                rw = f'{rw} AS {_quote_ident(mq.group("c"))}'
+            out_toks.append(rw)
+          return ', '.join(out_toks)
+
+        return ''.join(
+            _rep_unqual(qual_re.sub(_rep_qual, s)) if ic else s
+            for ic, s in _scan_sql_outside_literals(frag))
+
+      sel_sql = _rewrite_asof_fragment(
+          parsed_asof.select_raw, auto_alias_select=True)
+      w_clauses: list[str] = []
+      for ef in parsed_asof.extra_on_filters:
+        w_clauses.append(f'({_rewrite_asof_fragment(ef)})')
+      if parsed_asof.where_body:
+        w_clauses.append(f'({_rewrite_asof_fragment(parsed_asof.where_body)})')
+      where_sql = f' WHERE {" AND ".join(w_clauses)}' if w_clauses else ''
+      tail_rewritten = (
+          ' ' + _rewrite_asof_fragment(parsed_asof.tail_sql)
+          if parsed_asof.tail_sql else '')
+      clean_q = _normalize_sqlite_interval_expressions(
+          _normalize_sqlite_cast_types(
+              f'SELECT {sel_sql} FROM "_asof_joined"{where_sql}{tail_rewritten}'
+          ))
+      used_lower.add('_asof_joined')
+      first_alias = '_asof_joined'
+    else:
+      for ns in named_sources:
+        cols, rows, raw_cnt = load_endpoint_rows(
+            ns.endpoint,
+            default_project=default_project,
+            dlq_records=dlq_records,
+            warnings=warnings)
+        total_read += raw_cnt
+        if not cols and rows:
+          cols = [(k, 'TEXT') for k in rows[0].keys()]
+        if not cols:
+          # Empty dataset with no schema columns -> dummy placeholder column
+          cols = [('_empty', 'TEXT')]
+        col_defs = ', '.join(f'{_quote_ident(cn)} {ct}' for cn, ct in cols)
+        t_ident = _quote_ident(ns.alias)
+        conn.execute(f'CREATE TABLE {t_ident} ({col_defs})')
+        if rows:
+          col_names = [cn for cn, _ in cols]
+          for cn in col_names:
+            non_null_vals = [r.get(cn) for r in rows if r.get(cn) is not None]
+            if non_null_vals and all(isinstance(v, bool)
+                                     for v in non_null_vals):
+              bool_cols.add(cn.lower())
+            elif non_null_vals:
+              non_bool_cols.add(cn.lower())
+          placeholders = ', '.join('?' for _ in col_names)
+          col_list_sql = ', '.join(_quote_ident(cn) for cn in col_names)
+          batch = [
+              tuple(_normalize_sqlite_param(r.get(cn)) for cn in col_names)
+              for r in rows
+          ]
+          conn.executemany(
+              f'INSERT INTO {t_ident} ({col_list_sql}) VALUES ({placeholders})',
+              batch)
+        used_lower.add(ns.alias.lower())
+        if first_alias is None:
+          first_alias = ns.alias
 
     pure_bool_cols = bool_cols - non_bool_cols
     if pure_bool_cols:

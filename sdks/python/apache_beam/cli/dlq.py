@@ -269,6 +269,8 @@ def cli_yaml_provider_spec() -> dict[str, Any]:
           'CliWindowInto': 'apache_beam.cli.windowing.cli_window_into',
           'CliExtractPaneInfo': (
               'apache_beam.cli.windowing.cli_extract_pane_info'),
+          'CliAsofJoin': 'apache_beam.cli.asof_join.cli_asof_join',
+          'AsofJoin': 'apache_beam.cli.asof_join.cli_asof_join',
       },
   }
 

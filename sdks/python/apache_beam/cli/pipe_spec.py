@@ -282,6 +282,7 @@ def build_pipe_spec(
     on_violation: str = 'dlq',
     join_source: str | None = None,
     interval_join: str | dict[str, Any] | None = None,
+    asof_join: str | dict[str, Any] | None = None,
     max_watermark_skew: str | None = None,
     skew_action: str | None = None,
     dedupe_by: Iterable[str] | str | None = None,
@@ -320,24 +321,31 @@ def build_pipe_spec(
     raise PipeSpecError(
         f'invalid --cdc-format {cdc_format!r}; use auto, debezium, or flat')
 
-  if interval_join and not join_source:
+  if interval_join and asof_join:
     raise PipeSpecError(
-        '--interval-join requires a second source via --join [ALIAS=]URI '
+        '--interval-join and --asof-join are mutually exclusive')
+  has_two_stream_join = bool(interval_join or asof_join)
+  join_flag_label = '--asof-join' if asof_join else '--interval-join'
+  if has_two_stream_join and not join_source:
+    raise PipeSpecError(
+        f'{join_flag_label} requires a second source via --join [ALIAS=]URI '
         '(or a second --from)')
-  if join_source and not interval_join:
-    raise PipeSpecError('--join without --sql requires --interval-join <SPEC>')
-  if (max_watermark_skew is not None or
-      skew_action is not None) and not interval_join:
+  if join_source and not has_two_stream_join:
     raise PipeSpecError(
-        '--max-watermark-skew / --skew-action requires --interval-join '
-        '(or a 2-source temporal --sql JOIN)')
-  if interval_join and cdc:
-    raise PipeSpecError('--interval-join cannot be combined with --cdc')
+        '--join without --sql requires --interval-join <SPEC> or '
+        '--asof-join <SPEC>')
+  if (max_watermark_skew is not None or
+      skew_action is not None) and not has_two_stream_join:
+    raise PipeSpecError(
+        '--max-watermark-skew / --skew-action requires --interval-join or '
+        '--asof-join (or a 2-source temporal --sql JOIN)')
+  if has_two_stream_join and cdc:
+    raise PipeSpecError(f'{join_flag_label} cannot be combined with --cdc')
 
   left_alias_hint: str | None = None
   right_alias_hint: str | None = None
   clean_join_source: str | None = None
-  if interval_join:
+  if has_two_stream_join:
     left_alias_hint, source = _split_source_alias_prefix(source)
     right_alias_hint, clean_join_source = _split_source_alias_prefix(
         str(join_source))
@@ -437,20 +445,23 @@ def build_pipe_spec(
           "specify --dlq <PATH> or use --on-violation {fail|drop}")
 
   has_b23_window_opts = bool(
-      allowed_lateness is not None or trigger is not None or
+      (
+          allowed_lateness is not None and
+          (window is not None or asof_join is None)) or trigger is not None or
       accumulation is not None or late_action is not None or
       late_dlq_ep is not None or emit_pane_info or watermark_lag is not None)
 
   if zero_copy:
     if (cdc or where or pre_select or post_where or select or
         dlq_ep is not None or window or has_b23_window_opts or timestamp_col or
-        expect or interval_join or dedupe_by or enrich or infer):
+        expect or interval_join or asof_join or allowed_lateness is not None or
+        dedupe_by or enrich or infer):
       raise PipeSpecError(
           '--zero-copy registers existing Parquet files in-place without '
           'rewriting data, so it cannot be combined with --cdc, --where, '
           '--pre-select, --enrich, --infer, --post-where, --select, --window, '
           '--allowed-lateness, --trigger, --timestamp-col, --expect, '
-          '--interval-join, --dedupe-by, or --dlq')
+          '--interval-join, --asof-join, --dedupe-by, or --dlq')
     if dst_ep.kind != 'iceberg':
       raise PipeSpecError(
           f'--zero-copy requires an iceberg:// destination, got {dst_ep.raw!r}')
@@ -590,6 +601,52 @@ def build_pipe_spec(
           '--skew-action=dlq requires --dlq <SINK> (or use --skew-action {drop|warn|fail})'
       )
 
+  asof_join_cfg: dict[str, Any] | None = None
+  aj_parsed = None
+  if asof_join is not None:
+    from . import asof_join as aj_mod
+    eff_skew_act = skew_action or (
+        'dlq' if
+        (dlq_ep is not None and max_watermark_skew is not None) else None)
+    eff_asof_lateness = allowed_lateness if window is None else None
+    try:
+      if isinstance(asof_join, str):
+        asof_join_cfg = aj_mod.parse_asof_join_spec_str(
+            asof_join,
+            max_watermark_skew=max_watermark_skew,
+            skew_action=eff_skew_act,
+            left_alias=left_alias_hint,
+            right_alias=right_alias_hint,
+            allowed_lateness=eff_asof_lateness)
+      elif isinstance(asof_join, dict):
+        asof_join_cfg = dict(asof_join)
+        if left_alias_hint and 'left_alias' not in asof_join_cfg:
+          asof_join_cfg['left_alias'] = left_alias_hint
+        if right_alias_hint and 'right_alias' not in asof_join_cfg:
+          asof_join_cfg['right_alias'] = right_alias_hint
+        if max_watermark_skew is not None:
+          asof_join_cfg['max_watermark_skew'] = max_watermark_skew
+        if eff_skew_act is not None and 'skew_action' not in asof_join_cfg:
+          asof_join_cfg['skew_action'] = eff_skew_act
+        if (eff_asof_lateness is not None and
+            'allowed_lateness' not in asof_join_cfg):
+          asof_join_cfg['allowed_lateness'] = eff_asof_lateness
+      else:
+        raise ValueError(
+            f'unsupported asof_join type {type(asof_join).__name__}')
+      aj_parsed = aj_mod.parse_asof_join_config(asof_join_cfg)
+    except ValueError as e:
+      raise PipeSpecError(str(e)) from None
+    if aj_parsed.skew_action == 'dlq' and dlq_ep is None:
+      raise PipeSpecError(
+          '--skew-action=dlq requires --dlq <SINK> (or use --skew-action {drop|warn|fail})'
+      )
+    if (is_unbounded and aj_parsed.direction in ('forward', 'nearest') and
+        aj_parsed.tolerance is None):
+      raise PipeSpecError(
+          f'unbounded streaming --asof-join with direction={aj_parsed.direction!r} '
+          'requires a finite tolerance=DURATION (e.g. tolerance=5m)')
+
   dedupe_yaml_cfg: dict[str, Any] | None = None
   if not dedupe_by:
     if (dedupe_window is not None or dedupe_order is not None or dedupe_dlq or
@@ -613,6 +670,8 @@ def build_pipe_spec(
       raw_dcfg['timestamp_col'] = clean_timestamp_col
     elif ij_parsed is not None and ij_parsed.left_timestamp:
       raw_dcfg['timestamp_col'] = ij_parsed.left_timestamp
+    elif aj_parsed is not None and aj_parsed.left_timestamp:
+      raw_dcfg['timestamp_col'] = aj_parsed.left_timestamp
     if dedupe_dlq:
       raw_dcfg['dedupe_dlq'] = True
     if isinstance(dedupe_by, dict) and dedupe_by.get('force_stateful'):
@@ -824,12 +883,17 @@ def build_pipe_spec(
     cli_window_yaml_cfg = windowing_mod.windowing_config_to_yaml_dict(
         cli_window_parsed)
 
-  eff_where_cols = None if interval_join_cfg is not None else known_source_columns
+  if asof_join_cfg is not None and parsed_dlq_redact:
+    asof_join_cfg['dlq_redact_fields'] = list(parsed_dlq_redact)
+  two_stream_cfg = (
+      interval_join_cfg if interval_join_cfg is not None else asof_join_cfg)
+
+  eff_where_cols = None if two_stream_cfg is not None else known_source_columns
   eff_pre_select_cols = (
-      None if interval_join_cfg is not None else known_source_columns)
+      None if two_stream_cfg is not None else known_source_columns)
   eff_select_cols = (
       None if (
-          interval_join_cfg is not None or window_aggs is not None or
+          two_stream_cfg is not None or window_aggs is not None or
           pre_select is not None or bool(enrich_yaml_cfgs) or
           bool(infer_yaml_cfgs) or emit_pane_info) else known_source_columns)
 
@@ -1199,12 +1263,12 @@ def build_pipe_spec(
       prefer_python_lakehouse_and_cdc and src_ep.kind == 'file' and
       src_ep.format in ('parquet', 'avro') and (
           where_cfg or pre_select_cfg or post_where_cfg or enrich_yaml_cfgs or
-          infer_yaml_cfgs or select_cfg or interval_join_cfg is not None or
+          infer_yaml_cfgs or select_cfg or two_stream_cfg is not None or
           cli_window_yaml_cfg is not None))
   right_rowify_nested = bool(
       prefer_python_lakehouse_and_cdc and right_ep is not None and
       right_ep.kind == 'file' and right_ep.format in ('parquet', 'avro'))
-  if (rowify_nested or right_rowify_nested or interval_join_cfg is not None or
+  if (rowify_nested or right_rowify_nested or two_stream_cfg is not None or
       dedupe_yaml_cfg is not None or bool(enrich_yaml_cfgs) or
       bool(infer_yaml_cfgs) or cli_window_yaml_cfg is not None):
     needs_cli_provider = True
@@ -1215,14 +1279,14 @@ def build_pipe_spec(
       src_java and sink_java and cdc_norm_cfg is None and not where_cfg and
       not pre_select_cfg and not post_where_cfg and not enrich_yaml_cfgs and
       not infer_yaml_cfgs and not select_cfg and not dlq_ep and
-      not late_dlq_ep and interval_join_cfg is None and
-      dedupe_yaml_cfg is None and cli_window_yaml_cfg is None)
+      not late_dlq_ep and two_stream_cfg is None and dedupe_yaml_cfg is None and
+      cli_window_yaml_cfg is None)
   inject_counters = bool(include_counters) and not pure_java_pipe
   if inject_counters:
     needs_cli_provider = True
 
-  # Simple linear chain when neither `--dlq` nor `--interval-join` is active!
-  if dlq_ep is None and late_dlq_ep is None and interval_join_cfg is None:
+  # Simple linear chain when neither `--dlq` nor a 2-stream join is active!
+  if dlq_ep is None and late_dlq_ep is None and two_stream_cfg is None:
     chain_steps: list[dict[str, Any]] = [
         {
             'type': src_type,
@@ -1447,7 +1511,7 @@ def build_pipe_spec(
       out_ref = node_name
     return out_ref, counts_internally
 
-  if interval_join_cfg is not None and right_ep is not None and right_type is not None:
+  if two_stream_cfg is not None and right_ep is not None and right_type is not None:
     left_ref, left_counted = _attach_source_node(
         'ReadLeft', src_ep, src_type, src_cfg, 'NormalizeLeftSourceDlq')
     if rowify_nested:
@@ -1490,49 +1554,68 @@ def build_pipe_spec(
       })
       right_ref = 'CountReadRight'
 
-    assert ij_parsed is not None
-    ts_l_cfg: dict[str, Any] = {'timestamp_col': ij_parsed.left_timestamp}
-    ts_r_cfg: dict[str, Any] = {'timestamp_col': ij_parsed.right_timestamp}
-    if has_dlq:
-      ts_l_cfg['error_handling'] = {'output': 'errors'}
-      ts_r_cfg['error_handling'] = {'output': 'errors'}
-    dag_transforms.append({
-        'name': 'AssignTimestampsLeft',
-        'type': 'CliAssignTimestamps',
-        'input': left_ref,
-        'config': ts_l_cfg,
-    })
-    dag_transforms.append({
-        'name': 'AssignTimestampsRight',
-        'type': 'CliAssignTimestamps',
-        'input': right_ref,
-        'config': ts_r_cfg,
-    })
-    if has_dlq:
-      ij_l_in = 'AssignTimestampsLeft.good'
-      ij_r_in = 'AssignTimestampsRight.good'
-      dag_transforms.append(
-          _norm_dlq(
-              'NormalizeAssignTsLeftDlq',
-              'AssignTimestampsLeft.errors',
-              'CliAssignTimestamps'))
-      dag_transforms.append(
-          _norm_dlq(
-              'NormalizeAssignTsRightDlq',
-              'AssignTimestampsRight.errors',
-              'CliAssignTimestamps'))
-      dlq_norm_refs.extend(
-          ['NormalizeAssignTsLeftDlq', 'NormalizeAssignTsRightDlq'])
-    else:
-      ij_l_in = 'AssignTimestampsLeft'
-      ij_r_in = 'AssignTimestampsRight'
+    is_asof = asof_join_cfg is not None
+    parsed_2s = aj_parsed if is_asof else ij_parsed
+    assert parsed_2s is not None
+    l_ts_col = parsed_2s.left_timestamp
+    r_ts_col = parsed_2s.right_timestamp
 
-    ij_node_cfg = dict(interval_join_cfg)
+    if l_ts_col:
+      ts_l_cfg: dict[str, Any] = {'timestamp_col': l_ts_col}
+      if has_dlq:
+        ts_l_cfg['error_handling'] = {'output': 'errors'}
+      dag_transforms.append({
+          'name': 'AssignTimestampsLeft',
+          'type': 'CliAssignTimestamps',
+          'input': left_ref,
+          'config': ts_l_cfg,
+      })
+      if has_dlq:
+        ij_l_in = 'AssignTimestampsLeft.good'
+        dag_transforms.append(
+            _norm_dlq(
+                'NormalizeAssignTsLeftDlq',
+                'AssignTimestampsLeft.errors',
+                'CliAssignTimestamps'))
+        dlq_norm_refs.append('NormalizeAssignTsLeftDlq')
+      else:
+        ij_l_in = 'AssignTimestampsLeft'
+    else:
+      ij_l_in = left_ref
+
+    if r_ts_col:
+      ts_r_cfg: dict[str, Any] = {'timestamp_col': r_ts_col}
+      if has_dlq:
+        ts_r_cfg['error_handling'] = {'output': 'errors'}
+      dag_transforms.append({
+          'name': 'AssignTimestampsRight',
+          'type': 'CliAssignTimestamps',
+          'input': right_ref,
+          'config': ts_r_cfg,
+      })
+      if has_dlq:
+        ij_r_in = 'AssignTimestampsRight.good'
+        dag_transforms.append(
+            _norm_dlq(
+                'NormalizeAssignTsRightDlq',
+                'AssignTimestampsRight.errors',
+                'CliAssignTimestamps'))
+        dlq_norm_refs.append('NormalizeAssignTsRightDlq')
+      else:
+        ij_r_in = 'AssignTimestampsRight'
+    else:
+      ij_r_in = right_ref
+
+    join_node_name = 'AsofJoin' if is_asof else 'IntervalJoin'
+    join_node_type = 'CliAsofJoin' if is_asof else 'CliIntervalJoin'
+    join_norm_name = (
+        'NormalizeAsofJoinDlq' if is_asof else 'NormalizeIntervalJoinDlq')
+    ij_node_cfg = dict(two_stream_cfg)
     if has_dlq:
       ij_node_cfg['error_handling'] = {'output': 'errors'}
     dag_transforms.append({
-        'name': 'IntervalJoin',
-        'type': 'CliIntervalJoin',
+        'name': join_node_name,
+        'type': join_node_type,
         'input': {
             'left': ij_l_in,
             'right': ij_r_in,
@@ -1540,15 +1623,12 @@ def build_pipe_spec(
         'config': ij_node_cfg,
     })
     if has_dlq:
-      current_ref = 'IntervalJoin.good'
+      current_ref = f'{join_node_name}.good'
       dag_transforms.append(
-          _norm_dlq(
-              'NormalizeIntervalJoinDlq',
-              'IntervalJoin.errors',
-              'CliIntervalJoin'))
-      dlq_norm_refs.append('NormalizeIntervalJoinDlq')
+          _norm_dlq(join_norm_name, f'{join_node_name}.errors', join_node_type))
+      dlq_norm_refs.append(join_norm_name)
     else:
-      current_ref = 'IntervalJoin'
+      current_ref = join_node_name
 
     if clean_timestamp_col:
       dag_transforms.append({
