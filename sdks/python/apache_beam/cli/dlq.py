@@ -161,21 +161,35 @@ def build_dlq_normalizer_transform(
       "  first = msg.splitlines()[0] if msg else ''\n"
       "  head = first.split('(', 1)[0].split(':', 1)[0].strip()\n"
       "  return head if head.isidentifier() else 'TransformError'\n")
-  err_msg_src = (
-      'def normalize_dlq(err_row):\n'
-      "  msg = (getattr(err_row, 'error', None) or "
-      "getattr(err_row, 'msg', None) or "
-      "getattr(err_row, 'error_message', None) or str(err_row))\n"
-      '  return str(msg)[:4096]\n')
   if redact_tuple:
     redact_lit = repr(redact_tuple)
+    err_msg_src = (
+        'def normalize_dlq(err_row):\n'
+        '  import re\n'
+        f'  _rk = {redact_lit}\n'
+        "  msg = str(getattr(err_row, 'error', None) or "
+        "getattr(err_row, 'msg', None) or "
+        "getattr(err_row, 'error_message', None) or str(err_row))\n"
+        '  for _col in _rk:\n'
+        '    msg = re.sub(\n'
+        '        r\'([\\\'"]?\' + re.escape(_col) + r\'[\\\'"]?\\s*[:=]\\s*)(?:([\\\'"]).*?\\2|[^,\\s)\\]}]+)\',\n'
+        "        r'\\1<REDACTED>',\n"
+        '        msg)\n'
+        '  return msg[:4096]\n')
     redact_tail = (
         f'  _rk = {redact_lit}\n'
+        '  def _scrub(v, d=8):\n'
+        '    if d <= 0:\n'
+        '      return v\n'
+        '    if isinstance(v, dict):\n'
+        "      return {k: ('<REDACTED>' if k in _rk else _scrub(val, d - 1)) for k, val in v.items()}\n"
+        '    if isinstance(v, list):\n'
+        '      return [_scrub(x, d - 1) for x in v]\n'
+        '    return v\n'
         '  try:\n'
         '    _obj = json.loads(_out)\n'
-        '    if isinstance(_obj, dict):\n'
-        "      _obj = {k: ('<REDACTED>' if k in _rk else v) for k, v in _obj.items()}\n"
-        '      return json.dumps(_obj, allow_nan=False, sort_keys=True)\n'
+        '    if isinstance(_obj, (dict, list)):\n'
+        '      return json.dumps(_scrub(_obj), allow_nan=False, sort_keys=True)\n'
         '  except Exception:\n'
         '    pass\n'
         '  return _out\n')
@@ -184,23 +198,32 @@ def build_dlq_normalizer_transform(
         "  raw = getattr(err_row, 'raw_payload', None)\n"
         '  if isinstance(raw, str):\n'
         '    _out = raw\n'
+        "  elif hasattr(err_row, 'element'):\n"
+        "    _out = _safe_json_str(getattr(err_row, 'element'))\n"
+        "  elif hasattr(err_row, 'failed_row'):\n"
+        "    _out = _safe_json_str(getattr(err_row, 'failed_row'))\n"
+        "  elif hasattr(err_row, 'record'):\n"
+        "    _out = _safe_json_str(getattr(err_row, 'record'))\n"
         '  else:\n'
-        '    _out = None\n'
-        "    for attr in ('element', 'failed_row', 'record'):\n"
-        '      if hasattr(err_row, attr):\n'
-        '        _out = _safe_json_str(getattr(err_row, attr))\n'
-        '        break\n'
-        '    if _out is None:\n'
-        '      _out = _safe_json_str(err_row)\n' + redact_tail)
+        '    _out = _safe_json_str(err_row)\n' + redact_tail)
   else:
+    err_msg_src = (
+        'def normalize_dlq(err_row):\n'
+        "  msg = (getattr(err_row, 'error', None) or "
+        "getattr(err_row, 'msg', None) or "
+        "getattr(err_row, 'error_message', None) or str(err_row))\n"
+        '  return str(msg)[:4096]\n')
     payload_src = (
         'def normalize_dlq(err_row):\n' + _SAFE_JSON_HELPERS_SRC +
         "  raw = getattr(err_row, 'raw_payload', None)\n"
         '  if isinstance(raw, str):\n'
         '    return raw\n'
-        "  for attr in ('element', 'failed_row', 'record'):\n"
-        '    if hasattr(err_row, attr):\n'
-        '      return _safe_json_str(getattr(err_row, attr))\n'
+        "  if hasattr(err_row, 'element'):\n"
+        "    return _safe_json_str(getattr(err_row, 'element'))\n"
+        "  if hasattr(err_row, 'failed_row'):\n"
+        "    return _safe_json_str(getattr(err_row, 'failed_row'))\n"
+        "  if hasattr(err_row, 'record'):\n"
+        "    return _safe_json_str(getattr(err_row, 'record'))\n"
         '  return _safe_json_str(err_row)\n')
 
   return {

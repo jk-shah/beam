@@ -1186,7 +1186,10 @@ class _FileEnrichmentCaller:
           f'CliEnrich (file): lookup path not found or empty: {path!r}')
     total_size = 0
     for mp in matched:
-      if '://' not in mp and os.path.isfile(mp):
+      if '://' not in mp:
+        if not os.path.isfile(mp):
+          raise ValueError(
+              f'CliEnrich (file): lookup path {mp!r} is not a regular file')
         total_size += os.path.getsize(mp)
     if total_size > max_bytes:
       raise ValueError(

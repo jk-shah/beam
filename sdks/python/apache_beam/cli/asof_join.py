@@ -166,6 +166,8 @@ def parse_asof_join_spec_str(
     dlq_redact_fields: Iterable[str] | None = None,
 ) -> dict[str, Any]:
   """Parses CLI `--asof-join "key=sym,left_time=t_ts,right_time=q_ts,..."`."""
+  if len(spec_str or '') > 16384:
+    raise ValueError('--asof-join specification exceeds 16,384-char limit')
   s = (spec_str or '').strip()
   if not s:
     raise ValueError('--asof-join specification cannot be empty')
@@ -567,8 +569,10 @@ def join_bounded_asof(
 
   right_by_key: dict[bytes, list[tuple[float, str, str, dict[str, Any]]]] = {}
   for r in right_list:
-    k_bytes = interval_join.encode_canonical_key_values(
-        tuple(r.get(c) for c in config.right_key))
+    r_key_vals = tuple(r.get(c) for c in config.right_key)
+    if any(kv is None for kv in r_key_vals):
+      continue  # SQL semantics: NULL join keys never match NULL!
+    k_bytes = interval_join.encode_canonical_key_values(r_key_vals)
     t_r = interval_join.extract_record_timestamp(r, config.right_timestamp)
     tie_s = _encode_tie_key(r, config.right_order)
     canon_s = interval_join._encode_state_payload(r)
@@ -585,13 +589,16 @@ def join_bounded_asof(
   matched = 0
   unmatched = 0
   for l_row in left_list:
-    k_bytes = interval_join.encode_canonical_key_values(
-        tuple(l_row.get(c) for c in config.left_key))
+    l_key_vals = tuple(l_row.get(c) for c in config.left_key)
     t_l = interval_join.extract_record_timestamp(l_row, config.left_timestamp)
-    r_pair = sorted_right_by_key.get(k_bytes)
-    best_r = (
-        _find_best_right_entry(t_l, r_pair[0], r_pair[1], config)
-        if r_pair is not None else None)
+    if any(kv is None for kv in l_key_vals):
+      best_r = None
+    else:
+      k_bytes = interval_join.encode_canonical_key_values(l_key_vals)
+      r_pair = sorted_right_by_key.get(k_bytes)
+      best_r = (
+          _find_best_right_entry(t_l, r_pair[0], r_pair[1], config)
+          if r_pair is not None else None)
     if best_r is not None:
       matched += 1
       results.append(
@@ -897,6 +904,8 @@ class AsofJoinStatefulDoFn(beam.DoFn):
         if changed_cols:
           cur_wm['r_cols'] = prev_r_cols
           wm_state.write(json.dumps(cur_wm))
+      if any(row_payload.get(c) is None for c in self.config.right_key):
+        return  # SQL semantics: NULL join keys never match NULL!
       tie_s = _encode_tie_key(row_payload, self.config.right_order)
       right_buf.add((t, tie_s, encoded_json))
       clean_ms = self._compute_right_cleanup_ms(t)
@@ -947,7 +956,10 @@ class AsofJoinStatefulDoFn(beam.DoFn):
     unmatched = 0
     for t_l, _, l_json in ready_left:
       l_dict = interval_join._decode_state_payload(l_json)
-      best_r = _find_best_right_entry(t_l, sorted_right, t_list, self.config)
+      if any(l_dict.get(c) is None for c in self.config.left_key):
+        best_r = None
+      else:
+        best_r = _find_best_right_entry(t_l, sorted_right, t_list, self.config)
       if best_r is not None:
         matched += 1
         proj = interval_join.project_joined_row(

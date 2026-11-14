@@ -431,6 +431,34 @@ def extract_record_key(
   return tuple(d.get(k) for k in fields)
 
 
+def _scale_and_bound_epoch_seconds(
+    f: float, ts_field: str, raw_val: Any) -> float:
+  if not math.isfinite(f):
+    raise ValueError(
+        f'timestamp column {ts_field!r} must be a finite numeric value, got {raw_val!r}'
+    )
+  af = abs(f)
+  if af > 1e20:
+    raise ValueError(
+        f'timestamp {raw_val!r} in {ts_field!r} overflows supported epoch range'
+    )
+  if af > 1e17:
+    sec = f / 1_000_000_000.0  # epoch nanoseconds
+  elif af > 1e14:
+    sec = f / 1_000_000.0  # epoch microseconds
+  elif af > 1e11:
+    sec = f / 1_000.0  # epoch milliseconds
+  else:
+    sec = f
+  # Bound to ISO years 0001-01-01T00:00:00Z .. 9999-12-31T23:59:59Z so
+  # `datetime.fromtimestamp` and 64-bit protobuf microsecond timers never overflow!
+  if sec < -62_135_596_800.0 or sec > 253_402_300_799.0:
+    raise ValueError(
+        f'timestamp {raw_val!r} in {ts_field!r} is outside supported range [0001..9999]'
+    )
+  return sec
+
+
 def extract_record_timestamp(elem: Any, ts_field: str | None) -> float:
   """Extracts event timestamp in epoch seconds (float) from a Row or dict."""
   if not ts_field:
@@ -443,28 +471,20 @@ def extract_record_timestamp(elem: Any, ts_field: str | None) -> float:
   if isinstance(val, bool):
     raise ValueError(f'boolean value is not a valid timestamp in {ts_field!r}')
   if isinstance(val, (int, float, decimal.Decimal)):
-    f = float(val)
-    if not math.isfinite(f):
-      raise ValueError(
-          f'timestamp column {ts_field!r} must be a finite numeric value, got {val!r}'
-      )
-    return f / 1000.0 if abs(f) > 1e11 else f
+    return _scale_and_bound_epoch_seconds(float(val), ts_field, val)
   if isinstance(val, datetime.datetime):
     if val.tzinfo is None:
       val = val.replace(tzinfo=datetime.timezone.utc)
-    return val.timestamp()
+    return _scale_and_bound_epoch_seconds(val.timestamp(), ts_field, val)
 
   s = str(val).strip()
   try:
-    if re.fullmatch(r'[+-]?\d+(?:\.\d+)?', s):
-      f = float(s)
-      if not math.isfinite(f):
-        raise ValueError('non-finite timestamp')
-      return f / 1000.0 if abs(f) > 1e11 else f
+    if re.fullmatch(r'[+-]?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?', s):
+      return _scale_and_bound_epoch_seconds(float(s), ts_field, val)
     dt = datetime.datetime.fromisoformat(s.replace('Z', '+00:00'))
     if dt.tzinfo is None:
       dt = dt.replace(tzinfo=datetime.timezone.utc)
-    return dt.timestamp()
+    return _scale_and_bound_epoch_seconds(dt.timestamp(), ts_field, val)
   except Exception as e:
     raise ValueError(f'cannot parse timestamp value {val!r}: {e}') from None
 

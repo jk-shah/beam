@@ -121,11 +121,8 @@ def run_check(
       block = pipeline_block[extra]
       _check_transform_keys(
           block if isinstance(block, list) else [block], source_label)
-  for idx, t in enumerate(transforms):
-    if not isinstance(t, dict) or 'type' not in t:
-      raise CheckError(
-          f'{source_label}: transform #{idx + 1} must be a mapping with "type:"'
-      )
+
+  def _validate_single_cli_transform(t: dict[str, Any]) -> None:
     if t['type'] in ('CliIntervalJoin', 'IntervalJoin') and isinstance(
         t.get('config'), dict):
       from . import interval_join
@@ -180,11 +177,35 @@ def run_check(
       except ValueError as e:
         raise CheckError(
             f'{source_label}: invalid {t["type"]} config: {e}') from None
+
+  def _walk_and_validate_cli_transforms(items: Any) -> None:
+    if isinstance(items, dict):
+      items = [items]
+    if not isinstance(items, list):
+      return
+    for item in items:
+      if not isinstance(item, dict) or 'type' not in item:
+        continue
+      _validate_single_cli_transform(item)
+      for sub_k in ('transforms', 'extra_transforms', 'source', 'sink'):
+        if sub_k in item:
+          _walk_and_validate_cli_transforms(item[sub_k])
+
+  for idx, t in enumerate(transforms):
+    if not isinstance(t, dict) or 'type' not in t:
+      raise CheckError(
+          f'{source_label}: transform #{idx + 1} must be a mapping with "type:"'
+      )
     stages.append({
         'index': idx,
         'name': t.get('name') or t['type'],
         'type': t['type'],
     })
+
+  _walk_and_validate_cli_transforms(transforms)
+  for extra in ('source', 'sink', 'extra_transforms'):
+    if extra in pipeline_block:
+      _walk_and_validate_cli_transforms(pipeline_block[extra])
 
   from . import dlq
   _builtin_cli_targets = frozenset(
@@ -472,10 +493,46 @@ def _check_parquet_untyped_python_expressions(
 _SAFE_CALLABLE_IMPORTS = frozenset(
     ['json', 'math', 're', 'datetime', 'decimal', 'base64'])
 _DANGEROUS_CALLABLE_NAMES = frozenset([
-    '__import__', 'eval', 'exec', 'compile', 'open', 'input', 'breakpoint',
-    'globals', 'locals', 'vars', 'dir', 'delattr', 'setattr', 'builtins',
-    'os', 'sys', 'subprocess', 'shutil', 'socket', 'urllib', 'http', 'ctypes',
-    'importlib', 'pathlib', 'pickle', 'marshal',
+    '__import__',
+    'eval',
+    'exec',
+    'compile',
+    'open',
+    'input',
+    'breakpoint',
+    'globals',
+    'locals',
+    'vars',
+    'dir',
+    'delattr',
+    'setattr',
+    'builtins',
+    'type',
+    'object',
+    'super',
+    'classmethod',
+    'staticmethod',
+    'property',
+    'os',
+    'sys',
+    'subprocess',
+    'shutil',
+    'socket',
+    'urllib',
+    'http',
+    'ctypes',
+    'importlib',
+    'pathlib',
+    'pickle',
+    'marshal',
+])
+_FORBIDDEN_ATTR_NAMES = frozenset([
+    'gi_frame',
+    'f_globals',
+    'f_builtins',
+    'tb_frame',
+    'cr_frame',
+    'ag_frame',
 ])
 
 
@@ -507,6 +564,21 @@ def _is_safe_inline_callable(src: str) -> bool:
   else:
     return False
 
+  direct_attr_funcs: set[int] = set()
+  for node in ast.walk(stmt):
+    if isinstance(node, ast.Call) and isinstance(
+        node.func, ast.Name) and node.func.id in ('getattr', 'hasattr'):
+      if node.keywords or not (2 <= len(node.args) <= 3):
+        return False
+      attr_arg = node.args[1]
+      if not (isinstance(attr_arg, ast.Constant) and
+              isinstance(attr_arg.value, str)):
+        return False
+      if (attr_arg.value.startswith('__') or
+          attr_arg.value in _FORBIDDEN_ATTR_NAMES):
+        return False
+      direct_attr_funcs.add(id(node.func))
+
   for node in ast.walk(stmt):
     if isinstance(node, ast.Import):
       if any(alias.name not in _SAFE_CALLABLE_IMPORTS for alias in node.names):
@@ -515,16 +587,14 @@ def _is_safe_inline_callable(src: str) -> bool:
       if (node.module or '') not in _SAFE_CALLABLE_IMPORTS:
         return False
     elif isinstance(node, ast.Name):
+      if node.id in ('getattr',
+                     'hasattr') and id(node) not in direct_attr_funcs:
+        return False
       if node.id in _DANGEROUS_CALLABLE_NAMES or (node.id.startswith('__') and
                                                   node.id != '__row__'):
         return False
     elif isinstance(node, ast.Attribute):
-      if node.attr.startswith('__') or node.attr in ('gi_frame',
-                                                     'f_globals',
-                                                     'f_builtins',
-                                                     'tb_frame',
-                                                     'cr_frame',
-                                                     'ag_frame'):
+      if node.attr.startswith('__') or node.attr in _FORBIDDEN_ATTR_NAMES:
         return False
   return True
 
@@ -578,7 +648,13 @@ def _has_executable_python_transforms(block: Any) -> bool:
   if not isinstance(block, dict):
     return False
   t_type = str(block.get('type') or '')
-  if t_type in ('PyTransform', 'PythonCallable', 'MLTransform'):
+  if t_type in (
+      'PyTransform',
+      'PythonCallable',
+      'MLTransform',
+      'Enrichment',
+      'RunInference',
+  ):
     return True
   cfg = block.get('config')
   if isinstance(cfg, dict):

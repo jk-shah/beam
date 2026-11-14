@@ -263,6 +263,10 @@ def parse_kv_options(
       raise UriError(f'expected key/value mapping in {opt_file!r}')
     secret_key = _mapping_has_secret_key(loaded)
     if secret_key and os.name == 'posix':
+      if os.path.islink(opt_file):
+        raise UriError(
+            f'options file {opt_file!r} contains secret key {secret_key!r} '
+            'and cannot be a symbolic link; pass a regular 0600 file')
       try:
         mode = os.stat(opt_file).st_mode & 0o777
       except OSError:

@@ -473,6 +473,8 @@ def parse_pattern_spec_str(
     dlq_redact_fields: Iterable[str] | None = None,
 ) -> dict[str, Any]:
   """Parses `--pattern "key=user_id,seq=A -> B within 5m,..."` into YAML dict."""
+  if len(spec_str or '') > 16384:
+    raise ValueError('--pattern specification exceeds 16,384-char limit')
   s = (spec_str or '').strip()
   if not s:
     raise ValueError('--pattern specification cannot be empty')
@@ -990,8 +992,10 @@ def match_bounded_patterns(
   by_key: dict[bytes, list[tuple[float, int, dict[str, Any]]]] = {}
   for seq_i, rec in enumerate(records):
     d = interval_join._to_plain_dict(rec)
-    k_bytes = interval_join.encode_canonical_key_values(
-        tuple(d.get(k) for k in config.keys))
+    key_vals = tuple(d.get(k) for k in config.keys)
+    if any(kv is None for kv in key_vals):
+      continue
+    k_bytes = interval_join.encode_canonical_key_values(key_vals)
     t = interval_join.extract_record_timestamp(d, config.timestamp_col)
     by_key.setdefault(k_bytes, []).append((t, seq_i, d))
 
@@ -1294,12 +1298,23 @@ def cli_pattern_match(
     def process(self, record, elem_ts=beam.DoFn.TimestampParam):
       d = interval_join._to_plain_dict(record)
       try:
-        ckey = interval_join.encode_canonical_key_values(
-            tuple(d.get(k) for k in cfg.keys))
+        key_vals = tuple(d.get(k) for k in cfg.keys)
+        if any(kv is None for kv in key_vals):
+          if route_errors:
+            yield pvalue.TaggedOutput(
+                err_tag,
+                _make_cep_dlq_row(
+                    'MissingKeyError',
+                    f'null or missing partition key in {cfg.keys}',
+                    d,
+                    redact_fields=cfg.dlq_redact_fields))
+          return
+        ckey = interval_join.encode_canonical_key_values(key_vals)
         if cfg.timestamp_col:
           t = interval_join.extract_record_timestamp(d, cfg.timestamp_col)
         else:
-          t = float(elem_ts)
+          t = interval_join._scale_and_bound_epoch_seconds(
+              float(elem_ts), '<element_timestamp>', elem_ts)
         self._local_seq += 1
         payload = (t, self._local_seq, d) if self._bounded_seq else (t, d)
         yield TimestampedValue((ckey, payload), beam_timestamp.Timestamp.of(t))
