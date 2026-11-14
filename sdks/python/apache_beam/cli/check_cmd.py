@@ -157,6 +157,13 @@ def run_check(
       except ValueError as e:
         raise CheckError(
             f'{source_label}: invalid {t["type"]} config: {e}') from None
+    if t['type'] == 'CliWindowInto' and isinstance(t.get('config'), dict):
+      from . import windowing
+      try:
+        windowing.parse_windowing_config(t['config'])
+      except ValueError as e:
+        raise CheckError(
+            f'{source_label}: invalid {t["type"]} config: {e}') from None
     stages.append({
         'index': idx,
         'name': t.get('name') or t['type'],

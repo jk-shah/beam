@@ -313,6 +313,13 @@ _TIER1_EXPORTED_METRICS = (
     'inference_rows',
     'inference_errors',
     'inference_latency_ms',
+    'asof_matched',
+    'asof_unmatched',
+    'patterns_matched',
+    'patterns_expired',
+    'pattern_overflow_dropped',
+    'late_rows_dropped',
+    'late_panes_emitted',
 )
 
 
@@ -341,9 +348,10 @@ def finalize_cli_row_metrics(raw_counters: dict[str, int]) -> dict[str, int]:
   dupes_dropped = int(raw_counters.get('duplicates_dropped', 0))
   enrich_dropped = int(raw_counters.get('enrich_misses_dropped', 0))
   skew_dropped = int(raw_counters.get('skew_dropped', 0))
+  late_dropped = int(raw_counters.get('late_rows_dropped', 0))
   stage_drops = (
       cdc_skipped + cdc_superseded + exp_dropped + dupes_dropped +
-      enrich_dropped + skew_dropped)
+      enrich_dropped + skew_dropped + late_dropped)
   if ('pre_filter_rows' in raw_counters or 'post_filter_rows' in raw_counters or
       stage_drops > 0):
     pre_f = int(raw_counters.get('pre_filter_rows', 0))

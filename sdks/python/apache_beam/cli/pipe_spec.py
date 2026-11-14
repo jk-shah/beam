@@ -51,6 +51,7 @@ class PipeSpec(NamedTuple):
   dlq_endpoint: uris.ParsedEndpoint | None = None
   requires_java_xlang: bool = False
   is_unbounded: bool = False
+  late_dlq_endpoint: uris.ParsedEndpoint | None = None
 
 
 def _normalize_primary_keys(primary_keys: Iterable[str] | None) -> list[str]:
@@ -300,6 +301,13 @@ def build_pipe_spec(
     infer_fields: str | None = None,
     infer_tag: str | None = None,
     infer_flatten: bool = False,
+    allowed_lateness: str | None = None,
+    trigger: str | None = None,
+    accumulation: str | None = None,
+    late_action: str | None = None,
+    late_data_dlq: str | None = None,
+    emit_pane_info: bool = False,
+    watermark_lag: str | None = None,
     dlq_redact_fields: Iterable[str] | str | None = None,
 ) -> PipeSpec:
   """Returns the `PipeSpec` for `beam pipe`."""
@@ -392,6 +400,22 @@ def build_pipe_spec(
             if_exists='append' if if_exists == 'append' else 'fail',
             default_project=default_project,
             allow_jinja=allow_jinja) if dlq_sink else None)
+    late_dlq_default_fmt = None
+    if late_data_dlq:
+      if not (uris.extension_of(late_data_dlq) or
+              ('://' in late_data_dlq and late_data_dlq.split(
+                  '://', 1)[0].lower() not in uris.FILE_SCHEMES)):
+        late_dlq_default_fmt = (
+            (uris._infer_jinja_file_format(late_data_dlq) or 'json') if
+            allow_jinja and uris._has_jinja_syntax(late_data_dlq) else 'json')
+    late_dlq_ep = (
+        uris.parse_endpoint(
+            late_data_dlq,
+            is_read=False,
+            explicit_format=late_dlq_default_fmt,
+            if_exists='append' if if_exists == 'append' else 'fail',
+            default_project=default_project,
+            allow_jinja=allow_jinja) if late_data_dlq else None)
   except uris.UriError as e:
     raise PipeSpecError(str(e)) from None
 
@@ -412,15 +436,21 @@ def build_pipe_spec(
           "cannot route expectation violations to DLQ without a DLQ sink; "
           "specify --dlq <PATH> or use --on-violation {fail|drop}")
 
+  has_b23_window_opts = bool(
+      allowed_lateness is not None or trigger is not None or
+      accumulation is not None or late_action is not None or
+      late_dlq_ep is not None or emit_pane_info or watermark_lag is not None)
+
   if zero_copy:
     if (cdc or where or pre_select or post_where or select or
-        dlq_ep is not None or window or timestamp_col or expect or
-        interval_join or dedupe_by or enrich or infer):
+        dlq_ep is not None or window or has_b23_window_opts or timestamp_col or
+        expect or interval_join or dedupe_by or enrich or infer):
       raise PipeSpecError(
           '--zero-copy registers existing Parquet files in-place without '
           'rewriting data, so it cannot be combined with --cdc, --where, '
           '--pre-select, --enrich, --infer, --post-where, --select, --window, '
-          '--timestamp-col, --expect, --interval-join, --dedupe-by, or --dlq')
+          '--allowed-lateness, --trigger, --timestamp-col, --expect, '
+          '--interval-join, --dedupe-by, or --dlq')
     if dst_ep.kind != 'iceberg':
       raise PipeSpecError(
           f'--zero-copy requires an iceberg:// destination, got {dst_ep.raw!r}')
@@ -751,6 +781,49 @@ def build_pipe_spec(
       seen_infer_tags.add(i_parsed.tag)
       infer_yaml_cfgs.append(i_yaml)
 
+  cli_window_yaml_cfg: dict[str, Any] | None = None
+  cli_window_parsed = None
+  if has_b23_window_opts:
+    if window_spec is None:
+      raise PipeSpecError(
+          '--allowed-lateness / --trigger / --accumulation / --late-action / '
+          '--late-data-dlq / --emit-pane-info requires --window <SPEC>')
+    from . import windowing as windowing_mod
+    eff_late_act = late_action
+    if eff_late_act is None and late_dlq_ep is not None:
+      eff_late_act = 'dlq'
+    raw_w_cfg: dict[str, Any] = {'windowing': dict(window_spec)}
+    if allowed_lateness is not None:
+      raw_w_cfg['allowed_lateness'] = allowed_lateness
+    if trigger is not None:
+      raw_w_cfg['trigger'] = trigger
+    if accumulation is not None:
+      raw_w_cfg['accumulation'] = accumulation
+    if eff_late_act is not None:
+      raw_w_cfg['late_action'] = eff_late_act
+    if watermark_lag is not None:
+      raw_w_cfg['watermark_lag'] = watermark_lag
+    if parsed_dlq_redact:
+      raw_w_cfg['dlq_redact_fields'] = list(parsed_dlq_redact)
+    try:
+      cli_window_parsed = windowing_mod.parse_windowing_config(raw_w_cfg)
+    except ValueError as e:
+      raise PipeSpecError(str(e)) from None
+    if (cli_window_parsed.late_action == 'dlq' and dlq_ep is None and
+        late_dlq_ep is None):
+      raise PipeSpecError(
+          '--late-action=dlq requires --late-data-dlq <SINK> or --dlq <SINK> '
+          '(or use --late-action=drop)')
+    if (not is_unbounded and
+        cli_window_parsed.parsed_trigger.mode == 'standalone' and
+        cli_window_parsed.parsed_trigger.uses_processing_time):
+      raise PipeSpecError(
+          'standalone processing-time --trigger every:<DURATION> requires an '
+          'unbounded streaming source (use --trigger "watermark,early=..." or '
+          '--trigger count:<N> on bounded inputs)')
+    cli_window_yaml_cfg = windowing_mod.windowing_config_to_yaml_dict(
+        cli_window_parsed)
+
   eff_where_cols = None if interval_join_cfg is not None else known_source_columns
   eff_pre_select_cols = (
       None if interval_join_cfg is not None else known_source_columns)
@@ -758,7 +831,7 @@ def build_pipe_spec(
       None if (
           interval_join_cfg is not None or window_aggs is not None or
           pre_select is not None or bool(enrich_yaml_cfgs) or
-          bool(infer_yaml_cfgs)) else known_source_columns)
+          bool(infer_yaml_cfgs) or emit_pane_info) else known_source_columns)
 
   try:
     where_cfg = (
@@ -1126,13 +1199,14 @@ def build_pipe_spec(
       prefer_python_lakehouse_and_cdc and src_ep.kind == 'file' and
       src_ep.format in ('parquet', 'avro') and (
           where_cfg or pre_select_cfg or post_where_cfg or enrich_yaml_cfgs or
-          infer_yaml_cfgs or select_cfg or interval_join_cfg is not None))
+          infer_yaml_cfgs or select_cfg or interval_join_cfg is not None or
+          cli_window_yaml_cfg is not None))
   right_rowify_nested = bool(
       prefer_python_lakehouse_and_cdc and right_ep is not None and
       right_ep.kind == 'file' and right_ep.format in ('parquet', 'avro'))
   if (rowify_nested or right_rowify_nested or interval_join_cfg is not None or
       dedupe_yaml_cfg is not None or bool(enrich_yaml_cfgs) or
-      bool(infer_yaml_cfgs)):
+      bool(infer_yaml_cfgs) or cli_window_yaml_cfg is not None):
     needs_cli_provider = True
 
   # Pure Java-to-Java fast path: skip Python counter stages unless explicitly
@@ -1141,13 +1215,14 @@ def build_pipe_spec(
       src_java and sink_java and cdc_norm_cfg is None and not where_cfg and
       not pre_select_cfg and not post_where_cfg and not enrich_yaml_cfgs and
       not infer_yaml_cfgs and not select_cfg and not dlq_ep and
-      interval_join_cfg is None and dedupe_yaml_cfg is None)
+      not late_dlq_ep and interval_join_cfg is None and
+      dedupe_yaml_cfg is None and cli_window_yaml_cfg is None)
   inject_counters = bool(include_counters) and not pure_java_pipe
   if inject_counters:
     needs_cli_provider = True
 
   # Simple linear chain when neither `--dlq` nor `--interval-join` is active!
-  if dlq_ep is None and interval_join_cfg is None:
+  if dlq_ep is None and late_dlq_ep is None and interval_join_cfg is None:
     chain_steps: list[dict[str, Any]] = [
         {
             'type': src_type,
@@ -1168,12 +1243,20 @@ def build_pipe_spec(
           },
       })
     if clean_timestamp_col:
-      chain_steps.append({
-          'type': 'AssignTimestamps',
-          'config': {
-              'timestamp': clean_timestamp_col
-          },
-      })
+      if cli_window_yaml_cfg is not None:
+        chain_steps.append({
+            'type': 'CliAssignTimestamps',
+            'config': {
+                'timestamp_col': clean_timestamp_col
+            },
+        })
+      else:
+        chain_steps.append({
+            'type': 'AssignTimestamps',
+            'config': {
+                'timestamp': clean_timestamp_col
+            },
+        })
     if cdc_norm_cfg is not None:
       chain_steps.append({
           'type': 'CliNormalizeCdc',
@@ -1234,20 +1317,31 @@ def build_pipe_spec(
             },
         })
     if window_spec is not None:
-      chain_steps.append({
-          'type': 'WindowInto',
-          'config': {
-              'windowing': window_spec
-          },
-      })
-      if window_aggs:
+      if cli_window_yaml_cfg is not None:
         chain_steps.append({
-            'type': 'Combine',
+            'type': 'CliWindowInto',
+            'config': dict(cli_window_yaml_cfg),
+        })
+      else:
+        chain_steps.append({
+            'type': 'WindowInto',
             'config': {
-                'group_by': window_aggs.get('group_by', []),
-                'combine': window_aggs.get('combine', {}),
+                'windowing': window_spec
             },
         })
+      if window_aggs:
+        comb_cfg: dict[str, Any] = {
+            'group_by': window_aggs.get('group_by', []),
+            'combine': window_aggs.get('combine', {}),
+        }
+        if cli_window_yaml_cfg is not None:
+          comb_cfg['language'] = 'python'
+        chain_steps.append({
+            'type': 'Combine',
+            'config': comb_cfg,
+        })
+      if emit_pane_info:
+        chain_steps.append({'type': 'CliExtractPaneInfo', 'config': {}})
     if select_cfg is not None:
       chain_steps.append({'type': 'MapToFields', 'config': select_cfg})
     if parsed_expect_rules:
@@ -1491,15 +1585,36 @@ def build_pipe_spec(
       current_ref = 'CountRead'
 
     if clean_timestamp_col:
-      dag_transforms.append({
-          'name': 'AssignTimestamps',
-          'type': 'AssignTimestamps',
-          'input': current_ref,
-          'config': {
-              'timestamp': clean_timestamp_col
-          },
-      })
-      current_ref = 'AssignTimestamps'
+      if cli_window_yaml_cfg is not None:
+        ts_dag_cfg: dict[str, Any] = {'timestamp_col': clean_timestamp_col}
+        if has_dlq:
+          ts_dag_cfg['error_handling'] = {'output': 'errors'}
+        dag_transforms.append({
+            'name': 'AssignTimestamps',
+            'type': 'CliAssignTimestamps',
+            'input': current_ref,
+            'config': ts_dag_cfg,
+        })
+        if has_dlq:
+          dag_transforms.append(
+              _norm_dlq(
+                  'NormalizeAssignTsDlq',
+                  'AssignTimestamps.errors',
+                  'CliAssignTimestamps'))
+          dlq_norm_refs.append('NormalizeAssignTsDlq')
+          current_ref = 'AssignTimestamps.good'
+        else:
+          current_ref = 'AssignTimestamps'
+      else:
+        dag_transforms.append({
+            'name': 'AssignTimestamps',
+            'type': 'AssignTimestamps',
+            'input': current_ref,
+            'config': {
+                'timestamp': clean_timestamp_col
+            },
+        })
+        current_ref = 'AssignTimestamps'
 
   if cdc_norm_cfg is not None:
     norm_cdc = dict(cdc_norm_cfg)
@@ -1702,27 +1817,62 @@ def build_pipe_spec(
       })
       current_ref = 'CountPostPostFilter'
 
+  late_dlq_norm_ref: str | None = None
   if window_spec is not None:
-    dag_transforms.append({
-        'name': 'WindowInto',
-        'type': 'WindowInto',
-        'input': current_ref,
-        'config': {
-            'windowing': window_spec
-        },
-    })
-    current_ref = 'WindowInto'
+    if cli_window_yaml_cfg is not None:
+      w_cfg_copy = dict(cli_window_yaml_cfg)
+      want_win_dlq = bool(has_dlq or late_dlq_ep is not None)
+      if want_win_dlq:
+        w_cfg_copy['error_handling'] = {'output': 'errors'}
+      dag_transforms.append({
+          'name': 'WindowInto',
+          'type': 'CliWindowInto',
+          'input': current_ref,
+          'config': w_cfg_copy,
+      })
+      if want_win_dlq:
+        dag_transforms.append(
+            _norm_dlq(
+                'NormalizeWindowDlq', 'WindowInto.errors', 'CliWindowInto'))
+        if late_dlq_ep is not None:
+          late_dlq_norm_ref = 'NormalizeWindowDlq'
+        else:
+          dlq_norm_refs.append('NormalizeWindowDlq')
+        current_ref = 'WindowInto.good'
+      else:
+        current_ref = 'WindowInto'
+    else:
+      dag_transforms.append({
+          'name': 'WindowInto',
+          'type': 'WindowInto',
+          'input': current_ref,
+          'config': {
+              'windowing': window_spec
+          },
+      })
+      current_ref = 'WindowInto'
     if window_aggs:
+      comb_dag_cfg: dict[str, Any] = {
+          'group_by': window_aggs.get('group_by', []),
+          'combine': window_aggs.get('combine', {}),
+      }
+      if cli_window_yaml_cfg is not None:
+        comb_dag_cfg['language'] = 'python'
       dag_transforms.append({
           'name': 'WindowCombine',
           'type': 'Combine',
           'input': current_ref,
-          'config': {
-              'group_by': window_aggs.get('group_by', []),
-              'combine': window_aggs.get('combine', {}),
-          },
+          'config': comb_dag_cfg,
       })
       current_ref = 'WindowCombine'
+    if emit_pane_info:
+      dag_transforms.append({
+          'name': 'ExtractPaneInfo',
+          'type': 'CliExtractPaneInfo',
+          'input': current_ref,
+          'config': {},
+      })
+      current_ref = 'ExtractPaneInfo'
 
   if select_cfg is not None:
     s_cfg = dict(select_cfg)
@@ -1832,6 +1982,29 @@ def build_pipe_spec(
         'config': dict(dlq_ep.config),
     })
 
+  if late_dlq_ep is not None and late_dlq_norm_ref is not None:
+    late_input_ref = late_dlq_norm_ref
+    if inject_counters:
+      dag_transforms.append({
+          'name': 'CountLateDlq',
+          'type': 'CliCountRows',
+          'input': late_input_ref,
+          'config': {
+              'counter': 'dlq_rows'
+          },
+      })
+      late_input_ref = 'CountLateDlq'
+    late_sink_type = (
+        'CliWriteToBigQuery' if
+        (prefer_python_bigquery_sink and
+         late_dlq_ep.kind == 'bigquery') else late_dlq_ep.yaml_type)
+    dag_transforms.append({
+        'name': 'WriteLateDlq',
+        'type': late_sink_type,
+        'input': late_input_ref,
+        'config': dict(late_dlq_ep.config),
+    })
+
   spec = {
       'pipeline': {
           'transforms': dag_transforms,
@@ -1848,8 +2021,10 @@ def build_pipe_spec(
       dlq_endpoint=dlq_ep,
       requires_java_xlang=(
           src_java or right_java or sink_java or
-          (dlq_ep is not None and dlq_ep.is_java_xlang)),
-      is_unbounded=is_unbounded)
+          (dlq_ep is not None and dlq_ep.is_java_xlang) or
+          (late_dlq_ep is not None and late_dlq_ep.is_java_xlang)),
+      is_unbounded=is_unbounded,
+      late_dlq_endpoint=late_dlq_ep)
 
 
 def _redact_spec_secrets(

@@ -70,7 +70,7 @@ def render_llms_txt() -> str:
     text `.txt` (`Row(line: str)`), mixed-format directory globs like `data/*`,
     `delta://`, and `iceberg://` in `<100ms` locally or `type: Sql` on Dataflow;
     `--join` is accepted as an alias for repeating `--from` or as the right stream for `--interval-join`),
-    apply event-time windowing (`--window fixed:60s`, `sliding:5m,1m`, `session:30m` with `--timestamp-col COL`; `--window-size` is accepted),
+    apply event-time windowing, speculative/late triggers & late-data quarantine (`--window fixed:60s`, `sliding:5m,1m`, `session:30m` with `--timestamp-col COL` and optional `--allowed-lateness 10m --trigger "watermark,early=every:10s,late=count:1" --accumulation accumulating|discarding --late-action dlq|drop --late-data-dlq URI --emit-pane-info`; `--window-size` is accepted),
     correlate event streams with declarative interval joins (`--from o=URI --join s=URI --interval-join "key=id,left_time=o_ts,right_time=s_ts,lower=0s,upper=15m,type=left"` or 2-source SQL `BETWEEN ... INTERVAL`) and watermark skew circuit breaking (`--max-watermark-skew 30m --skew-action dlq|drop|warn|fail`),
     deduplicate at-least-once streams or batches (`--dedupe-by COL[,COL2] [--dedupe-window 10m] [--dedupe-keep first|last] [--dedupe-order COL] [--dedupe-dlq]`),
     hydrate external features or lookup tables (`--pre-select EXPR --enrich "bigquery|bigtable|vertexai|feast|file:..." [--enrich-opt K=V]`),

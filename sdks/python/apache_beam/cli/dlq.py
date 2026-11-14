@@ -266,6 +266,9 @@ def cli_yaml_provider_spec() -> dict[str, Any]:
           'Enrich': 'apache_beam.cli.enrich.cli_enrich',
           'CliInfer': 'apache_beam.cli.infer.cli_infer',
           'Infer': 'apache_beam.cli.infer.cli_infer',
+          'CliWindowInto': 'apache_beam.cli.windowing.cli_window_into',
+          'CliExtractPaneInfo': (
+              'apache_beam.cli.windowing.cli_extract_pane_info'),
       },
   }
 

@@ -175,6 +175,7 @@ _CLI_ZERO_FLAGS = {
         '--schema-check',
         '--dedupe-dlq',
         '--infer-flatten',
+        '--emit-pane-info',
         '--verbose',
         '--no-config',
         '--help',
@@ -234,6 +235,11 @@ _CLI_ONE_FLAGS = {
         '--window',
         '--window-size',
         '--window_size',
+        '--allowed-lateness',
+        '--trigger',
+        '--accumulation',
+        '--late-action',
+        '--late-data-dlq',
         '--timestamp-col',
         '--timestamp_col',
         '--format',
@@ -835,6 +841,51 @@ def _build_parser():
           'fixed:DURATION (or plain DURATION, e.g. 60s), '
           'sliding:SIZE,PERIOD (e.g. sliding:5m,1m), or '
           'session:GAP (e.g. session:30m)'))
+  pipe.add_argument(
+      '--allowed-lateness',
+      dest='allowed_lateness',
+      default=None,
+      metavar='DUR',
+      help=
+      'horizon past window end during which late data is still accepted (e.g. 10m)'
+  )
+  pipe.add_argument(
+      '--trigger',
+      dest='trigger',
+      default=None,
+      metavar='SPEC',
+      help=(
+          'pane firing trigger for --window (e.g. '
+          '"watermark,early=every:10s,late=count:1", "every:10s", "count:50")'))
+  pipe.add_argument(
+      '--accumulation',
+      dest='accumulation',
+      choices=('discarding', 'accumulating'),
+      default=None,
+      help='window pane accumulation mode when --trigger fires multiple panes')
+  pipe.add_argument(
+      '--late-action',
+      dest='late_action',
+      choices=('allow', 'drop', 'dlq'),
+      default=None,
+      help=
+      'action for droppably-late records arriving after window.end + allowed_lateness'
+  )
+  pipe.add_argument(
+      '--late-data-dlq',
+      dest='late_data_dlq',
+      default=None,
+      metavar='URI',
+      help=
+      'quarantine sink URI for droppably-late records (implies --late-action=dlq)'
+  )
+  pipe.add_argument(
+      '--emit-pane-info',
+      dest='emit_pane_info',
+      action='store_true',
+      help=(
+          'append typed window_start, window_end, pane_timing, pane_index, '
+          'pane_is_first, and pane_is_last columns'))
   pipe.add_argument(
       '--timestamp-col',
       '--timestamp_col',
@@ -2993,12 +3044,18 @@ def _pipe(
   raw_sources = list(args.sources or [])
   raw_joins = list(args.joins or [])
   has_interval_join_flag = bool(getattr(args, 'interval_join', None))
+  has_b23_flags = bool(
+      getattr(args, 'allowed_lateness', None) or
+      getattr(args, 'trigger', None) or getattr(args, 'accumulation', None) or
+      getattr(args, 'late_action', None) or
+      getattr(args, 'late_data_dlq', None) or
+      getattr(args, 'emit_pane_info', False))
   if args.sink is None and args.sql is None and getattr(
       args, 'select',
       None) and not (args.cdc or args.zero_copy or args.window or
-                     args.timestamp_col or args.dlq or has_interval_join_flag or
-                     getattr(args, 'dedupe_by', None) or
-                     getattr(args, 'pre_select', None) or
+                     has_b23_flags or args.timestamp_col or args.dlq or
+                     has_interval_join_flag or getattr(args, 'dedupe_by', None)
+                     or getattr(args, 'pre_select', None) or
                      getattr(args, 'post_where', None) or
                      getattr(args, 'enrich_specs', None) or
                      getattr(args, 'infer_specs', None)):
@@ -3048,12 +3105,14 @@ def _pipe(
           EXIT_USAGE)
     if (args.where or getattr(args, 'pre_select', None) or
         getattr(args, 'post_where', None) or args.select or args.cdc or
-        args.zero_copy or getattr(args, 'dedupe_by', None) or
+        args.zero_copy or args.window or has_b23_flags or
+        getattr(args, 'dedupe_by', None) or
         getattr(args, 'enrich_specs', None) or
         getattr(args, 'infer_specs', None)):
       raise _CliError(
           '--sql cannot be combined with --where, --pre-select, --enrich, '
-          '--infer, --post-where, --select, --cdc, --dedupe-by, or --zero-copy; '
+          '--infer, --post-where, --window, --allowed-lateness, --trigger, '
+          '--select, --cdc, --dedupe-by, or --zero-copy; '
           'express filters and projections inside --sql (or omit --sql)',
           EXIT_USAGE)
     try:
@@ -3512,9 +3571,45 @@ def _pipe(
         infer_fields=getattr(args, 'infer_fields', None),
         infer_tag=getattr(args, 'infer_tag', None),
         infer_flatten=bool(getattr(args, 'infer_flatten', False)),
+        allowed_lateness=getattr(args, 'allowed_lateness', None),
+        trigger=getattr(args, 'trigger', None),
+        accumulation=getattr(args, 'accumulation', None),
+        late_action=getattr(args, 'late_action', None),
+        late_data_dlq=getattr(args, 'late_data_dlq', None),
+        emit_pane_info=bool(getattr(args, 'emit_pane_info', False)),
         dlq_redact_fields=getattr(args, 'dlq_redact_fields', None))
   except pipe_spec.PipeSpecError as e:
     raise _CliError(str(e), EXIT_USAGE) from None
+
+  if args.assert_counts:
+    spec_transforms = pipe.spec.get('pipeline', {}).get('transforms', [])
+    if any(isinstance(t, dict) and t.get('type') == 'Combine'
+           for t in spec_transforms):
+      raise _CliError(
+          '--assert-counts cannot be combined with windowed aggregations '
+          '(Combine) because grouping collapses multiple input rows per window',
+          EXIT_USAGE)
+    for t_node in spec_transforms:
+      if not isinstance(t_node, dict):
+        continue
+      if t_node.get('type') in ('WindowInto', 'CliWindowInto'):
+        w_cfg = (t_node.get('config') or {}).get('windowing') or {}
+        w_type = str(w_cfg.get('type') or '').lower()
+        if w_type in ('sliding', 'sessions'):
+          raise _CliError(
+              f'--assert-counts cannot be combined with {w_type} windows '
+              'because multi-window assignment/merging changes output row '
+              'cardinality',
+              EXIT_USAGE)
+      if t_node.get('type') == 'CliWindowInto':
+        from . import windowing as _win_mod
+        w_parsed = _win_mod.parse_windowing_config(t_node.get('config') or {})
+        if w_parsed.parsed_trigger.is_multi_pane:
+          raise _CliError(
+              '--assert-counts cannot be combined with multi-pane --trigger '
+              'specs because speculative/late firings emit multiple panes per '
+              'window',
+              EXIT_USAGE)
 
   if (getattr(args, 'infer_specs', None) and is_local_runner and
       not args.dry_run):
@@ -3714,7 +3809,13 @@ def _pipe(
 
   orig_out_prefix = pipe.output_prefix
   orig_dlq_prefix = (
-      pipe.dlq_endpoint.output_prefix if pipe.dlq_endpoint else None)
+      pipe.dlq_endpoint.output_prefix if pipe.dlq_endpoint else (
+          pipe.late_dlq_endpoint.output_prefix
+          if pipe.late_dlq_endpoint else None))
+  secondary_late_dlq_prefix = (
+      pipe.late_dlq_endpoint.output_prefix if
+      (pipe.dlq_endpoint is not None and
+       pipe.late_dlq_endpoint is not None) else None)
   staged_spec, sink_stage_dir, sink_stage_prefix, dlq_stage_dir, dlq_stage_prefix = (
       _stage_spec_sinks(
           pipe.spec,
@@ -3742,6 +3843,8 @@ def _pipe(
     local_check_paths.append(clean_join_uri)
   if args.dlq:
     local_check_paths.append(args.dlq)
+  if getattr(args, 'late_data_dlq', None):
+    local_check_paths.append(args.late_data_dlq)
 
   post_checks = {
       'assert_counts': bool(args.assert_counts),
@@ -3777,6 +3880,17 @@ def _pipe(
     extra_warnings.append(warn_dedup_pt)
     if not json_session.enabled:
       print(f'warning: {warn_dedup_pt}', file=sys.stderr)
+  if (getattr(args, 'trigger', None) and
+      getattr(args, 'accumulation', None) is None and
+      any(isinstance(t, dict) and t.get('type') == 'Combine'
+          for t in pipe.spec.get('pipeline', {}).get('transforms', []))):
+    warn_acc = (
+        '--trigger with windowed aggregations defaults to '
+        '--accumulation=discarding (delta panes); pass '
+        '--accumulation=accumulating for cumulative window totals')
+    extra_warnings.append(warn_acc)
+    if not json_session.enabled:
+      print(f'warning: {warn_acc}', file=sys.stderr)
   if getattr(args, 'enrich_specs', None):
     enrich_nodes = [
         t for t in pipe.spec.get('pipeline', {}).get('transforms', [])
@@ -3845,7 +3959,7 @@ def _pipe(
         print(f'note: {note_inf_pii}', file=sys.stderr)
 
   try:
-    return _run_yaml(
+    rc_out = _run_yaml(
         resolved_args,
         args.verbose,
         direct_yaml_text=yaml_str,
@@ -3868,6 +3982,16 @@ def _pipe(
         extra_warnings=extra_warnings,
         json_session=json_session,
         t0=t0)
+    if (rc_out == EXIT_OK and secondary_late_dlq_prefix and is_local_runner and
+        not args.dry_run and '://' not in secondary_late_dlq_prefix and
+        args.if_exists != 'append' and not explicit_sharding):
+      late_matches = _matching_files(
+          secondary_late_dlq_prefix,
+          args.verbose,
+          error_exit_code=EXIT_PIPELINE_FAILED)
+      if late_matches:
+        _materialize_single_local_file(secondary_late_dlq_prefix, late_matches)
+    return rc_out
   finally:
     for d in (sink_stage_dir, dlq_stage_dir):
       if d:
@@ -3927,8 +4051,8 @@ def _stage_spec_sinks(
   if want_dlq and dlq_prefix is not None and not is_chain:
     for t in transforms:
       cfg = t.get('config')
-      if (t.get('name') == 'WriteDlq' and isinstance(cfg, dict) and
-          cfg.get('path') == dlq_prefix):
+      if (t.get('name') in ('WriteDlq', 'WriteLateDlq') and
+          isinstance(cfg, dict) and cfg.get('path') == dlq_prefix):
         dlq_dir, dlq_stage = _prepare_local_stage_prefix(dlq_prefix)
         cfg['path'] = dlq_stage
         break
