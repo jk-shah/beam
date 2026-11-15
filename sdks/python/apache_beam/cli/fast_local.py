@@ -288,10 +288,22 @@ def _transform_configs(spec: dict[str, Any]):
   return cdc_norm_cfg, cdc_mat_cfg, where_cfg, select_cfg, expect_cfg, limit_cfg
 
 
-def _safe_row_getattr(obj: Any, attr: str):
-  if not isinstance(attr, str) or attr.startswith('_'):
-    raise AttributeError(f'private attribute {attr!r} is not allowed')
-  return getattr(obj, attr)
+_ISOLATED_NS: dict[str, Any] = {
+    '__builtins__': {
+        'AttributeError': AttributeError,
+        'getattr': getattr,
+        'isinstance': isinstance,
+        'str': str,
+    }
+}
+exec(  # pylint: disable=exec-used
+    "def _safe_row_getattr(obj, attr, *default):\n"
+    "  if not isinstance(attr, str) or attr.startswith('_'):\n"
+    "    raise AttributeError(f'private attribute {attr!r} is not allowed')\n"
+    "  return getattr(obj, attr, *default)\n",
+    _ISOLATED_NS,
+)
+_safe_row_getattr = _ISOLATED_NS['_safe_row_getattr']
 
 
 _SAFE_FAST_BUILTINS: dict[str, Any] = {
@@ -334,14 +346,19 @@ def _compile_callable(src: str):
 
 
 def _compile_expression(expr: str):
+  from . import check_cmd
   from . import expect as expect_mod
+  if not isinstance(expr, str) or not check_cmd._is_safe_inline_expression(expr):
+    raise FastPipeError('disallowed or unsafe expression in local fast path')
   try:
     code = expect_mod.compile_expectation_expression(expr)
   except ValueError as e:
     raise FastPipeError(str(e)) from None
 
+  eval_builtins = {**expect_mod._SAFE_BUILTINS, **_SAFE_FAST_BUILTINS}
+
   def fn(row):
-    return eval(code, {'__builtins__': _SAFE_FAST_BUILTINS}, row._asdict())  # pylint: disable=eval-used
+    return eval(code, {'__builtins__': eval_builtins}, row._asdict())  # pylint: disable=eval-used
 
   return fn
 
@@ -904,13 +921,15 @@ def run(
         for r in raw_rules
     ]
     compiled_rules = [
-        (r, compile(r.expression, f'<fast_expectation:{r.name}>', 'eval'))
+        (r, expect_mod.compile_expectation_expression(r.expression))
         for r in parsed_rules
     ]
     kept_exp = []
     for row in rows:
       failed_rule = None
       for rule, code in compiled_rules:
+        exp_metrics['expectations_evaluated'] = (
+            exp_metrics.get('expectations_evaluated', 0) + 1)
         if expect_mod.evaluate_record(code, row):
           exp_metrics[f'expectation_passed_{rule.name}'] = (
               exp_metrics.get(f'expectation_passed_{rule.name}', 0) + 1)
@@ -939,7 +958,15 @@ def run(
           raise FastPipeError(
               f"Expectation rule {failed_rule.name!r} violated and no DLQ route configured; "
               f"row: {row._asdict() if hasattr(row, '_asdict') else row}")
-        dlq_records.append(_error_record('CliExpect', expect_mod.ExpectationViolation(f"Rule {failed_rule.name!r} violated: {failed_rule.expression}"), row))
+        rec_dlq = _error_record(
+            'CliExpect',
+            expect_mod.ExpectationViolation(
+                f'Rule {failed_rule.name!r} violated: {failed_rule.expression}'),
+            row)
+        rec_dlq['error'] = (
+            f'Rule {failed_rule.name!r} violated: {failed_rule.expression}'
+        )[:_MAX_ERROR_LEN]
+        dlq_records.append(rec_dlq)
       elif action == 'drop':
         exp_metrics[f'expectation_dropped_{failed_rule.name}'] = (
             exp_metrics.get(f'expectation_dropped_{failed_rule.name}', 0) + 1)

@@ -164,6 +164,8 @@ def validate_readonly_select_sql(
   q = (sql_query or '').strip()
   if not q:
     raise SqlPipeError('--sql query cannot be empty')
+  if len(q.encode('utf-8', errors='replace')) > 1_048_576:
+    raise SqlPipeError('--sql query exceeds 1 MB safety limit')
   if uris._has_jinja_syntax(q):
     if not allow_jinja:
       raise SqlPipeError(
@@ -1453,10 +1455,32 @@ def build_sql_yaml_spec(
         dlq_ep=dlq_ep,
         allow_jinja=allow_jinja)
 
+  _SQL_RESERVED_TAGS = frozenset({
+      'in', 'select', 'from', 'where', 'group', 'order', 'by', 'join', 'on',
+      'as', 'table', 'user', 'values', 'union', 'limit', 'having', 'all', 'and',
+      'or', 'not', 'null', 'is', 'true', 'false', 'case', 'when', 'then', 'end',
+  })
+  eff_sql_inputs = dict(sql_inputs)
+  if len(eff_sql_inputs) == 1:
+    only_alias, only_read = next(iter(eff_sql_inputs.items()))
+    refs_source = bool(re.search(r'\bFROM\s+source\b', code_only, re.I))
+    refs_alias = bool(
+        re.search(rf'\bFROM\s+[`"]?{re.escape(only_alias)}[`"]?\b', code_only, re.I))
+    if refs_source and not refs_alias:
+      eff_sql_inputs = {'source': only_read}
+    elif refs_source and 'source' not in eff_sql_inputs:
+      eff_sql_inputs['source'] = only_read
+    if only_alias.lower() in _SQL_RESERVED_TAGS and only_alias in eff_sql_inputs:
+      safe_alias = f'tbl_{only_alias}'
+      if not refs_alias:
+        del eff_sql_inputs[only_alias]
+        if not eff_sql_inputs:
+          eff_sql_inputs[safe_alias] = only_read
+
   sql_input_val: Any = (
-      next(iter(sql_inputs.values()))
-      if len(sql_inputs) == 1 and 'pcollection' in clean_q.lower() else
-      sql_inputs)
+      next(iter(eff_sql_inputs.values()))
+      if len(eff_sql_inputs) == 1 and 'pcollection' in code_only.lower() else
+      eff_sql_inputs)
   transforms.append({
       'name': 'SqlQuery',
       'type': 'Sql',
@@ -2778,15 +2802,41 @@ def _run_duckdb(
         END
       )
     ''')
+    import threading
     raw_mem = os.environ.get('BEAM_CLI_DUCKDB_MAX_MEMORY', '').strip() or '512MB'
     if not re.fullmatch(r'\d+\s*(?:KB|MB|GB|KiB|MiB|GiB)', raw_mem, re.I):
       raw_mem = '512MB'
+    raw_max_sec = os.environ.get('BEAM_CLI_SQL_MAX_SECONDS', '').strip()
+    try:
+      max_sql_sec = float(raw_max_sec) if raw_max_sec else 30.0
+      if not math.isfinite(max_sql_sec) or max_sql_sec <= 0:
+        max_sql_sec = 30.0
+    except ValueError:
+      max_sql_sec = 30.0
     raw_max_rows = os.environ.get('BEAM_CLI_SQL_MAX_RESULT_ROWS', '').strip()
-    max_sql_rows = int(raw_max_rows) if raw_max_rows else 1_000_000
+    try:
+      max_sql_rows = int(raw_max_rows) if raw_max_rows else 1_000_000
+      if max_sql_rows <= 0:
+        max_sql_rows = 1_000_000
+    except ValueError:
+      max_sql_rows = 1_000_000
     con.execute(f"SET memory_limit = '{raw_mem}'")
     con.execute("SET max_temp_directory_size = '0B'")
     con.execute('SET threads = 2')
     con.execute('SET lock_configuration = true')
+    timed_out = False
+
+    def _interrupt_duckdb() -> None:
+      nonlocal timed_out
+      timed_out = True
+      try:
+        con.interrupt()
+      except Exception:  # pylint: disable=broad-except
+        pass
+
+    watchdog = threading.Timer(max_sql_sec, _interrupt_duckdb)
+    watchdog.daemon = True
+    watchdog.start()
     try:
       cur = con.execute(clean_q)
       out_cols = [d[0] for d in (cur.description or [])]
@@ -2801,6 +2851,11 @@ def _run_duckdb(
               f'SQL query exceeded local result limit ({max_sql_rows:,} rows); '
               'add LIMIT or run distributed SQL with --runner=DataflowRunner')
     except duckdb.Error as e:
+      if timed_out or 'interrupt' in str(e).lower():
+        raise SqlPipeError(
+            f'SQL query exceeded local execution time limit '
+            f'({max_sql_sec:g}s); check for unbounded recursive CTEs or '
+            'cross joins') from None
       avail_list = [ns.alias for ns in named_sources]
       if len(named_sources) == 1 and 'source' not in used_lower:
         avail_list.append('source')
@@ -2810,6 +2865,8 @@ def _run_duckdb(
           f'SQL execution error (DuckDB): {first_line} '
           f'(available tables: {avail})'
           f'{_sql_error_hint(first_line, clean_q)}') from None
+    finally:
+      watchdog.cancel()
     return out_cols, [dict(zip(out_cols, t)) for t in fetched], total_read
   finally:
     con.close()
@@ -3111,16 +3168,30 @@ def run_in_memory_sql(
       allowed_actions.add(sqlite3.SQLITE_RECURSIVE)
 
     def _readonly_authorizer(action_code, arg1, arg2, dbname, source):
-      del arg1, arg2, dbname, source
+      del arg1, dbname, source
+      if action_code == sqlite3.SQLITE_FUNCTION and (
+          str(arg2 or '').lower() in {'zeroblob', 'randomblob', 'load_extension'}
+      ):
+        return sqlite3.SQLITE_DENY
       if action_code in allowed_actions:
         return sqlite3.SQLITE_OK
       return sqlite3.SQLITE_DENY
 
     import time as _time
     raw_max_sec = os.environ.get('BEAM_CLI_SQL_MAX_SECONDS', '').strip()
-    max_sql_sec = float(raw_max_sec) if raw_max_sec else 30.0
+    try:
+      max_sql_sec = float(raw_max_sec) if raw_max_sec else 30.0
+      if not math.isfinite(max_sql_sec) or max_sql_sec <= 0:
+        max_sql_sec = 30.0
+    except ValueError:
+      max_sql_sec = 30.0
     raw_max_rows = os.environ.get('BEAM_CLI_SQL_MAX_RESULT_ROWS', '').strip()
-    max_sql_rows = int(raw_max_rows) if raw_max_rows else 1_000_000
+    try:
+      max_sql_rows = int(raw_max_rows) if raw_max_rows else 1_000_000
+      if max_sql_rows <= 0:
+        max_sql_rows = 1_000_000
+    except ValueError:
+      max_sql_rows = 1_000_000
     sql_deadline = _time.monotonic() + max_sql_sec
     timed_out = False
 
@@ -3131,6 +3202,11 @@ def run_in_memory_sql(
         return 1
       return 0
 
+    if hasattr(conn, 'setlimit') and hasattr(sqlite3, 'SQLITE_LIMIT_LENGTH'):
+      try:
+        conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 16 * 1024 * 1024)
+      except Exception:  # pylint: disable=broad-except
+        pass
     conn.set_progress_handler(_progress_guard, 10_000)
     conn.set_authorizer(_readonly_authorizer)
     try:
@@ -3234,7 +3310,9 @@ def _new_sql_stage_path(target: str, tag: str) -> str:
       prefix=f'.{base}.{tag}.', suffix='.tmp', dir=parent)
   os.close(fd)
   try:
-    os.chmod(tmp_path, 0o644)
+    cur_umask = os.umask(0o077)
+    os.umask(cur_umask)
+    os.chmod(tmp_path, 0o666 & ~cur_umask)
   except OSError:
     pass
   return tmp_path
@@ -3372,24 +3450,3 @@ def stage_rows_to_local_file(
     raise
   return tmp_path, final_path
 
-
-def write_rows_to_local_file(
-    out_cols: list[str],
-    out_rows: list[dict[str, Any]],
-    sink_ep: uris.ParsedEndpoint,
-    *,
-    if_exists: str = 'fail',
-    warnings: list[str] | None = None,
-) -> list[str]:
-  """Writes `out_rows` directly to a local file (`parquet`, `json`, `csv`)."""
-  tmp_path, final_path = stage_rows_to_local_file(
-      out_cols, out_rows, sink_ep, if_exists=if_exists, warnings=warnings)
-  try:
-    os.replace(tmp_path, final_path)
-  finally:
-    if os.path.exists(tmp_path):
-      try:
-        os.unlink(tmp_path)
-      except OSError:
-        pass
-  return [final_path]

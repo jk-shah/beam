@@ -74,10 +74,10 @@ def render_llms_txt() -> str:
     `--join` is accepted as an alias for repeating `--from` or as the right stream for `--interval-join`),
     apply event-time windowing, speculative/late triggers & late-data quarantine (`--window fixed:60s`, `sliding:5m,1m`, `session:30m` with `--timestamp-col COL` and optional `--allowed-lateness 10m --trigger "watermark,early=every:10s,late=count:1" --accumulation accumulating|discarding --late-action dlq|drop --late-data-dlq URI --emit-pane-info`; `--window-size` is accepted),
     correlate event streams with declarative interval or point-in-time ASOF joins (`--from o=URI --join s=URI --interval-join "on=id,left_time=o_ts,right_time=s_ts,between=0s..15m,type=left"` or `--asof-join "on=sym,left_time=t_ts,right_time=q_ts,direction=backward|forward|nearest,within=5m"`, or 2-source SQL `BETWEEN ... INTERVAL` / `ASOF [LEFT|INNER] JOIN`) and watermark skew circuit breaking (`--max-watermark-skew 30m --skew-action dlq|drop|warn|fail`),
-    detect ordered event sequences, bounded repetitions, and missing follow-up events (`--pattern "on=user_id,seq=login -> mfa -> purchase within 5m"` or `--pattern "on=order_id,seq=checkout -> !payment within 15m"`),
+    detect ordered event sequences, bounded repetitions, and missing follow-up events (`--timestamp-col event_ts --pattern "on=user_id,seq=login -> mfa -> purchase within 5m"` or `--timestamp-col event_ts --pattern "checkout -> !payment within 15m" --pattern-opt key=order_id`),
     deduplicate at-least-once streams or batches (`--dedupe-by|--dedup-by COL[,COL2] [--dedupe-window 10m] [--dedupe-keep first|last] [--dedupe-order COL] [--dedupe-dlq [URI]]`),
-    hydrate external features or lookup tables (`--pre-select EXPR --enrich "bigquery|bigtable|vertexai|feast|file:..." [--enrich-opt K=V]`),
-    run streaming or batch ML inference (`--infer "vertexai|hf|mock:..." [--infer-fields "col AS feat, nested.col AS feat2"] [--infer-tag prediction] [--infer-flatten] [--post-where|--post-filter EXPR]`),
+    hydrate external features or lookup tables (`--pre-select EXPR --enrich "bigquery|bigtable|vertexai|feast|file:..." [--enrich-opt [STAGE:]K=V]`),
+    run streaming or batch ML inference (`--infer "vertexai|hf|mock:..." [--infer-fields "col AS feat, nested.col AS feat2"] [--infer-tag prediction] [--infer-flatten] [--infer-opt [STAGE:]K=V] [--post-where|--post-filter EXPR]`; stage order is `--where -> --pre-select -> --enrich -> --infer -> --post-where -> --window -> --select -> --expect`),
     enforce data quality rules (`--expect "rule: expr -> dlq|drop|fail"`), run pre-flight
     schema contract comparison (`--check-schema`), quarantine dirty rows (`--dlq` or `--dead-letter-target`, scrubbing PII via `--dlq-redact-fields|--redact-fields COLS`),
     drop invalid rows (`--drop-bad` / `--skip-errors`), enforce scan budget (`--max-bytes`), verify
@@ -121,10 +121,9 @@ def render_llms_txt() -> str:
     `--limit all` up to 100,000) each for `only_in_left`, `only_in_right`,
     `value_mismatches`, `duplicate_keys` (`truncated` flag; values are untrusted data).
 - `beam check <FILE.yaml | -> [--plan [--trust-providers]] [-p|--param K=V] [--jinja-variables JSON] [--json]`
-    Offline SafeLoader YAML validator + deterministic `plan_hash` (`sha256`).
+    Offline `<100ms` SafeLoader YAML validator + static `Cli*` config checks + deterministic `plan_hash` (`sha256`).
     Detects untyped Python expressions preceding `WriteToParquet` and warns statically.
-    `--plan` falls back to the static check, with a warning, if expansion needs cloud access;
-    expansion logs are hidden unless `--verbose`.
+    Pass `--plan` to construct the full Beam graph locally (falls back to static check with a warning if expansion needs cloud access).
 - `beam run <FILE.yaml | -> [-p|--param K=V] [--jinja-variables JSON] [--no-jinja] [--wait-timeout DUR] [--json]`
     Execute a Beam YAML pipeline locally or on Dataflow / Flink / Spark.
 - `beam wait <JOB_ID> [--timeout DUR] [--profile P] [--json]` / `beam cancel <JOB_ID> [--drain] [--profile P]`
@@ -240,6 +239,19 @@ beam pipe --from pubsub://projects/my-proj/subscriptions/orders-cdc \\
           --to bigquery://my-proj.analytics.orders_live \\
           --cdc --primary-key order_id --dlq gs://my-bucket/dlq/cdc_bad.json \\
           --from-opt fields="order_id:int,customer:str,amount:float" --json
+
+# 5. Enrich + ML Inference + PII-Redacted DLQ + Post-Filter
+beam pipe --from events.jsonl --to scored.parquet --dlq dlq/bad.jsonl --dlq-redact-fields email,ssn \\
+          --pre-select "*, lower(strip(raw_uid)) AS user_id" \\
+          --enrich "file:users.parquet,key=user_id,columns=[tier:str,country:str],on_miss=dlq" \\
+          --infer "mock:fraud_v1,fields=[amount,tier],flatten=true" \\
+          --post-where "prediction_score >= 0.8 AND tier = 'VIP'" --assert-counts --json
+
+# 6. Point-in-Time ASOF Join & Stateful CEP Pattern Detection
+beam pipe --from t=trades.jsonl --join q=quotes.jsonl --to matched.parquet \\
+          --asof-join "on=symbol,left_time=trade_ts,right_time=quote_ts,within=5s,direction=backward" --json
+beam pipe --from clicks.jsonl --to alerts.jsonl --timestamp-col event_ts \\
+          --pattern "on=user_id,seq=login -> mfa -> !logout within 10m,mode=relaxed" --json
 ```
 """
 

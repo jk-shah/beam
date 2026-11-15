@@ -983,6 +983,13 @@ def parse_infer_spec_str(
         if idx == 0 and provider == 'vertexai' and 'endpoint_id' not in kv:
           kv['endpoint_id'] = tok.strip().strip("'\"")
           continue
+        if idx == 0 and provider == 'mock':
+          clean_tok = tok.strip().strip("'\"")
+          if clean_tok.lower() in ('static', 'echo', 'linear'):
+            kv.setdefault('mode', clean_tok.lower())
+          elif clean_tok:
+            kv.setdefault('model_id', clean_tok)
+          continue
         if last_key in ('fields', 'infer_fields'):
           kv[last_key] = f"{kv[last_key]}, {tok.strip()}"
           continue

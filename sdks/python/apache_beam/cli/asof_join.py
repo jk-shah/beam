@@ -1071,10 +1071,16 @@ def cli_asof_join(
           'beam_cli', 'skew_dropped')
 
     def process(self, record, elem_ts=beam.DoFn.TimestampParam):
+      import uuid
       d = interval_join._to_plain_dict(record)
       try:
-        ckey = interval_join.encode_canonical_key_values(
-            tuple(d.get(k) for k in self.key_cols))
+        k_vals = tuple(d.get(k) for k in self.key_cols)
+        if any(v is None for v in k_vals):
+          if self.side == 'R' or base_cfg.join_type != 'left':
+            return
+          ckey = b'\xffNULLL\x00' + uuid.uuid4().bytes
+        else:
+          ckey = interval_join.encode_canonical_key_values(k_vals)
         if self.ts_col:
           t = interval_join.extract_record_timestamp(d, self.ts_col)
         else:
@@ -1140,20 +1146,38 @@ def cli_asof_join(
 
       dlq_pcolls: list[Any] = []
       if is_bounded and not join_cfg.force_stateful:
+        import uuid
         keyed_left = (
             win_left
-            | 'KeyLeft' >> beam.Map(
-                lambda r: (
-                    interval_join.encode_canonical_key_values(
-                        interval_join.extract_record_key(r, join_cfg.left_key)),
-                    r)).with_output_types(tuple[bytes, Any]))
+            | 'KeyLeft' >> beam.FlatMap(
+                lambda r: (() if (
+                    any(
+                        v is None
+                        for v in interval_join.extract_record_key(
+                            r, join_cfg.left_key)) and
+                    join_cfg.join_type != 'left') else [(
+                        (
+                            b'\xffNULLL\x00' + uuid.uuid4().bytes if any(
+                                v is None
+                                for v in interval_join.extract_record_key(
+                                    r, join_cfg.left_key)) else
+                            interval_join.encode_canonical_key_values(
+                                interval_join.extract_record_key(
+                                    r, join_cfg.left_key))),
+                        r,
+                    )])).with_output_types(tuple[bytes, Any]))
         keyed_right = (
             win_right
-            | 'KeyRight' >> beam.Map(
-                lambda r: (
-                    interval_join.encode_canonical_key_values(
-                        interval_join.extract_record_key(r, join_cfg.right_key)
-                    ), r)).with_output_types(tuple[bytes, Any]))
+            | 'KeyRight' >> beam.FlatMap(
+                lambda r: (() if any(
+                    v is None
+                    for v in interval_join.extract_record_key(
+                        r, join_cfg.right_key)) else [(
+                            interval_join.encode_canonical_key_values(
+                                interval_join.extract_record_key(
+                                    r, join_cfg.right_key)),
+                            r,
+                        )])).with_output_types(tuple[bytes, Any]))
         grouped = {
             'left': keyed_left, 'right': keyed_right
         } | 'CoGroupByKey' >> beam.CoGroupByKey()

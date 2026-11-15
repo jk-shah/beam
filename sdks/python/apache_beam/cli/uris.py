@@ -115,7 +115,7 @@ def _looks_like_utf8_text(sample: bytes) -> bool:
       for ch in text)
 
 
-_SHARD_OR_GLOB_SUFFIX = re.compile(r'(-\d+-of-\d+|[-*?])+$')
+_SHARD_SUFFIX_RE = re.compile(r'-\d+-of-\d+$')
 _SECRET_KEY_RE = re.compile(
     r'(password|passwd|passphrase|secret|token|private_key|signing_key|'
     r'encryption_key|client_secret|access_key|api[-_]?key|authorization|'
@@ -127,8 +127,21 @@ _BQ_TABLE_ID_RE = re.compile(
     r'(?P<dataset>[A-Za-z0-9_]+)\.(?P<table>[A-Za-z0-9_$-]+)$')
 
 
+def _strip_shard_or_glob_suffix(name: str) -> str:
+  while True:
+    trimmed = name.rstrip('-*?')
+    m = _SHARD_SUFFIX_RE.search(trimmed)
+    if m:
+      next_name = trimmed[:m.start()]
+    else:
+      next_name = trimmed
+    if next_name == name:
+      return name
+    name = next_name
+
+
 def extension_of(path: str) -> str:
-  name = _SHARD_OR_GLOB_SUFFIX.sub('', os.path.basename(path.replace('\\', '/')))
+  name = _strip_shard_or_glob_suffix(os.path.basename(path.replace('\\', '/')))
   return os.path.splitext(name)[1].lower()
 
 
@@ -243,27 +256,51 @@ def _mapping_has_secret_key(obj: Any) -> str | None:
 
 
 def _load_checked_opt_file(opt_file: str) -> dict[str, Any]:
-  from . import output as out_mod
-  if not os.path.isfile(opt_file):
-    raise UriError(f'options file not found: {opt_file!r}')
+  import errno
+  import stat
+
   import yaml
+
+  from . import output as out_mod
+
+  if os.path.islink(opt_file):
+    raise UriError(
+        f'options file {opt_file!r} cannot be a symbolic link; '
+        'pass a regular 0600 file')
+  flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0)
   try:
-    raw_text = out_mod.read_bounded_text(opt_file, label=opt_file)
+    fd = os.open(opt_file, flags)
+  except OSError as exc:
+    if exc.errno == getattr(errno, 'ELOOP', -1):
+      raise UriError(
+          f'options file {opt_file!r} cannot be a symbolic link; '
+          'pass a regular 0600 file') from None
+    raise UriError(f'options file not found: {opt_file!r}') from None
+
+  try:
+    fstat = os.fstat(fd)
+    if not stat.S_ISREG(fstat.st_mode):
+      raise UriError(f'options file {opt_file!r} must be a regular file')
+    with os.fdopen(fd, 'rb') as fh:
+      fd = -1
+      raw_text = out_mod.read_bounded_text(fh, label=opt_file)
     loaded = out_mod.safe_yaml_load(raw_text) or {}
+  except UriError:
+    raise
   except (OSError, ValueError, yaml.YAMLError) as e:
     raise UriError(f'could not parse {opt_file!r}: {e}') from None
+  finally:
+    if fd != -1:
+      try:
+        os.close(fd)
+      except OSError:
+        pass
+
   if not isinstance(loaded, dict):
     raise UriError(f'expected key/value mapping in {opt_file!r}')
   secret_key = _mapping_has_secret_key(loaded)
   if secret_key and os.name == 'posix':
-    if os.path.islink(opt_file):
-      raise UriError(
-          f'options file {opt_file!r} contains secret key {secret_key!r} '
-          'and cannot be a symbolic link; pass a regular 0600 file')
-    try:
-      mode = os.stat(opt_file).st_mode & 0o777
-    except OSError:
-      mode = 0
+    mode = fstat.st_mode & 0o777
     if mode & 0o077:
       raise UriError(
           f'options file {opt_file!r} contains secret key {secret_key!r} '

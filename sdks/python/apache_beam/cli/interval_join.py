@@ -173,17 +173,9 @@ def encode_canonical_key_values(values: Iterable[Any]) -> bytes:
 
 
 def _make_dlq_row(step: str, err_type: str, msg: str, elem: Any) -> beam.Row:
-  try:
-    raw_json = json.dumps(_to_plain_dict(elem), default=str, sort_keys=True)
-  except Exception:  # pylint: disable=broad-except
-    raw_json = str(elem)[:4096]
-  return beam.Row(
-      step=step,
-      error_type=err_type,
-      error=msg[:4096],
-      raw_payload=raw_json,
-      element=raw_json,
-  )
+  from . import dlq
+  return dlq.make_transform_dlq_row(
+      step, err_type, msg, _to_plain_dict(elem))
 
 
 def parse_interval_duration(raw: str | int | float) -> float:
@@ -785,17 +777,25 @@ def join_bounded_records(
 
   left_by_key: dict[bytes, list[list[Any]]] = {}
   right_by_key: dict[bytes, list[list[Any]]] = {}
+  null_left_unmatched: list[Any] = []
+  null_right_unmatched: list[Any] = []
 
   for r in left_list_raw:
-    k = encode_canonical_key_values(
-        extract_record_key(r, config.left_key))
+    k_vals = extract_record_key(r, config.left_key)
     ts = extract_record_timestamp(r, config.left_timestamp)
+    if any(v is None for v in k_vals):
+      null_left_unmatched.append(r)
+      continue
+    k = encode_canonical_key_values(k_vals)
     left_by_key.setdefault(k, []).append([ts, r, False])
 
   for r in right_list_raw:
-    k = encode_canonical_key_values(
-        extract_record_key(r, config.right_key))
+    k_vals = extract_record_key(r, config.right_key)
     ts = extract_record_timestamp(r, config.right_timestamp)
+    if any(v is None for v in k_vals):
+      null_right_unmatched.append(r)
+      continue
+    k = encode_canonical_key_values(k_vals)
     right_by_key.setdefault(k, []).append([ts, r, False])
 
   all_keys = list(
@@ -845,6 +845,26 @@ def join_bounded_records(
                   config,
                   left_cols=left_cols,
                   right_cols=right_cols))
+
+  if config.join_type in ('left', 'full'):
+    for l_elem in null_left_unmatched:
+      results.append(
+          project_joined_row(
+              l_elem,
+              None,
+              config,
+              left_cols=left_cols,
+              right_cols=right_cols))
+
+  if config.join_type in ('right', 'full'):
+    for r_elem in null_right_unmatched:
+      results.append(
+          project_joined_row(
+              None,
+              r_elem,
+              config,
+              left_cols=left_cols,
+              right_cols=right_cols))
 
   return results
 
@@ -1458,10 +1478,20 @@ def cli_interval_join(
           'beam_cli', 'skew_dropped')
 
     def process(self, record):
+      import uuid
       d = _to_plain_dict(record)
       try:
-        ckey = encode_canonical_key_values(
-            tuple(d.get(k) for k in self.key_cols))
+        k_vals = tuple(d.get(k) for k in self.key_cols)
+        if any(v is None for v in k_vals):
+          if self.side == 'L' and base_cfg.join_type not in ('left', 'full'):
+            return
+          if self.side == 'R' and base_cfg.join_type not in ('right', 'full'):
+            return
+          ckey = (
+              b'\xffNULL' + self.side.encode('ascii') + b'\x00' +
+              uuid.uuid4().bytes)
+        else:
+          ckey = encode_canonical_key_values(k_vals)
         t = extract_record_timestamp(d, self.ts_col)
         yield (ckey, (self.side, t, d))
       except Exception as e:  # pylint: disable=broad-except
@@ -1519,20 +1549,41 @@ def cli_interval_join(
       dlq_pcolls: list[Any] = []
 
       if is_bounded and not join_cfg.force_stateful:
+        import uuid
         keyed_left = (
             win_left
-            | 'KeyLeft' >> beam.Map(
-                lambda r: (
-                    encode_canonical_key_values(
-                        extract_record_key(r, join_cfg.left_key)), r)).
-            with_output_types(tuple[bytes, Any]))
+            | 'KeyLeft' >> beam.FlatMap(
+                lambda r: (() if (
+                    any(
+                        v is None
+                        for v in extract_record_key(r, join_cfg.left_key)) and
+                    join_cfg.join_type not in ('left', 'full')) else [(
+                        (
+                            b'\xffNULLL\x00' + uuid.uuid4().bytes if any(
+                                v is None
+                                for v in extract_record_key(
+                                    r, join_cfg.left_key)) else
+                            encode_canonical_key_values(
+                                extract_record_key(r, join_cfg.left_key))),
+                        r,
+                    )])).with_output_types(tuple[bytes, Any]))
         keyed_right = (
             win_right
-            | 'KeyRight' >> beam.Map(
-                lambda r: (
-                    encode_canonical_key_values(
-                        extract_record_key(r, join_cfg.right_key)), r)).
-            with_output_types(tuple[bytes, Any]))
+            | 'KeyRight' >> beam.FlatMap(
+                lambda r: (() if (
+                    any(
+                        v is None
+                        for v in extract_record_key(r, join_cfg.right_key)) and
+                    join_cfg.join_type not in ('right', 'full')) else [(
+                        (
+                            b'\xffNULLR\x00' + uuid.uuid4().bytes if any(
+                                v is None
+                                for v in extract_record_key(
+                                    r, join_cfg.right_key)) else
+                            encode_canonical_key_values(
+                                extract_record_key(r, join_cfg.right_key))),
+                        r,
+                    )])).with_output_types(tuple[bytes, Any]))
         grouped = {
             'left': keyed_left, 'right': keyed_right
         } | 'CoGroupByKey' >> beam.CoGroupByKey()

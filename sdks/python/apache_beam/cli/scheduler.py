@@ -87,19 +87,52 @@ def _sanitize_identifier(name: str) -> str:
 
 
 def _load_pipeline_options_from_source(source: str) -> dict[str, Any]:
-  """Extracts options block from a YAML pipeline file if readable."""
-  if not source or source == '-' or '://' in source:
+  """Extracts options block from a YAML pipeline file or stdin if provided."""
+  import sys
+
+  from . import output
+
+  if not source or '://' in source:
     return {}
-  if not os.path.exists(source):
+  s_trim = source.strip()
+  if s_trim.startswith(('beam ', 'apache-beam ')):
     return {}
-  try:
-    import yaml
-    with open(source, 'r', encoding='utf-8') as f:
-      data = yaml.safe_load(f)
+  if s_trim == '-':
+    try:
+      raw_text = output.read_bounded_text(sys.stdin, label='stdin YAML')
+      data = output.safe_yaml_load(raw_text)
+    except Exception as exc:
+      raise SchedulerError(f'invalid YAML on stdin: {exc}') from None
+    if isinstance(data, dict):
+      opts = data.get('options', {}) or {}
+      return opts if isinstance(opts, dict) else {}
+    raise SchedulerError('stdin YAML must be a mapping')
+
+  if s_trim.lower().endswith(('.yaml', '.yml')):
+    if os.path.islink(s_trim):
+      raise SchedulerError(
+          f'refusing symbolic link pipeline file {s_trim!r}')
+    if not os.path.isfile(s_trim):
+      raise SchedulerError(f'pipeline file not found: {s_trim}')
+    try:
+      raw_text = output.read_bounded_text(s_trim, label=s_trim)
+      data = output.safe_yaml_load(raw_text)
+    except Exception as exc:
+      raise SchedulerError(f'invalid YAML in {s_trim!r}: {exc}') from None
+    if isinstance(data, dict):
+      opts = data.get('options', {}) or {}
+      return opts if isinstance(opts, dict) else {}
+    return {}
+
+  if os.path.isfile(s_trim) and not os.path.islink(s_trim):
+    try:
+      raw_text = output.read_bounded_text(s_trim, label=s_trim)
+      data = output.safe_yaml_load(raw_text)
       if isinstance(data, dict):
-        return data.get('options', {}) or {}
-  except Exception:
-    pass
+        opts = data.get('options', {}) or {}
+        return opts if isinstance(opts, dict) else {}
+    except Exception:  # pylint: disable=broad-except
+      return {}
   return {}
 
 
@@ -254,6 +287,8 @@ def run_export_schedule(
     retry_delay_min: int = 5,
 ) -> ScheduleExportReport:
   """Main entry point for `beam export-schedule`."""
+  from . import uris
+
   orch = str(orchestrator).strip().lower()
   if orch not in VALID_ORCHESTRATORS:
     raise SchedulerError(
@@ -264,42 +299,65 @@ def run_export_schedule(
 
   # Extract options from pipeline YAML if present
   pipeline_opts = _load_pipeline_options_from_source(source)
-  eff_project = project or pipeline_opts.get('project') or os.environ.get('GOOGLE_CLOUD_PROJECT') or 'my-gcp-project'
-  eff_location = location or pipeline_opts.get('region') or os.environ.get('CLOUDSDK_COMPUTE_REGION') or 'us-central1'
+  eff_project = str(
+      project or pipeline_opts.get('project') or
+      os.environ.get('GOOGLE_CLOUD_PROJECT') or 'my-gcp-project').strip()
+  eff_location = str(
+      location or pipeline_opts.get('region') or
+      os.environ.get('CLOUDSDK_COMPUTE_REGION') or 'us-central1').strip()
   eff_sa = service_account_email or pipeline_opts.get('service_account_email')
 
-  # Resolve template GCS path
+  if not re.fullmatch(r'[a-z0-9.:-]+', eff_project) or eff_project.startswith('-'):
+    raise SchedulerError(f'Invalid GCP project identifier {eff_project!r}')
+  if not re.fullmatch(r'[a-z0-9-]+', eff_location) or eff_location.startswith('-'):
+    raise SchedulerError(f'Invalid GCP region/location {eff_location!r}')
+
+  raw_base = (
+      os.path.splitext(os.path.basename(source))[0]
+      if source and source != '-' else 'beam_pipeline')
+  clean_base = _sanitize_identifier(raw_base)
+  slug_base = re.sub(r'[^a-zA-Z0-9._-]+', '-', clean_base).strip('-') or 'pipeline'
+
+  # Resolve template GCS path (guaranteed free of spaces)
   eff_template = template_gcs_path
   if not eff_template:
-    if source.startswith('gs://') and source.endswith('.json'):
+    if source.startswith('gs://') and source.endswith('.json') and ' ' not in source:
       eff_template = source
     else:
-      base_name = os.path.splitext(os.path.basename(source))[0] if source and source != '-' else 'pipeline'
-      eff_template = f'gs://{eff_project}-templates/{base_name}.json'
+      eff_template = f'gs://{eff_project}-templates/{slug_base}.json'
 
-  base_name = os.path.splitext(os.path.basename(source))[0] if source and source != '-' else 'beam_pipeline'
-  clean_base = _sanitize_identifier(base_name)
   eff_dag_id = dag_id or f'{clean_base}_dag'
-  eff_job_name = job_name or f'{clean_base}-job'
+  eff_job_name = job_name or f'{clean_base.replace("_", "-")}-job'
+  if not re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_-]{0,127}', eff_job_name):
+    raise SchedulerError(
+        f'Invalid job name {eff_job_name!r}; must start with a letter and '
+        'contain only letters, digits, hyphens, or underscores')
 
   # Environment block for Flex Template launch
   env_block: dict[str, Any] = {}
   if eff_sa:
-    env_block['serviceAccountEmail'] = eff_sa
+    env_block['serviceAccountEmail'] = str(eff_sa)
   if subnetwork:
     env_block['subnetwork'] = subnetwork
   if network:
     env_block['network'] = network
 
-  # Parse parameters
+  # Parse parameters (rejecting hardcoded secrets)
   param_dict: dict[str, str] = {}
   if parameters:
     for p in parameters:
       if '=' in p:
         k, v = p.split('=', 1)
-        param_dict[k.strip()] = v.strip()
+        ks = k.strip()
+        vs = v.strip()
       else:
-        param_dict[p.strip()] = ''
+        ks = p.strip()
+        vs = ''
+      if uris._SECRET_KEY_RE.search(ks):
+        raise SchedulerError(
+            f'Refusing to bake secret parameter {ks!r} into exported schedule; '
+            'pass a Secret Manager resource name instead')
+      param_dict[ks] = vs
 
   if orch == 'composer':
     job_name_pattern = f'{eff_job_name}-{{{{ ds_nodash }}}}'
@@ -324,13 +382,16 @@ def run_export_schedule(
         project=eff_project,
         location=eff_location,
         template_gcs_path=eff_template,
-        service_account_email=eff_sa,
+        service_account_email=str(eff_sa) if eff_sa else None,
         parameters=param_dict,
         environment=env_block,
     )
 
   if to_destination:
     dest_path = os.path.abspath(to_destination)
+    if os.path.islink(dest_path):
+      raise SchedulerError(
+          f'Refusing to write schedule through symbolic link {dest_path!r}')
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
     with open(dest_path, 'w', encoding='utf-8') as f:
       f.write(content)

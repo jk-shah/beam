@@ -177,10 +177,12 @@ def extract_endpoint_schema(
   else:
     raise ValueError(f'unsupported schema input: {location_or_schema!r}')
 
+  from . import output
   normalized = []
   for f in raw_fields:
     if isinstance(f, dict):
-      name = str(f.get('name') or f.get('field_name') or '')
+      name = output.sanitize_untrusted_text(
+          str(f.get('name') or f.get('field_name') or ''), max_chars=256)
       raw_t = f.get('type') or f.get('field_type') or 'UNKNOWN'
       mode = str(f.get('mode') or '').upper()
       is_nullable = f.get('nullable', mode != 'REQUIRED')
@@ -188,17 +190,18 @@ def extract_endpoint_schema(
       normalized.append({
           'name': name,
           'type': norm_t,
-          'raw_type': str(raw_t),
+          'raw_type': output.sanitize_untrusted_text(str(raw_t), max_chars=256),
           'nullable': bool(is_nullable),
           'mode': 'NULLABLE' if is_nullable else 'REQUIRED',
       })
     elif isinstance(f, (list, tuple)) and len(f) >= 2:
-      name, raw_t = str(f[0]), f[1]
+      name = output.sanitize_untrusted_text(str(f[0]), max_chars=256)
+      raw_t = f[1]
       norm_t = normalize_type(raw_t)
       normalized.append({
           'name': name,
           'type': norm_t,
-          'raw_type': str(raw_t),
+          'raw_type': output.sanitize_untrusted_text(str(raw_t), max_chars=256),
           'nullable': True,
           'mode': 'NULLABLE',
       })
@@ -215,6 +218,11 @@ def diff_schemas(
     target_label: str = 'target',
 ) -> dict[str, Any]:
   """Compares source and target schemas against compatibility mode rules."""
+  import os
+  import shlex
+
+  from . import output
+
   eff_mode = str(mode).strip().upper()
   if eff_mode not in ('BACKWARD', 'FORWARD', 'FULL'):
     raise ValueError(
@@ -222,6 +230,17 @@ def diff_schemas(
 
   src_fields = extract_endpoint_schema(source_schema)
   tgt_fields = extract_endpoint_schema(target_schema)
+  safe_src_lbl = output.sanitize_untrusted_text(str(source_label), max_chars=512)
+  safe_tgt_lbl = output.sanitize_untrusted_text(str(target_label), max_chars=512)
+  q_src = shlex.quote(safe_src_lbl)
+  q_tgt = shlex.quote(safe_tgt_lbl)
+  replace_suffix = ''
+  try:
+    if safe_tgt_lbl != 'target' and (
+        '://' in safe_tgt_lbl or os.path.exists(safe_tgt_lbl)):
+      replace_suffix = ' --if-exists=replace'
+  except OSError:
+    pass
 
   src_map = {f['name']: f for f in src_fields}
   tgt_map = {f['name']: f for f in tgt_fields}
@@ -234,9 +253,13 @@ def diff_schemas(
   nullability_mismatches: list[dict[str, Any]] = []
   next_actions: list[dict[str, Any]] = []
 
+  def _is_safe_col(col_name: str) -> bool:
+    return bool(output.SAFE_IDENTIFIER_RE.match(col_name))
+
   # 1. Evaluate Target Requirements against Source (BACKWARD / FULL)
   if eff_mode in ('BACKWARD', 'FULL'):
     for tgt_name, tgt_col in tgt_map.items():
+      safe_col = _is_safe_col(tgt_name)
       if tgt_name not in src_map:
         columns_missing.append(f"{tgt_name} ({tgt_col['type']}, {tgt_col['mode']})")
         if not tgt_col['nullable']:
@@ -248,17 +271,24 @@ def diff_schemas(
               'target_mode': tgt_col['mode'],
               'description': (
                   f"Target requires non-null column '{tgt_name}' ({tgt_col['type']}), "
-                  f"but it is missing from {source_label}."
+                  f"but it is missing from {safe_src_lbl}."
               ),
           })
-          hint_def = f"--select \"'DEFAULT_VAL' AS {tgt_name}, *\""
+          if safe_col:
+            hint_def = f"--select \"'DEFAULT_VAL' AS {tgt_name}, *\""
+            cmd_str = (
+                f'beam pipe --from {q_src} --to {q_tgt} '
+                f'{hint_def}{replace_suffix}')
+          else:
+            hint_def = '--select "<DEFAULT_EXPR>, *"'
+            cmd_str = f'beam pipe --from {q_src} --to {q_tgt}{replace_suffix}'
           next_actions.append({
               'action': 'provide_default_column',
               'field': tgt_name,
-              'command': f'beam pipe --from {source_label} --to {target_label} {hint_def}',
+              'command': cmd_str,
               'command_hint': hint_def,
               'description': f"Supply a fallback or default value for required column '{tgt_name}'.",
-              'requires_human': False,
+              'requires_human': bool(replace_suffix or not safe_col),
           })
         else:
           warnings.append({
@@ -266,7 +296,7 @@ def diff_schemas(
               'issue': 'SAFE_COLUMN_MISSING',
               'severity': 'INFO',
               'description': (
-                  f"Target column '{tgt_name}' ({tgt_col['type']}) is missing in {source_label} "
+                  f"Target column '{tgt_name}' ({tgt_col['type']}) is missing in {safe_src_lbl} "
                   "and will be populated with NULL."
               ),
           })
@@ -286,21 +316,28 @@ def diff_schemas(
               'source_mode': src_col['mode'],
               'target_mode': tgt_col['mode'],
               'description': (
-                  f"Column '{tgt_name}' is NULLABLE in {source_label}, but REQUIRED in {target_label}. "
+                  f"Column '{tgt_name}' is NULLABLE in {safe_src_lbl}, but REQUIRED in {safe_tgt_lbl}. "
                   "Potential NULL values will violate target database constraints."
               ),
           })
-          hint_null = (
-              f"--where \"{tgt_name} IS NOT NULL\" or "
-              f"--select \"COALESCE({tgt_name}, 'DEFAULT') AS {tgt_name}, *\""
-          )
+          if safe_col:
+            hint_null = (
+                f"--where \"{tgt_name} IS NOT NULL\" or "
+                f"--select \"COALESCE({tgt_name}, 'DEFAULT') AS {tgt_name}, *\""
+            )
+            cmd_null = (
+                f'beam pipe --from {q_src} --to {q_tgt} '
+                f'--where "{tgt_name} IS NOT NULL"{replace_suffix}')
+          else:
+            hint_null = '--where "<COL> IS NOT NULL"'
+            cmd_null = f'beam pipe --from {q_src} --to {q_tgt}{replace_suffix}'
           next_actions.append({
               'action': 'filter_or_coalesce_nulls',
               'field': tgt_name,
-              'command': f'beam pipe --from {source_label} --to {target_label} --where "{tgt_name} IS NOT NULL"',
+              'command': cmd_null,
               'command_hint': hint_null,
               'description': f"Filter out null records or apply COALESCE() to column '{tgt_name}'.",
-              'requires_human': False,
+              'requires_human': bool(replace_suffix or not safe_col),
           })
 
         # Type compatibility check
@@ -350,14 +387,21 @@ def diff_schemas(
                     f"without potential runtime cast failure or precision loss ({narrow_reason})."
                 ),
             })
-            hint_cast = f"--select \"CAST({tgt_name} AS {tt}) AS {tgt_name}, *\""
+            if safe_col:
+              hint_cast = f"--select \"CAST({tgt_name} AS {tt}) AS {tgt_name}, *\""
+              cmd_cast = (
+                  f'beam pipe --from {q_src} --to {q_tgt} '
+                  f'{hint_cast}{replace_suffix}')
+            else:
+              hint_cast = f'--select "CAST(<COL> AS {tt}) AS <COL>, *"'
+              cmd_cast = f'beam pipe --from {q_src} --to {q_tgt}{replace_suffix}'
             next_actions.append({
                 'action': 'explicit_type_cast',
                 'field': tgt_name,
-                'command': f'beam pipe --from {source_label} --to {target_label} {hint_cast}',
+                'command': cmd_cast,
                 'command_hint': hint_cast,
                 'description': f"Explicitly cast column '{tgt_name}' to {tt} before writing.",
-                'requires_human': False,
+                'requires_human': bool(replace_suffix or not safe_col),
             })
           else:
             violations.append({

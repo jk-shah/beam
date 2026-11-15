@@ -244,7 +244,7 @@ def build_dlq_normalizer_transform(
         f'  _rk = {redact_lit}\n'
         "  msg = str(getattr(err_row, 'error', None) or "
         "getattr(err_row, 'msg', None) or "
-        "getattr(err_row, 'error_message', None) or str(err_row))\n"
+        "getattr(err_row, 'error_message', None) or str(err_row))[:4096]\n"
         '  for _col in _rk:\n'
         '    msg = re.sub(\n'
         '        r\'([\\\'"]?\' + re.escape(_col) + r\'[\\\'"]?\\s*[:=]\\s*)(?:([\\\'"]).*?\\2|[^,\\s)\\]}]+)\',\n'
@@ -1489,14 +1489,19 @@ def cli_count_rows(counter: str = 'rows_read'):
 
 
 def cli_limit_rows(limit: int):
-  """Caps output at `limit` rows per window while tracking `stage_dropped_rows`."""
+  """Caps output at `limit` rows per window while preserving timestamps and tracking `stage_dropped_rows`."""
   import apache_beam as beam
   from apache_beam.metrics import Metrics
+  from apache_beam.transforms.window import TimestampedValue
 
   n = int(limit)
   if isinstance(limit, bool) or n < 0:
     raise ValueError(
         f'CliLimitRows limit must be an integer >= 0, got {limit!r}')
+
+  class _TagTsDoFn(beam.DoFn):
+    def process(self, element, ts=beam.DoFn.TimestampParam):
+      yield (ts, element)
 
   class _LimitCombineFn(beam.CombineFn):
     def create_accumulator(self):
@@ -1524,15 +1529,21 @@ def cli_limit_rows(limit: int):
         Metrics.counter('beam_cli', 'stage_dropped_rows').inc(dropped)
       return kept
 
+  class _UnpackLimitDoFn(beam.DoFn):
+    def process(self, items):
+      for ts, elem in items:
+        yield TimestampedValue(elem, ts)
+
   class _CliLimitRowsTransform(beam.PTransform):
     def expand(self, pcoll):
       elem_type = pcoll.element_type
       return (
           pcoll
+          | 'TagTs' >> beam.ParDo(_TagTsDoFn())
           | 'CombineLimit' >> beam.CombineGlobally(
               _LimitCombineFn()).without_defaults()
           | 'UnpackLimit' >>
-          beam.FlatMap(lambda items: items).with_output_types(elem_type))
+          beam.ParDo(_UnpackLimitDoFn()).with_output_types(elem_type))
 
   return _CliLimitRowsTransform()
 
@@ -1596,6 +1607,7 @@ def cli_write_to_bigquery(
   from apache_beam.metrics import Metrics
   from apache_beam.options.pipeline_options import GoogleCloudOptions
   from apache_beam.typehints.row_type import RowTypeConstraint
+  from . import output as out_mod
 
   err_tag = (error_handling or {}).get('output', 'errors')
   dlq_row_type = RowTypeConstraint.from_fields([
@@ -1634,10 +1646,13 @@ def cli_write_to_bigquery(
       else:
         row_dict = getattr(bq_err, 'row', bq_err)
         err_str = str(getattr(bq_err, 'error_message', bq_err))
+      clean_err = out_mod.sanitize_untrusted_text(err_str, max_chars=4096)
+      clean_err = out_mod.redact_inline_secrets(
+          clean_err, placeholder='<REDACTED_SECRET>')
       yield beam.Row(
           step='WriteToBigQuery',
           error_type='BigQueryWriteError',
-          error=err_str[:4096],
+          error=clean_err[:4096],
           raw_payload=safe_json_dumps(row_dict))
 
   class _CliWriteBqTransform(beam.PTransform):

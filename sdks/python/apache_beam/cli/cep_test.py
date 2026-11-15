@@ -418,6 +418,49 @@ class CliPatternMatchCliEndToEndTest(unittest.TestCase):
       )
       self.assertEqual(pkg['sdk_language'], 'PYTHON')
 
+  def test_pattern_opt_and_orphan_rejection(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      in_p = os.path.join(tmp, 'events.jsonl')
+      out_p = os.path.join(tmp, 'out.jsonl')
+      with open(in_p, 'w', encoding='utf-8') as f:
+        f.write(
+            '{"uid": "u1", "event_type": "login", "ts": "2026-06-01T12:00:00Z"}\n'
+        )
+        f.write(
+            '{"uid": "u1", "event_type": "buy", "ts": "2026-06-01T12:01:00Z"}\n'
+        )
+
+      # Orphan `--pattern-opt` without `--pattern` fast-fails with exit code 2
+      rc_bad, out_bad, _ = _run_cli([
+          'pipe',
+          in_p,
+          out_p,
+          '--pattern-opt',
+          'key=uid',
+          '--dry-run',
+          '--json',
+      ])
+      self.assertEqual(rc_bad, 2, out_bad)
+      self.assertIn('--pattern', json.loads(out_bad)['error']['message'])
+
+      # Positional sequence + `--pattern-opt key=uid` succeeds
+      rc_ok, out_ok, err_ok = _run_cli([
+          'pipe',
+          in_p,
+          out_p,
+          '--timestamp-col',
+          'ts',
+          '--pattern',
+          'login -> buy within 5m',
+          '--pattern-opt',
+          'key=uid',
+          '--pattern-opt',
+          'mode=strict',
+          '--json',
+      ])
+      self.assertEqual(rc_ok, 0, f'STDOUT: {out_ok}\nSTDERR: {err_ok}')
+      self.assertEqual(json.loads(out_ok)['metrics']['patterns_matched'], 1)
+
 
 if __name__ == '__main__':
   unittest.main()

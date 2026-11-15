@@ -261,6 +261,8 @@ _CLI_ONE_FLAGS = {
         '--interval-join',
         '--asof-join',
         '--pattern',
+        '--pattern-opt',
+        '--pattern-opt-file',
         '--max-watermark-skew',
         '--skew-action',
         '--dedupe-by',
@@ -1367,6 +1369,19 @@ def _build_parser():
       help=
       'ordered event sequence / absence CEP spec (e.g. "on=user_id,seq=a -> b within 5m")'
   )
+  g_stream.add_argument(
+      '--pattern-opt',
+      dest='pattern_opts',
+      action='append',
+      default=[],
+      metavar='KEY=VAL',
+      help='additional --pattern option (repeatable, e.g. mode=strict)')
+  g_stream.add_argument(
+      '--pattern-opt-file',
+      dest='pattern_opt_file',
+      default=None,
+      metavar='FILE',
+      help='YAML/JSON options file for --pattern')
   g_stream.add_argument(
       '--max-watermark-skew',
       dest='max_watermark_skew',
@@ -3854,11 +3869,12 @@ def _pipe_impl(
     elif (getattr(args, 'interval_join', None) or
           getattr(args, 'asof_join', None) or getattr(args, 'pattern', None) or
           getattr(args, 'dedupe_by', None) or
-          getattr(args, 'enrich_specs', None)):
+          getattr(args, 'enrich_specs', None) or
+          getattr(args, 'infer_specs', None)):
       raise _CliError(
           '--key / --primary-key enables --cdc mode and cannot be implicitly '
           'combined with --interval-join, --asof-join, --pattern, --dedupe-by, '
-          'or --enrich; pass key=COL inside --interval-join/--asof-join/'
+          '--enrich, or --infer; pass key=COL inside --interval-join/--asof-join/'
           '--pattern/--enrich or --dedupe-by COL (or pass --cdc explicitly if '
           'CDC is intended)',
           EXIT_USAGE)
@@ -3914,10 +3930,12 @@ def _pipe_impl(
   if args.sink is None and args.sql is None and getattr(
       args, 'select', None) and not (
           args.cdc or args.zero_copy or args.window or has_b23_flags or
-          args.timestamp_col or args.dlq or has_interval_join_flag or
-          getattr(args, 'pattern', None) or getattr(args, 'dedupe_by', None) or
-          getattr(args, 'pre_select', None) or getattr(args, 'post_where', None)
-          or getattr(args, 'enrich_specs', None) or
+          args.timestamp_col or args.dlq or has_interval_join_flag or getattr(
+              args, 'pattern', None) or getattr(args, 'pattern_opts', None) or
+          getattr(args, 'pattern_opt_file', None) or getattr(
+              args, 'dedupe_by', None) or getattr(args, 'pre_select', None) or
+          getattr(args, 'post_where', None) or
+          getattr(args, 'enrich_specs', None) or
           getattr(args, 'infer_specs', None)):
     from . import pipe_sql as _ps_mod
     first_src = raw_sources[0] if raw_sources else ''
@@ -3934,7 +3952,8 @@ def _pipe_impl(
     args.where = None
     args.select = None
 
-  if args.sql is not None and getattr(args, 'pattern', None):
+  if args.sql is not None and (getattr(args, 'pattern', None) or getattr(
+      args, 'pattern_opts', None) or getattr(args, 'pattern_opt_file', None)):
     raise _CliError('--pattern cannot be combined with --sql', EXIT_USAGE)
 
   join_source_for_pipe: str | None = None
@@ -4472,6 +4491,8 @@ def _pipe_impl(
         interval_join=getattr(args, 'interval_join', None),
         asof_join=getattr(args, 'asof_join', None),
         pattern=getattr(args, 'pattern', None),
+        pattern_opts=getattr(args, 'pattern_opts', None),
+        pattern_opt_file=getattr(args, 'pattern_opt_file', None),
         max_watermark_skew=getattr(args, 'max_watermark_skew', None),
         skew_action=getattr(args, 'skew_action', None),
         dedupe_by=getattr(args, 'dedupe_by', None),
@@ -4638,6 +4659,10 @@ def _pipe_impl(
           f'zero-copy registration failed: {_summarize(e)}',
           EXIT_PIPELINE_FAILED) from None
 
+    zc_res.setdefault('files', [zc_res['metadata_path']])
+    zc_res.setdefault('file_count', len(zc_res.get('registered_files', ())))
+    zc_res.setdefault('row_count', int(zc_res['rows_registered']))
+    zc_res.setdefault('bytes_copied', 0)
     zc_metrics = {
         'rows_read': int(zc_res['rows_registered']),
         'rows_written': int(zc_res['rows_registered']),
@@ -4726,7 +4751,8 @@ def _pipe_impl(
         json_session=json_session,
         t0=t0,
         mixed_groups=mixed_groups,
-        ephemeral_preview=ephemeral_preview)
+        ephemeral_preview=ephemeral_preview,
+        resolved_args=resolved_args)
     if fast_rc is not None:
       return fast_rc
 
@@ -4900,6 +4926,22 @@ def _pipe_impl(
       extra_warnings.append(note_inf_pii)
       if not json_session.enabled:
         print(f'note: {note_inf_pii}', file=sys.stderr)
+  if (getattr(args, 'pattern', None) and
+      pipe.source_endpoint is not None and
+      pipe.source_endpoint.kind == 'file' and
+      not getattr(args, 'timestamp_col', None)):
+    has_pat_ts = any(
+        isinstance(t, dict) and t.get('type') == 'CliPatternMatch' and
+        (t.get('config') or {}).get('timestamp_col')
+        for t in pipe.spec.get('pipeline', {}).get('transforms', []))
+    if not has_pat_ts:
+      warn_pat_ts = (
+          '--pattern on a file source was invoked without --timestamp-col; '
+          'auto-probing ts/event_ts/timestamp/event_time if present — pass '
+          '--timestamp-col <COL> explicitly to bind event time')
+      extra_warnings.append(warn_pat_ts)
+      if not json_session.enabled:
+        print(f'warning: {warn_pat_ts}', file=sys.stderr)
 
   try:
     rc_out = _run_yaml(
@@ -5088,11 +5130,13 @@ def _run_fast_local_pipe(
     t0,
     mixed_groups=None,
     ephemeral_preview: bool = False,
+    resolved_args: list[str] | None = None,
 ) -> int | None:
   """Runs a qualifying `beam pipe` in-process; None falls back to Beam."""
   from . import fast_local
   canonical_spec = json.dumps(pipe.spec, sort_keys=True, separators=(',', ':'))
-  plan_hash = 'sha256:' + hashlib.sha256(canonical_spec.encode('utf-8')).hexdigest()
+  plan_hash = 'sha256:' + hashlib.sha256(
+      canonical_spec.encode('utf-8')).hexdigest()
   try:
     res = fast_local.run(
         pipe,
@@ -5108,8 +5152,7 @@ def _run_fast_local_pipe(
   except fast_local.FastPipeError as e:
     raise _CliError(f'pipeline failed: {e}', EXIT_PIPELINE_FAILED) from None
   except (ValueError, FileNotFoundError) as e:
-    raise _CliError(
-        f'could not build the pipeline: {e}', EXIT_USAGE) from None
+    raise _CliError(f'could not build the pipeline: {e}', EXIT_USAGE) from None
   except Exception as e:  # pylint: disable=broad-except
     _maybe_print_traceback(args.verbose)
     raise _CliError(
@@ -5144,6 +5187,21 @@ def _run_fast_local_pipe(
   }
   if pipe.dlq_endpoint is not None:
     outputs['dlq_files'] = res.dlq_files
+  fast_warnings = list(res.warnings)
+  has_nowait = any(
+      a in ('--no_wait_until_finish', '--no-wait',
+            '--no-wait-until-finish') or (
+                a.startswith((
+                    '--no_wait_until_finish=',
+                    '--no-wait=',
+                    '--no-wait-until-finish=')) and
+                a.split('=', 1)[1].strip().lower() not in ('0', 'false', 'no'))
+      for a in (resolved_args or ()))
+  if has_nowait:
+    fast_warnings.append(
+        '--no-wait / --no_wait_until_finish on a local in-process runner '
+        'returns without waiting for local execution; use '
+        '--runner=DataflowRunner for detached background jobs')
   dur_ms = int((time.monotonic() - t0) * 1000)
   if json_session.enabled:
     json_session.emit(
@@ -5156,12 +5214,12 @@ def _run_fast_local_pipe(
             duration_ms=dur_ms,
             metrics=res.metrics,
             outputs=outputs,
-            warnings=list(res.warnings),
+            warnings=fast_warnings,
             untrusted_data=output.wrap_untrusted_rows(
                 preview_rows_data, truncated=preview_trunc)
             if want_rows else None))
   else:
-    for warning in res.warnings:
+    for warning in fast_warnings:
       print(f'warning: {warning}', file=sys.stderr)
     if ephemeral_preview:
       for r in preview_rows_data:
@@ -5395,10 +5453,18 @@ def _run_yaml(
         return EXIT_OK
 
       runner_raw = (
-          orig_runner_raw if switched_to_fnapi else
-          options.view_as(StandardOptions).runner)
+          orig_runner_raw
+          if switched_to_fnapi else options.view_as(StandardOptions).runner)
       is_local = _runner_name(runner_raw) in _LOCAL_RUNNERS
       no_wait = options.view_as(StandardOptions).no_wait_until_finish
+      if is_local and no_wait:
+        warn_nw = (
+            '--no-wait / --no_wait_until_finish on a local in-process runner '
+            'returns without waiting for local execution; use '
+            '--runner=DataflowRunner for detached background jobs')
+        warnings_list.append(warn_nw)
+        if json_session is None or not json_session.enabled:
+          print(f'warning: {warn_nw}', file=sys.stderr)
 
       # Remote submission 30-minute idempotency check!
       idem_key: str | None = None

@@ -543,6 +543,7 @@ _DANGEROUS_CALLABLE_NAMES = frozenset([
     'pathlib',
     'pickle',
     'marshal',
+    'pow',
 ])
 _FORBIDDEN_ATTR_NAMES = frozenset([
     'gi_frame',
@@ -551,17 +552,104 @@ _FORBIDDEN_ATTR_NAMES = frozenset([
     'tb_frame',
     'cr_frame',
     'ag_frame',
+    'format',
+    'format_map',
 ])
+_SAFE_BUILTINS_COMBINE_FNS = frozenset([
+    'sum',
+    'min',
+    'max',
+    'count',
+    'any',
+    'all',
+    'mean',
+    'concat',
+])
+
+
+def _ast_within_budget(root: Any, *, max_nodes: int, max_depth: int) -> bool:
+  import ast
+  nodes = list(ast.walk(root))
+  if len(nodes) > max_nodes:
+    return False
+
+  def _depth(n: Any, d: int) -> bool:
+    if d > max_depth:
+      return False
+    return all(_depth(c, d + 1) for c in ast.iter_child_nodes(n))
+
+  return _depth(root, 1)
+
+
+def _is_safe_inline_expression(src: str) -> bool:
+  """True only for a single side-effect-free Python expression (`mode='eval'`)."""
+  import ast
+  if not isinstance(src, str) or not src.strip() or len(src) > 8192:
+    return False
+  try:
+    parsed = ast.parse(src, mode='eval')
+  except SyntaxError:
+    return False
+  if not _ast_within_budget(parsed, max_nodes=128, max_depth=16):
+    return False
+
+  direct_attr_funcs: set[int] = set()
+  for node in ast.walk(parsed):
+    if isinstance(node, (
+        ast.Lambda,
+        ast.ListComp,
+        ast.SetComp,
+        ast.DictComp,
+        ast.GeneratorExp,
+        ast.NamedExpr,
+        ast.Yield,
+        ast.YieldFrom,
+        ast.Await,
+        ast.Pow,
+        ast.LShift,
+        ast.RShift,
+        ast.JoinedStr,
+        ast.FormattedValue,
+    )):
+      return False
+    if isinstance(node, ast.Call) and isinstance(
+        node.func, ast.Name) and node.func.id in ('getattr', 'hasattr'):
+      if node.keywords or not (2 <= len(node.args) <= 3):
+        return False
+      attr_arg = node.args[1]
+      if not (isinstance(attr_arg, ast.Constant) and
+              isinstance(attr_arg.value, str)):
+        return False
+      if (attr_arg.value.startswith('_') or
+          attr_arg.value in _FORBIDDEN_ATTR_NAMES):
+        return False
+      direct_attr_funcs.add(id(node.func))
+
+  for node in ast.walk(parsed):
+    if isinstance(node, ast.Name):
+      if node.id in ('getattr',
+                     'hasattr') and id(node) not in direct_attr_funcs:
+        return False
+      if node.id in _DANGEROUS_CALLABLE_NAMES or (
+          node.id.startswith('_') and node.id != '__row__'):
+        return False
+    elif isinstance(node, ast.Attribute):
+      if node.attr.startswith('_') or node.attr in _FORBIDDEN_ATTR_NAMES:
+        return False
+  return True
 
 
 def _is_safe_inline_callable(src: str) -> bool:
   """True only for pure side-effect-free `def fn(row):` or `lambda row:`."""
   import ast
+  if not isinstance(src, str) or len(src) > 32768:
+    return False
   try:
     mod = ast.parse(src)
   except SyntaxError:
     return False
-  if len(mod.body) != 1:
+  if len(mod.body) != 1 or not _ast_within_budget(
+      mod, max_nodes=1024, max_depth=32):
     return False
   stmt = mod.body[0]
   if isinstance(stmt, ast.FunctionDef):
@@ -584,6 +672,22 @@ def _is_safe_inline_callable(src: str) -> bool:
 
   direct_attr_funcs: set[int] = set()
   for node in ast.walk(stmt):
+    if isinstance(node, (
+        ast.While,
+        ast.AsyncFunctionDef,
+        ast.ClassDef,
+        ast.Await,
+        ast.Yield,
+        ast.YieldFrom,
+        ast.Global,
+        ast.Nonlocal,
+        ast.Pow,
+        ast.LShift,
+        ast.RShift,
+        ast.JoinedStr,
+        ast.FormattedValue,
+    )):
+      return False
     if isinstance(node, ast.Call) and isinstance(
         node.func, ast.Name) and node.func.id in ('getattr', 'hasattr'):
       if node.keywords or not (2 <= len(node.args) <= 3):
@@ -634,6 +738,10 @@ def _config_has_untrusted_python(obj: Any) -> bool:
       c = obj.get('callable')
       if not isinstance(c, str) or not _is_safe_inline_callable(c):
         return True
+    if 'expression' in obj:
+      e = obj.get('expression')
+      if not isinstance(e, str) or not _is_safe_inline_expression(e):
+        return True
     return any(_config_has_untrusted_python(v) for v in obj.values())
   if isinstance(obj, list):
     return any(_config_has_untrusted_python(item) for item in obj)
@@ -660,7 +768,7 @@ def _config_has_untrusted_udf_hooks(obj: Any) -> bool:
 
 
 def _has_executable_python_transforms(block: Any) -> bool:
-  """Detects `PyTransform` or untrusted Python callables before `--plan`."""
+  """Detects `PyTransform` or untrusted Python callables/expressions before `--plan`."""
   if isinstance(block, list):
     return any(_has_executable_python_transforms(item) for item in block)
   if not isinstance(block, dict):
@@ -677,8 +785,45 @@ def _has_executable_python_transforms(block: Any) -> bool:
   cfg = block.get('config')
   if isinstance(cfg, dict):
     lang = str(cfg.get('language') or '').lower()
-    if lang == 'python' and _config_has_untrusted_python(cfg):
-      return True
+    if lang == 'python':
+      if _config_has_untrusted_python(cfg):
+        return True
+      # Validate string shorthand expressions normalized by Beam YAML mapping/filter.
+      for expr_key in ('keep', 'by', 'timestamp'):
+        val = cfg.get(expr_key)
+        if isinstance(val, str) and not _is_safe_inline_expression(val):
+          return True
+      fields_map = cfg.get('fields')
+      if isinstance(fields_map, dict):
+        for fv in fields_map.values():
+          if isinstance(fv, str) and not _is_safe_inline_expression(fv):
+            return True
+      if t_type == 'Combine':
+        comb_map = cfg.get('combine')
+        if not isinstance(comb_map, dict):
+          return True
+        for spec in comb_map.values():
+          if isinstance(spec, str):
+            if spec.lower() not in _SAFE_BUILTINS_COMBINE_FNS:
+              return True
+          elif isinstance(spec, dict):
+            fn_spec = spec.get('fn')
+            if isinstance(fn_spec, str):
+              fn_name = fn_spec
+            elif isinstance(fn_spec, dict):
+              if fn_spec.get('config'):
+                return True
+              fn_name = str(fn_spec.get('type') or '')
+            else:
+              return True
+            if fn_name.lower() not in _SAFE_BUILTINS_COMBINE_FNS:
+              return True
+            val_spec = spec.get('value')
+            if isinstance(val_spec, str) and not _is_safe_inline_expression(
+                val_spec):
+              return True
+          else:
+            return True
     if _config_has_untrusted_udf_hooks(cfg):
       return True
     if 'constructor' in cfg and t_type not in ('ReadFromCsv',

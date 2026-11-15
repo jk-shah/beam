@@ -618,6 +618,13 @@ def _read_source_text(
     raise PackageError(str(e), EXIT_USAGE) from None
 
 
+def _write_safe_local_file(target: Path, text: str) -> None:
+  if target.is_symlink():
+    raise PackageError(
+        f'refusing to write through symbolic link {target}', EXIT_USAGE)
+  target.write_text(text, encoding='utf-8')
+
+
 def _build_launch_snippets(
     *,
     template_location: str,
@@ -631,9 +638,18 @@ def _build_launch_snippets(
   sample_kv = ','.join(f'{k}=<VALUE>' for k in required_params)
   proj_flag = f' --project={shlex.quote(project)}' if project else ''
   param_flag = f' --parameters={shlex.quote(sample_kv)}' if sample_kv else ''
+  if template_location.startswith('gs://'):
+    gcs_spec_uri = template_location
+    upload_prefix = ''
+  else:
+    gcs_spec_uri = f'gs://<BUCKET>/templates/{template_name}.json'
+    upload_prefix = (
+        f'gcloud storage cp {shlex.quote(template_location)} '
+        f'{shlex.quote(gcs_spec_uri)} && ')
   gcloud_cmd = (
-      f'gcloud dataflow flex-template run {shlex.quote(template_name + "-job")}'
-      f' --template-file-gcs-location={shlex.quote(template_location)}'
+      f'{upload_prefix}gcloud dataflow flex-template run '
+      f'{shlex.quote(template_name + "-job")}'
+      f' --template-file-gcs-location={shlex.quote(gcs_spec_uri)}'
       f' --region={shlex.quote(region)}{proj_flag}{param_flag}')
 
   params_dict_literal = (
@@ -647,7 +663,7 @@ def _build_launch_snippets(
       '    body={\n'
       '        "launchParameter": {\n'
       f'            "jobName": "{template_name}-{{{{ ds_nodash }}}}",\n'
-      f'            "containerSpecGcsPath": {template_location!r},\n'
+      f'            "containerSpecGcsPath": {gcs_spec_uri!r},\n'
       f'            "parameters": {params_dict_literal},\n'
       '        }\n'
       '    },\n'
@@ -709,6 +725,14 @@ def run_package(
         EXIT_USAGE)
 
   is_py_file = source_basename.endswith('.py')
+  if not is_py_file:
+    from . import output as out_mod
+    if out_mod.redact_inline_secrets(source_text) != source_text:
+      raise PackageError(
+          'refusing to bake inline credentials or tokens into Flex Template '
+          'YAML; parameterize secrets with Jinja `{{ secret_param }}` or '
+          'Google Cloud Secret Manager.',
+          EXIT_USAGE)
   if sdk_norm == 'auto':
     resolved_sdk = 'PYTHON' if (is_py_file or requirements_file) else 'YAML'
   else:
@@ -749,8 +773,36 @@ def run_package(
   warnings_out: list[str] = []
   written_files: list[str] = []
 
+  def _mapping_has_literal_secret(obj: Any) -> str | None:
+    from . import uris as uris_mod
+    if isinstance(obj, dict):
+      for k, v in obj.items():
+        if uris_mod._SECRET_KEY_RE.search(str(k)):
+          sv = '' if v is None else str(v).strip()
+          if sv and sv not in (
+              '<REDACTED_SECRET>',
+              '<redacted>',
+              '__BEAM_JINJA_PLACEHOLDER__',
+          ) and '__BEAM_JINJA_PLACEHOLDER__' not in sv:
+            return str(k)
+        nested = _mapping_has_literal_secret(v)
+        if nested:
+          return nested
+    elif isinstance(obj, list):
+      for item in obj:
+        nested = _mapping_has_literal_secret(item)
+        if nested:
+          return nested
+    return None
+
   if resolved_sdk == 'YAML':
     yaml_doc = _validate_yaml_with_jinja_placeholders(source_text)
+    bad_sec_key = _mapping_has_literal_secret(yaml_doc)
+    if bad_sec_key:
+      raise PackageError(
+          f'refusing to bake secret key {bad_sec_key!r} into Flex Template '
+          'metadata; parameterize via Jinja `{{ ... }}` or Secret Manager.',
+          EXIT_USAGE)
     custom_provs = _find_custom_python_providers(yaml_doc)
     if custom_provs:
       if sdk_norm == 'auto':
@@ -808,15 +860,21 @@ def run_package(
     spec_json = json.dumps(container_spec, indent=2, sort_keys=True) + '\n'
     if output_dir and not dry_run:
       out_d = Path(output_dir)
+      if out_d.is_symlink():
+        raise PackageError(
+            f'refusing symbolic link --output-dir {output_dir}', EXIT_USAGE)
       out_d.mkdir(parents=True, exist_ok=True)
       p_spec = out_d / f'{safe_name}.template.json'
-      p_spec.write_text(spec_json, encoding='utf-8')
+      _write_safe_local_file(p_spec, spec_json)
       written_files.append(str(p_spec))
       p_yaml = out_d / 'pipeline.yaml'
-      p_yaml.write_text(source_text, encoding='utf-8')
+      _write_safe_local_file(p_yaml, source_text)
       written_files.append(str(p_yaml))
 
     if to_location and not dry_run:
+      if '://' not in to_location and Path(to_location).is_symlink():
+        raise PackageError(
+            f'refusing symbolic link --to {to_location}', EXIT_USAGE)
       _write_text_destination(to_location, spec_json, project=project)
       written_files.append(to_location)
 
@@ -855,6 +913,12 @@ def run_package(
     extra_yaml_name = None
   else:
     yaml_doc = _validate_yaml_with_jinja_placeholders(source_text)
+    bad_sec_key = _mapping_has_literal_secret(yaml_doc)
+    if bad_sec_key:
+      raise PackageError(
+          f'refusing to bake secret key {bad_sec_key!r} into Flex Template '
+          'bundle; parameterize via Jinja `{{ ... }}` or Secret Manager.',
+          EXIT_USAGE)
     parameters = extract_jinja_parameters(source_text)
     extra_yaml_name = 'pipeline.yaml'
     entrypoint_name = 'flex_yaml_entrypoint.py'
@@ -921,23 +985,28 @@ def run_package(
   metadata_json = json.dumps(metadata, indent=2, sort_keys=True) + '\n'
 
   def _populate_bundle_dir(target_dir: Path) -> None:
+    if target_dir.is_symlink():
+      raise PackageError(
+          f'refusing symbolic link bundle directory {target_dir}', EXIT_USAGE)
     target_dir.mkdir(parents=True, exist_ok=True)
-    p_df = target_dir / 'Dockerfile'
-    p_df.write_text(dockerfile_text, encoding='utf-8')
-    p_ep = target_dir / entrypoint_name
-    p_ep.write_text(entrypoint_code, encoding='utf-8')
-    p_meta = target_dir / 'metadata.json'
-    p_meta.write_text(metadata_json, encoding='utf-8')
-    p_spec = target_dir / f'{safe_name}.template.json'
-    p_spec.write_text(spec_json, encoding='utf-8')
+    _write_safe_local_file(target_dir / 'Dockerfile', dockerfile_text)
+    _write_safe_local_file(target_dir / entrypoint_name, entrypoint_code)
+    _write_safe_local_file(target_dir / 'metadata.json', metadata_json)
+    _write_safe_local_file(target_dir / f'{safe_name}.template.json', spec_json)
     if extra_yaml_name:
-      (target_dir / extra_yaml_name).write_text(source_text, encoding='utf-8')
+      _write_safe_local_file(target_dir / extra_yaml_name, source_text)
     if requirements_file:
-      shutil.copy2(requirements_file, target_dir / 'requirements.txt')
+      req_dst = target_dir / 'requirements.txt'
+      if req_dst.is_symlink():
+        raise PackageError(
+            f'refusing symbolic link {req_dst}', EXIT_USAGE)
+      shutil.copy2(requirements_file, req_dst)
     if bundle_preview_wheel_path is not None:
-      shutil.copy2(
-          bundle_preview_wheel_path,
-          target_dir / bundle_preview_wheel_path.name)
+      whl_dst = target_dir / bundle_preview_wheel_path.name
+      if whl_dst.is_symlink():
+        raise PackageError(
+            f'refusing symbolic link {whl_dst}', EXIT_USAGE)
+      shutil.copy2(bundle_preview_wheel_path, whl_dst)
 
   if output_dir and not dry_run:
     out_d = Path(output_dir)

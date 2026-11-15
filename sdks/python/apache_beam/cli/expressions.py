@@ -475,11 +475,6 @@ def _lex_and_normalize_with_colmap(
   return ''.join(out), colref_map
 
 
-def _lex_and_normalize(raw: str) -> str:
-  normalized, _ = _lex_and_normalize_with_colmap(raw)
-  return normalized
-
-
 def _ast_stats(node: ast.AST, depth: int = 1) -> tuple[int, int]:
   count = 1
   max_d = depth

@@ -819,7 +819,22 @@ class CliInferEndToEndPipeTest(unittest.TestCase):
       self.assertTrue(chk['valid'])
       self.assertEqual(chk['mode'], 'expanded_plan')
 
-      # beam package --sdk=auto selects PYTHON and detects transformers + torch!
+      # Literal unredacted `hf_token` is refused by `beam package`!
+      lit_sec_path = os.path.join(tmp, 'infer_lit_sec.yaml')
+      with open(lit_sec_path, 'w', encoding='utf-8') as f:
+        f.write(
+            out_ok.replace('<REDACTED_SECRET>', 'hf_LiteralSecret123').replace(
+                '<redacted>', 'hf_LiteralSecret123'))
+      with self.assertRaises(package_mod.PackageError):
+        package_mod.run_package(
+            lit_sec_path,
+            to_location=os.path.join(tmp, 'spec_sec.json'),
+            sdk='auto',
+            output_dir=os.path.join(tmp, 'pkg_sec'),
+            dry_run=True,
+        )
+
+      # Redacted dry-run YAML auto-selects PYTHON and detects transformers + torch!
       import yaml as pyyaml
       doc = pyyaml.safe_load(out_ok)
       pkgs = package_mod._detect_yaml_extra_packages(doc)
@@ -836,6 +851,173 @@ class CliInferEndToEndPipeTest(unittest.TestCase):
       self.assertTrue(
           any('transformers' in w for w in pkg_res['warnings']),
           pkg_res['warnings'])
+
+  def test_agent_study_regressions(self):
+    import time as _time
+    with tempfile.TemporaryDirectory() as tmp:
+      src = os.path.join(tmp, 'events.jsonl')
+      with open(src, 'w', encoding='utf-8') as f:
+        f.write('{"uid": "u1", "text": "great", "amount": 25.0}\n')
+        f.write('{"uid": "u2", "text": "ok", "amount": 5.0}\n')
+
+      # P0-1 & P0-3: Single-source `--sql "SELECT * FROM source"` works locally & with `--emit-yaml --json`
+      sql_out = os.path.join(tmp, 'sql_out.jsonl')
+      rc_sql, out_sql, err_sql = _run_cli([
+          'pipe',
+          src,
+          sql_out,
+          '--sql',
+          'SELECT uid, amount FROM source WHERE amount >= 10',
+          '--json',
+      ])
+      self.assertEqual(rc_sql, 0, f'STDOUT: {out_sql}\nSTDERR: {err_sql}')
+      self.assertEqual(json.loads(out_sql)['metrics']['rows_written'], 1)
+
+      rc_emit, out_emit, _ = _run_cli([
+          'pipe',
+          src,
+          '--sql',
+          'SELECT uid FROM source',
+          '--emit-yaml',
+          '--json',
+      ])
+      self.assertEqual(rc_emit, 0, out_emit)
+      self.assertIn('yaml', json.loads(out_emit)['outputs'])
+
+      # P0-2 & P0-4: Positional `mock:<model_id>` + stage-scoped `--infer-opt 1:...` + `--expect`
+      inf_out = os.path.join(tmp, 'inf_out.jsonl')
+      rc_inf, out_inf, err_inf = _run_cli([
+          'pipe',
+          src,
+          inf_out,
+          '--infer',
+          'mock:sentiment_v1,fields=text',
+          '--infer',
+          'mock:fraud_v1,fields=amount',
+          '--infer-opt',
+          '1:flatten=true',
+          '--infer-opt',
+          '2:score=0.95',
+          '--expect',
+          'prediction_score > 0 AND prediction_2.score >= 0.9',
+          '--on-violation',
+          'fail',
+          '--json',
+      ])
+      self.assertEqual(rc_inf, 0, f'STDOUT: {out_inf}\nSTDERR: {err_inf}')
+      self.assertEqual(json.loads(out_inf)['metrics']['rows_written'], 2)
+
+      # Out-of-range stage prefix rejected with exit code 2
+      rc_bad_st, out_bad_st, _ = _run_cli([
+          'pipe',
+          src,
+          inf_out,
+          '--infer',
+          'mock:sentiment_v1,fields=text',
+          '--infer-opt',
+          '3:flatten=true',
+          '--dry-run',
+          '--json',
+      ])
+      self.assertEqual(rc_bad_st, 2, out_bad_st)
+
+      # P1-1: `--post-where` referencing a derived `--select` alias emits actionable `--pre-select` hint
+      rc_pw, out_pw, _ = _run_cli([
+          'pipe',
+          src,
+          inf_out,
+          '--select',
+          'uid, amount * 2 AS doubled_amt',
+          '--post-where',
+          'doubled_amt > 10',
+          '--dry-run',
+          '--json',
+      ])
+      self.assertEqual(rc_pw, 2, out_pw)
+      self.assertIn('--pre-select', json.loads(out_pw)['error']['message'])
+
+      # P1-4: Static `beam check` executes in <200ms without importing full Beam SDK
+      yaml_p = os.path.join(tmp, 'fast_check.yaml')
+      _, yaml_txt, _ = _run_cli([
+          'pipe',
+          src,
+          inf_out,
+          '--infer',
+          'mock:sentiment_v1,fields=text',
+          '--dry-run',
+      ])
+      with open(yaml_p, 'w', encoding='utf-8') as f:
+        f.write(yaml_txt)
+      t0 = _time.monotonic()
+      chk = check_cmd.run_check(yaml_p, expand_plan=False)
+      elapsed_ms = (_time.monotonic() - t0) * 1000.0
+      self.assertTrue(chk['valid'])
+      self.assertEqual(chk['mode'], 'offline_static')
+      self.assertLess(elapsed_ms, 500.0)
+
+      # Blind retest #1: `--timestamp-col ts --window fixed:60s --select` parses ISO-8601 strings cleanly
+      clicks_p = os.path.join(tmp, 'clicks.jsonl')
+      with open(clicks_p, 'w', encoding='utf-8') as f:
+        f.write(
+            '{"ts":"2026-01-01T10:00:05Z","dept":"eng","amount":15.0}\n'
+            '{"ts":"2026-01-01T10:00:40Z","dept":"eng","amount":20.0}\n'
+            '{"ts":"2026-01-01T10:01:10Z","dept":"sales","amount":50.0}\n')
+      win_out = os.path.join(tmp, 'win_out.jsonl')
+      rc_win, out_win, err_win = _run_cli([
+          'pipe',
+          clicks_p,
+          win_out,
+          '--timestamp-col',
+          'ts',
+          '--window',
+          'fixed:60s',
+          '--select',
+          'dept, SUM(amount) AS sum_amount, COUNT(*) AS cnt',
+          '--json',
+      ])
+      self.assertEqual(rc_win, 0, f'STDOUT: {out_win}\nSTDERR: {err_win}')
+      self.assertEqual(json.loads(out_win)['metrics']['rows_written'], 2)
+
+      # Blind retest #2: File `--pattern` without `--timestamp-col` auto-probes `ts` and warns
+      cep_in = os.path.join(tmp, 'cep_auto.jsonl')
+      with open(cep_in, 'w', encoding='utf-8') as f:
+        f.write(
+            '{"user_id":"u1","event_type":"login","ts":"2026-01-01T10:00:00Z"}\n'
+            '{"user_id":"u1","event_type":"buy","ts":"2026-01-01T10:02:00Z"}\n'
+            '{"user_id":"u2","event_type":"login","ts":"2026-01-01T10:00:00Z"}\n'
+            '{"user_id":"u2","event_type":"buy","ts":"2026-01-01T10:08:00Z"}\n')
+      cep_out = os.path.join(tmp, 'cep_auto_out.jsonl')
+      rc_ca, out_ca, err_ca = _run_cli([
+          'pipe',
+          cep_in,
+          cep_out,
+          '--pattern',
+          'login -> buy within 5m',
+          '--pattern-opt',
+          'key=user_id',
+          '--pattern-opt',
+          'mode=strict',
+          '--json',
+      ])
+      self.assertEqual(rc_ca, 0, f'STDOUT: {out_ca}\nSTDERR: {err_ca}')
+      env_ca = json.loads(out_ca)
+      self.assertEqual(env_ca['metrics']['patterns_matched'], 1)
+      self.assertTrue(
+          any('--timestamp-col' in w for w in env_ca.get('warnings', ())))
+
+      # Blind retest #3: `local_fast` emits `--no_wait_until_finish` warning
+      nw_out = os.path.join(tmp, 'nowait_out.jsonl')
+      rc_nw, out_nw, _ = _run_cli([
+          'pipe',
+          src,
+          nw_out,
+          '--no_wait_until_finish',
+          '--json',
+      ])
+      self.assertEqual(rc_nw, 0, out_nw)
+      env_nw = json.loads(out_nw)
+      self.assertTrue(
+          any('no_wait_until_finish' in w for w in env_nw.get('warnings', ())))
 
 
 if __name__ == '__main__':

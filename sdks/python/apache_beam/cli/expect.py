@@ -121,8 +121,47 @@ _DISALLOWED_AST_NODES = (
 _ACTION_CHOICES = frozenset(['dlq', 'drop', 'fail'])
 
 
+_ALLOWED_EXPECT_AST_NODES = (
+    ast.Expression,
+    ast.BoolOp,
+    ast.And,
+    ast.Or,
+    ast.UnaryOp,
+    ast.Not,
+    ast.UAdd,
+    ast.USub,
+    ast.BinOp,
+    ast.Add,
+    ast.Sub,
+    ast.Mult,
+    ast.Div,
+    ast.FloorDiv,
+    ast.Mod,
+    ast.Compare,
+    ast.Eq,
+    ast.NotEq,
+    ast.Lt,
+    ast.LtE,
+    ast.Gt,
+    ast.GtE,
+    ast.Is,
+    ast.IsNot,
+    ast.In,
+    ast.NotIn,
+    ast.IfExp,
+    ast.Call,
+    ast.Attribute,
+    ast.Subscript,
+    ast.Constant,
+    ast.Name,
+    ast.Load,
+    ast.List,
+    ast.Tuple,
+)
+
+
 def _validate_expectation_ast(expr: str) -> ast.Expression:
-  """Validates an expectation expression AST, blocking `_` attributes and RCE."""
+  """Validates an expectation expression AST using a strict allowlist."""
   if not isinstance(expr, str) or not expr.strip():
     raise ValueError('Empty expectation rule specification')
   if len(expr) > 4096:
@@ -137,16 +176,16 @@ def _validate_expectation_ast(expr: str) -> ast.Expression:
     children = list(ast.iter_child_nodes(node))
     return 1 + (max((_depth(c) for c in children), default=0))
 
-  if _depth(parsed) > 32:
+  if _depth(parsed) > 16:
     raise ValueError(
-        'Expectation expression exceeds maximum AST nesting depth (32)')
+        'Expectation expression exceeds maximum AST nesting depth (16)')
   nodes = list(ast.walk(parsed))
-  if len(nodes) > 256:
+  if len(nodes) > 128:
     raise ValueError(
-        'Expectation expression exceeds maximum AST node count (256)')
+        'Expectation expression exceeds maximum AST node count (128)')
 
   for node in nodes:
-    if isinstance(node, _DISALLOWED_AST_NODES):
+    if not isinstance(node, _ALLOWED_EXPECT_AST_NODES):
       raise ValueError(
           f'Disallowed construct {type(node).__name__} in expectation {expr!r}')
     if isinstance(node, ast.Name) and node.id.startswith('_'):
@@ -154,11 +193,19 @@ def _validate_expectation_ast(expr: str) -> ast.Expression:
           f'Underscore-prefixed identifier {node.id!r} is disallowed in expectation'
       )
     if isinstance(node, ast.Attribute):
-      if node.attr.startswith('_'):
+      if node.attr.startswith('_') or node.attr in ('format', 'format_map'):
         raise ValueError(
-            f'Underscore-prefixed attribute {node.attr!r} is disallowed in expectation'
-        )
+            f'Disallowed attribute {node.attr!r} in expectation {expr!r}')
+    if isinstance(node, ast.Subscript):
+      if not isinstance(node.slice, ast.Constant) or (
+          isinstance(node.slice.value, str) and
+          node.slice.value.startswith('_')):
+        raise ValueError(
+            f'Disallowed subscript key in expectation {expr!r}')
     if isinstance(node, ast.Call):
+      if node.keywords:
+        raise ValueError(
+            f'Keyword arguments are disallowed in expectation {expr!r}')
       if isinstance(node.func, ast.Name):
         if node.func.id not in _SAFE_CALL_NAMES:
           raise ValueError(
@@ -188,27 +235,214 @@ class ExpectationRule(NamedTuple):
   on_violation: str = 'dlq'
 
 
-def _sql_like_fn(val: Any, pattern: Any) -> bool:
+def _sql_like_fn(val: Any, pattern: Any) -> bool | None:
+  """Linear/quadratic two-pointer SQL LIKE matcher (zero regex ReDoS)."""
   if val is None or pattern is None:
+    return None
+  s = str(val)
+  raw_p = str(pattern)
+  if len(s) > 65536 or len(raw_p) > 4096:
     return False
-  parts = re.split(r'([%_])', str(pattern))
-  rx = ['^']
-  for p in parts:
-    if p == '%':
-      rx.append('.*')
-    elif p == '_':
-      rx.append('.')
+  # Tokenize pattern into ('*', '') | ('?', '') | ('L', char) with `\` escape,
+  # collapsing consecutive `%` wildcards.
+  ptoks: list[tuple[str, str]] = []
+  idx = 0
+  plen = len(raw_p)
+  while idx < plen:
+    ch = raw_p[idx]
+    if ch == '\\' and idx + 1 < plen:
+      ptoks.append(('L', raw_p[idx + 1]))
+      idx += 2
+    elif ch == '%':
+      if not ptoks or ptoks[-1][0] != '*':
+        ptoks.append(('*', ''))
+      idx += 1
+    elif ch == '_':
+      ptoks.append(('?', ''))
+      idx += 1
     else:
-      rx.append(re.escape(p))
-  rx.append('$')
-  return bool(re.match(''.join(rx), str(val), flags=re.DOTALL))
+      ptoks.append(('L', ch))
+      idx += 1
+
+  si = 0
+  pi = 0
+  slen = len(s)
+  ntoks = len(ptoks)
+  star_pi = -1
+  star_si = -1
+  while si < slen:
+    if pi < ntoks and (ptoks[pi][0] == '?' or
+                       (ptoks[pi][0] == 'L' and ptoks[pi][1] == s[si])):
+      si += 1
+      pi += 1
+    elif pi < ntoks and ptoks[pi][0] == '*':
+      star_pi = pi
+      star_si = si
+      pi += 1
+    elif star_pi != -1:
+      pi = star_pi + 1
+      star_si += 1
+      si = star_si
+    else:
+      return False
+  while pi < ntoks and ptoks[pi][0] == '*':
+    pi += 1
+  return pi == ntoks
+
+
+def _exp_mul(a: Any, b: Any) -> Any:
+  if a is None or b is None:
+    return None
+  if isinstance(a, (str, bytes, list, tuple)) or isinstance(
+      b, (str, bytes, list, tuple)):
+    raise ValueError('sequence repetition (*) is disallowed in expectations')
+  return a * b
+
+
+def _exp_not(v: Any) -> bool | None:
+  if v is None:
+    return None
+  return not bool(v)
+
+
+def _exp_and(vals: list[Any]) -> bool | None:
+  saw_none = False
+  for v in vals:
+    if v is None:
+      saw_none = True
+    elif not bool(v):
+      return False
+  return None if saw_none else True
+
+
+def _exp_or(vals: list[Any]) -> bool | None:
+  saw_none = False
+  for v in vals:
+    if v is None:
+      saw_none = True
+    elif bool(v):
+      return True
+  return None if saw_none else False
+
+
+def _exp_cmp(op_name: str, lhs: Any, rhs: Any) -> bool | None:
+  if op_name == 'is':
+    return lhs is rhs
+  if op_name == 'is_not':
+    return lhs is not rhs
+  if lhs is None:
+    return None
+  if op_name in ('in', 'not_in'):
+    if rhs is None:
+      return None
+    if isinstance(rhs, str):
+      res: bool | None = str(lhs) in rhs
+    else:
+      saw_null = False
+      matched = False
+      for item in rhs:
+        if item is None:
+          saw_null = True
+        elif lhs == item:
+          matched = True
+          break
+      res = True if matched else (None if saw_null else False)
+    return _exp_not(res) if op_name == 'not_in' else res
+  if rhs is None:
+    return None
+  if op_name == 'eq':
+    return lhs == rhs
+  if op_name == 'ne':
+    return lhs != rhs
+  if op_name == 'lt':
+    return lhs < rhs
+  if op_name == 'le':
+    return lhs <= rhs
+  if op_name == 'gt':
+    return lhs > rhs
+  if op_name == 'ge':
+    return lhs >= rhs
+  return False
+
+
+class _Expect3VLTransformer(ast.NodeTransformer):
+  """Rewrites expectation AST to enforce SQL 3VL on NULLs and block sequence `*`."""
+
+  _CMP_MAP = {
+      ast.Eq: 'eq',
+      ast.NotEq: 'ne',
+      ast.Lt: 'lt',
+      ast.LtE: 'le',
+      ast.Gt: 'gt',
+      ast.GtE: 'ge',
+      ast.Is: 'is',
+      ast.IsNot: 'is_not',
+      ast.In: 'in',
+      ast.NotIn: 'not_in',
+  }
+
+  def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
+    self.generic_visit(node)
+    if isinstance(node.op, ast.Mult):
+      return ast.Call(
+          func=ast.Name(id='_cli_exp_mul', ctx=ast.Load()),
+          args=[node.left, node.right],
+          keywords=[])
+    return node
+
+  def visit_UnaryOp(self, node: ast.UnaryOp) -> ast.AST:
+    self.generic_visit(node)
+    if isinstance(node.op, ast.Not):
+      return ast.Call(
+          func=ast.Name(id='_cli_exp_not', ctx=ast.Load()),
+          args=[node.operand],
+          keywords=[])
+    return node
+
+  def visit_BoolOp(self, node: ast.BoolOp) -> ast.AST:
+    self.generic_visit(node)
+    fn_id = '_cli_exp_and' if isinstance(node.op, ast.And) else '_cli_exp_or'
+    return ast.Call(
+        func=ast.Name(id=fn_id, ctx=ast.Load()),
+        args=[ast.List(elts=node.values, ctx=ast.Load())],
+        keywords=[])
+
+  def visit_Compare(self, node: ast.Compare) -> ast.AST:
+    self.generic_visit(node)
+    parts: list[ast.expr] = []
+    cur_left = node.left
+    for op, comp in zip(node.ops, node.comparators):
+      op_str = self._CMP_MAP.get(type(op))
+      if op_str is None:
+        return node
+      parts.append(
+          ast.Call(
+              func=ast.Name(id='_cli_exp_cmp', ctx=ast.Load()),
+              args=[ast.Constant(value=op_str), cur_left, comp],
+              keywords=[]))
+      cur_left = comp
+    if len(parts) == 1:
+      return parts[0]
+    return ast.Call(
+        func=ast.Name(id='_cli_exp_and', ctx=ast.Load()),
+        args=[ast.List(elts=parts, ctx=ast.Load())],
+        keywords=[])
 
 
 _SAFE_BUILTINS.update({
     'ifnull': _SAFE_BUILTINS['coalesce'],
     'trim': _SAFE_BUILTINS['strip'],
-    'length': len,
+    'length': lambda s: None if s is None else len(s),
+    'len': lambda s: None if s is None else len(s),
+    'lower': lambda s: None if s is None else str(s).lower(),
+    'upper': lambda s: None if s is None else str(s).upper(),
+    'strip': lambda s: None if s is None else str(s).strip(),
     'sql_like': _sql_like_fn,
+    '_cli_exp_mul': _exp_mul,
+    '_cli_exp_not': _exp_not,
+    '_cli_exp_and': _exp_and,
+    '_cli_exp_or': _exp_or,
+    '_cli_exp_cmp': _exp_cmp,
 })
 _SAFE_CALL_NAMES = _SAFE_CALL_NAMES | frozenset(
     ['ifnull', 'trim', 'length', 'sql_like'])
@@ -237,20 +471,63 @@ _EXPECT_CAST_MAP: dict[str, str] = {
 }
 
 
+def _join_expect_pieces(pieces: list[str]) -> str:
+  joined: list[str] = []
+  for idx, piece in enumerate(pieces):
+    if idx > 0:
+      prev = pieces[idx - 1]
+      if prev != '.' and piece not in ('.', ',', ')', ']') and prev not in (
+          '(', '['):
+        joined.append(' ')
+    joined.append(piece)
+  return ''.join(joined)
+
+
+def _pop_trailing_atom(out: list[str]) -> str:
+  """Pops a complete trailing primary atom (`a`, `a.b`, `a.lower()`, `(x)`) from `out`."""
+  picked: list[str] = []
+  while out:
+    tok = out.pop()
+    picked.append(tok)
+    if tok in (')', ']'):
+      open_tok = '(' if tok == ')' else '['
+      depth = 1
+      while out and depth > 0:
+        t2 = out.pop()
+        picked.append(t2)
+        if t2 == tok:
+          depth += 1
+        elif t2 == open_tok:
+          depth -= 1
+      # Include optional callable/attribute prefix before `(` / `[`
+      while out and (out[-1] == '.' or out[-1].isidentifier()):
+        picked.append(out.pop())
+      break
+    if out and out[-1] == '.':
+      picked.append(out.pop())
+      continue
+    break
+  picked.reverse()
+  return _join_expect_pieces(picked)
+
+
 def normalize_expectation_expression(expr: str) -> str:
-  """Token-safely normalizes SQL syntax (`=`, `<>`, `LIKE`, `CAST`, `IS NULL`) into Python."""
+  """Token-safely normalizes SQL syntax (`=`, `<>`, `LIKE`, `IN`, `CAST`, `IS NULL`)."""
   import io
   import tokenize
   cleaned = expr.strip()
   if not cleaned:
     return cleaned
-  # Replace backticked identifiers `` `col` `` outside quotes before tokenizing.
-  cleaned = re.sub(r'`([A-Za-z_][A-Za-z0-9_]*)`', r'\1', cleaned)
-  cleaned = re.sub(r'<>', '!=', cleaned)
+  # Strip backticks around bare identifiers only outside string literals.
   try:
+    # Replace backticked identifiers safely via regex only when not inside quotes.
+    cleaned_bt = re.sub(
+        r"""('(?:\\.|[^'])*'|"(?:\\.|[^"])*")|`([A-Za-z_][A-Za-z0-9_]*)`""",
+        lambda m: m.group(1) if m.group(1) is not None else m.group(2),
+        cleaned)
     raw_toks = [
         (t.type, t.string)
-        for t in tokenize.generate_tokens(io.StringIO(cleaned).readline)
+        for t in tokenize.generate_tokens(io.StringIO(cleaned_bt).readline)
         if t.type not in (
             tokenize.ENCODING, tokenize.ENDMARKER, tokenize.NL, tokenize.NEWLINE)
     ]
@@ -264,6 +541,16 @@ def normalize_expectation_expression(expr: str) -> str:
     while i < n:
       tt, tv = toks[i]
       tu = tv.upper() if tt == tokenize.NAME else ''
+      # `<>` operator (single OP token `'<>'` in Python `tokenize`, or `'<'` + `'>'`)
+      if tt == tokenize.OP and tv == '<>':
+        out.append('!=')
+        i += 1
+        continue
+      if (tt == tokenize.OP and tv == '<' and i + 1 < n and
+          toks[i + 1] == (tokenize.OP, '>')):
+        out.append('!=')
+        i += 2
+        continue
       # `IS NOT NULL` / `IS NULL`
       if tt == tokenize.NAME and tu == 'IS':
         if (i + 2 < n and toks[i + 1][0] == tokenize.NAME and
@@ -300,21 +587,57 @@ def normalize_expectation_expression(expr: str) -> str:
           if py_fn is None:
             raise ValueError(
                 f'Unsupported CAST type {toks[as_idx + 1][1]!r} in expectation')
-          inner_str = ' '.join(_norm_tokens(toks[i + 2:as_idx]))
+          inner_str = _join_expect_pieces(_norm_tokens(toks[i + 2:as_idx]))
           out.append(f'{py_fn}({inner_str})')
           i = j + 1
           continue
-      # `[NOT] LIKE <pattern>` (rewrites preceding atom + pattern into `sql_like(a, pat)`)
+      # `[NOT] IN ( ... )` -> rewrite parenthesized SQL value list to `[...]`
+      if (tt == tokenize.NAME and tu == 'NOT' and i + 2 < n and
+          toks[i + 1][0] == tokenize.NAME and toks[i + 1][1].upper() == 'IN'
+          and toks[i + 2] == (tokenize.OP, '(')):
+        depth = 1
+        j = i + 3
+        while j < n and depth > 0:
+          if toks[j][0] == tokenize.OP and toks[j][1] in ('(', '[', '{'):
+            depth += 1
+          elif toks[j][0] == tokenize.OP and toks[j][1] in (')', ']', '}'):
+            depth -= 1
+            if depth == 0:
+              break
+          j += 1
+        if depth == 0:
+          inner = _norm_tokens(toks[i + 3:j])
+          out.extend(['not', 'in', '[', *inner, ']'])
+          i = j + 1
+          continue
+      if (tt == tokenize.NAME and tu == 'IN' and i + 1 < n and
+          toks[i + 1] == (tokenize.OP, '(')):
+        depth = 1
+        j = i + 2
+        while j < n and depth > 0:
+          if toks[j][0] == tokenize.OP and toks[j][1] in ('(', '[', '{'):
+            depth += 1
+          elif toks[j][0] == tokenize.OP and toks[j][1] in (')', ']', '}'):
+            depth -= 1
+            if depth == 0:
+              break
+          j += 1
+        if depth == 0:
+          inner = _norm_tokens(toks[i + 2:j])
+          out.extend(['in', '[', *inner, ']'])
+          i = j + 1
+          continue
+      # `[NOT] LIKE <pattern>`
       if (tt == tokenize.NAME and tu == 'NOT' and i + 2 < n and
           toks[i + 1][0] == tokenize.NAME and
           toks[i + 1][1].upper() == 'LIKE' and out):
-        lhs = out.pop()
+        lhs = _pop_trailing_atom(out)
         pat = toks[i + 2][1]
         out.append(f'(not sql_like({lhs}, {pat}))')
         i += 3
         continue
       if tt == tokenize.NAME and tu == 'LIKE' and i + 1 < n and out:
-        lhs = out.pop()
+        lhs = _pop_trailing_atom(out)
         pat = toks[i + 1][1]
         out.append(f'sql_like({lhs}, {pat})')
         i += 2
@@ -340,16 +663,7 @@ def normalize_expectation_expression(expr: str) -> str:
       i += 1
     return out
 
-  pieces = _norm_tokens(raw_toks)
-  joined: list[str] = []
-  for idx, piece in enumerate(pieces):
-    if idx > 0:
-      prev = pieces[idx - 1]
-      if prev != '.' and piece not in ('.', ',', ')', ']') and prev not in (
-          '(', '['):
-        joined.append(' ')
-    joined.append(piece)
-  return ''.join(joined)
+  return _join_expect_pieces(_norm_tokens(raw_toks))
 
 
 def parse_expectation_rule(
@@ -410,9 +724,10 @@ def parse_expectation_rule(
 
 
 def compile_expectation_expression(expr: str) -> Any:
-  """AST-validates and compiles a normalized expectation expression."""
+  """AST-validates, applies SQL 3VL null-safety, and compiles an expectation."""
   parsed = _validate_expectation_ast(expr)
-  return compile(parsed, '<expectation>', 'eval')
+  transformed = ast.fix_missing_locations(_Expect3VLTransformer().visit(parsed))
+  return compile(transformed, '<expectation>', 'eval')
 
 
 def evaluate_record(
@@ -423,7 +738,9 @@ def evaluate_record(
   if isinstance(compiled_code, str):
     compiled_code = compile_expectation_expression(compiled_code)
   elif hasattr(compiled_code, 'co_names'):
-    if any(str(n).startswith('_') for n in compiled_code.co_names):
+    if any(
+        str(n).startswith('_') and not str(n).startswith('_cli_exp_')
+        for n in compiled_code.co_names):
       raise ValueError('Underscore attribute/name access is disallowed')
   if hasattr(row, '_asdict'):
     row_dict = row._asdict()
@@ -439,7 +756,7 @@ def evaluate_record(
 
   try:
     result = eval(compiled_code, {'__builtins__': _SAFE_BUILTINS}, scope)  # pylint: disable=eval-used
-    return bool(result)
+    return result is True or (result is not None and bool(result))
   except Exception:  # pylint: disable=broad-except
     return False
 
@@ -453,6 +770,7 @@ def cli_expect(
   import apache_beam as beam
   from apache_beam import metrics
   from apache_beam import pvalue
+
   from . import dlq
 
   parsed_rules: list[ExpectationRule] = []

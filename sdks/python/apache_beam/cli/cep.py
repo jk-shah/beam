@@ -457,17 +457,31 @@ class _CompiledPredicate:
         if mname == 'upper':
           return s_t.upper()
         if mname == 'strip':
-          return s_t.strip()
+          return s_t.strip(str(args[0])) if args else s_t.strip()
+        if mname == 'lstrip':
+          return s_t.lstrip(str(args[0])) if args else s_t.lstrip()
+        if mname == 'rstrip':
+          return s_t.rstrip(str(args[0])) if args else s_t.rstrip()
+        if mname == 'replace' and len(args) >= 2:
+          return (
+              s_t.replace(str(args[0]), str(args[1]), int(args[2]))
+              if len(args) >= 3 else s_t.replace(str(args[0]), str(args[1])))
         if mname == 'startswith':
           return s_t.startswith(str(args[0]))
         if mname == 'endswith':
           return s_t.endswith(str(args[0]))
+    if isinstance(node, ast.IfExp):
+      cond_v = self._eval_node(node.test, row_dict)
+      return (
+          self._eval_node(node.body, row_dict)
+          if bool(cond_v) else self._eval_node(node.orelse, row_dict))
     raise ValueError(f'unsupported AST node {type(node).__name__}')
 
 
 def parse_pattern_spec_str(
     spec_str: str,
     *,
+    extra_opts: Mapping[str, Any] | None = None,
     timestamp_col: str | None = None,
     allowed_lateness: str | None = None,
     dlq_redact_fields: Iterable[str] | None = None,
@@ -487,8 +501,11 @@ def parse_pattern_spec_str(
       raise ValueError('--pattern JSON must be an object')
   else:
     raw_dict = {}
-    for tok in interval_join.split_bracket_tokens(s):
+    for idx, tok in enumerate(interval_join.split_bracket_tokens(s)):
       if '=' not in tok:
+        if idx == 0 and '->' in tok and 'seq' not in raw_dict:
+          raw_dict['seq'] = tok.strip().strip("'\"")
+          continue
         raise ValueError(
             f'invalid token {tok!r} in --pattern; expected key=value '
             '(e.g. "key=user_id,seq=login -> purchase within 5m")')
@@ -498,6 +515,11 @@ def parse_pattern_spec_str(
       if len(vs) >= 2 and vs[0] == vs[-1] and vs[0] in ("'", '"'):
         vs = vs[1:-1]
       raw_dict[ks] = vs
+
+  if extra_opts:
+    for ek, ev in extra_opts.items():
+      norm_k = str(ek).strip().lower().replace('-', '_')
+      raw_dict.setdefault(norm_k, ev)
 
   if timestamp_col and 'timestamp_col' not in raw_dict:
     raw_dict['timestamp_col'] = timestamp_col
@@ -578,6 +600,8 @@ def parse_pattern_config(raw: Mapping[str, Any]) -> PatternConfig:
 
   mode = str(norm.get('mode') or norm.get('contiguity') or
              'relaxed').strip().lower()
+  if mode == 'strict':
+    mode = 'contiguous'
   if mode not in _ALLOWED_MODES:
     raise ValueError(
         f'invalid mode {mode!r} in CliPatternMatch; expected relaxed or contiguous'
@@ -998,7 +1022,13 @@ def match_bounded_patterns(
     if any(kv is None for kv in key_vals):
       continue
     k_bytes = interval_join.encode_canonical_key_values(key_vals)
-    t = interval_join.extract_record_timestamp(d, config.timestamp_col)
+    eff_ts_col = config.timestamp_col or next((
+        c for c in ('ts', 'event_ts', 'timestamp', 'event_time')
+        if d.get(c) is not None),
+                                              None)
+    t = (
+        interval_join.extract_record_timestamp(d, eff_ts_col)
+        if eff_ts_col else 0.0)
     by_key.setdefault(k_bytes, []).append((t, seq_i, d))
 
   all_matches: list[dict[str, Any]] = []
@@ -1309,6 +1339,16 @@ def cli_pattern_match(
         ckey = interval_join.encode_canonical_key_values(key_vals)
         if cfg.timestamp_col:
           t = interval_join.extract_record_timestamp(d, cfg.timestamp_col)
+        elif float(elem_ts) <= -1e11:
+          auto_col = next((
+              c for c in ('ts', 'event_ts', 'timestamp', 'event_time')
+              if d.get(c) is not None),
+                          None)
+          if auto_col is not None:
+            t = interval_join.extract_record_timestamp(d, auto_col)
+          else:
+            t = interval_join._scale_and_bound_epoch_seconds(
+                float(elem_ts), '<element_timestamp>', elem_ts)
         else:
           t = interval_join._scale_and_bound_epoch_seconds(
               float(elem_ts), '<element_timestamp>', elem_ts)

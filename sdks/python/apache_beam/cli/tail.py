@@ -78,8 +78,9 @@ _ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?(\x07|\x1b\\)|[\x0
 
 
 def _sanitize_terminal_str(s: str) -> str:
-  """Strips ANSI escape sequences and non-printable control characters from untrusted values."""
-  return _ANSI_ESCAPE_RE.sub('', s)
+  """Strips ANSI, C1, and Unicode BiDi control characters from untrusted values."""
+  from . import output
+  return output.sanitize_untrusted_text(s, max_chars=4096)
 
 
 class InteractiveTailFormatter:
@@ -91,7 +92,7 @@ class InteractiveTailFormatter:
   """
 
   def __init__(self, uri: str, follow: bool = False, use_color: bool | None = None):
-    self.uri = uri
+    self.uri = _sanitize_terminal_str(str(uri))
     self.follow = follow
     if use_color is None:
       self.use_color = (

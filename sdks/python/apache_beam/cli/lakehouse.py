@@ -1250,7 +1250,12 @@ def register_iceberg_catalog_table(
   # 3. Generic Iceberg REST Catalog
   if cat_type == 'rest' and cat_props.get('uri'):
     rest_uri = str(cat_props['uri']).rstrip('/')
+    _validate_rest_catalog_security(rest_uri, cat_props)
+    _check_no_dotdot_or_controls(table_ident, 'Iceberg table identifier')
     parts = [p for p in table_ident.split('.') if p]
+    if any('/' in p or '\\' in p for p in parts):
+      raise LakehouseError(
+          f'Invalid Iceberg table identifier {table_ident!r}')
     if len(parts) >= 2:
       ns = '%1F'.join(urllib.parse.quote(p, safe='') for p in parts[:-1])
       tbl = urllib.parse.quote(parts[-1], safe='')
@@ -1260,12 +1265,16 @@ def register_iceberg_catalog_table(
         headers['Authorization'] = f"Bearer {str(cat_props['token']).replace(chr(13), '').replace(chr(10), '')}"
       payload = {'name': tbl, 'metadata-location': _to_iceberg_uri(metadata_path)}
       try:
-        opener = urllib.request.build_opener(
+        handlers: list[Any] = [
             urllib.request.HTTPSHandler(),
-            urllib.request.HTTPHandler(),
-            _SameOriginHttpsRedirectHandler())
+            _SameOriginHttpsRedirectHandler(),
+        ]
+        if rest_uri.lower().startswith('http://'):
+          handlers.append(urllib.request.HTTPHandler())
+        opener = urllib.request.build_opener(*handlers)
         req = urllib.request.Request(reg_url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
         with opener.open(req, timeout=10) as resp:
+          del resp
           return {'catalog': 'rest', 'status': 'registered', 'uri': rest_uri, 'table': table_ident}
       except Exception as e:  # pylint: disable=broad-except
         return {'catalog': 'rest', 'status': 'failed', 'error': str(e)}
@@ -1290,14 +1299,15 @@ def resolve_iceberg_table_dir(
   raw_table = str(config.get('table') or '').rstrip('/')
   table_ident = raw_table.lstrip('/')
 
+  # If cat_type is explicitly rest with a uri, run security check immediately
+  # even when an explicit storage location override is supplied.
+  if cat_type == 'rest' and cat_props.get('uri'):
+    _validate_rest_catalog_security(str(cat_props['uri']), cat_props)
+
   # Explicit direct table location if passed.
   if config.get('location'):
     _check_no_dotdot_or_controls(str(config['location']), 'Iceberg location')
     return _normalize_fs_root(str(config['location']))
-
-  # If cat_type is explicitly rest with a uri, run security check immediately
-  if cat_type == 'rest' and cat_props.get('uri'):
-    _validate_rest_catalog_security(str(cat_props['uri']), cat_props)
 
   # 1. BigQuery managed Iceberg API first:
   if (cat_type in ('bigquery', 'bigquery-managed', 'bigquery_managed') or

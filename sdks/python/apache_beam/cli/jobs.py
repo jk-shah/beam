@@ -101,13 +101,22 @@ def parse_duration_seconds(raw: str | int | float) -> float:
 
 
 def _jobs_dir() -> Path:
-  beam_home = os.path.expanduser(os.environ.get('BEAM_HOME', '~/.beam'))
-  d = Path(beam_home) / 'jobs'
-  d.mkdir(mode=0o700, parents=True, exist_ok=True)
+  beam_home = Path(os.path.expanduser(os.environ.get('BEAM_HOME', '~/.beam')))
+  if os.path.islink(beam_home):
+    raise JobError(
+        f'refusing symlinked BEAM_HOME directory {str(beam_home)!r}',
+        EXIT_USAGE)
+  d = beam_home / 'jobs'
   if os.path.islink(d):
     raise JobError(
         f'refusing symlinked jobs directory {str(d)!r}', EXIT_USAGE)
+  beam_home.mkdir(mode=0o700, parents=True, exist_ok=True)
+  d.mkdir(mode=0o700, parents=True, exist_ok=True)
+  if os.path.islink(beam_home) or os.path.islink(d):
+    raise JobError(
+        f'refusing symlinked jobs directory {str(d)!r}', EXIT_USAGE)
   try:
+    os.chmod(beam_home, 0o700)
     os.chmod(d, 0o700)
   except OSError:
     pass
@@ -609,12 +618,6 @@ class _DataflowPoller:
       ])
       self._apiclient = apiclient.DataflowApplicationClient(opts)
     return bool(self._apiclient.modify_job_state(job_id, target_state))
-
-
-def _query_dataflow_job(
-    job_id: str, project: str, region: str) -> tuple[str, dict[str, int]]:
-  """Single-shot helper retained for callers querying Dataflow state once."""
-  return _DataflowPoller(project, region).query(job_id, project, region)
 
 
 def wait_for_job(

@@ -350,6 +350,8 @@ def build_pipe_spec(
     interval_join: str | dict[str, Any] | None = None,
     asof_join: str | dict[str, Any] | None = None,
     pattern: str | dict[str, Any] | None = None,
+    pattern_opts: Iterable[str] | None = None,
+    pattern_opt_file: str | None = None,
     max_watermark_skew: str | None = None,
     skew_action: str | None = None,
     dedupe_by: Iterable[str] | str | None = None,
@@ -830,6 +832,27 @@ def build_pipe_spec(
   else:
     raw_enrich_items = list(enrich)
 
+  def _split_stage_opts(
+      raw_opts_map: Mapping[str, Any],
+      num_stages: int,
+      opt_flag: str,
+  ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    global_map: dict[str, Any] = {}
+    per_stage: list[dict[str, Any]] = [{} for _ in range(num_stages)]
+    for rk, rv in raw_opts_map.items():
+      m_st = re.match(r'^(\d+):(.+)$', str(rk).strip())
+      if m_st:
+        s_idx = int(m_st.group(1))
+        sub_k = m_st.group(2).strip()
+        if s_idx < 1 or s_idx > num_stages or not sub_k:
+          raise PipeSpecError(
+              f'{opt_flag} stage prefix {m_st.group(1)}: out of range for '
+              f'{num_stages} configured stage(s) (use 1..{num_stages})')
+        per_stage[s_idx - 1][sub_k] = rv
+      else:
+        global_map[str(rk)] = rv
+    return global_map, per_stage
+
   enrich_yaml_cfgs: list[dict[str, Any]] = []
   if not raw_enrich_items:
     if enrich_opts or enrich_opt_file:
@@ -842,20 +865,23 @@ def build_pipe_spec(
           enrich_opts, enrich_opt_file, '--enrich-opt')
     except uris.UriError as e:
       raise PipeSpecError(str(e)) from None
+    glob_e_opts, stage_e_opts_list = _split_stage_opts(
+        parsed_enrich_opts, len(raw_enrich_items), '--enrich-opt')
     if parsed_dlq_redact:
-      parsed_enrich_opts.setdefault(
-          'dlq_redact_fields', list(parsed_dlq_redact))
+      glob_e_opts.setdefault('dlq_redact_fields', list(parsed_dlq_redact))
     single_stage = len(raw_enrich_items) == 1
-    for e_item in raw_enrich_items:
+    for idx_enr, e_item in enumerate(raw_enrich_items):
+      eff_e_opts = {**glob_e_opts, **stage_e_opts_list[idx_enr]}
+      has_scoped_only = bool(stage_e_opts_list[idx_enr]) and not glob_e_opts
       try:
         if isinstance(e_item, str):
           e_yaml = enrich_mod.parse_enrich_spec_str(
               e_item,
-              extra_opts=parsed_enrich_opts,
+              extra_opts=eff_e_opts,
               default_project=default_project,
-              single_stage=single_stage)
+              single_stage=single_stage or has_scoped_only)
         elif isinstance(e_item, dict):
-          merged_ecfg = {**parsed_enrich_opts, **e_item}
+          merged_ecfg = {**eff_e_opts, **e_item}
           e_yaml = enrich_mod.enrich_config_to_yaml_dict(
               enrich_mod.parse_enrich_config(
                   merged_ecfg, default_project=default_project))
@@ -899,11 +925,15 @@ def build_pipe_spec(
           infer_opts, infer_opt_file, '--infer-opt')
     except uris.UriError as e:
       raise PipeSpecError(str(e)) from None
+    glob_i_opts, stage_i_opts_list = _split_stage_opts(
+        parsed_infer_opts, len(raw_infer_items), '--infer-opt')
     if parsed_dlq_redact:
-      parsed_infer_opts.setdefault('dlq_redact_fields', list(parsed_dlq_redact))
+      glob_i_opts.setdefault('dlq_redact_fields', list(parsed_dlq_redact))
     single_infer = len(raw_infer_items) == 1
     seen_infer_tags: set[str] = set()
     for idx_inf, i_item in enumerate(raw_infer_items):
+      eff_i_opts = {**glob_i_opts, **stage_i_opts_list[idx_inf]}
+      has_scoped_inf = bool(stage_i_opts_list[idx_inf]) and not glob_i_opts
       stage_fields = (
           infer_fields_list[idx_inf] if idx_inf < len(infer_fields_list) else
           (infer_fields_list[0] if len(infer_fields_list) == 1 else None))
@@ -915,20 +945,20 @@ def build_pipe_spec(
               isinstance(i_item, dict) and
               ('tag' in i_item or 'inference_tag' in i_item))
       if (not has_explicit_tag and not single_infer and idx_inf > 0 and
-          'tag' not in parsed_infer_opts):
+          'tag' not in eff_i_opts):
         stage_tag = f'prediction_{idx_inf + 1}'
       try:
         if isinstance(i_item, str):
           i_yaml = infer_mod.parse_infer_spec_str(
               i_item,
-              extra_opts=parsed_infer_opts,
+              extra_opts=eff_i_opts,
               infer_fields=stage_fields,
               infer_tag=stage_tag,
               infer_flatten=infer_flatten,
               default_project=default_project,
-              single_stage=single_infer)
+              single_stage=single_infer or has_scoped_inf)
         elif isinstance(i_item, dict):
-          merged_icfg = {**parsed_infer_opts, **i_item}
+          merged_icfg = {**eff_i_opts, **i_item}
           if stage_fields is not None:
             merged_icfg.setdefault('fields', stage_fields)
           if stage_tag is not None:
@@ -1001,18 +1031,28 @@ def build_pipe_spec(
       interval_join_cfg if interval_join_cfg is not None else asof_join_cfg)
 
   pattern_yaml_cfg: dict[str, Any] | None = None
-  if pattern is not None:
+  if pattern is None:
+    if pattern_opts or pattern_opt_file:
+      raise PipeSpecError(
+          '--pattern-opt / --pattern-opt-file requires --pattern <SPEC>')
+  else:
     from . import cep as cep_mod
+    try:
+      parsed_pattern_opts = uris.parse_kv_options(
+          pattern_opts, pattern_opt_file, '--pattern-opt')
+    except uris.UriError as e:
+      raise PipeSpecError(str(e)) from None
     eff_pat_lat = allowed_lateness if window is None else None
     try:
       if isinstance(pattern, str):
         pattern_yaml_cfg = cep_mod.parse_pattern_spec_str(
             pattern,
+            extra_opts=parsed_pattern_opts,
             timestamp_col=clean_timestamp_col,
             allowed_lateness=eff_pat_lat,
             dlq_redact_fields=parsed_dlq_redact)
       elif isinstance(pattern, dict):
-        raw_pcfg = dict(pattern)
+        raw_pcfg = {**parsed_pattern_opts, **pattern}
         if clean_timestamp_col and 'timestamp_col' not in raw_pcfg:
           raw_pcfg['timestamp_col'] = clean_timestamp_col
         if eff_pat_lat is not None and 'allowed_lateness' not in raw_pcfg:
@@ -1030,10 +1070,6 @@ def build_pipe_spec(
       raise PipeSpecError(
           'pattern overflow_action=dlq requires --dlq <SINK> '
           '(or use overflow_action=drop|fail)')
-    if is_unbounded and not clean_timestamp_col and not parsed_pat.timestamp_col:
-      # Unbounded Pub/Sub carries message publish timestamps natively; file/other
-      # unbounded sources work with element timestamps too, so no hard error needed.
-      pass
 
   eff_where_cols = None if two_stream_cfg is not None else known_source_columns
   eff_pre_select_cols = (
@@ -1068,6 +1104,49 @@ def build_pipe_spec(
         if select else None)
   except expressions.ExpressionError as e:
     raise PipeSpecError(str(e)) from None
+
+  if post_where_cfg is not None and select_cfg is not None:
+    keep_obj = post_where_cfg.get('keep')
+    if isinstance(keep_obj, dict):
+      pw_refs = set(
+          re.findall(
+              r"getattr\(row,\s*'([^']+)'\)",
+              str(keep_obj.get('callable') or '')))
+    elif isinstance(keep_obj, str):
+      pw_refs = set(re.findall(r'\b([A-Za-z_][A-Za-z0-9_]*)\b', keep_obj)) - {
+          'and', 'or', 'not', 'is', 'None', 'True', 'False', 'in'
+      }
+    else:
+      pw_refs = set()
+    if pw_refs:
+      pre_avail: set[str] = set(known_source_columns or ())
+      if pre_select_cfg is not None:
+        pre_avail.update((pre_select_cfg.get('fields') or {}).keys())
+      for ec in enrich_yaml_cfgs:
+        ep_p = str(ec.get('prefix') or '')
+        for col_s in (ec.get('columns') or ()):
+          base_c = str(col_s).split(':', 1)[0].strip()
+          pre_avail.add(f'{ep_p}{base_c}')
+      for ic in infer_yaml_cfgs:
+        it = str(ic.get('tag') or 'prediction')
+        pre_avail.add(it)
+        if ic.get('flatten'):
+          for sub_c in ('score', 'label', 'model_id'):
+            pre_avail.add(f'{it}_{sub_c}')
+      sel_fields_map = select_cfg.get('fields') or {}
+      for s_col, s_spec in sel_fields_map.items():
+        if s_col in pw_refs and s_col not in pre_avail:
+          if isinstance(s_spec, dict):
+            s_call = str(s_spec.get('callable') or '')
+            is_passthrough = f"getattr(row, '{s_col}')" in s_call
+          else:
+            s_call = str(s_spec).strip()
+            is_passthrough = s_call == s_col
+          if not is_passthrough:
+            raise PipeSpecError(
+                f'--post-where references column {s_col!r} defined in '
+                '--select, which runs after --post-where; move derived '
+                'columns needed by --post-where into --pre-select')
 
   if (cdc and select_cfg is not None and prefer_python_lakehouse_and_cdc and
       dst_ep.kind != 'file'):
@@ -1412,14 +1491,15 @@ def build_pipe_spec(
       src_ep.format in ('parquet', 'avro') and (
           where_cfg or pre_select_cfg or post_where_cfg or enrich_yaml_cfgs or
           infer_yaml_cfgs or select_cfg or two_stream_cfg is not None or
-          pattern_yaml_cfg is not None or cli_window_yaml_cfg is not None))
+          pattern_yaml_cfg is not None or cli_window_yaml_cfg is not None or
+          bool(window_aggs)))
   right_rowify_nested = bool(
       prefer_python_lakehouse_and_cdc and right_ep is not None and
       right_ep.kind == 'file' and right_ep.format in ('parquet', 'avro'))
   if (rowify_nested or right_rowify_nested or two_stream_cfg is not None or
       dedupe_yaml_cfg is not None or bool(enrich_yaml_cfgs) or
       bool(infer_yaml_cfgs) or pattern_yaml_cfg is not None or
-      cli_window_yaml_cfg is not None):
+      cli_window_yaml_cfg is not None or bool(window_aggs)):
     needs_cli_provider = True
 
   # Pure Java-to-Java fast path: skip Python counter stages unless explicitly
@@ -1429,19 +1509,18 @@ def build_pipe_spec(
       not pre_select_cfg and not post_where_cfg and not enrich_yaml_cfgs and
       not infer_yaml_cfgs and not select_cfg and not dlq_ep and
       not late_dlq_ep and two_stream_cfg is None and dedupe_yaml_cfg is None and
-      pattern_yaml_cfg is None and cli_window_yaml_cfg is None)
+      pattern_yaml_cfg is None and cli_window_yaml_cfg is None and
+      not window_aggs)
   inject_counters = bool(include_counters) and not pure_java_pipe
   if inject_counters:
     needs_cli_provider = True
 
   # Simple linear chain when neither `--dlq` nor a 2-stream join is active!
   if dlq_ep is None and late_dlq_ep is None and two_stream_cfg is None:
-    chain_steps: list[dict[str, Any]] = [
-        {
-            'type': src_type,
-            'config': src_cfg,
-        }
-    ]
+    chain_steps: list[dict[str, Any]] = [{
+        'type': src_type,
+        'config': src_cfg,
+    }]
     if rowify_nested:
       # Must directly follow the source: a schema-typed step in between would
       # encode the nested dicts with RowCoder and fail.
@@ -1456,7 +1535,8 @@ def build_pipe_spec(
           },
       })
     if clean_timestamp_col:
-      if cli_window_yaml_cfg is not None or pattern_yaml_cfg is not None:
+      if (cli_window_yaml_cfg is not None or pattern_yaml_cfg is not None or
+          bool(window_aggs) or dedupe_yaml_cfg is not None):
         chain_steps.append({
             'type': 'CliAssignTimestamps',
             'config': {
@@ -1827,7 +1907,8 @@ def build_pipe_spec(
       current_ref = 'CountRead'
 
     if clean_timestamp_col:
-      if cli_window_yaml_cfg is not None or pattern_yaml_cfg is not None:
+      if (cli_window_yaml_cfg is not None or pattern_yaml_cfg is not None or
+          bool(window_aggs) or dedupe_yaml_cfg is not None):
         ts_dag_cfg: dict[str, Any] = {'timestamp_col': clean_timestamp_col}
         if has_dlq:
           ts_dag_cfg['error_handling'] = {'output': 'errors'}

@@ -499,8 +499,10 @@ def parse_enrich_spec_str(
     kv = {'handler': 'file', 'path': first_tok}
     rem_toks = split_bracket_tokens(s)[1:]
     rest = ','.join(rem_toks)
-  elif ':' not in first_tok and '=' not in first_tok and first_low.endswith(
-      ('.csv', '.json', '.jsonl', '.parquet')):
+  elif ('=' not in first_tok and first_low.endswith(
+      ('.csv', '.json', '.jsonl', '.parquet')) and
+        (':' not in first_tok or (re.match(r'^[a-zA-Z]:[\\/]', first_tok) and
+                                  len(split_bracket_tokens(s)) > 1))):
     handler = 'file'
     raw_handler = 'file'
     kv = {'handler': 'file', 'path': first_tok}
@@ -1014,12 +1016,14 @@ def _coerce_typed_value(val: Any, dtype: str | None) -> Any:
 
 
 def _sanitize_enrich_error(exc: Exception, handler: str) -> str:
-  raw = f'{type(exc).__name__}: {exc}'
+  raw = output.sanitize_untrusted_text(
+      f'{type(exc).__name__}: {exc}', max_chars=4096)
   scrubbed = output.redact_inline_secrets(raw, placeholder='<REDACTED_SECRET>')
   scrubbed = output._LONG_QUOTED_RE.sub("'<REDACTED>'", scrubbed)
   # Strip any embedded SQL query fragments from upstream BQ exceptions.
-  scrubbed = re.sub(
-      r'(?is)\bSELECT\b.+\bFROM\b.+', 'SELECT <redacted_query>', scrubbed)
+  idx = scrubbed.upper().find('SELECT ')
+  if idx != -1 and ' FROM ' in scrubbed[idx:].upper():
+    scrubbed = scrubbed[:idx] + 'SELECT <redacted_query>'
   return f'CliEnrich ({handler}) {scrubbed}'[:1024]
 
 
@@ -2236,23 +2240,32 @@ class CliEnrich(beam.PTransform):
         caller_factory=self._caller_factory,
         redis_client=self._redis_client)
 
+    class _MaterializeEnrichDoFn(beam.DoFn):
+      def process(self, element):
+        yield element
+
+    def _materialize(pc):
+      mat = beam.ParDo(_MaterializeEnrichDoFn())
+      if out_row_type is not None:
+        mat = mat.with_output_types(out_row_type)
+      res_pc = pc | 'MaterializeEnrich' >> mat
+      if out_row_type is not None:
+        res_pc.element_type = out_row_type
+      return res_pc
+
     if self._has_error_handling or self._cfg.on_miss == 'dlq':
       pardo = beam.ParDo(dofn).with_outputs('errors', main='good')
       if out_row_type is not None:
         pardo = pardo.with_output_types(out_row_type)
       res = pcoll | 'Enrich' >> pardo
-      good = res['good']
-      if out_row_type is not None:
-        good.element_type = out_row_type
+      good = _materialize(res['good'])
       return {'good': good, 'errors': res['errors']}
 
     pardo = beam.ParDo(dofn)
     if out_row_type is not None:
       pardo = pardo.with_output_types(out_row_type)
     out = pcoll | 'Enrich' >> pardo
-    if out_row_type is not None:
-      out.element_type = out_row_type
-    return out
+    return _materialize(out)
 
 
 def cli_enrich(

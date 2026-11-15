@@ -176,22 +176,24 @@ def _keep_quoted(literal: str) -> bool:
   import os
   if re.fullmatch(r'\d{4}-\d{2}-\d{2}_\d{2}_\d{2}_\d{2}-\d+', literal):
     return True  # Dataflow job ID (e.g. 2026-11-10_14_34_36-14034864922449419400)
-  if re.fullmatch(r'[A-Za-z0-9_.:/()\[\]-]+', literal) and (
+  if re.fullmatch(r'[A-Za-z0-9_.:/()\[\]<> -]+', literal) and (
       '/' in literal and not literal.startswith('/') and
+      ('<lambda at ' in literal or ' ' not in literal) and
       not re.search(r'[A-Za-z0-9+/]{40,}', literal)):
-    return True  # A step label such as ReadCsvWithDlq/ParseShards/ParDo(...)
+    return True  # A step label such as AssignTimestamps/Map(<lambda at ...>)
   if re.fullmatch(
       r'(gs|s3|azfs|hdfs|file|bigquery|bq|delta|iceberg|pubsub|kafka|'
       r'postgres|postgresql|mysql|spanner)://[^\s@?#]+', literal):
     return True
-  # Safe local file/glob path (even when missing, e.g. "no such file: '...'"):
-  # contains a directory separator or known file extension, only path/glob
-  # characters, and no 32+ char extensionless segment that could be a token.
-  if re.fullmatch(r'[A-Za-z0-9_./*?\[\]-]+', literal) and (
-      '/' in literal or literal.lower().endswith((
+  # Safe local file/glob path (Unix or Windows drive path, even when missing):
+  norm_lit = literal.replace('\\\\', '/').replace('\\', '/')
+  path_tail = norm_lit[2:] if re.match(r'^[A-Za-z]:/', norm_lit) else norm_lit
+  if re.fullmatch(r'[A-Za-z0-9_./*?\[\]-]+', path_tail) and (
+      '/' in norm_lit or norm_lit.lower().endswith((
           '.csv', '.json', '.jsonl', '.parquet', '.avro', '.yaml', '.yml',
           '.txt', '.sql', '.py'))):
-    if not any(len(seg) >= 32 and '.' not in seg for seg in literal.split('/')):
+    if not any(
+        len(seg) >= 32 and '.' not in seg for seg in path_tail.split('/')):
       return True
   try:
     return os.path.exists(literal)
@@ -342,7 +344,7 @@ def read_bounded_text(
 
 
 def validate_safe_jinja_template(template_text: str) -> None:
-  """Validates Jinja2 template AST against private attributes and disallowed globals."""
+  """Validates Jinja2 template AST against SSTI, file includes, and private access."""
   import jinja2
   from jinja2 import nodes as jnodes
 
@@ -353,6 +355,17 @@ def validate_safe_jinja_template(template_text: str) -> None:
     raise ValueError(
         f'invalid Jinja2 syntax (line {e.lineno}): {e.message}') from None
 
+  for inc_node in parsed.find_all(
+      (jnodes.Include, jnodes.Import, jnodes.FromImport, jnodes.Extends)):
+    raise ValueError(
+        f'disallowed Jinja2 template inclusion ({type(inc_node).__name__})')
+  for pow_node in parsed.find_all(jnodes.Pow):
+    del pow_node
+    raise ValueError('disallowed Jinja2 power operator (**) in template')
+  for fnode in parsed.find_all(jnodes.Filter):
+    if str(fnode.name) in ('attr', 'format'):
+      raise ValueError(
+          f'disallowed Jinja2 filter |{fnode.name} in template')
   for nnode in parsed.find_all(jnodes.Name):
     name_s = str(nnode.name)
     if name_s.startswith('_') or name_s in _BLOCKED_JINJA_GLOBALS:
@@ -363,8 +376,12 @@ def validate_safe_jinja_template(template_text: str) -> None:
       raise ValueError(
           f'disallowed private Jinja2 attribute .{gnode.attr} in template')
   for inode in parsed.find_all(jnodes.Getitem):
-    if isinstance(inode.arg, jnodes.Const) and str(inode.arg.value).startswith(
-        '_'):
+    if not isinstance(inode.arg, jnodes.Const) or not isinstance(
+        inode.arg.value, (int, str)):
+      raise ValueError(
+          'disallowed dynamic Jinja2 subscript in template; '
+          'use constant string or integer keys')
+    if isinstance(inode.arg.value, str) and inode.arg.value.startswith('_'):
       raise ValueError(
           f'disallowed private Jinja2 key {inode.arg.value!r} in template')
 
@@ -372,6 +389,7 @@ def validate_safe_jinja_template(template_text: str) -> None:
 def safe_expand_jinja(template_text: str, variables_json_or_dict: Any) -> str:
   """Renders `template_text` inside `ImmutableSandboxedEnvironment`."""
   import datetime as _dt
+
   import jinja2
   from jinja2 import sandbox as jsandbox
 
@@ -668,5 +686,3 @@ class JsonOutputSession:
       sys.stdout = self._prev_stdout
     return False
 
-
-JsonEnvelopeSession = JsonOutputSession
