@@ -2469,10 +2469,60 @@ def register_zero_copy_to_iceberg(
       if hive_parts and not partition_cols:
         partition_cols = list(hive_parts.keys())
       parquet_files.append((p, sz, hive_parts))
+  elif source_ep.kind == 'iceberg':
+    src_tdir = resolve_iceberg_table_dir(
+        source_ep.config, default_project=default_project)
+    src_st = load_iceberg_state(
+        src_tdir, snapshot_id=source_ep.config.get('snapshot_id'))
+    meta_obj = src_st.get('metadata') or {}
+    pspecs = meta_obj.get('partition-specs') or []
+    def_spec_id = meta_obj.get('default-spec-id', 0)
+    cur_pspec = next(
+        (ps for ps in pspecs if ps.get('spec-id') == def_spec_id),
+        pspecs[-1]
+        if pspecs else {'fields': meta_obj.get('partition-spec') or []})
+    partition_cols = [
+        str(pf['name']) for pf in (cur_pspec.get('fields') or [])
+        if pf.get('name')
+    ]
+    dst_tdir = resolve_iceberg_table_dir(
+        sink_ep.config, default_project=default_project)
+    if _normalize_fs_root(src_tdir) == _normalize_fs_root(dst_tdir):
+      cat_reg = register_iceberg_catalog_table(
+          sink_ep.config.get('table', ''),
+          dst_tdir,
+          src_st['metadata_path'],
+          catalog_name=sink_ep.config.get('catalog_name'),
+          catalog_properties=sink_ep.config.get('catalog_properties'),
+          default_project=default_project)
+      same_dir_res: dict[str, Any] = {
+          'snapshot_id': src_st.get('current_snapshot_id'),
+          'metadata_path': src_st['metadata_path'],
+          'registered_files': [f['path'] for f in src_st.get('data_files', [])],
+          'rows_registered': int(src_st.get('raw_record_count') or 0),
+          'bytes_copied': 0,
+          'zero_copy': True,
+      }
+      if cat_reg and cat_reg.get('status') != 'none':
+        same_dir_res['catalog_registration'] = cat_reg
+      if partition_cols:
+        same_dir_res['partition_columns'] = partition_cols
+      return same_dir_res
+    if src_st.get('pos_delete_files') or src_st.get('eq_delete_files'):
+      raise LakehouseError(
+          'Iceberg source table has active position/equality delete files '
+          'whose raw Parquet files cannot be zero-copy aliased into another '
+          'Iceberg table without materializing live rows; run standard '
+          '`beam pipe` without --zero-copy')
+    parquet_files = [(
+        f['path'],
+        int(f.get('file_size_in_bytes') or 0),
+        dict(f.get('partition') or {}),
+    ) for f in src_st.get('data_files', [])]
   else:
     raise LakehouseError(
-        '--zero-copy supports delta:// tables and Parquet file/glob sources; '
-        f'got {source_ep.raw!r}')
+        '--zero-copy supports delta://, iceberg://, and Parquet file/glob '
+        f'sources; got {source_ep.raw!r}')
 
   if not parquet_files:
     raise FileNotFoundError(
@@ -2677,6 +2727,10 @@ def sync_lakehouse_catalog(
   if '://' not in eff_from:
     if os.path.exists(os.path.join(eff_from, '_delta_log')):
       eff_from = f'delta://{eff_from}'
+    elif os.path.isdir(os.path.join(eff_from, 'metadata')) and any(
+        fn.endswith('.metadata.json')
+        for fn in os.listdir(os.path.join(eff_from, 'metadata'))):
+      eff_from = f'iceberg://{os.path.abspath(eff_from)}'
     elif os.path.isdir(eff_from):
       format_override = 'parquet'
 
@@ -2727,11 +2781,24 @@ def sync_lakehouse_catalog(
       partition_cols = list(snap.get('partition_columns') or [])
       schema_fields = snap.get('schema') or []
     elif source_ep.kind == 'iceberg':
-      tdir = resolve_iceberg_table_dir(source_ep.config, default_project=default_project)
-      meta = read_iceberg_metadata(tdir)
-      schema_fields = meta.get('schema', {}).get('fields', [])
-      snap_list = meta.get('snapshots', [])
-      files_count = len(snap_list)
+      tdir = resolve_iceberg_table_dir(
+          source_ep.config, default_project=default_project)
+      st = load_iceberg_state(
+          tdir, snapshot_id=source_ep.config.get('snapshot_id'))
+      schema_fields = list(st.get('schema') or [])
+      files_count = len(st.get('data_files') or [])
+      total_bytes = int(st.get('estimated_bytes') or 0)
+      meta_obj = st.get('metadata') or {}
+      pspecs = meta_obj.get('partition-specs') or []
+      def_spec_id = meta_obj.get('default-spec-id', 0)
+      cur_pspec = next(
+          (ps for ps in pspecs if ps.get('spec-id') == def_spec_id),
+          pspecs[-1]
+          if pspecs else {'fields': meta_obj.get('partition-spec') or []})
+      partition_cols = [
+          str(pf['name']) for pf in (cur_pspec.get('fields') or [])
+          if pf.get('name')
+      ]
     elif source_ep.kind == 'file':
       raw_files = _fs_list_files(source_ep.config['path'])
       files_count = len(raw_files)

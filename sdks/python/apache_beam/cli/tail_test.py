@@ -18,6 +18,7 @@
 import contextlib
 import datetime
 import io
+import json
 import os
 import shutil
 import sys
@@ -350,6 +351,108 @@ class TailCommandsTest(unittest.TestCase):
       )
     self.assertEqual(res['mode'], 'lakehouse_commit_follow')
     self.assertEqual(res['sampled_count'], 1)
+
+    # Real Delta Lake commit follow (`delta://`) + bounded snapshot peek
+    delta_dir = os.path.join(self.tmp, 'delta_events')
+    os.makedirs(os.path.join(delta_dir, '_delta_log'))
+    p0 = os.path.join(delta_dir, 'part-0.parquet')
+    pq.write_table(pa.Table.from_pylist([{'id': 1, 'msg': 'v0'}]), p0)
+    commit0 = [
+        json.dumps({'protocol': {'minReaderVersion': 1, 'minWriterVersion': 2}}),
+        json.dumps({
+            'metaData': {
+                'id': 't1',
+                'schemaString': json.dumps({
+                    'type': 'struct',
+                    'fields': [
+                        {'name': 'id', 'type': 'long', 'nullable': True, 'metadata': {}},
+                        {'name': 'msg', 'type': 'string', 'nullable': True, 'metadata': {}},
+                    ],
+                }),
+                'partitionColumns': [],
+            }
+        }),
+        json.dumps({
+            'add': {
+                'path': 'part-0.parquet',
+                'size': os.path.getsize(p0),
+                'modificationTime': 1700000000000,
+                'dataChange': True,
+            }
+        }),
+    ]
+    with open(
+        os.path.join(delta_dir, '_delta_log', '00000000000000000000.json'),
+        'w',
+        encoding='utf-8',
+    ) as f:
+      f.write('\n'.join(commit0) + '\n')
+
+    def commit_v1():
+      time.sleep(0.12)
+      p1 = os.path.join(delta_dir, 'part-1.parquet')
+      pq.write_table(pa.Table.from_pylist([{'id': 2, 'msg': 'v1'}]), p1)
+      with open(
+          os.path.join(delta_dir, '_delta_log', '00000000000000000001.json'),
+          'w',
+          encoding='utf-8',
+      ) as f:
+        f.write(
+            json.dumps({
+                'add': {
+                    'path': 'part-1.parquet',
+                    'size': os.path.getsize(p1),
+                    'modificationTime': 1700000001000,
+                    'dataChange': True,
+                }
+            })
+            + '\n'
+        )
+
+    td = threading.Thread(target=commit_v1, daemon=True)
+    td.start()
+    res_delta = tail.run_tail(
+        f'delta://{delta_dir}',
+        limit=1,
+        duration='2s',
+        follow=True,
+        poll_interval=0.05,
+    )
+    td.join(timeout=2)
+    self.assertEqual(res_delta['mode'], 'lakehouse_commit_follow')
+    self.assertEqual(res_delta['sampled_count'], 1)
+    self.assertEqual(res_delta['untrusted_data']['rows'][0]['id'], 2)
+
+    # Bounded snapshot_peek on file with on_record callback
+    peek_seen = []
+    res_peek = tail.run_tail(
+        f'delta://{delta_dir}',
+        limit=5,
+        follow=False,
+        on_record=lambda r, idx: peek_seen.append((idx, r['id'])),
+    )
+    self.assertEqual(res_peek['mode'], 'snapshot_peek')
+    self.assertEqual(res_peek['sampled_count'], 2)
+    self.assertEqual(len(peek_seen), 2)
+
+    # Extensionless rotated log file follow (regression for tail.py scheme split)
+    rot_log = os.path.join(self.tmp, 'syslog_stream')
+    with open(rot_log, 'w', encoding='utf-8') as f:
+      f.write('old-line-before-rotation-that-is-longer\n')
+
+    def rotate_and_append():
+      time.sleep(0.12)
+      # Simulate copytruncate (smaller size than initial offset!) + JSON + text
+      with open(rot_log, 'w', encoding='utf-8') as f:
+        f.write('{"lvl":"WARN"}\nplain after rotate\n')
+
+    tr = threading.Thread(target=rotate_and_append, daemon=True)
+    tr.start()
+    res_rot = tail.run_tail(
+        rot_log, limit=2, duration='2s', follow=True, poll_interval=0.05
+    )
+    tr.join(timeout=2)
+    self.assertEqual(res_rot['sampled_count'], 2)
 
     # Validation errors on -f with bigquery:// and bad --limit
     with self.assertRaises(tail.TailError):

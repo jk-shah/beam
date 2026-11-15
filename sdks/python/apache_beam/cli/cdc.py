@@ -37,6 +37,7 @@ import datetime
 import decimal
 import io
 import json
+import math
 import re
 from typing import Any
 from typing import Iterable

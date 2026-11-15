@@ -218,15 +218,15 @@ jobs:
           overall = float(cov['totals']['percent_covered'])
           print(f'Overall CLI statement coverage: {overall:.2f}%')
           failures = []
-          if overall < 75.0:
-            failures.append(f'Overall coverage {overall:.2f}% < 75.0% floor')
+          if overall < 77.0:
+            failures.append(f'Overall coverage {overall:.2f}% < 77.0% floor')
           for fpath, info in sorted(cov.get('files', {}).items()):
             bname = os.path.basename(fpath)
             if bname.endswith('_test.py') or bname == '__init__.py':
               continue
             pct = float(info['summary']['percent_covered'])
-            if pct < 68.0:
-              failures.append(f'{bname}: {pct:.1f}% < 68.0% component floor')
+            if pct < 70.0:
+              failures.append(f'{bname}: {pct:.1f}% < 70.0% component floor')
           if failures:
             print('Coverage gate failed:\n  ' + '\n  '.join(failures), file=sys.stderr)
             sys.exit(1)

@@ -5335,6 +5335,7 @@ def stage_rows_to_local_file(
   has_explicit_ext = ext in (
       '.parquet',
       '.pq',
+      '.avro',
       '.json',
       '.jsonl',
       '.ndjson',
@@ -5386,6 +5387,62 @@ def stage_rows_to_local_file(
             for c in out_cols
         })
       pq.write_table(tbl, tmp_path)
+    elif fmt == 'avro':
+      try:
+        import fastavro
+      except ImportError as exc:
+        raise SqlEngineMissingError(
+            "Writing Avro locally requires 'fastavro'; install with: "
+            'pip install fastavro') from exc
+      avro_fields: list[dict[str, Any]] = []
+      avro_kinds: dict[str, str] = {}
+      for col in out_cols:
+        non_null = [r.get(col) for r in rows_to_write if r.get(col) is not None]
+        if non_null and all(isinstance(v, bool) for v in non_null):
+          ak = 'boolean'
+        elif non_null and all(
+            isinstance(v, int) and not isinstance(v, bool) for v in non_null):
+          ak = 'long'
+        elif non_null and all(
+            isinstance(v, (int, float)) and not isinstance(v, bool)
+            for v in non_null):
+          ak = 'double'
+        elif non_null and all(
+            isinstance(v, (bytes, bytearray, memoryview)) for v in non_null):
+          ak = 'bytes'
+        else:
+          ak = 'string'
+        avro_kinds[col] = ak
+        avro_fields.append({
+            'name': col,
+            'type': ['null', ak],
+            'default': None,
+        })
+      parsed_schema = fastavro.parse_schema({
+          'type': 'record',
+          'name': 'BeamCliSqlRecord',
+          'fields': avro_fields,
+      })
+      avro_records: list[dict[str, Any]] = []
+      for r in rows_to_write:
+        rec_out: dict[str, Any] = {}
+        for col in out_cols:
+          v = r.get(col)
+          if v is None:
+            rec_out[col] = None
+          elif avro_kinds[col] == 'double':
+            rec_out[col] = float(v)
+          elif avro_kinds[col] == 'bytes':
+            rec_out[col] = bytes(v)
+          elif avro_kinds[col] == 'string' and not isinstance(v, str):
+            rec_out[col] = (
+                json.dumps(_sanitize_json_nan(v), default=str, allow_nan=False)
+                if isinstance(v, (dict, list)) else str(v))
+          else:
+            rec_out[col] = v
+        avro_records.append(rec_out)
+      with open(tmp_path, 'wb') as f:
+        fastavro.writer(f, parsed_schema, avro_records)
     elif fmt == 'csv':
       delim = str(sink_ep.config.get('delimiter', ',') or ',')
       with open(tmp_path, 'w', encoding='utf-8', newline='') as f:

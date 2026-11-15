@@ -611,6 +611,156 @@ class PythonSqlLoweringEndToEndTest(unittest.TestCase):
     self.assertEqual(rc_i, cli.EXIT_OK, err_i)
     self.assertIn('CliIntervalJoin', env_i['outputs']['yaml'])
 
+  def test_local_sql_avro_sink_and_append_roundtrip(self):
+    import fastavro
+    csv_in = os.path.join(self.tmp, 'items.csv')
+    with open(csv_in, 'w', encoding='utf-8') as f:
+      f.write('id,price,active\n1,12.5,true\n2,7.0,false\n')
+    out_avro = os.path.join(self.tmp, 'items_out.avro')
+
+    rc, env, err = _run_cli([
+        'pipe',
+        csv_in,
+        out_avro,
+        '--sql',
+        'SELECT id, price * 2.0 AS doubled, active FROM source ORDER BY id',
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, f'{env} {err}')
+    with open(out_avro, 'rb') as bf:
+      rows = [dict(r) for r in fastavro.reader(bf)]
+    self.assertEqual(
+        rows,
+        [
+            {'id': 1, 'doubled': 25.0, 'active': True},
+            {'id': 2, 'doubled': 14.0, 'active': False},
+        ])
+
+    # Append mode reads existing binary Avro and appends cleanly
+    rc2, env2, err2 = _run_cli([
+        'pipe',
+        csv_in,
+        out_avro,
+        '--if-exists',
+        'append',
+        '--sql',
+        'SELECT id + 10 AS id, price AS doubled, active FROM source WHERE id = 1',
+    ])
+    self.assertEqual(rc2, cli.EXIT_OK, f'{env2} {err2}')
+    with open(out_avro, 'rb') as bf:
+      rows2 = [dict(r) for r in fastavro.reader(bf)]
+    self.assertEqual(len(rows2), 3)
+
+  def test_keyed_json_document_sink_and_validation_errors(self):
+    jl_in = os.path.join(self.tmp, 'sales.jsonl')
+    with open(jl_in, 'w', encoding='utf-8') as f:
+      f.write('{"region":"west","amt":10}\n{"region":"west","amt":15}\n')
+      f.write('{"region":"east","amt":40}\n')
+
+    keyed_out = os.path.join(self.tmp, 'by_region.json')
+    rc, env, err = _run_cli([
+        'pipe',
+        jl_in,
+        keyed_out,
+        '--to-opt',
+        'key=region',
+        '--sql',
+        'SELECT region, SUM(amt) AS total FROM source GROUP BY region',
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, f'{env} {err}')
+    doc = json.load(open(keyed_out, encoding='utf-8'))
+    self.assertEqual(doc, {'west': {'total': 25}, 'east': {'total': 40}})
+
+    # Duplicate key without GROUP BY fails cleanly
+    dup_out = os.path.join(self.tmp, 'dup.json')
+    rc_dup, env_dup, _ = _run_cli([
+        'pipe',
+        jl_in,
+        dup_out,
+        '--to-opt',
+        'key=region',
+        '--sql',
+        'SELECT region, amt FROM source',
+    ])
+    self.assertNotEqual(rc_dup, cli.EXIT_OK)
+    self.assertIn('appears more than once', env_dup['error']['message'])
+
+  def test_duckdb_engine_parquet_and_iceberg_sql_read(self):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    wh = os.path.join(self.tmp, 'wh')
+    seed_pq = os.path.join(self.tmp, 'seed.parquet')
+    pq.write_table(
+        pa.Table.from_pylist([
+            {'uid': 'u1', 'region': 'us', 'spend': 10.5},
+            {'uid': 'u2', 'region': 'us', 'spend': 29.5},
+            {'uid': 'u3', 'region': 'eu', 'spend': 50.0},
+        ]),
+        seed_pq)
+    ice_uri = f'iceberg://mart.users?warehouse={wh}'
+    rc_s, _, err_s = _run_cli(['pipe', seed_pq, ice_uri, '--zero-copy'])
+    self.assertEqual(rc_s, cli.EXIT_OK, err_s)
+
+    out_pq = os.path.join(self.tmp, 'duck_summary.parquet')
+    rc_q, env_q, err_q = _run_cli([
+        'pipe',
+        ice_uri,
+        out_pq,
+        '--sql-engine',
+        'duckdb',
+        '--sql',
+        'SELECT region, COUNT(*) AS n, SUM(spend) AS total_spend '
+        'FROM source GROUP BY region ORDER BY region',
+    ])
+    self.assertEqual(rc_q, cli.EXIT_OK, f'{env_q} {err_q}')
+    rows = pq.read_table(out_pq).to_pylist()
+    self.assertEqual(
+        rows,
+        [
+            {'region': 'eu', 'n': 1, 'total_spend': 50.0},
+            {'region': 'us', 'n': 2, 'total_spend': 40.0},
+        ])
+
+  def test_python_sql_engine_having_only_agg_and_select_distinct_on_beam(self):
+    jl_in = os.path.join(self.tmp, 'visits.jsonl')
+    with open(jl_in, 'w', encoding='utf-8') as f:
+      f.write('{"region":"us","uid":"a"}\n{"region":"us","uid":"b"}\n')
+      f.write('{"region":"eu","uid":"c"}\n{"region":"eu","uid":"c"}\n')
+
+    # Aggregate (`COUNT(DISTINCT uid)`) appears ONLY in HAVING, not SELECT!
+    out_hav = os.path.join(self.tmp, 'having_out.parquet')
+    rc_h, env_h, err_h = _run_cli([
+        'pipe',
+        jl_in,
+        out_hav,
+        '--sql-engine',
+        'python',
+        '--sql',
+        'SELECT region FROM source GROUP BY 1 HAVING COUNT(DISTINCT uid) >= 2',
+    ])
+    self.assertEqual(rc_h, cli.EXIT_OK, f'{env_h} {err_h}')
+    import pyarrow.parquet as pq
+    matches_h = (
+        [out_hav] if os.path.isfile(out_hav) else sorted(
+            p for p in os.listdir(self.tmp) if p.startswith('having_out.parquet')))
+    rows_h = []
+    for p in matches_h:
+      fp = p if os.path.isabs(p) else os.path.join(self.tmp, p)
+      rows_h.extend(pq.read_table(fp).to_pylist())
+    self.assertEqual(rows_h, [{'region': 'us'}])
+
+    # SELECT DISTINCT lowered to CliDeduplicate
+    out_dist = os.path.join(self.tmp, 'dist_out.parquet')
+    rc_d, env_d, err_d = _run_cli([
+        'pipe',
+        jl_in,
+        out_dist,
+        '--sql-engine',
+        'python',
+        '--sql',
+        'SELECT DISTINCT region FROM source',
+    ])
+    self.assertEqual(rc_d, cli.EXIT_OK, f'{env_d} {err_d}')
+
 
 if __name__ == '__main__':
   unittest.main()

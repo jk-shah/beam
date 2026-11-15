@@ -31,6 +31,7 @@ import re
 import shlex
 from typing import Any
 from typing import Iterable
+from typing import Mapping
 from typing import NamedTuple
 
 from . import dlq
@@ -1215,6 +1216,44 @@ def build_pipe_spec(
                 f'--post-where references column {s_col!r} defined in '
                 '--select, which runs after --post-where; move derived '
                 'columns needed by --post-where into --pre-select')
+
+  if parsed_expect_rules and select_cfg is not None:
+    import ast as _ast
+    from . import expect as expect_mod
+    sel_fields_map = select_cfg.get('fields') or {}
+    sel_out_cols = set(sel_fields_map.keys())
+    is_sel_append = bool(select_cfg.get('append'))
+    sel_dropped = set(select_cfg.get('drop') or ()) - sel_out_cols
+    ignore_names = set(expect_mod._SAFE_BUILTINS.keys()) | {
+        '_cli_exp_col',
+        'sql_like',
+        'sql_ilike',
+    }
+    for exp_rule in parsed_expect_rules:
+      tree = _ast.parse(exp_rule.expression, mode='eval')
+      call_fn_ids = {
+          id(n.func) for n in _ast.walk(tree) if isinstance(n, _ast.Call)
+      }
+      exp_refs: list[str] = []
+      for n in _ast.walk(tree):
+        if (isinstance(n, _ast.Call) and isinstance(n.func, _ast.Name) and
+            n.func.id == '_cli_exp_col' and len(n.args) == 1 and
+            isinstance(n.args[0], _ast.Constant) and
+            isinstance(n.args[0].value, str)):
+          exp_refs.append(n.args[0].value)
+        elif (isinstance(n, _ast.Name) and id(n) not in call_fn_ids and
+              n.id not in ignore_names):
+          exp_refs.append(n.id)
+      for eref in exp_refs:
+        if (not is_sel_append and eref not in sel_out_cols) or (
+            is_sel_append and eref in sel_dropped):
+          shown_sel = ', '.join(sel_fields_map) or '<none>'
+          raise PipeSpecError(
+              f'--expect rule {exp_rule.name!r} references column {eref!r}, '
+              'which was dropped by --select (--expect runs after --select; '
+              f'selected columns: {shown_sel}); validate a projected column '
+              f'in --expect, include {eref!r} in --select, or filter earlier '
+              'with --where')
 
   if (cdc and select_cfg is not None and prefer_python_lakehouse_and_cdc and
       dst_ep.kind != 'file'):
