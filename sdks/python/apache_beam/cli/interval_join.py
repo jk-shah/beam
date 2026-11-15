@@ -142,10 +142,22 @@ def _canonical_number_bytes(val: int | float | decimal.Decimal) -> bytes:
     return b'NaN'
   if dec.is_infinite():
     return b'+Inf' if dec > 0 else b'-Inf'
-  norm = dec.normalize()
-  if norm == 0:
+  if dec.is_zero():
     return b'0'
-  return format(norm, 'f').encode('ascii')
+  t = dec.as_tuple()
+  d_str = ''.join(str(d) for d in t.digits).lstrip('0')
+  stripped = d_str.rstrip('0')
+  exp = int(t.exponent) + (len(d_str) - len(stripped))
+  sign_pfx = '-' if t.sign else ''
+  if -100 <= exp <= 100:
+    if exp >= 0:
+      return f'{sign_pfx}{stripped}{"0" * exp}'.encode('ascii')
+    dot_pos = len(stripped) + exp
+    if dot_pos > 0:
+      return f'{sign_pfx}{stripped[:dot_pos]}.{stripped[dot_pos:]}'.encode(
+          'ascii')
+    return f'{sign_pfx}0.{"0" * (-dot_pos)}{stripped}'.encode('ascii')
+  return f'{sign_pfx}{stripped}e{exp}'.encode('ascii')
 
 
 def encode_canonical_key_values(values: Iterable[Any]) -> bytes:

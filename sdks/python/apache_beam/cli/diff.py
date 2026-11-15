@@ -94,11 +94,27 @@ def _canonical_number_bytes(val: int | float | decimal.Decimal) -> bytes:
     return b'NaN'
   if dec.is_infinite():
     return b'+Inf' if dec > 0 else b'-Inf'
-  norm = dec.normalize()
-  # Treat -0 and 0 identically.
-  if norm == 0:
+  # Treat -0, 0, and 0.000 identically without calling `dec.normalize()` under
+  # Python's default 28-digit thread context (which rounds 38-digit Parquet /
+  # BigQuery BIGNUMERIC Decimals!).
+  if dec.is_zero():
     return b'0'
-  return format(norm, 'f').encode('ascii')
+  t = dec.as_tuple()
+  d_str = ''.join(str(d) for d in t.digits).lstrip('0')
+  stripped = d_str.rstrip('0')
+  exp = int(t.exponent) + (len(d_str) - len(stripped))
+  sign_pfx = '-' if t.sign else ''
+  # Render human-readable fixed-point for moderate exponents, and bounded
+  # canonical scientific form for huge exponents to avoid O(exp) zero padding.
+  if -100 <= exp <= 100:
+    if exp >= 0:
+      return f'{sign_pfx}{stripped}{"0" * exp}'.encode('ascii')
+    dot_pos = len(stripped) + exp
+    if dot_pos > 0:
+      return f'{sign_pfx}{stripped[:dot_pos]}.{stripped[dot_pos:]}'.encode(
+          'ascii')
+    return f'{sign_pfx}0.{"0" * (-dot_pos)}{stripped}'.encode('ascii')
+  return f'{sign_pfx}{stripped}e{exp}'.encode('ascii')
 
 
 def _encode_key_atom(val: Any) -> tuple[int, bytes]:
@@ -138,8 +154,8 @@ def _canonical_row_digest(
     elif isinstance(v, bool):
       parts.append((k, 1, '1' if v else '0'))
     elif isinstance(v, (int, float, decimal.Decimal)):
-      if float_sig_digits is not None and not (
-          isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
+      if float_sig_digits is not None and not (isinstance(
+          v, float) and (math.isnan(v) or math.isinf(v))):
         parts.append((k, 2, f'{float(v):.{float_sig_digits}g}'))
       else:
         parts.append((k, 2, _canonical_number_bytes(v).decode('ascii')))
@@ -164,14 +180,28 @@ def _values_equal(a: Any, b: Any, rtol: float, atol: float) -> bool:
     return isinstance(a, bool) and isinstance(b, bool) and a == b
   if isinstance(a, (int, float, decimal.Decimal)) and isinstance(
       b, (int, float, decimal.Decimal)):
-    fa_nan = (isinstance(a, float) and math.isnan(a)) or (
-        isinstance(a, decimal.Decimal) and a.is_nan())
-    fb_nan = (isinstance(b, float) and math.isnan(b)) or (
-        isinstance(b, decimal.Decimal) and b.is_nan())
+    fa_nan = (isinstance(a, float) and
+              math.isnan(a)) or (isinstance(a, decimal.Decimal) and a.is_nan())
+    fb_nan = (isinstance(b, float) and
+              math.isnan(b)) or (isinstance(b, decimal.Decimal) and b.is_nan())
     if fa_nan or fb_nan:
       return fa_nan and fb_nan
     if rtol == 0.0 and atol == 0.0:
       return _canonical_number_bytes(a) == _canonical_number_bytes(b)
+    if not isinstance(a, float) and not isinstance(b, float):
+      da = a if isinstance(a, decimal.Decimal) else decimal.Decimal(a)
+      db = b if isinstance(b, decimal.Decimal) else decimal.Decimal(b)
+      if da.is_infinite() or db.is_infinite():
+        return da == db
+      prec = max(
+          80, len(da.as_tuple().digits) + 8, len(db.as_tuple().digits) + 8)
+      ctx = decimal.Context(prec=prec)
+      diff_abs = ctx.abs(ctx.subtract(da, db))
+      scale = max(ctx.abs(da), ctx.abs(db))
+      bound = max(
+          ctx.multiply(decimal.Decimal(str(rtol)), scale),
+          decimal.Decimal(str(atol)))
+      return diff_abs <= bound
     return math.isclose(float(a), float(b), rel_tol=rtol, abs_tol=atol)
   if hasattr(a, 'to_rfc3339') and hasattr(b, 'to_rfc3339'):
     return a.to_rfc3339() == b.to_rfc3339()
@@ -1004,4 +1034,3 @@ def run_diff(
       shutil.rmtree(tmp_dir, ignore_errors=True)
 
   return _finalize_report(summary, schema_diff, job_id=job_id, final_state=final_state)
-

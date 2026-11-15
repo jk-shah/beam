@@ -5472,6 +5472,41 @@ def _run_yaml(
         idem_key = jobs.compute_idempotency_key(raw_argv_for_idem, plan_hash)
         existing_rec = jobs.lookup_recent_submission(idem_key)
         if existing_rec is not None:
+          ex_state = str(existing_rec.get('state') or '').upper()
+          if (not no_wait and ex_state not in jobs._TERMINAL_SUCCESS_STATES and
+              _runner_name(runner_raw) == 'dataflow'):
+            gcp_re = options.view_as(GoogleCloudOptions)
+            w_code, existing_rec = jobs.wait_for_job(
+                str(existing_rec['job_id']),
+                timeout_seconds=wait_timeout_sec,
+                project=gcp_re.project or existing_rec.get('project'),
+                region=gcp_re.region or existing_rec.get('region'),
+                show_progress=not (json_session is not None and
+                                   json_session.enabled))
+            if w_code == EXIT_TIMEOUT:
+              raise _CliError(
+                  f're-attached job {existing_rec["job_id"]!r} still running '
+                  f'after --wait-timeout ({wait_timeout_sec}s)',
+                  EXIT_TIMEOUT,
+                  extra={
+                      'detached': True,
+                      'deduplicated': True,
+                      'job_id': existing_rec.get('job_id'),
+                      'runner': existing_rec.get('runner'),
+                      'state': existing_rec.get('state'),
+                  })
+            if w_code != EXIT_OK:
+              err_detail = (
+                  existing_rec.get('post_check_error') or
+                  f"re-attached job {existing_rec.get('job_id')!r} failed "
+                  f"(state: {existing_rec.get('state')})")
+              raise _CliError(
+                  str(err_detail),
+                  w_code,
+                  extra={
+                      'outputs': existing_rec.get('outputs', {}),
+                      'metrics': existing_rec.get('metrics', {}),
+                  })
           if json_session is not None and json_session.enabled:
             json_session.emit(
                 output.build_envelope(
@@ -5482,6 +5517,7 @@ def _run_yaml(
                     job_id=existing_rec.get('job_id'),
                     state=existing_rec.get('state'),
                     duration_ms=int((time.monotonic() - t0) * 1000),
+                    metrics=existing_rec.get('metrics') or None,
                     warnings=warnings_list + [
                         'Re-attached to recent identical remote submission '
                         '(idempotency guard).'
@@ -5640,6 +5676,13 @@ def _run_yaml(
       return EXIT_OK
 
     if state != PipelineState.DONE:
+      if not is_local and job_id:
+        jobs.mark_job_validation(
+            job_id,
+            passed=False,
+            exit_code=EXIT_PIPELINE_FAILED,
+            error=f'pipeline finished in state {state}',
+            state=str(state))
       raise _CliError(
           f'pipeline finished in state {state}', EXIT_PIPELINE_FAILED)
 
@@ -5655,6 +5698,13 @@ def _run_yaml(
     if post_checks and post_checks.get('assert_counts'):
       err_msg = jobs.check_assert_counts(row_metrics)
       if err_msg:
+        if not is_local and job_id:
+          jobs.mark_job_validation(
+              job_id,
+              passed=False,
+              exit_code=EXIT_PIPELINE_FAILED,
+              error=err_msg,
+              metrics=row_metrics)
         raise _CliError(err_msg, EXIT_PIPELINE_FAILED)
 
     outputs_dict: dict[str, Any] = {}
@@ -5689,8 +5739,9 @@ def _run_yaml(
       from . import diff
       v_cfg = post_checks['verify_diff']
       v_right = (
-          written[0] if len(written) == 1 else
-          (output_prefix + '*' if output_prefix is not None else v_cfg['right']))
+          written[0] if len(written) == 1 else (
+              output_prefix +
+              '*' if output_prefix is not None else v_cfg['right']))
       diff_rc, diff_rep = diff.run_diff(
           v_cfg['left'],
           v_right,
@@ -5706,10 +5757,24 @@ def _run_yaml(
           outputs_dict['file_count'] = 0
         if dlq_commit_target is not None:
           outputs_dict.pop('dlq_files', None)
+        v_err = (
+            f'--verify detected mismatch between '
+            f'{v_cfg["left"]} and {v_cfg["right"]}')
+        if not is_local and job_id:
+          jobs.mark_job_validation(
+              job_id,
+              passed=False,
+              exit_code=EXIT_DIFF_MISMATCH,
+              error=v_err,
+              metrics=row_metrics,
+              outputs=outputs_dict,
+              verify_diff=diff_rep)
         raise _CliError(
-            f'--verify detected mismatch between {v_cfg["left"]} and {v_cfg["right"]}',
+            v_err,
             EXIT_DIFF_MISMATCH,
-            extra={'outputs': outputs_dict, 'metrics': row_metrics})
+            extra={
+                'outputs': outputs_dict, 'metrics': row_metrics
+            })
 
     if dlq_commit_target is not None and dlq_prefix is not None:
       dlq_files = _commit_staged_local_files(
@@ -5736,6 +5801,14 @@ def _run_yaml(
     if ephemeral_preview:
       outputs_dict['files'] = []
       outputs_dict['file_count'] = 0
+
+    if not is_local and job_id:
+      jobs.mark_job_validation(
+          job_id,
+          passed=True,
+          exit_code=EXIT_OK,
+          metrics=row_metrics,
+          outputs=outputs_dict)
 
     dur_ms = int((time.monotonic() - t0) * 1000)
     if json_session is not None and json_session.enabled:

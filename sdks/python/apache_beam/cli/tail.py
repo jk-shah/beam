@@ -49,7 +49,9 @@ import io
 import json
 import os
 import re
+import signal
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -348,26 +350,163 @@ def run_tail(
       2)
 
 
+_PUBSUB_LEASE_WINDOW_SEC = 900
+_PUBSUB_HEARTBEAT_SEC = 300.0
+_PUBSUB_FOLLOW_FALLBACK_MAX_AGE_SEC = 86400.0
+
+
+def _tail_leases_dir() -> Path:
+  beam_home = Path(os.path.expanduser(os.environ.get('BEAM_HOME', '~/.beam')))
+  if os.path.islink(beam_home):
+    raise OSError(f'refusing symlinked BEAM_HOME {str(beam_home)!r}')
+  d = beam_home / 'tail_leases'
+  if os.path.islink(d):
+    raise OSError(f'refusing symlinked tail_leases {str(d)!r}')
+  return d
+
+
+def _write_local_tail_lease(sub_id: str, lease_until: int) -> None:
+  try:
+    d = _tail_leases_dir()
+    d.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    jobs._atomic_write_json(
+        d / f'{sub_id}.json', {
+            'pid': os.getpid(), 'lease_until': int(lease_until)
+        })
+  except Exception:  # pylint: disable=broad-except
+    pass
+
+
+def _remove_local_tail_lease(sub_id: str | None) -> None:
+  if not sub_id:
+    return
+  try:
+    (_tail_leases_dir() / f'{sub_id}.json').unlink(missing_ok=True)
+  except Exception:  # pylint: disable=broad-except
+    pass
+
+
+def _is_local_tail_pid_alive(sub_name: str, now: float) -> bool:
+  try:
+    lease_file = _tail_leases_dir() / f'{sub_name}.json'
+    if not lease_file.is_file() or os.path.islink(lease_file):
+      return False
+    data = json.loads(lease_file.read_text(encoding='utf-8'))
+    pid = int(data.get('pid', 0))
+    if pid <= 0:
+      return False
+  except Exception:  # pylint: disable=broad-except
+    return False
+  try:
+    os.kill(pid, 0)
+    return True
+  except ProcessLookupError:
+    try:
+      lease_file.unlink(missing_ok=True)
+    except OSError:
+      pass
+    return False
+  except PermissionError:
+    return True
+  except Exception:  # pylint: disable=broad-except
+    return False
+
+
 def _gc_stale_peek_subscriptions(
     subscriber, publisher, topic_path: str, max_age_sec: float = 900.0) -> None:
-  """Best-effort cleanup of orphaned `beam-cli-peek-*` subscriptions."""
+  """Best-effort cleanup of orphaned `beam-cli-peek-*` / `beam-cli-follow-*` subscriptions.
+
+  Never deletes a subscription whose local process is still alive, whose
+  `beam_lease_until` heartbeat label has not expired, or whose encoded
+  expiration / follow TTL is still active.
+  """
   now = time.time()
   try:
     for sub_path in publisher.list_topic_subscriptions(
         request={'topic': topic_path}):
       sub_name = sub_path.rsplit('/', 1)[-1]
-      if not sub_name.startswith('beam-cli-peek-'):
+      is_peek = sub_name.startswith('beam-cli-peek-')
+      is_follow = sub_name.startswith('beam-cli-follow-')
+      if not (is_peek or is_follow):
+        continue
+      if _is_local_tail_pid_alive(sub_name, now):
         continue
       parts = sub_name.split('-')
-      if len(parts) >= 5:
+      if len(parts) < 5:
+        continue
+      try:
+        ts_val = int(parts[3], 16)
+      except ValueError:
+        continue
+
+      # Check subscription labels (`beam_lease_until` / `beam_mode`) before any
+      # deletion so long-running `beam tail -f` sessions (>15m) on any host are
+      # never deleted mid-stream!
+      lease_until: int | None = None
+      label_mode: str | None = None
+      try:
+        sub_meta = subscriber.get_subscription(
+            request={'subscription': sub_path})
+        labels = getattr(sub_meta, 'labels', None)
+        if labels is not None and hasattr(labels, 'get'):
+          label_mode = str(labels.get('beam_mode') or '').lower() or None
+          raw_lease = labels.get('beam_lease_until')
+          if raw_lease is not None:
+            lease_until = int(str(raw_lease))
+      except Exception:  # pylint: disable=broad-except
+        pass
+
+      if lease_until is not None:
+        # Active session heartbeats `beam_lease_until` every 5m (+60s skew grace).
+        if now <= (lease_until + 60):
+          continue
         try:
-          created_ts = int(parts[3], 16)
-          if (now - created_ts) > max_age_sec:
-            subscriber.delete_subscription(request={'subscription': sub_path})
+          subscriber.delete_subscription(request={'subscription': sub_path})
+        except Exception:  # pylint: disable=broad-except
+          pass
+        continue
+
+      # Fallback when labels are unavailable (e.g., restricted IAM without
+      # `pubsub.subscriptions.get`/`update` or legacy subscription names):
+      # - `beam-cli-follow-*` (or `beam_mode=follow`) relies on `finally:` +
+      #   GCP Pub/Sub native idle `expiration_policy` (24h) so active >15m
+      #   follow sessions are never killed by concurrent `beam tail` startups!
+      effective_age_limit = (
+          _PUBSUB_FOLLOW_FALLBACK_MAX_AGE_SEC if
+          (is_follow or label_mode == 'follow') else max_age_sec)
+      if (now - ts_val) > effective_age_limit:
+        try:
+          subscriber.delete_subscription(request={'subscription': sub_path})
         except Exception:  # pylint: disable=broad-except
           pass
   except Exception:  # pylint: disable=broad-except
     pass
+
+
+def _refresh_pubsub_lease(
+    subscriber, ephemeral_sub: str, sub_id: str, mode: str,
+    lease_sec: int) -> int:
+  lease_until = int(time.time()) + max(_PUBSUB_LEASE_WINDOW_SEC, int(lease_sec))
+  _write_local_tail_lease(sub_id, lease_until)
+  try:
+    subscriber.update_subscription(
+        request={
+            'subscription': {
+                'name': ephemeral_sub,
+                'labels': {
+                    'beam_cli': 'peek',
+                    'beam_mode': mode,
+                    'beam_lease_until': str(lease_until),
+                },
+            },
+            'update_mask': {
+                'paths': ['labels']
+            },
+        })
+  except Exception:  # pylint: disable=broad-except
+    pass
+  return lease_until
 
 
 def _tail_pubsub(
@@ -392,6 +531,7 @@ def _tail_pubsub(
 
   subscriber = pubsub_v1.SubscriberClient()
   ephemeral_sub: str | None = None
+  ephemeral_sub_id: str | None = None
   sub_path = ep.config.get('subscription')
   topic_path = ep.config.get('topic')
 
@@ -417,7 +557,29 @@ def _tail_pubsub(
     seen_ids_set.add(mid)
     return True
 
+  prev_sigterm = None
+  installed_sigterm = False
+  if threading.current_thread() is threading.main_thread() and hasattr(
+      signal, 'SIGTERM'):
+    try:
+
+      def _on_sigterm(_signum, _frame):
+        raise KeyboardInterrupt()
+
+      prev_sigterm = signal.getsignal(signal.SIGTERM)
+      signal.signal(signal.SIGTERM, _on_sigterm)
+      installed_sigterm = True
+    except (OSError, ValueError):
+      installed_sigterm = False
+
   try:
+    mode_tag = 'follow' if follow else 'peek'
+    lease_span = _PUBSUB_LEASE_WINDOW_SEC
+    if duration_sec is not None and not follow:
+      lease_span = max(
+          _PUBSUB_LEASE_WINDOW_SEC, min(86400, int(duration_sec) + 120))
+    last_lease_refresh = time.monotonic()
+
     if topic_path and not sub_path:
       parts = topic_path.split('/')
       proj = parts[1] if len(parts) >= 4 else default_project
@@ -430,17 +592,43 @@ def _tail_pubsub(
         raise TailError(str(e), 2) from None
       publisher = pubsub_v1.PublisherClient()
       _gc_stale_peek_subscriptions(subscriber, publisher, topic_path)
-      epoch_hex = format(int(time.time()), 'x')
-      sub_id = f'beam-cli-peek-{epoch_hex}-{uuid.uuid4().hex[:8]}'
-      ephemeral_sub = f'projects/{proj}/subscriptions/{sub_id}'
-      subscriber.create_subscription(
-          request={
-              'name': ephemeral_sub,
-              'topic': topic_path,
-              'ack_deadline_seconds': 10,
-              'message_retention_duration': {'seconds': 600},
-              'expiration_policy': {'ttl': {'seconds': 86400}},
-          })
+      now_int = int(time.time())
+      # Encode creation/anchor timestamp; `beam-cli-follow-*` protects long
+      # `-f` sessions even when `pubsub.subscriptions.get`/`update` is absent.
+      sub_prefix = 'beam-cli-follow' if follow else 'beam-cli-peek'
+      anchor_ts = (
+          now_int if follow else now_int +
+          max(0, lease_span - _PUBSUB_LEASE_WINDOW_SEC))
+      epoch_hex = format(anchor_ts, 'x')
+      ephemeral_sub_id = f'{sub_prefix}-{epoch_hex}-{uuid.uuid4().hex[:8]}'
+      ephemeral_sub = f'projects/{proj}/subscriptions/{ephemeral_sub_id}'
+      lease_until = now_int + lease_span
+      _write_local_tail_lease(ephemeral_sub_id, lease_until)
+      base_sub_req: dict[str, Any] = {
+          'name': ephemeral_sub,
+          'topic': topic_path,
+          'ack_deadline_seconds': 10,
+          'message_retention_duration': {
+              'seconds': 600
+          },
+          'expiration_policy': {
+              'ttl': {
+                  'seconds': 86400
+              }
+          },
+      }
+      try:
+        subscriber.create_subscription(
+            request={
+                **base_sub_req,
+                'labels': {
+                    'beam_cli': 'peek',
+                    'beam_mode': mode_tag,
+                    'beam_lease_until': str(lease_until),
+                },
+            })
+      except (TypeError, gcp_exceptions.InvalidArgument):
+        subscriber.create_subscription(request=base_sub_req)
       sub_path = ephemeral_sub
 
     deadline = (
@@ -453,12 +641,16 @@ def _tail_pubsub(
           break
         if deadline is not None and time.monotonic() >= deadline:
           break
+        if (ephemeral_sub and ephemeral_sub_id and
+            (time.monotonic() - last_lease_refresh) >= _PUBSUB_HEARTBEAT_SEC):
+          _refresh_pubsub_lease(
+              subscriber, ephemeral_sub, ephemeral_sub_id, mode_tag, lease_span)
+          last_lease_refresh = time.monotonic()
 
         remaining = (
-            max(0.2, deadline - time.monotonic())
-            if deadline is not None else 5.0)
-        batch_max = (
-            min(20, limit - len(rows)) if limit is not None else 20)
+            max(0.2, deadline -
+                time.monotonic()) if deadline is not None else 5.0)
+        batch_max = (min(20, limit - len(rows)) if limit is not None else 20)
         if batch_max <= 0:
           break
 
@@ -566,6 +758,12 @@ def _tail_pubsub(
       except Exception:  # pylint: disable=broad-except
         pass
   finally:
+    if installed_sigterm:
+      try:
+        signal.signal(signal.SIGTERM, prev_sigterm)
+      except (OSError, ValueError):
+        pass
+    _remove_local_tail_lease(ephemeral_sub_id)
     if ephemeral_sub:
       try:
         subscriber.delete_subscription(request={'subscription': ephemeral_sub})
@@ -1080,4 +1278,3 @@ def _tail_lakehouse_follow(
       'untrusted_data': output.wrap_untrusted_rows(
           rows, truncated=truncated_budget or hit_limit),
   }
-

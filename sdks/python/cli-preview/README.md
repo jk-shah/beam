@@ -301,7 +301,17 @@ beam pipe --from pubsub://projects/<PROJ>/subscriptions/orders --to bigquery://<
 ## 11. Architecture & Documentation Links
 
 * **Official Beam Website CLI Reference**: [`website/www/site/content/en/documentation/sdks/cli.md`](../../../website/www/site/content/en/documentation/sdks/cli.md)
-* **CLI Module Map & Test Runner (`408` tests across 25 modules)**: [`sdks/python/apache_beam/cli/README.md`](../apache_beam/cli/README.md)
+* **CLI Module Map & Test Runner (`431` tests across 27 modules)**: [`sdks/python/apache_beam/cli/README.md`](../apache_beam/cli/README.md)
 * **AI Coding Agent Skill**: [`.agents/skills/apache-beam-cli/SKILL.md`](../../../.agents/skills/apache-beam-cli/SKILL.md)
 
 All CLI source modules live directly in their upstream target path [`sdks/python/apache_beam/cli/`](../apache_beam/cli/README.md) (**Feature Complete** at `v0.2.0`) so individual PR slices cherry-pick cleanly onto `apache/beam:master` ([apache/beam#40891](https://github.com/apache/beam/issues/40891)). This `sdks/python/cli-preview/` package is a lightweight pure-Python overlay that lets anyone install and test the complete CLI experience against released PyPI `apache-beam` wheels in seconds.
+
+---
+
+## 12. Acknowledgements
+
+Special thanks to **[Darsh Patel (`@darshpatel1052`)](https://github.com/darshpatel1052)** for hands-on testing of `beam-cli-preview` and uncovering three subtle correctness bugs:
+1. **`beam diff` 38-digit Parquet `Decimal` precision loss**: Python's default 28-digit thread context in `Decimal.normalize()` rounded 38-digit `decimal128(38, s)` / `BIGNUMERIC` values before comparison and key hashing (fixed in `diff.py` and `interval_join.py`).
+2. **Remote job retry idempotency reusing failed validation records**: `DONE` remote job records whose post-job validation (`--assert-counts` or `--verify`) failed could be reused on retry within the 30-minute idempotency window and return `EXIT_OK` (fixed via persisted `validation_state` tracking in `jobs.py` and `main.py`).
+3. **Concurrent Pub/Sub `beam tail` ephemeral subscription GC**: Starting a new topic `beam tail` session deleted `beam-cli-peek-*` subscriptions older than 15 minutes even when an active `beam tail -f` session was still consuming from them (fixed via lease heartbeats, `beam-cli-follow-*` isolation, and local PID lease guards in `tail.py`).
+

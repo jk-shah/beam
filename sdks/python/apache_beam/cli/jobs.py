@@ -194,6 +194,13 @@ def lookup_recent_submission(
   state = str(rec.get('state') or '').upper()
   if state in _TERMINAL_FAILURE_STATES:
     return None
+  val_state = str(rec.get('validation_state') or '').upper()
+  if (val_state == 'FAILED' or rec.get('post_check_error') or
+      rec.get('validation_exit_code') not in (None, 0)):
+    return None
+  if (state in _TERMINAL_SUCCESS_STATES and rec.get('post_checks') and
+      val_state != 'PASSED'):
+    return None
   return rec
 
 
@@ -213,6 +220,7 @@ def record_job_submission(
   from . import output as out_mod
   safe_id = validate_job_id(job_id)
   now = time.time()
+  has_post = bool(post_checks)
   record = {
       'job_id': safe_id,
       'runner': runner,
@@ -223,6 +231,7 @@ def record_job_submission(
       'submitted_at': now,
       'updated_at': now,
       'post_checks': post_checks or {},
+      'validation_state': 'PENDING' if has_post else 'NONE',
       'outputs': outputs or {},
       'metrics': {},
   }
@@ -248,6 +257,43 @@ def record_job_submission(
     ledger[idem_key] = {'job_id': safe_id, 'submitted_at': now}
     _atomic_write_json(ledger_path, ledger)
   return record
+
+
+def mark_job_validation(
+    job_id: str,
+    *,
+    passed: bool,
+    exit_code: int = 0,
+    error: str | None = None,
+    state: str | None = None,
+    metrics: dict[str, Any] | None = None,
+    outputs: dict[str, Any] | None = None,
+    verify_diff: dict[str, Any] | None = None,
+) -> None:
+  """Updates persisted job record with post-job validation outcome."""
+  try:
+    safe_id = validate_job_id(job_id)
+    rec = load_job_record(safe_id)
+  except JobError:
+    return
+  if state is not None:
+    rec['state'] = state
+  rec['updated_at'] = time.time()
+  has_post = bool(rec.get('post_checks'))
+  rec['validation_state'] = (('PASSED' if has_post else 'NONE')
+                             if passed else 'FAILED')
+  rec['validation_exit_code'] = int(exit_code)
+  if error:
+    rec['post_check_error'] = error
+  else:
+    rec.pop('post_check_error', None)
+  if metrics is not None:
+    rec['metrics'] = dict(metrics)
+  if outputs is not None:
+    rec['outputs'] = {**dict(rec.get('outputs') or {}), **dict(outputs)}
+  if verify_diff is not None:
+    rec['verify_diff'] = verify_diff
+  _atomic_write_json(_jobs_dir() / f'{safe_id}.json', rec)
 
 
 def load_job_record(job_id: str) -> dict[str, Any]:
@@ -725,11 +771,11 @@ def wait_for_job(
       if post.get('assert_counts'):
         err_msg = check_assert_counts(counters)
         if err_msg:
+          record['validation_state'] = 'FAILED'
+          record['validation_exit_code'] = EXIT_PIPELINE_FAILED
+          record['post_check_error'] = err_msg
           _atomic_write_json(_jobs_dir() / f'{safe_id}.json', record)
-          return EXIT_PIPELINE_FAILED, {
-              **record,
-              'post_check_error': err_msg,
-          }
+          return EXIT_PIPELINE_FAILED, dict(record)
       if post.get('verify_diff'):
         from . import diff
         v_cfg = post['verify_diff']
@@ -743,9 +789,18 @@ def wait_for_job(
         outputs_obj['verify'] = diff_report
         record['outputs'] = outputs_obj
         record['verify_diff'] = diff_report
-        _atomic_write_json(_jobs_dir() / f'{safe_id}.json', record)
         if diff_code != 0:
-          return diff_code, record
+          v_err = (
+              f'--verify detected mismatch between '
+              f'{v_cfg["left"]} and {v_cfg["right"]}')
+          record['validation_state'] = 'FAILED'
+          record['validation_exit_code'] = diff_code
+          record['post_check_error'] = v_err
+          _atomic_write_json(_jobs_dir() / f'{safe_id}.json', record)
+          return diff_code, dict(record)
+      record['validation_state'] = 'PASSED' if post else 'NONE'
+      record['validation_exit_code'] = EXIT_OK
+      record.pop('post_check_error', None)
       _atomic_write_json(_jobs_dir() / f'{safe_id}.json', record)
       return EXIT_OK, record
 

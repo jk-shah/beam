@@ -4663,6 +4663,222 @@ class Round12FixesTest(unittest.TestCase):
     self.assertIn('change_type_map', yaml_out)
     self.assertIn('update_postimage: UPDATE_AFTER', yaml_out)
 
+  def test_diff_38_digit_parquet_decimals_detects_mismatch(self):
+    """Regression test (credit: Darsh Patel, @darshpatel1052): 38-digit Parquet Decimals must not round to 28 digits."""
+    import decimal
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from apache_beam.cli import interval_join
+
+    d_left = decimal.Decimal('1234567890123456789012345678901234.5678')
+    d_right_diff = decimal.Decimal('1234567890123456789012345678901234.5679')
+    d_right_same = decimal.Decimal('1234567890123456789012345678901234.5678')
+    k1 = decimal.Decimal('99999999999999999999999999999999999991')
+    k2 = decimal.Decimal('99999999999999999999999999999999999992')
+
+    # Also verify shared interval_join key encoder distinguishes 38-digit keys.
+    self.assertNotEqual(
+        interval_join.encode_canonical_key_values([k1]),
+        interval_join.encode_canonical_key_values([k2]))
+
+    schema = pa.schema([
+        ('k', pa.decimal128(38, 0)),
+        ('amount', pa.decimal128(38, 4)),
+    ])
+    left_pq = os.path.join(self.tmp, 'dec38_left.parquet')
+    right_bad_pq = os.path.join(self.tmp, 'dec38_right_bad.parquet')
+    right_ok_pq = os.path.join(self.tmp, 'dec38_right_ok.parquet')
+
+    pq.write_table(
+        pa.Table.from_pydict({
+            'k': [k1, k2], 'amount': [d_left, d_left]
+        },
+                             schema=schema),
+        left_pq)
+    pq.write_table(
+        pa.Table.from_pydict({
+            'k': [k1, k2], 'amount': [d_left, d_right_diff]
+        },
+                             schema=schema),
+        right_bad_pq)
+    pq.write_table(
+        pa.Table.from_pydict({
+            'k': [k1, k2], 'amount': [d_left, d_right_same]
+        },
+                             schema=schema),
+        right_ok_pq)
+
+    rc_bad, env_bad, err_bad = _run_json(
+        ['diff', left_pq, right_bad_pq, '--key', 'k'])
+    self.assertEqual(rc_bad, diff.EXIT_DIFF_MISMATCH, err_bad)
+    self.assertFalse(env_bad['outputs']['match'])
+    self.assertEqual(env_bad['outputs']['summary']['value_mismatches'], 1)
+    self.assertEqual(env_bad['outputs']['summary']['matched_rows'], 1)
+
+    # High-precision `--atol` check on 38-digit Decimals:
+    # diff is 0.0001 -> fails `--atol 0.00001`, passes `--atol 0.001`.
+    rc_tight, _, _ = _run_json(
+        ['diff', left_pq, right_bad_pq, '--key', 'k', '--atol', '0.00001'])
+    self.assertEqual(rc_tight, diff.EXIT_DIFF_MISMATCH)
+    rc_loose, env_loose, _ = _run_json(
+        ['diff', left_pq, right_bad_pq, '--key', 'k', '--atol', '0.001'])
+    self.assertEqual(rc_loose, cli.EXIT_OK)
+    self.assertTrue(env_loose['outputs']['match'])
+
+    rc_ok, env_ok, err_ok = _run_json(
+        ['diff', left_pq, right_ok_pq, '--key', 'k'])
+    self.assertEqual(rc_ok, cli.EXIT_OK, err_ok)
+    self.assertTrue(env_ok['outputs']['match'])
+
+  def test_idempotency_never_reuses_done_record_when_validation_failed(self):
+    """Regression test (credit: Darsh Patel, @darshpatel1052): failed post-checks on DONE jobs must not return success on retry."""
+    beam_home = os.path.join(self.tmp, 'idem_val_home')
+    with mock.patch.dict(os.environ, {'BEAM_HOME': beam_home}, clear=False):
+      idem = jobs.compute_idempotency_key([
+          'pipe',
+          '--from',
+          'gs://b/in.csv',
+          '--to',
+          'gs://b/out.csv',
+          '--assert-counts'
+      ],
+                                          'sha256:plan1')
+      jobs.record_job_submission(
+          '2026-11-14_job-bad-counts',
+          runner='DataflowRunner',
+          state='JOB_STATE_RUNNING',
+          command='pipe',
+          project='my-proj',
+          region='us-central1',
+          idem_key=idem,
+          post_checks={'assert_counts': True})
+      # While still RUNNING, in-flight submission is found.
+      self.assertIsNotNone(jobs.lookup_recent_submission(idem))
+
+      # Now `wait_for_job` sees JOB_STATE_DONE with imbalanced counters!
+      w_code, w_rec = jobs.wait_for_job(
+          '2026-11-14_job-bad-counts',
+          query_fn=lambda jid, p, r: (
+              'JOB_STATE_DONE',
+              {'rows_read': 10, 'rows_written': 7, 'dlq_rows': 0},
+          ))
+      self.assertEqual(w_code, cli.EXIT_PIPELINE_FAILED)
+      self.assertEqual(w_rec['validation_state'], 'FAILED')
+      # Persisted record on disk MUST reflect validation failure, and
+      # `lookup_recent_submission` MUST NOT reuse it!
+      persisted = jobs.load_job_record('2026-11-14_job-bad-counts')
+      self.assertEqual(persisted['validation_state'], 'FAILED')
+      self.assertIsNone(jobs.lookup_recent_submission(idem))
+
+      # Also test synchronous `_run_yaml` retry after `--assert-counts` failure:
+      idem2 = jobs.compute_idempotency_key([
+          'pipe',
+          '--from',
+          'gs://b/in2.csv',
+          '--to',
+          'gs://b/out2.csv',
+          '--assert-counts'
+      ],
+                                           'sha256:plan2')
+      jobs.record_job_submission(
+          '2026-11-14_job-sync-fail',
+          runner='DataflowRunner',
+          state='DONE',
+          command='pipe',
+          project='my-proj',
+          region='us-central1',
+          idem_key=idem2,
+          post_checks={'assert_counts': True})
+      # Even before `mark_job_validation`, an unvalidated DONE record with
+      # `post_checks` must not be blindly reused as passed!
+      self.assertIsNone(jobs.lookup_recent_submission(idem2))
+      jobs.mark_job_validation(
+          '2026-11-14_job-sync-fail',
+          passed=False,
+          exit_code=cli.EXIT_PIPELINE_FAILED,
+          error='row conservation failed')
+      self.assertIsNone(jobs.lookup_recent_submission(idem2))
+
+      # Once a new job passes validation, idempotency reuse is allowed.
+      jobs.record_job_submission(
+          '2026-11-14_job-sync-ok',
+          runner='DataflowRunner',
+          state='DONE',
+          command='pipe',
+          project='my-proj',
+          region='us-central1',
+          idem_key=idem2,
+          post_checks={'assert_counts': True})
+      jobs.mark_job_validation(
+          '2026-11-14_job-sync-ok',
+          passed=True,
+          exit_code=cli.EXIT_OK,
+          metrics={
+              'rows_read': 10, 'rows_written': 10
+          })
+      reused = jobs.lookup_recent_submission(idem2)
+      self.assertIsNotNone(reused)
+      self.assertEqual(reused['job_id'], '2026-11-14_job-sync-ok')
+
+  def test_pubsub_tail_gc_preserves_active_sessions_past_15_minutes(self):
+    """Regression test (credit: Darsh Patel, @darshpatel1052): concurrent Pub/Sub tail must not delete active >15m sessions."""
+    import time
+    from apache_beam.cli import tail
+
+    beam_home = os.path.join(self.tmp, 'tail_lease_home')
+    now = int(time.time())
+    old_hex = format(now - 1800, 'x')  # Created 30 minutes ago (> 900s!)
+
+    sub_active_heartbeat = (
+        f'projects/p1/subscriptions/beam-cli-peek-{old_hex}-aaaa1111')
+    sub_active_local_pid = (
+        f'projects/p1/subscriptions/beam-cli-peek-{old_hex}-bbbb2222')
+    sub_active_follow_no_iam = (
+        f'projects/p1/subscriptions/beam-cli-follow-{old_hex}-cccc3333')
+    sub_dead_expired = (
+        f'projects/p1/subscriptions/beam-cli-peek-{old_hex}-dddd4444')
+
+    fake_pub = mock.MagicMock()
+    fake_pub.list_topic_subscriptions.return_value = [
+        sub_active_heartbeat,
+        sub_active_local_pid,
+        sub_active_follow_no_iam,
+        sub_dead_expired,
+    ]
+
+    def _fake_get_sub(request):
+      name = request['subscription']
+      if name == sub_active_heartbeat:
+        return mock.Mock(
+            labels={
+                'beam_cli': 'peek',
+                'beam_mode': 'follow',
+                'beam_lease_until': str(now + 600),
+            })
+      if name == sub_dead_expired:
+        return mock.Mock(
+            labels={
+                'beam_cli': 'peek',
+                'beam_mode': 'peek',
+                'beam_lease_until': str(now - 300),
+            })
+      raise RuntimeError('PermissionDenied on get_subscription')
+
+    fake_sub = mock.MagicMock()
+    fake_sub.get_subscription.side_effect = _fake_get_sub
+
+    with mock.patch.dict(os.environ, {'BEAM_HOME': beam_home}, clear=False):
+      tail._write_local_tail_lease(
+          f'beam-cli-peek-{old_hex}-bbbb2222', now + 600)
+      tail._gc_stale_peek_subscriptions(
+          fake_sub, fake_pub, 'projects/p1/topics/events', max_age_sec=900.0)
+
+    deleted = [
+        c.kwargs['request']['subscription']
+        for c in fake_sub.delete_subscription.call_args_list
+    ]
+    self.assertEqual(deleted, [sub_dead_expired])
+
 
 if __name__ == '__main__':
   unittest.main()
