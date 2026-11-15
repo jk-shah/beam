@@ -32,12 +32,15 @@ Safety rules:
 """
 
 import argparse
+import contextlib
 import difflib
 import functools
 import json
 import os
 import re
 import sys
+import tempfile
+import time
 from pathlib import Path
 from typing import Any
 from typing import NamedTuple
@@ -48,9 +51,10 @@ _EXIT_USAGE = 2
 
 class ConfigError(Exception):
   """An error in `beam config`, reported to the user with `exit_code`."""
-  def __init__(self, message, exit_code):
+  def __init__(self, message, exit_code, *, is_corrupt: bool = False):
     super().__init__(message)
     self.exit_code = exit_code
+    self.is_corrupt = is_corrupt
 
 
 _VALID_KEY_RE = re.compile(r'^[a-zA-Z][a-zA-Z0-9_-]*$')
@@ -59,9 +63,25 @@ _VALID_PROFILE_RE = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9._-]*$')
 # Credentials belong in ADC, environment variables, or `--*-opt-file`, never in
 # a plain-text default options file.
 _SECRET_KEY_RE = re.compile(
-    r'(password|passwd|secret|token|private_key|client_secret|'
-    r'access_key|api_key|jaas|credential|connection_string)',
+    r'(password|passwd|passphrase|secret|token|auth[-_]?token|'
+    r'private[-_]?key|signing[-_]?key|encryption[-_]?key|'
+    r'client[-_]?secret|access[-_]?key|api[-_]?key|'
+    r'bearer|authorization|jaas|credential|connection[-_]?string|'
+    r'(?:^|[_.-]|(?<=[a-z]))(?:pwd|cookie|auth)(?:$|[_.-]|(?=[A-Z0-9])))',
     re.IGNORECASE)
+
+_SECRET_VALUE_TOKEN_RE = re.compile(
+    r'(?:'
+    r'\bya29\.[A-Za-z0-9._-]{8,}|'
+    r'\bsk-[A-Za-z0-9_-]{12,}|'
+    r'\bAIza[0-9A-Za-z_-]{20,}|'
+    r'\bgh[pousr]_[A-Za-z0-9_]{12,}|'
+    r'\bgithub_pat_[A-Za-z0-9_]{12,}|'
+    r'\bhf_[A-Za-z0-9]{12,}|'
+    r'\bAKIA[0-9A-Z]{16}\b|'
+    r'\bxox[baprs]-[A-Za-z0-9-]{10,}|'
+    r'\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'
+    r')')
 
 
 class _OptionMeta(NamedTuple):
@@ -214,30 +234,187 @@ def _option_catalog(
   return _cached_option_catalog(key)
 
 
+def _fresh_config() -> dict[str, Any]:
+  return {
+      'active_profile': 'default', 'profiles': {
+          'default': {
+              'options': {}
+          }
+      }
+  }
+
+
+@contextlib.contextmanager
+def _config_lock(config_path: str):
+  parent = os.path.dirname(os.path.abspath(config_path)) or '.'
+  if os.path.islink(parent):
+    raise ConfigError(
+        f'refusing symbolic link config directory {parent}', _EXIT_USAGE)
+  os.makedirs(parent, mode=0o700, exist_ok=True)
+  lock_path = os.path.join(parent, '.config.lock')
+  if os.path.islink(lock_path):
+    raise ConfigError(
+        f'refusing symbolic link config lock file {lock_path}', _EXIT_USAGE)
+  fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+  try:
+    if os.name == 'nt':
+      import msvcrt
+      os.lseek(fd, 0, os.SEEK_SET)
+      try:
+        if os.fstat(fd).st_size == 0:
+          os.write(fd, b'\0')
+          os.lseek(fd, 0, os.SEEK_SET)
+      except OSError:
+        pass
+      while True:
+        try:
+          msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+          break
+        except OSError:
+          time.sleep(0.05)
+    else:
+      import fcntl
+      fcntl.flock(fd, fcntl.LOCK_EX)
+    yield
+  finally:
+    try:
+      if os.name == 'nt':
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+      else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+      pass
+    os.close(fd)
+
+
+def _load_or_recover_for_mutation(path: str) -> dict[str, Any]:
+  try:
+    data = _load_config(path)
+  except ConfigError as err:
+    if not err.is_corrupt:
+      raise
+    backup_path = f'{path}.corrupt'
+    if os.path.islink(backup_path):
+      raise ConfigError(
+          f'refusing symbolic link backup path {backup_path}',
+          _EXIT_USAGE) from None
+    try:
+      if os.path.exists(path):
+        os.replace(path, backup_path)
+        print(
+            f'warning: backed up corrupt config {path} to {backup_path} '
+            'and initialized fresh configuration',
+            file=sys.stderr)
+    except OSError as exc:
+      raise ConfigError(
+          f'could not back up corrupt config {path}: {exc}',
+          _EXIT_USAGE) from None
+    data = _fresh_config()
+
+  if not isinstance(data.get('profiles'), dict):
+    data['profiles'] = {}
+  return data
+
+
+def _ensure_profile_options(data: dict[str, Any], profile: str) -> dict[str, Any]:
+  profiles = data.setdefault('profiles', {})
+  if not isinstance(profiles, dict):
+    profiles = {}
+    data['profiles'] = profiles
+  prof_entry = profiles.get(profile)
+  if not isinstance(prof_entry, dict):
+    prof_entry = {'options': {}}
+    profiles[profile] = prof_entry
+  opts = prof_entry.get('options')
+  if not isinstance(opts, dict):
+    opts = {}
+    prof_entry['options'] = opts
+  return opts
+
+
 def run_command(args, config_path=None):
   """Executes `beam config <action>` and returns an exit code."""
   path = _default_config_path(config_path)
-  data = _load_config(path)
+  if os.path.islink(path):
+    raise ConfigError(
+        f'refusing symbolic link config file {path}', _EXIT_USAGE)
   action = args.config_action
 
   if action == 'use':
     profile = _validate_profile_name(args.profile_name)
-    data['active_profile'] = profile
-    data.setdefault('profiles', {}).setdefault(profile, {'options': {}})
-    _save_config(path, data)
+    with _config_lock(path):
+      data = _load_or_recover_for_mutation(path)
+      data['active_profile'] = profile
+      _ensure_profile_options(data, profile)
+      _save_config(path, data)
     print(f'Switched active profile to {profile!r} ({path}).')
     return 0
 
-  profile = _select_profile(data, getattr(args, 'profile', None))
-  options = (
-      data.setdefault('profiles', {}).setdefault(profile,
-                                                 {}).setdefault('options', {}))
+  if action == 'reset':
+    explicit_prof = getattr(args, 'profile', None)
+    clean_prof = (
+        _validate_profile_name(explicit_prof) if explicit_prof else None)
+    with _config_lock(path):
+      if os.path.islink(path):
+        raise ConfigError(
+            f'refusing symbolic link config file {path}', _EXIT_USAGE)
+      if clean_prof:
+        data = _load_or_recover_for_mutation(path)
+        data.setdefault('profiles', {})[clean_prof] = {'options': {}}
+        _save_config(path, data)
+      else:
+        try:
+          _ = _load_config(path)
+        except ConfigError as err:
+          if not err.is_corrupt:
+            raise
+          backup_path = f'{path}.corrupt'
+          if not os.path.islink(backup_path) and os.path.exists(path):
+            try:
+              os.replace(path, backup_path)
+              print(
+                  f'warning: backed up corrupt config {path} to {backup_path}',
+                  file=sys.stderr)
+            except OSError:
+              pass
+        _save_config(path, _fresh_config())
+    print(f'Reset configuration ({path}).')
+    return 0
 
   if action == 'set':
     dest, value = _parse_key_value(args.option, args.value)
-    options[dest] = value
-    _save_config(path, data)
+    with _config_lock(path):
+      data = _load_or_recover_for_mutation(path)
+      profile = _select_profile(data, getattr(args, 'profile', None))
+      options = _ensure_profile_options(data, profile)
+      options[dest] = value
+      _save_config(path, data)
     return 0
+
+  if action == 'unset':
+    stripped = _validate_option_key(args.option)
+    with _config_lock(path):
+      data = _load_or_recover_for_mutation(path)
+      profile = _select_profile(data, getattr(args, 'profile', None))
+      options = _ensure_profile_options(data, profile)
+      if options:
+        dest = (
+            stripped if stripped in options else _canonical_dest(
+                args.option, warn_unknown=False))
+        options.pop(dest, None)
+      _save_config(path, data)
+    return 0
+
+  data = _load_config(path)
+  profile = _select_profile(data, getattr(args, 'profile', None))
+  prof_entry = (data.get('profiles') or {}).get(profile) or {}
+  options = (
+      prof_entry.get('options')
+      if isinstance(prof_entry, dict) and isinstance(
+          prof_entry.get('options'), dict) else {})
 
   if action == 'get':
     stripped = _validate_option_key(args.option)
@@ -257,16 +434,6 @@ def run_command(args, config_path=None):
       print(val)
     return 0
 
-  if action == 'unset':
-    stripped = _validate_option_key(args.option)
-    if options:
-      dest = (
-          stripped if stripped in options else _canonical_dest(
-              args.option, warn_unknown=False))
-      options.pop(dest, None)
-    _save_config(path, data)
-    return 0
-
   # action == 'list'
   import yaml
   dumper = getattr(yaml, 'CSafeDumper', yaml.SafeDumper)
@@ -281,13 +448,22 @@ def resolve_pipeline_args(
   if _is_disabled(no_config):
     return list(cli_args)
   path = _default_config_path(config_path)
+  if os.path.islink(path):
+    raise ConfigError(
+        f'refusing symbolic link config file {path}', _EXIT_USAGE)
   if not os.path.isfile(path):
     return list(cli_args)
 
   data = _load_config(path)
   active = _select_profile(data, profile)
-  options = data.get('profiles', {}).get(active, {}).get('options', {})
-  if not options:
+  profiles = data.get('profiles')
+  if not isinstance(profiles, dict):
+    return list(cli_args)
+  prof_entry = profiles.get(active)
+  if not isinstance(prof_entry, dict):
+    return list(cli_args)
+  options = prof_entry.get('options')
+  if not isinstance(options, dict) or not options:
     return list(cli_args)
 
   overridden = _overridden_dests(cli_args)
@@ -319,13 +495,16 @@ def configured_sql_runner(
   if _is_disabled(no_config):
     return 'direct'
   path = _default_config_path(config_path)
+  if os.path.islink(path):
+    raise ConfigError(
+        f'refusing symbolic link config file {path}', _EXIT_USAGE)
   if not os.path.isfile(path):
     return 'direct'
 
   data = _load_config(path)
   active = _select_profile(data, profile)
-  raw = data.get('profiles', {}).get(active, {}).get('options',
-                                                     {}).get('runner')
+  raw = (data.get('profiles') or {}).get(active, {}).get('options',
+                                                         {}).get('runner')
   if not raw:
     return 'direct'
   norm = str(raw).strip().lower()
@@ -383,14 +562,11 @@ _DANGEROUS_CONFIG_OPTIONS = frozenset([
 
 
 def _load_config(path) -> dict[str, Any]:
+  if os.path.islink(path):
+    raise ConfigError(
+        f'refusing symbolic link config file {path}', _EXIT_USAGE)
   if not os.path.isfile(path):
-    return {
-        'active_profile': 'default', 'profiles': {
-            'default': {
-                'options': {}
-            }
-        }
-    }
+    return _fresh_config()
   if os.name == 'posix':
     try:
       mode = os.stat(path).st_mode & 0o777
@@ -405,31 +581,78 @@ def _load_config(path) -> dict[str, Any]:
   from . import output as out_mod
   try:
     raw_text = out_mod.read_bounded_text(path, label=path)
-    loaded = out_mod.safe_yaml_load(raw_text) or {}
-  except (OSError, ValueError, yaml.YAMLError) as e:
+  except (OSError, ValueError) as e:
     raise ConfigError(f'could not read {path}: {e}', _EXIT_USAGE) from None
+  try:
+    loaded = out_mod.safe_yaml_load(raw_text)
+  except (ValueError, yaml.YAMLError) as e:
+    raise ConfigError(
+        f'could not read {path}: {e}', _EXIT_USAGE, is_corrupt=True) from None
+  if loaded is None:
+    loaded = {}
   if not isinstance(loaded, dict):
     raise ConfigError(
         f'expected a YAML mapping in {path}, got {type(loaded).__name__}',
-        _EXIT_USAGE)
+        _EXIT_USAGE,
+        is_corrupt=True)
+  if 'profiles' in loaded and not isinstance(loaded['profiles'], dict):
+    raise ConfigError(
+        f"expected 'profiles' to be a YAML mapping in {path}",
+        _EXIT_USAGE,
+        is_corrupt=True)
   return loaded
 
 
 def _save_config(path, data):
+  if os.path.islink(path):
+    raise ConfigError(
+        f'refusing symbolic link config file {path}', _EXIT_USAGE)
   import yaml
   dumper = getattr(yaml, 'CSafeDumper', yaml.SafeDumper)
-  parent = os.path.dirname(path)
+  parent = os.path.dirname(os.path.abspath(path))
   if parent:
+    if os.path.islink(parent):
+      raise ConfigError(
+          f'refusing symbolic link config directory {parent}', _EXIT_USAGE)
     os.makedirs(parent, mode=0o700, exist_ok=True)
-  tmp_path = f'{path}.{os.getpid()}.part'
+  fd, tmp_path = tempfile.mkstemp(
+      prefix=f'.tmp_{os.path.basename(path)}_',
+      suffix='.part',
+      dir=parent or '.')
   try:
-    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+      os.fchmod(fd, 0o600)
+    except (AttributeError, OSError):
+      pass
     with os.fdopen(fd, 'w', encoding='utf-8') as f:
       yaml.dump(data, f, Dumper=dumper, sort_keys=False)
+      f.flush()
+      try:
+        os.fsync(f.fileno())
+      except OSError:
+        pass
+    if os.path.islink(path):
+      raise ConfigError(
+          f'refusing symbolic link config file {path}', _EXIT_USAGE)
     os.replace(tmp_path, path)
+    if os.name == 'posix':
+      try:
+        os.chmod(path, 0o600)
+      except OSError:
+        pass
+  except ConfigError:
+    if os.path.exists(tmp_path):
+      try:
+        os.remove(tmp_path)
+      except OSError:
+        pass
+    raise
   except OSError as e:
     if os.path.exists(tmp_path):
-      os.remove(tmp_path)
+      try:
+        os.remove(tmp_path)
+      except OSError:
+        pass
     raise ConfigError(f'could not write {path}: {e}', _EXIT_USAGE) from None
 
 
@@ -460,6 +683,29 @@ def _validate_option_key(raw_option: str) -> str:
   return stripped
 
 
+def _validate_option_value(raw_value: str) -> None:
+  from . import output as out_mod
+  from . import uris
+  text = str(raw_value)
+  try:
+    uris.reject_inline_credentials(text)
+    for part in text.split(','):
+      seg = part.strip()
+      uris.reject_inline_credentials(seg)
+      if '=' in seg:
+        _, rhs = seg.split('=', 1)
+        uris.reject_inline_credentials(rhs.strip())
+  except uris.UriError as e:
+    raise ConfigError(str(e), _EXIT_USAGE) from None
+
+  if _SECRET_VALUE_TOKEN_RE.search(text) or (
+      out_mod.redact_inline_secrets(text) != text):
+    raise ConfigError(
+        'refusing to store inline credentials or secret token in plain-text '
+        'config; use credentials providers or environment variables instead',
+        _EXIT_USAGE)
+
+
 def _canonical_dest(raw_option, warn_unknown=True):
   stripped = _validate_option_key(raw_option)
   by_dest, by_flag = _option_catalog()
@@ -479,6 +725,7 @@ def _canonical_dest(raw_option, warn_unknown=True):
 def _parse_key_value(raw_option, raw_value):
   stripped = raw_option.strip().lstrip('-')
   dest = _canonical_dest(raw_option, warn_unknown=True)
+  _validate_option_value(raw_value)
   by_dest, by_flag = _option_catalog()
   meta = by_dest.get(dest)
   _, flag_bool = by_flag.get(stripped, (dest, None))

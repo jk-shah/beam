@@ -109,7 +109,7 @@ EOF
 
 echo ""
 echo "8) Late JSONL Schema-Drift Protection (>100 rows -> quarantined to --dlq + explicit warning)"
-python3 - "${WORK_DIR}/events_120.jsonl" <<'PY'
+"${PYTHON_BIN:-python3}" - "${WORK_DIR}/events_120.jsonl" <<'PY'
 import json, sys
 with open(sys.argv[1], 'w', encoding='utf-8') as f:
   for i in range(1, 121):

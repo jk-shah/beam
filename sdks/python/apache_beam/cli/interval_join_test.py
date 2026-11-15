@@ -33,7 +33,6 @@ from apache_beam.cli import uris
 
 class IntervalDurationParseTest(unittest.TestCase):
   """Tests interval duration parsing across seconds, minutes, hours, days, ms."""
-
   def test_parse_valid_durations(self):
     self.assertEqual(interval_join.parse_interval_duration(0), 0.0)
     self.assertEqual(interval_join.parse_interval_duration('0s'), 0.0)
@@ -57,7 +56,6 @@ class IntervalDurationParseTest(unittest.TestCase):
 
 class IntervalJoinConfigTest(unittest.TestCase):
   """Tests configuration parsing and validation."""
-
   def test_valid_config_defaults(self):
     cfg = interval_join.parse_interval_join_config({
         'key': 'user_id',
@@ -65,8 +63,8 @@ class IntervalJoinConfigTest(unittest.TestCase):
         'right_time': 'order_time',
         'upper_bound': '15m',
     })
-    self.assertEqual(cfg.left_key, ('user_id',))
-    self.assertEqual(cfg.right_key, ('user_id',))
+    self.assertEqual(cfg.left_key, ('user_id', ))
+    self.assertEqual(cfg.right_key, ('user_id', ))
     self.assertEqual(cfg.lower_bound_sec, 0.0)
     self.assertEqual(cfg.upper_bound_sec, 900.0)
     self.assertEqual(cfg.join_type, 'inner')
@@ -81,8 +79,8 @@ class IntervalJoinConfigTest(unittest.TestCase):
         'upper_bound': '10m',
         'join_type': 'left',
     })
-    self.assertEqual(cfg.left_key, ('uid',))
-    self.assertEqual(cfg.right_key, ('customer_id',))
+    self.assertEqual(cfg.left_key, ('uid', ))
+    self.assertEqual(cfg.right_key, ('customer_id', ))
     self.assertEqual(cfg.lower_bound_sec, -60.0)
     self.assertEqual(cfg.upper_bound_sec, 600.0)
     self.assertEqual(cfg.join_type, 'left')
@@ -126,10 +124,9 @@ class IntervalJoinConfigTest(unittest.TestCase):
 
 class RecordExtractionTest(unittest.TestCase):
   """Tests key and timestamp extraction across rows, dicts, ISO strings, and epoch numbers."""
-
   def test_extract_key(self):
     d = {'user_id': 42, 'name': 'Alice'}
-    self.assertEqual(interval_join.extract_record_key(d, 'user_id'), (42,))
+    self.assertEqual(interval_join.extract_record_key(d, 'user_id'), (42, ))
 
   def test_extract_timestamp_epoch_sec(self):
     self.assertEqual(
@@ -143,10 +140,10 @@ class RecordExtractionTest(unittest.TestCase):
 
   def test_extract_timestamp_iso(self):
     iso_str = '2026-03-31T12:00:00Z'
-    expected = datetime.datetime(2026, 3, 31, 12, 0, 0, tzinfo=datetime.timezone.utc).timestamp()
+    expected = datetime.datetime(
+        2026, 3, 31, 12, 0, 0, tzinfo=datetime.timezone.utc).timestamp()
     self.assertEqual(
-        interval_join.extract_record_timestamp({'ts': iso_str}, 'ts'),
-        expected)
+        interval_join.extract_record_timestamp({'ts': iso_str}, 'ts'), expected)
 
   def test_extract_timestamp_datetime_obj(self):
     dt = datetime.datetime(2026, 3, 31, 12, 0, 0, tzinfo=datetime.timezone.utc)
@@ -166,7 +163,6 @@ class RecordExtractionTest(unittest.TestCase):
 
 class BoundedIntervalJoinAlgorithmTest(unittest.TestCase):
   """Tests in-memory join algorithm for inner, left, and full outer joins."""
-
   def setUp(self):
     self.cfg = interval_join.parse_interval_join_config({
         'key': 'user_id',
@@ -178,13 +174,23 @@ class BoundedIntervalJoinAlgorithmTest(unittest.TestCase):
     })
 
     self.left_records = [
-        {'user_id': 1, 'click_time': 1000, 'campaign': 'spring_sale'},
-        {'user_id': 2, 'click_time': 2000, 'campaign': 'summer_promo'},
+        {
+            'user_id': 1, 'click_time': 1000, 'campaign': 'spring_sale'
+        },
+        {
+            'user_id': 2, 'click_time': 2000, 'campaign': 'summer_promo'
+        },
     ]
     self.right_records = [
-        {'user_id': 1, 'order_time': 1050, 'amount': 49.99},  # match click 1 (+50s <= 900s)
-        {'user_id': 1, 'order_time': 2500, 'amount': 99.99},  # too late for click 1 (>900s)
-        {'user_id': 2, 'order_time': 1950, 'amount': 19.99},  # before click 2 (<0s)
+        {
+            'user_id': 1, 'order_time': 1050, 'amount': 49.99
+        },  # match click 1 (+50s <= 900s)
+        {
+            'user_id': 1, 'order_time': 2500, 'amount': 99.99
+        },  # too late for click 1 (>900s)
+        {
+            'user_id': 2, 'order_time': 1950, 'amount': 19.99
+        },  # before click 2 (<0s)
     ]
 
   def test_inner_join(self):
@@ -240,12 +246,20 @@ class BeamPipelineIntervalJoinTest(unittest.TestCase):
     from apache_beam.testing.util import equal_to
 
     left_data = [
-        {'uid': 'u1', 'click_ts': 1000, 'campaign': 'c1'},
-        {'uid': 'u2', 'click_ts': 5000, 'campaign': 'c2'},
+        {
+            'uid': 'u1', 'click_ts': 1000, 'campaign': 'c1'
+        },
+        {
+            'uid': 'u2', 'click_ts': 5000, 'campaign': 'c2'
+        },
     ]
     right_data = [
-        {'uid': 'u1', 'purchase_ts': 1200, 'rev': 50.0},
-        {'uid': 'u1', 'purchase_ts': 9999, 'rev': 20.0},
+        {
+            'uid': 'u1', 'purchase_ts': 1200, 'rev': 50.0
+        },
+        {
+            'uid': 'u1', 'purchase_ts': 9999, 'rev': 20.0
+        },
     ]
 
     with TestPipeline(runner='DirectRunner') as p:
@@ -268,20 +282,34 @@ class BeamPipelineIntervalJoinTest(unittest.TestCase):
 
 class SqlIntervalJoinTest(unittest.TestCase):
   """Tests in-memory SQLite and Beam SQL interval join queries."""
-
   def test_sqlite_interval_sql_execution(self):
     with tempfile.TemporaryDirectory() as tmpdir:
       clicks_file = os.path.join(tmpdir, 'clicks.jsonl')
       orders_file = os.path.join(tmpdir, 'orders.jsonl')
 
       with open(clicks_file, 'w', encoding='utf-8') as f:
-        f.write(json.dumps({'user_id': 101, 'click_time': 1000, 'ad': 'search'}) + '\n')
-        f.write(json.dumps({'user_id': 102, 'click_time': 2000, 'ad': 'display'}) + '\n')
+        f.write(
+            json.dumps({
+                'user_id': 101, 'click_time': 1000, 'ad': 'search'
+            }) + '\n')
+        f.write(
+            json.dumps({
+                'user_id': 102, 'click_time': 2000, 'ad': 'display'
+            }) + '\n')
 
       with open(orders_file, 'w', encoding='utf-8') as f:
-        f.write(json.dumps({'user_id': 101, 'order_time': 1060, 'total': 88.50}) + '\n')
-        f.write(json.dumps({'user_id': 101, 'order_time': 3000, 'total': 12.00}) + '\n')
-        f.write(json.dumps({'user_id': 102, 'order_time': 1900, 'total': 45.00}) + '\n')
+        f.write(
+            json.dumps({
+                'user_id': 101, 'order_time': 1060, 'total': 88.50
+            }) + '\n')
+        f.write(
+            json.dumps({
+                'user_id': 101, 'order_time': 3000, 'total': 12.00
+            }) + '\n')
+        f.write(
+            json.dumps({
+                'user_id': 102, 'order_time': 1900, 'total': 45.00
+            }) + '\n')
 
       named_sources = pipe_sql.parse_named_sources(
           [f'clicks={clicks_file}', f'orders={orders_file}'],
@@ -314,10 +342,16 @@ class SqlIntervalJoinTest(unittest.TestCase):
       alerts_file = os.path.join(tmpdir, 'alerts.jsonl')
 
       with open(events_file, 'w', encoding='utf-8') as f:
-        f.write(json.dumps({'device_id': 'd1', 'event_time': 1000, 'val': 99.2}) + '\n')
+        f.write(
+            json.dumps({
+                'device_id': 'd1', 'event_time': 1000, 'val': 99.2
+            }) + '\n')
 
       with open(alerts_file, 'w', encoding='utf-8') as f:
-        f.write(json.dumps({'device_id': 'd1', 'alert_time': 980, 'severity': 'HIGH'}) + '\n')
+        f.write(
+            json.dumps({
+                'device_id': 'd1', 'alert_time': 980, 'severity': 'HIGH'
+            }) + '\n')
 
       named_sources = pipe_sql.parse_named_sources(
           [f'events={events_file}', f'alerts={alerts_file}'],
@@ -406,14 +440,23 @@ class WatermarkSkewCircuitBreakerTest(unittest.TestCase):
         'max_watermark_skew': '15m',
     })
     left_records = [
-        {'user_id': 1, 'click_time': 1000.0, 'ad': 'valid'},
-        {'user_id': 1, 'click_time': 2000.0, 'ad': 'valid2'},
+        {
+            'user_id': 1, 'click_time': 1000.0, 'ad': 'valid'
+        },
+        {
+            'user_id': 1, 'click_time': 2000.0, 'ad': 'valid2'
+        },
     ]
     right_records = [
-        {'user_id': 1, 'order_time': 1060.0, 'total': 10.0},    # Skew = 60s <= 900s -> match
-        {'user_id': 1, 'order_time': 5000.0, 'total': 99.0},    # Skew = 3000s > 900s -> pruned by breaker
+        {
+            'user_id': 1, 'order_time': 1060.0, 'total': 10.0
+        },  # Skew = 60s <= 900s -> match
+        {
+            'user_id': 1, 'order_time': 5000.0, 'total': 99.0
+        },  # Skew = 3000s > 900s -> pruned by breaker
     ]
-    results = interval_join.join_bounded_records(left_records, right_records, cfg)
+    results = interval_join.join_bounded_records(
+        left_records, right_records, cfg)
     self.assertEqual(len(results), 1)
     self.assertEqual(results[0]['total'], 10.0)
     self.assertEqual(results[0]['ad'], 'valid')
@@ -435,10 +478,21 @@ class WatermarkSkewCircuitBreakerTest(unittest.TestCase):
 
     # Keyed stream elements: (key, (tag, timestamp, payload))
     stream_events = [
-        (('u1',), ('L', 1000.0, {'user_id': 'u1', 'click_time': 1000.0, 'ad': 'valid'})),
-        (('u1',), ('R', 1030.0, {'user_id': 'u1', 'order_time': 1030.0, 'total': 42.0})),
+        (('u1', ),
+         ('L', 1000.0, {
+             'user_id': 'u1', 'click_time': 1000.0, 'ad': 'valid'
+         })),
+        (('u1', ),
+         ('R', 1030.0, {
+             'user_id': 'u1', 'order_time': 1030.0, 'total': 42.0
+         })),
         # Excessively late event on L: arrives with t=500, but R watermark is already at 1030 (skew = 530s > 60s)
-        (('u1',), ('L', 500.0, {'user_id': 'u1', 'click_time': 500.0, 'ad': 'severely_late'})),
+        (('u1', ),
+         (
+             'L',
+             500.0, {
+                 'user_id': 'u1', 'click_time': 500.0, 'ad': 'severely_late'
+             })),
     ]
 
     with beam.Pipeline() as p:
@@ -446,8 +500,7 @@ class WatermarkSkewCircuitBreakerTest(unittest.TestCase):
           p
           | beam.Create(stream_events)
           | beam.ParDo(interval_join.IntervalJoinStatefulDoFn(cfg))
-          | beam.Map(lambda r: (r.user_id, r.ad, r.total))
-      )
+          | beam.Map(lambda r: (r.user_id, r.ad, r.total)))
       assert_that(results, equal_to([('u1', 'valid', 42.0)]))
 
   def test_stateful_streaming_non_finite_timestamp_dropped(self):
@@ -465,10 +518,26 @@ class WatermarkSkewCircuitBreakerTest(unittest.TestCase):
 
     # Keyed stream elements with NaN and inf timestamps mixed in with valid records
     stream_events = [
-        (('u1',), ('L', 1000.0, {'user_id': 'u1', 'click_time': 1000.0, 'ad': 'valid'})),
-        (('u1',), ('L', float('nan'), {'user_id': 'u1', 'click_time': float('nan'), 'ad': 'nan_ts'})),
-        (('u1',), ('R', float('inf'), {'user_id': 'u1', 'order_time': float('inf'), 'total': -1.0})),
-        (('u1',), ('R', 1030.0, {'user_id': 'u1', 'order_time': 1030.0, 'total': 42.0})),
+        (('u1', ),
+         ('L', 1000.0, {
+             'user_id': 'u1', 'click_time': 1000.0, 'ad': 'valid'
+         })),
+        (('u1', ),
+         (
+             'L',
+             float('nan'), {
+                 'user_id': 'u1', 'click_time': float('nan'), 'ad': 'nan_ts'
+             })),
+        (('u1', ),
+         (
+             'R',
+             float('inf'), {
+                 'user_id': 'u1', 'order_time': float('inf'), 'total': -1.0
+             })),
+        (('u1', ),
+         ('R', 1030.0, {
+             'user_id': 'u1', 'order_time': 1030.0, 'total': 42.0
+         })),
     ]
 
     with beam.Pipeline() as p:
@@ -935,6 +1004,166 @@ class CliPipeAndSqlIntervalJoinLoweringTest(unittest.TestCase):
       with open(out_path, encoding='utf-8') as f:
         got = [json.loads(line) for line in f if line.strip()]
       self.assertEqual(got, [{'uid': 1, 'total': 75.0}])
+
+
+class IntervalJoinProductionHardeningRegressionTest(unittest.TestCase):
+  def test_asymmetric_key_column_collision_prefixed_without_duplicate_schema_crash(
+      self):
+    import apache_beam as beam
+    from apache_beam.runners.portability.fn_api_runner import fn_runner
+    from apache_beam.testing.util import assert_that
+    from apache_beam.testing.util import equal_to
+
+    for force_st in (False, True):
+      with self.subTest(force_stateful=force_st):
+        p = beam.Pipeline(runner=fn_runner.FnApiRunner())
+        left_pc = p | 'L' >> beam.Create([
+            beam.Row(uid=101, click_time=1000, campaign='spring'),
+        ])
+        # Right stream joins on `customer_id`, AND also carries a non-key column
+        # named `uid` colliding with `left_key=('uid',)`!
+        right_pc = p | 'R' >> beam.Create([
+            beam.Row(
+                customer_id=101,
+                uid='right_other_uid',
+                order_time=1020,
+                amount=49.5),
+        ])
+        joined = {
+            'left': left_pc, 'right': right_pc
+        } | interval_join.CliIntervalJoin(
+            left_key='uid',
+            right_key='customer_id',
+            left_time='click_time',
+            right_time='order_time',
+            lower_bound='0s',
+            upper_bound='60s',
+            join_type='inner',
+            right_alias='ord',
+            force_stateful=force_st,
+        )
+        assert_that(
+            joined | beam.Map(lambda r: (r.uid, r.ord_uid, r.amount)),
+            equal_to([(101, 'right_other_uid', 49.5)]),
+        )
+        p.run().wait_until_finish()
+
+  def test_stream_tag_dofn_preserves_event_timestamp_and_guards_bounds(self):
+    import apache_beam as beam
+    from apache_beam.runners.portability.fn_api_runner import fn_runner
+    from apache_beam.testing.util import assert_that
+    from apache_beam.testing.util import equal_to
+
+    p = beam.Pipeline(runner=fn_runner.FnApiRunner())
+    left_pc = p | 'L' >> beam.Create([beam.Row(uid='u1', l_ts=1000, x=1)])
+    right_pc = p | 'R' >> beam.Create([beam.Row(uid='u1', r_ts=1025, y=2)])
+    joined = {
+        'left': left_pc, 'right': right_pc
+    } | interval_join.CliIntervalJoin(
+        key='uid',
+        left_time='l_ts',
+        right_time='r_ts',
+        lower_bound='0s',
+        upper_bound='60s',
+        join_type='inner',
+        force_stateful=True,
+    )
+    assert_that(
+        joined | beam.Map(
+            lambda r, ts=beam.DoFn.TimestampParam: float(ts) in
+            (1000.0, 1025.0)),
+        equal_to([True]),
+    )
+    p.run().wait_until_finish()
+
+    p_bad = beam.Pipeline(runner=fn_runner.FnApiRunner())
+    bad_l = p_bad | 'BadL' >> beam.Create([beam.Row(uid='u1', l_ts=1e30, x=1)])
+    bad_r = p_bad | 'BadR' >> beam.Create([beam.Row(uid='u1', r_ts=1000, y=2)])
+    res_bad = {
+        'left': bad_l, 'right': bad_r
+    } | interval_join.CliIntervalJoin(
+        key='uid',
+        left_time='l_ts',
+        right_time='r_ts',
+        lower_bound='0s',
+        upper_bound='60s',
+        join_type='inner',
+        force_stateful=True,
+        error_handling={'output': 'bad_ts'},
+    )
+    assert_that(
+        res_bad['bad_ts'] | beam.Map(lambda r: r.error_type),
+        equal_to(['ValueError']),
+    )
+    p_bad.run().wait_until_finish()
+
+  def test_stateful_join_skips_redundant_opposite_bag_state_rewrites(self):
+    class _TrackingBag:
+      def __init__(self, initial=()):
+        self._items = list(initial)
+        self.clear_calls = 0
+        self.add_calls = 0
+
+      def read(self):
+        return list(self._items)
+
+      def clear(self):
+        self.clear_calls += 1
+        self._items.clear()
+
+      def add(self, item):
+        self.add_calls += 1
+        self._items.append(item)
+
+    class _FakeValueState:
+      def __init__(self):
+        self._val = None
+
+      def read(self):
+        return self._val
+
+      def write(self, val):
+        self._val = val
+
+      def clear(self):
+        self._val = None
+
+    class _FakeTimer:
+      def set(self, _ts):
+        pass
+
+      def clear(self):
+        pass
+
+    cfg_inner = interval_join.parse_interval_join_config({
+        'key': 'uid',
+        'left_time': 'l_ts',
+        'right_time': 'r_ts',
+        'lower_bound': '0s',
+        'upper_bound': '60s',
+        'join_type': 'inner',
+    })
+    dofn = interval_join.IntervalJoinStatefulDoFn(cfg_inner, route_errors=False)
+    ckey = interval_join.encode_canonical_key_values(['u1'])
+    right_bag = _TrackingBag([(1010.0, '{"uid":"u1","r_ts":1010,"v":7}', False)
+                              ])
+    left_bag = _TrackingBag()
+    emitted = list(
+        dofn.process(
+            (ckey, ('L', 1000.0, {
+                'uid': 'u1', 'l_ts': 1000, 'x': 1
+            })),
+            elem_ts=1000.0,
+            left_buf=left_bag,
+            right_buf=right_bag,
+            timer=_FakeTimer(),
+            wm_state=_FakeValueState(),
+            next_gc=_FakeValueState(),
+        ))
+    self.assertEqual(len(emitted), 1)
+    # On `inner` join, `right_buf` entries' `matched` flag never changes, so
+    # `right_buf.clear()` must NOT be called!
+    self.assertEqual(right_bag.clear_calls, 0)
 
 
 if __name__ == '__main__':

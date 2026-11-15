@@ -103,6 +103,15 @@ options:
   project: config-project
   region: us-east1
   service_account_email: runner-sa@config-project.iam.gserviceaccount.com
+  subnetwork: regions/us-east1/subnetworks/prod-subnet
+  network: prod-vpc
+  temp_location: gs://config-project/tmp
+  staging_location: gs://config-project/staging
+  no_use_public_ips: true
+  worker_machine_type: n2-standard-4
+  max_num_workers: 16
+  num_workers: 4
+  enable_streaming_engine: true
 pipeline:
   transforms: []
 """)
@@ -124,10 +133,48 @@ pipeline:
 
     with open(out_file, 'r', encoding='utf-8') as f:
       content = f.read()
-      # Should inherit project and region from pipeline.yaml
+      ast.parse(content)
       self.assertIn('config-project', content)
       self.assertIn('us-east1', content)
       self.assertIn('runner-sa@config-project.iam.gserviceaccount.com', content)
+      self.assertIn('regions/us-east1/subnetworks/prod-subnet', content)
+      self.assertIn('prod-vpc', content)
+      self.assertIn('gs://config-project/tmp', content)
+      self.assertIn('gs://config-project/staging', content)
+      self.assertIn('WORKER_IP_PRIVATE', content)
+      self.assertIn('n2-standard-4', content)
+      self.assertIn("'maxWorkers': 16", content)
+      self.assertIn("'numWorkers': 4", content)
+      self.assertIn("'enableStreamingEngine': True", content)
+
+    # Explicit CLI arguments override YAML options
+    override_report = scheduler.run_export_schedule(
+        self.yaml_file,
+        schedule='@hourly',
+        orchestrator='composer',
+        subnetwork='regions/us-east1/subnetworks/override-subnet',
+        network='override-vpc',
+    )
+    self.assertIn('override-subnet', override_report.content)
+    self.assertIn('override-vpc', override_report.content)
+
+  def test_export_schedule_rejects_inline_credentials_and_tokens_in_params(self):
+    for bad_param in (
+        'source_uri=postgres://admin:s3cr3t@db.internal:5432/prod',
+        'endpoint=sk-proj-1234567890abcdef1234',
+        'header=ya29.a0AfH6SMBx1234567890',
+        'gkey=AIzaSyA12345678901234567890123456',
+        'repo=ghp_1234567890abcdef123456',
+        'model=hf_1234567890abcdef123456',
+    ):
+      with self.subTest(bad_param=bad_param):
+        with self.assertRaises(scheduler.SchedulerError):
+          scheduler.run_export_schedule(
+              self.yaml_file,
+              schedule='@daily',
+              orchestrator='composer',
+              parameters=[bad_param],
+          )
 
   def test_export_schedule_cloud_scheduler(self):
     out_file = os.path.join(self.tmp_dir, 'deploy.sh')

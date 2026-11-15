@@ -203,11 +203,16 @@ class ErgonomicsTest(unittest.TestCase):
     rows = env['untrusted_data']['rows']
     self.assertEqual([r['id'] for r in rows], [1])
 
-    # Unsupported SQL `LIKE` produces a targeted `--sql` hint
+    # Native SQL `LIKE` works in `--where`, while regex `RLIKE` hints `--sql`
     rc_like, env_like, _ = _run_cli_json(
         ['pipe', self.csv_path, '--where', "email LIKE '%@example.com'"])
-    self.assertEqual(rc_like, 2)
-    self.assertIn('--sql', env_like['error']['message'])
+    self.assertEqual(rc_like, 0)
+    self.assertGreaterEqual(len(env_like['untrusted_data']['rows']), 1)
+
+    rc_rlike, env_rlike, _ = _run_cli_json(
+        ['pipe', self.csv_path, '--where', "email RLIKE '.*@example\\.com'"])
+    self.assertEqual(rc_rlike, 2)
+    self.assertIn('--sql', env_rlike['error']['message'])
 
     # Misspelled column on fixed-schema CSV fails in <50ms with did-you-mean!
     rc_col, env_col, _ = _run_cli_json(

@@ -26,6 +26,7 @@ JARs and `~/.beam/maven-wrapper/` are shared between `beam-sql.sh` and
 `sort -V`.
 """
 
+import contextlib
 import json
 import os
 import re
@@ -34,9 +35,11 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
 from xml.sax.saxutils import escape as xml_escape
 
@@ -54,6 +57,7 @@ class SqlError(Exception):
 
 
 _MAIN_CLASS = 'org.apache.beam.sdk.extensions.sql.jdbc.BeamSqlLine'
+_WRAPPER_MAIN_CLASS = 'org.apache.maven.wrapper.MavenWrapperMain'
 
 # Supported runners and the extra Maven dependency each needs, matching
 # `scripts/beam-sql.sh`. DirectRunner is already a transitive dependency of
@@ -64,6 +68,51 @@ _RUNNER_ARTIFACTS = {
 }
 
 _VALID_ARTIFACT_PART = re.compile(r'^[a-z0-9][a-z0-9._-]*$')
+
+
+def _is_valid_jar(jar_path: str) -> bool:
+  return (
+      os.path.isfile(jar_path) and not os.path.islink(jar_path) and
+      zipfile.is_zipfile(jar_path))
+
+
+@contextlib.contextmanager
+def _file_lock(lock_path: str):
+  lock_dir = os.path.dirname(os.path.abspath(lock_path)) or '.'
+  os.makedirs(lock_dir, mode=0o700, exist_ok=True)
+  fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+  try:
+    if os.name == 'nt':
+      import msvcrt
+      os.lseek(fd, 0, os.SEEK_SET)
+      try:
+        if os.fstat(fd).st_size == 0:
+          os.write(fd, b'\0')
+          os.lseek(fd, 0, os.SEEK_SET)
+      except OSError:
+        pass
+      while True:
+        try:
+          msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+          break
+        except OSError:
+          time.sleep(0.05)
+    else:
+      import fcntl
+      fcntl.flock(fd, fcntl.LOCK_EX)
+    yield
+  finally:
+    try:
+      if os.name == 'nt':
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+      else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+      pass
+    os.close(fd)
 
 
 def _installed_beam_version() -> str:
@@ -117,18 +166,19 @@ def run(
   jar_path = os.path.join(
       cache_dir, _cache_filename(resolved_version, runner_key, clean_ios))
 
-  if os.path.isfile(jar_path) and not os.path.islink(jar_path):
+  if _is_valid_jar(jar_path):
     print(f'Using cached Beam SQL JAR: {jar_path}', file=sys.stderr)
   else:
-    mvnw = _ensure_maven_wrapper(home)
+    wrapper_jar = _ensure_maven_wrapper(home)
     _build_shaded_jar(
-        mvnw=mvnw,
+        wrapper_jar,
         java_home=java_home,
         version=resolved_version,
         runner_key=runner_key,
         ios=clean_ios,
         jar_path=jar_path,
-        debug=debug)
+        debug=debug,
+        java_bin=java_bin)
 
   cmd = [java_bin, '-cp', jar_path, _MAIN_CLASS, *sqlline_args]
   if debug:
@@ -213,12 +263,17 @@ def _find_java():
   `shutil.which('java')` alone is not enough: on macOS `/usr/bin/java` is an OS
   stub that exits non-zero when no JDK is installed.
   """
+  java_exe = 'java.exe' if os.name == 'nt' else 'java'
   env_home = os.environ.get('JAVA_HOME', '').strip()
   if env_home:
-    java_bin = os.path.join(env_home, 'bin', 'java')
+    java_bin = os.path.join(env_home, 'bin', java_exe)
+    if not os.path.isfile(java_bin) and os.name == 'nt':
+      fallback_bin = os.path.join(env_home, 'bin', 'java')
+      if os.path.isfile(fallback_bin):
+        java_bin = fallback_bin
     if not os.path.isfile(java_bin):
       raise SqlError(
-          f'JAVA_HOME={env_home!r} does not contain bin/java; '
+          f'JAVA_HOME={env_home!r} does not contain bin/{java_exe}; '
           'Beam SQL requires Java 11 or newer',
           _EXIT_MISSING_DEPENDENCY)
   else:
@@ -278,10 +333,6 @@ _DEFAULT_ICEBERG_VERSION = '1.12.0'
 _DEFAULT_BIGDATAOSS_GCS_CONNECTOR_VERSION = '4.0.4'
 _APACHE_SNAPSHOT_REPOSITORY_URL = (
     'https://repository.apache.org/content/repositories/snapshots/')
-_MAVEN_WRAPPER_SCRIPT_URL = (
-    'https://raw.githubusercontent.com/apache/maven-wrapper/refs/tags/'
-    f'maven-wrapper-{_MAVEN_WRAPPER_VERSION}/maven-wrapper-distribution/'
-    'src/resources/mvnw')
 _MAVEN_WRAPPER_JAR_URL = (
     'https://repo.maven.apache.org/maven2/org/apache/maven/wrapper/'
     f'maven-wrapper/{_MAVEN_WRAPPER_VERSION}/'
@@ -291,32 +342,55 @@ _MAVEN_DISTRIBUTION_URL = (
     f'{_MAVEN_VERSION}/apache-maven-{_MAVEN_VERSION}-bin.zip')
 
 
+def _atomic_write_props(props_path: str, content: str) -> None:
+  props_dir = os.path.dirname(os.path.abspath(props_path)) or '.'
+  os.makedirs(props_dir, mode=0o700, exist_ok=True)
+  fd, tmp_path = tempfile.mkstemp(
+      prefix='.tmp_props_', suffix='.part', dir=props_dir)
+  try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+      f.write(content)
+    os.replace(tmp_path, props_path)
+  finally:
+    if os.path.exists(tmp_path):
+      try:
+        os.remove(tmp_path)
+      except OSError:
+        pass
+
+
 def _ensure_maven_wrapper(beam_home):
-  """Returns cached `~/.beam/maven-wrapper/mvnw`, downloading it once."""
+  """Returns cached `maven-wrapper.jar` path, downloading it once safely."""
   wrapper_dir = os.path.join(beam_home, 'maven-wrapper')
   if os.path.islink(wrapper_dir):
     raise SqlError(
         f'refusing symlinked Maven Wrapper directory {wrapper_dir!r}',
         _EXIT_USAGE)
-  mvnw = os.path.join(wrapper_dir, 'mvnw')
   wrapper_jar = os.path.join(
       wrapper_dir, '.mvn', 'wrapper', 'maven-wrapper.jar')
   wrapper_props = os.path.join(
       wrapper_dir, '.mvn', 'wrapper', 'maven-wrapper.properties')
+  lock_path = os.path.join(beam_home, '.maven-wrapper.lock')
 
-  if (os.path.isfile(mvnw) and not os.path.islink(mvnw) and
-      os.path.isfile(wrapper_jar) and not os.path.islink(wrapper_jar) and
-      os.path.isfile(wrapper_props)):
-    return mvnw
+  with _file_lock(lock_path):
+    if (_is_valid_jar(wrapper_jar) and os.path.isfile(wrapper_props) and
+        not os.path.islink(wrapper_props)):
+      return wrapper_jar
 
-  print(f'Downloading Maven Wrapper into {wrapper_dir}...', file=sys.stderr)
-  os.makedirs(os.path.dirname(wrapper_jar), mode=0o700, exist_ok=True)
-  with open(wrapper_props, 'w', encoding='utf-8') as f:
-    f.write(f'distributionUrl={_MAVEN_DISTRIBUTION_URL}\n')
-  _download_https(_MAVEN_WRAPPER_SCRIPT_URL, mvnw)
-  _download_https(_MAVEN_WRAPPER_JAR_URL, wrapper_jar)
-  os.chmod(mvnw, 0o755)
-  return mvnw
+    print(f'Downloading Maven Wrapper into {wrapper_dir}...', file=sys.stderr)
+    os.makedirs(os.path.dirname(wrapper_jar), mode=0o700, exist_ok=True)
+    _atomic_write_props(
+        wrapper_props, f'distributionUrl={_MAVEN_DISTRIBUTION_URL}\n')
+    _download_https(_MAVEN_WRAPPER_JAR_URL, wrapper_jar)
+    if not _is_valid_jar(wrapper_jar):
+      try:
+        os.remove(wrapper_jar)
+      except OSError:
+        pass
+      raise SqlError(
+          f'downloaded Maven Wrapper JAR at {wrapper_jar} is corrupt',
+          _EXIT_FAILED)
+    return wrapper_jar
 
 
 class _HttpsOnlyRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -496,65 +570,94 @@ def _render_pom(version, runner_key, ios):
 
 
 def _build_shaded_jar(
-    mvnw, java_home, version, runner_key, ios, jar_path, debug):
+    wrapper_jar,
+    java_home,
+    version,
+    runner_key,
+    ios,
+    jar_path,
+    debug,
+    *,
+    java_bin=None):
   """Builds the Beam SQL shaded uber-JAR and caches it atomically."""
-  io_desc = f', ios: {", ".join(ios)}' if ios else ''
-  print(
-      f'Building Beam SQL v{version} JAR (runner: {runner_key}{io_desc}); '
-      'this takes a moment on first run...',
-      file=sys.stderr)
-  env = os.environ.copy()
-  env['JAVA_HOME'] = java_home
+  lock_path = f'{jar_path}.lock'
+  with _file_lock(lock_path):
+    if _is_valid_jar(jar_path):
+      print(f'Using cached Beam SQL JAR: {jar_path}', file=sys.stderr)
+      return
 
-  with tempfile.TemporaryDirectory() as work_dir:
-    pom_path = os.path.join(work_dir, 'pom.xml')
-    with open(pom_path, 'w', encoding='utf-8') as f:
-      f.write(_render_pom(version, runner_key, ios))
+    io_desc = f', ios: {", ".join(ios)}' if ios else ''
+    print(
+        f'Building Beam SQL v{version} JAR (runner: {runner_key}{io_desc}); '
+        'this takes a moment on first run...',
+        file=sys.stderr)
+    env = os.environ.copy()
+    env['JAVA_HOME'] = java_home
 
-    cmd = [mvnw, '-f', pom_path]
-    if not debug:
-      cmd.append('-q')
-    cmd.extend(['--batch-mode', 'package'])
-    if debug:
-      print('+ ' + ' '.join(cmd), file=sys.stderr)
-      proc = subprocess.run(cmd, env=env, check=False)
-      details = ''
-    else:
-      proc = subprocess.run(
-          cmd, env=env, capture_output=True, text=True, check=False)
-      details = (proc.stderr or proc.stdout or '').strip()
+    java_exe = 'java.exe' if os.name == 'nt' else 'java'
+    resolved_java = java_bin or os.path.join(java_home, 'bin', java_exe)
+    abs_wrapper = os.path.abspath(wrapper_jar)
+    # `<beam_home>/maven-wrapper/.mvn/wrapper/maven-wrapper.jar` -> `<beam_home>/maven-wrapper`
+    wrapper_dir = os.path.dirname(os.path.dirname(os.path.dirname(abs_wrapper)))
 
-    built_jar = os.path.join(
-        work_dir, 'target', 'beam-sql-shell-runner-1.0.jar')
-    if proc.returncode != 0 or not os.path.isfile(built_jar):
-      if 'Could not find artifact org.apache.beam:' in details:
+    with tempfile.TemporaryDirectory() as work_dir:
+      pom_path = os.path.join(work_dir, 'pom.xml')
+      with open(pom_path, 'w', encoding='utf-8') as f:
+        f.write(_render_pom(version, runner_key, ios))
+
+      cmd = [
+          resolved_java,
+          f'-Dmaven.multiModuleProjectDirectory={wrapper_dir}',
+          '-cp',
+          wrapper_jar,
+          _WRAPPER_MAIN_CLASS,
+          '-f',
+          pom_path,
+      ]
+      if not debug:
+        cmd.append('-q')
+      cmd.extend(['--batch-mode', 'package'])
+      if debug:
+        print('+ ' + ' '.join(cmd), file=sys.stderr)
+        proc = subprocess.run(cmd, env=env, check=False)
+        details = ''
+      else:
+        proc = subprocess.run(
+            cmd, env=env, capture_output=True, text=True, check=False)
+        details = (proc.stderr or proc.stdout or '').strip()
+
+      built_jar = os.path.join(
+          work_dir, 'target', 'beam-sql-shell-runner-1.0.jar')
+      if proc.returncode != 0 or not _is_valid_jar(built_jar):
+        if 'Could not find artifact org.apache.beam:' in details:
+          raise SqlError(
+              f'Maven could not resolve a Beam {version} artifact:\n'
+              f'  {details.splitlines()[-1]}\n'
+              '  check --version (`beam sql --list-versions`) and --io '
+              '(`beam sql --list-ios`)',
+              _EXIT_USAGE)
+        suffix = f':\n{details}' if details else ''
         raise SqlError(
-            f'Maven could not resolve a Beam {version} artifact:\n'
-            f'  {details.splitlines()[-1]}\n'
-            '  check --version (`beam sql --list-versions`) and --io '
-            '(`beam sql --list-ios`)',
-            _EXIT_USAGE)
-      suffix = f':\n{details}' if details else ''
-      raise SqlError(
-          f'Maven build for Beam SQL JAR failed{suffix}', _EXIT_FAILED)
+            f'Maven build for Beam SQL JAR failed{suffix}', _EXIT_FAILED)
 
-    # Atomic replace inside the cache directory so Ctrl-C never leaves a
-    # truncated JAR that a later run would mistake for a valid cache hit.
-    jar_dir = os.path.dirname(os.path.abspath(jar_path)) or '.'
-    os.makedirs(jar_dir, mode=0o700, exist_ok=True)
-    fd, tmp_jar = tempfile.mkstemp(prefix='.tmp_jar_', suffix='.part', dir=jar_dir)
-    os.close(fd)
-    try:
-      shutil.copyfile(built_jar, tmp_jar)
-      os.replace(tmp_jar, jar_path)
-    finally:
-      if os.path.exists(tmp_jar):
-        try:
-          os.remove(tmp_jar)
-        except OSError:
-          pass
+      # Atomic replace inside the cache directory so Ctrl-C never leaves a
+      # truncated JAR that a later run would mistake for a valid cache hit.
+      jar_dir = os.path.dirname(os.path.abspath(jar_path)) or '.'
+      os.makedirs(jar_dir, mode=0o700, exist_ok=True)
+      fd, tmp_jar = tempfile.mkstemp(
+          prefix='.tmp_jar_', suffix='.part', dir=jar_dir)
+      os.close(fd)
+      try:
+        shutil.copyfile(built_jar, tmp_jar)
+        os.replace(tmp_jar, jar_path)
+      finally:
+        if os.path.exists(tmp_jar):
+          try:
+            os.remove(tmp_jar)
+          except OSError:
+            pass
 
-  print(f'Cached Beam SQL JAR at {jar_path}', file=sys.stderr)
+    print(f'Cached Beam SQL JAR at {jar_path}', file=sys.stderr)
 
 
 _METADATA_URL = (

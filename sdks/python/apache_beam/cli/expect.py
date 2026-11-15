@@ -43,7 +43,8 @@ Key capabilities:
 from __future__ import annotations
 
 import ast
-import re
+import datetime
+import keyword
 from typing import Any
 from typing import NamedTuple
 
@@ -58,6 +59,7 @@ _SAFE_BUILTINS: dict[str, Any] = {
     'max': max,
     'min': min,
     'round': round,
+    'set': set,
     'str': str,
     'tuple': tuple,
     'dict': dict,
@@ -184,14 +186,24 @@ def _validate_expectation_ast(expr: str) -> ast.Expression:
     raise ValueError(
         'Expectation expression exceeds maximum AST node count (128)')
 
+  valid_col_calls: set[int] = set()
+  for node in nodes:
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and
+        node.func.id == '_cli_exp_col' and not node.keywords and
+        len(node.args) == 1 and isinstance(node.args[0], ast.Constant) and
+        isinstance(node.args[0].value, str) and node.args[0].value and
+        not node.args[0].value.startswith('_')):
+      valid_col_calls.add(id(node.func))
+
   for node in nodes:
     if not isinstance(node, _ALLOWED_EXPECT_AST_NODES):
       raise ValueError(
           f'Disallowed construct {type(node).__name__} in expectation {expr!r}')
     if isinstance(node, ast.Name) and node.id.startswith('_'):
-      raise ValueError(
-          f'Underscore-prefixed identifier {node.id!r} is disallowed in expectation'
-      )
+      if id(node) not in valid_col_calls:
+        raise ValueError(
+            f'Underscore-prefixed identifier {node.id!r} is disallowed in '
+            'expectation')
     if isinstance(node, ast.Attribute):
       if node.attr.startswith('_') or node.attr in ('format', 'format_map'):
         raise ValueError(
@@ -207,15 +219,16 @@ def _validate_expectation_ast(expr: str) -> ast.Expression:
         raise ValueError(
             f'Keyword arguments are disallowed in expectation {expr!r}')
       if isinstance(node.func, ast.Name):
-        if node.func.id not in _SAFE_CALL_NAMES:
+        if (node.func.id not in _SAFE_CALL_NAMES and
+            id(node.func) not in valid_col_calls):
           raise ValueError(
-              f'Disallowed function call {node.func.id!r} in expectation {expr!r}'
-          )
+              f'Disallowed function call {node.func.id!r} in expectation '
+              f'{expr!r}')
       elif isinstance(node.func, ast.Attribute):
         if node.func.attr not in _SAFE_STR_METHODS:
           raise ValueError(
-              f'Disallowed method call {node.func.attr!r} in expectation {expr!r}'
-          )
+              f'Disallowed method call {node.func.attr!r} in expectation '
+              f'{expr!r}')
       else:
         raise ValueError(f'Disallowed dynamic call in expectation {expr!r}')
   return parsed
@@ -235,16 +248,60 @@ class ExpectationRule(NamedTuple):
   on_violation: str = 'dlq'
 
 
-def _sql_like_fn(val: Any, pattern: Any) -> bool | None:
-  """Linear/quadratic two-pointer SQL LIKE matcher (zero regex ReDoS)."""
+_EPOCH_UTC = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+_ONE_MICROSECOND = datetime.timedelta(microseconds=1)
+
+
+def _is_temporal_value(val: Any) -> bool:
+  if isinstance(val, (datetime.datetime, datetime.date)):
+    return True
+  micros = getattr(val, 'micros', None)
+  return isinstance(micros, int) and not isinstance(micros, bool)
+
+
+def _coerce_temporal_epoch_us(val: Any, *, allow_str: bool = False) -> int | None:
+  """Converts a `datetime`, `date`, Beam `Timestamp`, or ISO `str` to UTC us."""
+  micros = getattr(val, 'micros', None)
+  if isinstance(micros, int) and not isinstance(micros, bool):
+    return micros
+  if isinstance(val, datetime.datetime):
+    dt = (
+        val.replace(tzinfo=datetime.timezone.utc)
+        if val.tzinfo is None else val.astimezone(datetime.timezone.utc))
+    return (dt - _EPOCH_UTC) // _ONE_MICROSECOND
+  if isinstance(val, datetime.date):
+    dt = datetime.datetime(
+        val.year, val.month, val.day, tzinfo=datetime.timezone.utc)
+    return (dt - _EPOCH_UTC) // _ONE_MICROSECOND
+  if allow_str and isinstance(val, str):
+    s = val.strip()
+    if not s or len(s) > 128:
+      return None
+    if s.endswith(('Z', 'z')):
+      s = s[:-1] + '+00:00'
+    try:
+      dt = datetime.datetime.fromisoformat(s)
+      return _coerce_temporal_epoch_us(dt, allow_str=False)
+    except ValueError:
+      try:
+        d = datetime.date.fromisoformat(s)
+        return _coerce_temporal_epoch_us(d, allow_str=False)
+      except ValueError:
+        return None
+  return None
+
+
+def _sql_like_core(val: Any, pattern: Any, *, case_insensitive: bool = False) -> bool | None:
+  """Bounded NFA SQL LIKE / ILIKE matcher (zero regex ReDoS)."""
   if val is None or pattern is None:
     return None
   s = str(val)
   raw_p = str(pattern)
   if len(s) > 65536 or len(raw_p) > 4096:
     return False
-  # Tokenize pattern into ('*', '') | ('?', '') | ('L', char) with `\` escape,
-  # collapsing consecutive `%` wildcards.
+  if case_insensitive:
+    s = s.lower()
+    raw_p = raw_p.lower()
   ptoks: list[tuple[str, str]] = []
   idx = 0
   plen = len(raw_p)
@@ -290,6 +347,14 @@ def _sql_like_fn(val: Any, pattern: Any) -> bool | None:
   return pi == ntoks
 
 
+def _sql_like_fn(val: Any, pattern: Any) -> bool | None:
+  return _sql_like_core(val, pattern, case_insensitive=False)
+
+
+def _sql_ilike_fn(val: Any, pattern: Any) -> bool | None:
+  return _sql_like_core(val, pattern, case_insensitive=True)
+
+
 def _exp_mul(a: Any, b: Any) -> Any:
   if a is None or b is None:
     return None
@@ -325,6 +390,15 @@ def _exp_or(vals: list[Any]) -> bool | None:
   return None if saw_none else False
 
 
+def _values_eq_3vl(lhs: Any, rhs: Any) -> bool:
+  if _is_temporal_value(lhs) or _is_temporal_value(rhs):
+    us_l = _coerce_temporal_epoch_us(lhs, allow_str=True)
+    us_r = _coerce_temporal_epoch_us(rhs, allow_str=True)
+    if us_l is not None and us_r is not None:
+      return us_l == us_r
+  return bool(lhs == rhs)
+
+
 def _exp_cmp(op_name: str, lhs: Any, rhs: Any) -> bool | None:
   if op_name == 'is':
     return lhs is rhs
@@ -343,13 +417,18 @@ def _exp_cmp(op_name: str, lhs: Any, rhs: Any) -> bool | None:
       for item in rhs:
         if item is None:
           saw_null = True
-        elif lhs == item:
+        elif _values_eq_3vl(lhs, item):
           matched = True
           break
       res = True if matched else (None if saw_null else False)
     return _exp_not(res) if op_name == 'not_in' else res
   if rhs is None:
     return None
+  if _is_temporal_value(lhs) or _is_temporal_value(rhs):
+    us_l = _coerce_temporal_epoch_us(lhs, allow_str=True)
+    us_r = _coerce_temporal_epoch_us(rhs, allow_str=True)
+    if us_l is not None and us_r is not None:
+      lhs, rhs = us_l, us_r
   if op_name == 'eq':
     return lhs == rhs
   if op_name == 'ne':
@@ -366,7 +445,7 @@ def _exp_cmp(op_name: str, lhs: Any, rhs: Any) -> bool | None:
 
 
 class _Expect3VLTransformer(ast.NodeTransformer):
-  """Rewrites expectation AST to enforce SQL 3VL on NULLs and block sequence `*`."""
+  """Rewrites expectation AST for lazy short-circuiting SQL 3VL and safety."""
 
   _CMP_MAP = {
       ast.Eq: 'eq',
@@ -381,40 +460,150 @@ class _Expect3VLTransformer(ast.NodeTransformer):
       ast.NotIn: 'not_in',
   }
 
+  def __init__(self) -> None:
+    self._temp_idx = 0
+
+  def _temp(self) -> str:
+    self._temp_idx += 1
+    return f'_cli_exp_t{self._temp_idx}'
+
+  def _null_safe(self, operands: list[ast.expr], build) -> ast.expr:
+    tests: list[ast.expr] = []
+    refs: list[ast.expr] = []
+    for operand in operands:
+      if isinstance(operand, ast.Constant):
+        if operand.value is None:
+          return ast.Constant(value=None)
+        refs.append(operand)
+        continue
+      name = self._temp()
+      tests.append(
+          ast.Compare(
+              left=ast.NamedExpr(
+                  target=ast.Name(id=name, ctx=ast.Store()), value=operand),
+              ops=[ast.Is()],
+              comparators=[ast.Constant(value=None)]))
+      refs.append(ast.Name(id=name, ctx=ast.Load()))
+    body = build(*refs)
+    if not tests:
+      return body
+    test = (
+        tests[0] if len(tests) == 1 else ast.BoolOp(op=ast.Or(), values=tests))
+    return ast.IfExp(test=test, body=ast.Constant(value=None), orelse=body)
+
+  def _lazy_bool3(self, is_and: bool, values: list[ast.expr]) -> ast.expr:
+    """Builds lazy short-circuiting SQL 3VL `and`/`or` via `IfExp`+`NamedExpr`."""
+    names = [self._temp() for _ in values]
+    decided = ast.Constant(value=not is_and)
+    none_checks = [
+        ast.Compare(
+            left=ast.Name(id=n, ctx=ast.Load()),
+            ops=[ast.Is()],
+            comparators=[ast.Constant(value=None)]) for n in names
+    ]
+    none_test = (
+        none_checks[0] if len(none_checks) == 1 else ast.BoolOp(
+            op=ast.Or(), values=none_checks))
+    expr: ast.expr = ast.IfExp(
+        test=none_test,
+        body=ast.Constant(value=None),
+        orelse=ast.Constant(value=is_and))
+    for name, val in reversed(list(zip(names, values))):
+      bound = ast.NamedExpr(
+          target=ast.Name(id=name, ctx=ast.Store()), value=val)
+      truth: ast.expr = ast.Name(id=name, ctx=ast.Load())
+      if is_and:
+        truth = ast.UnaryOp(op=ast.Not(), operand=truth)
+      test = ast.BoolOp(
+          op=ast.And(),
+          values=[
+              ast.Compare(
+                  left=bound,
+                  ops=[ast.IsNot()],
+                  comparators=[ast.Constant(value=None)]),
+              truth,
+          ])
+      expr = ast.IfExp(test=test, body=decided, orelse=expr)
+    return expr
+
   def visit_BinOp(self, node: ast.BinOp) -> ast.AST:
-    self.generic_visit(node)
+    left = self.visit(node.left)
+    right = self.visit(node.right)
     if isinstance(node.op, ast.Mult):
-      return ast.Call(
-          func=ast.Name(id='_cli_exp_mul', ctx=ast.Load()),
-          args=[node.left, node.right],
-          keywords=[])
-    return node
+      return self._null_safe(
+          [left, right],
+          lambda a, b: ast.Call(
+              func=ast.Name(id='_cli_exp_mul', ctx=ast.Load()),
+              args=[a, b],
+              keywords=[]))
+    op = node.op
+    return self._null_safe(
+        [left, right], lambda a, b: ast.BinOp(left=a, op=op, right=b))
 
   def visit_UnaryOp(self, node: ast.UnaryOp) -> ast.AST:
-    self.generic_visit(node)
+    operand = self.visit(node.operand)
     if isinstance(node.op, ast.Not):
       return ast.Call(
           func=ast.Name(id='_cli_exp_not', ctx=ast.Load()),
-          args=[node.operand],
+          args=[operand],
           keywords=[])
-    return node
+    if isinstance(operand, ast.Constant):
+      return ast.UnaryOp(op=node.op, operand=operand)
+    op = node.op
+    return self._null_safe([operand], lambda v: ast.UnaryOp(op=op, operand=v))
+
+  def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
+    val = self.visit(node.value)
+    attr = node.attr
+    return self._null_safe(
+        [val], lambda v: ast.Attribute(value=v, attr=attr, ctx=ast.Load()))
+
+  def visit_Call(self, node: ast.Call) -> ast.AST:
+    if isinstance(node.func, ast.Attribute):
+      recv = self.visit(node.func.value)
+      args = [self.visit(a) for a in node.args]
+      method = node.func.attr
+      return self._null_safe(
+          [recv],
+          lambda v: ast.Call(
+              func=ast.Attribute(value=v, attr=method, ctx=ast.Load()),
+              args=args,
+              keywords=[]))
+    if isinstance(node.func, ast.Name):
+      fn = node.func.id
+      args = [self.visit(a) for a in node.args]
+      if fn in ('int', 'float', 'abs', 'round', 'str') and args:
+        rest = args[1:]
+        return self._null_safe(
+            [args[0]],
+            lambda v: ast.Call(
+                func=ast.Name(id=fn, ctx=ast.Load()),
+                args=[v, *rest],
+                keywords=[]))
+      return ast.Call(
+          func=ast.Name(id=fn, ctx=ast.Load()), args=args, keywords=[])
+    return self.generic_visit(node)
 
   def visit_BoolOp(self, node: ast.BoolOp) -> ast.AST:
-    self.generic_visit(node)
-    fn_id = '_cli_exp_and' if isinstance(node.op, ast.And) else '_cli_exp_or'
-    return ast.Call(
-        func=ast.Name(id=fn_id, ctx=ast.Load()),
-        args=[ast.List(elts=node.values, ctx=ast.Load())],
-        keywords=[])
+    visited_vals = [self.visit(v) for v in node.values]
+    return self._lazy_bool3(isinstance(node.op, ast.And), visited_vals)
 
   def visit_Compare(self, node: ast.Compare) -> ast.AST:
-    self.generic_visit(node)
+    left_v = self.visit(node.left)
+    comp_vs = [self.visit(c) for c in node.comparators]
     parts: list[ast.expr] = []
-    cur_left = node.left
-    for op, comp in zip(node.ops, node.comparators):
+    cur_left = left_v
+    for op, comp in zip(node.ops, comp_vs):
       op_str = self._CMP_MAP.get(type(op))
       if op_str is None:
         return node
+      is_none_const = lambda n: isinstance(n, ast.Constant) and n.value is None
+      if op_str in ('eq', 'ne') and (is_none_const(cur_left) or
+                                     is_none_const(comp)):
+        op_str = 'is' if op_str == 'eq' else 'is_not'
+      if op_str in ('in', 'not_in') and isinstance(comp, ast.Constant) and not (
+          comp.value is None):
+        comp = ast.Tuple(elts=[comp], ctx=ast.Load())
       parts.append(
           ast.Call(
               func=ast.Name(id='_cli_exp_cmp', ctx=ast.Load()),
@@ -423,10 +612,7 @@ class _Expect3VLTransformer(ast.NodeTransformer):
       cur_left = comp
     if len(parts) == 1:
       return parts[0]
-    return ast.Call(
-        func=ast.Name(id='_cli_exp_and', ctx=ast.Load()),
-        args=[ast.List(elts=parts, ctx=ast.Load())],
-        keywords=[])
+    return self._lazy_bool3(True, parts)
 
 
 _SAFE_BUILTINS.update({
@@ -438,6 +624,7 @@ _SAFE_BUILTINS.update({
     'upper': lambda s: None if s is None else str(s).upper(),
     'strip': lambda s: None if s is None else str(s).strip(),
     'sql_like': _sql_like_fn,
+    'sql_ilike': _sql_ilike_fn,
     '_cli_exp_mul': _exp_mul,
     '_cli_exp_not': _exp_not,
     '_cli_exp_and': _exp_and,
@@ -445,7 +632,7 @@ _SAFE_BUILTINS.update({
     '_cli_exp_cmp': _exp_cmp,
 })
 _SAFE_CALL_NAMES = _SAFE_CALL_NAMES | frozenset(
-    ['ifnull', 'trim', 'length', 'sql_like'])
+    ['ifnull', 'trim', 'length', 'sql_like', 'sql_ilike'])
 
 _EXPECT_CAST_MAP: dict[str, str] = {
     'int': 'int',
@@ -483,48 +670,129 @@ def _join_expect_pieces(pieces: list[str]) -> str:
   return ''.join(joined)
 
 
-def _pop_trailing_atom(out: list[str]) -> str:
-  """Pops a complete trailing primary atom (`a`, `a.b`, `a.lower()`, `(x)`) from `out`."""
+_LHS_STOP_TOKENS = frozenset([
+    'and',
+    'or',
+    'not',
+    ',',
+    '(',
+    '[',
+    '==',
+    '!=',
+    '<',
+    '<=',
+    '>',
+    '>=',
+    'in',
+    'is',
+    'if',
+    'else',
+])
+
+
+def _pop_trailing_value_expr(out: list[str]) -> str:
+  """Pops the LHS value expression preceding `[NOT] LIKE/ILIKE/BETWEEN`."""
   picked: list[str] = []
+  depth = 0
   while out:
-    tok = out.pop()
+    tok = out[-1]
+    if depth == 0 and tok in _LHS_STOP_TOKENS:
+      break
+    out.pop()
     picked.append(tok)
     if tok in (')', ']'):
-      open_tok = '(' if tok == ')' else '['
-      depth = 1
-      while out and depth > 0:
-        t2 = out.pop()
-        picked.append(t2)
-        if t2 == tok:
-          depth += 1
-        elif t2 == open_tok:
-          depth -= 1
-      # Include optional callable/attribute prefix before `(` / `[`
-      while out and (out[-1] == '.' or out[-1].isidentifier()):
-        picked.append(out.pop())
-      break
-    if out and out[-1] == '.':
-      picked.append(out.pop())
-      continue
-    break
+      depth += 1
+    elif tok in ('(', '['):
+      depth -= 1
+      if depth < 0:
+        out.append(picked.pop())
+        break
   picked.reverse()
   return _join_expect_pieces(picked)
 
 
+def _scan_value_operand(
+    toks: list[tuple[int, str]],
+    start: int,
+    *,
+    stop_on_and: bool = True,
+) -> tuple[list[tuple[int, str]], int]:
+  """Scans a value operand up to the next top-level boolean boundary."""
+  import tokenize
+  depth = 0
+  j = start
+  n = len(toks)
+  stop_names = {'OR', 'IF', 'ELSE'} | ({'AND'} if stop_on_and else set())
+  while j < n:
+    jt, jv = toks[j]
+    if jt == tokenize.OP and jv in ('(', '[', '{'):
+      depth += 1
+    elif jt == tokenize.OP and jv in (')', ']', '}'):
+      if depth == 0:
+        break
+      depth -= 1
+    elif depth == 0:
+      if jt == tokenize.OP and jv == ',':
+        break
+      if jt == tokenize.NAME and jv.upper() in stop_names:
+        break
+    j += 1
+  return toks[start:j], j
+
+
+def _replace_backticks_outside_strings(raw: str) -> str:
+  """Rewrites `` `col` `` into plain identifier or `_cli_exp_col('col')`."""
+  out: list[str] = []
+  quote: str | None = None
+  escaped = False
+  i = 0
+  n = len(raw)
+  while i < n:
+    ch = raw[i]
+    if quote is not None:
+      out.append(ch)
+      if escaped:
+        escaped = False
+      elif ch == '\\':
+        escaped = True
+      elif ch == quote:
+        quote = None
+      i += 1
+      continue
+    if ch in ("'", '"'):
+      quote = ch
+      out.append(ch)
+      i += 1
+      continue
+    if ch == '`':
+      end = raw.find('`', i + 1)
+      if end == -1:
+        raise ValueError(
+            f'Unterminated backtick identifier in expectation {raw!r}')
+      col_name = raw[i + 1:end]
+      if not col_name or col_name.startswith('_'):
+        raise ValueError(
+            f'Invalid or underscore-prefixed backtick identifier {col_name!r}')
+      if col_name.isidentifier() and not keyword.iskeyword(col_name):
+        out.append(col_name)
+      else:
+        out.append(f'_cli_exp_col({col_name!r})')
+      i = end + 1
+      continue
+    out.append(ch)
+    i += 1
+  return ''.join(out)
+
+
 def normalize_expectation_expression(expr: str) -> str:
-  """Token-safely normalizes SQL syntax (`=`, `<>`, `LIKE`, `IN`, `CAST`, `IS NULL`)."""
+  """Token-safely normalizes SQL syntax (`=`, `<>`, `LIKE`/`ILIKE`, `BETWEEN`, `IN`, `CAST`, `IS NULL`)."""
   import io
   import tokenize
   cleaned = expr.strip()
   if not cleaned:
     return cleaned
-  # Strip backticks around bare identifiers only outside string literals.
+  cleaned_bt = _replace_backticks_outside_strings(cleaned)
   try:
-    # Replace backticked identifiers safely via regex only when not inside quotes.
-    cleaned_bt = re.sub(
-        r"""('(?:\\.|[^'])*'|"(?:\\.|[^"])*")|`([A-Za-z_][A-Za-z0-9_]*)`""",
-        lambda m: m.group(1) if m.group(1) is not None else m.group(2),
-        cleaned)
     raw_toks = [
         (t.type, t.string)
         for t in tokenize.generate_tokens(io.StringIO(cleaned_bt).readline)
@@ -627,20 +895,60 @@ def normalize_expectation_expression(expr: str) -> str:
           out.extend(['in', '[', *inner, ']'])
           i = j + 1
           continue
-      # `[NOT] LIKE <pattern>`
+      # `[NOT] BETWEEN <low> AND <high>`
+      is_not_between = (
+          tt == tokenize.NAME and tu == 'NOT' and i + 1 < n and
+          toks[i + 1][0] == tokenize.NAME and
+          toks[i + 1][1].upper() == 'BETWEEN' and bool(out))
+      is_between = (
+          tt == tokenize.NAME and tu == 'BETWEEN' and bool(out) and
+          not (out and out[-1] == '.'))
+      if is_not_between or is_between:
+        lhs = _pop_trailing_value_expr(out)
+        if not lhs:
+          raise ValueError(f'Missing LHS operand before BETWEEN in {expr!r}')
+        low_start = i + 2 if is_not_between else i + 1
+        low_toks, and_idx = _scan_value_operand(
+            toks, low_start, stop_on_and=True)
+        if (not low_toks or and_idx >= n or toks[and_idx][0] != tokenize.NAME or
+            toks[and_idx][1].upper() != 'AND'):
+          raise ValueError(
+              f'BETWEEN requires `<low> AND <high>` in expectation {expr!r}')
+        high_toks, next_i = _scan_value_operand(
+            toks, and_idx + 1, stop_on_and=True)
+        if not high_toks:
+          raise ValueError(
+              f'Missing upper bound in BETWEEN expression {expr!r}')
+        low_s = _join_expect_pieces(_norm_tokens(low_toks))
+        high_s = _join_expect_pieces(_norm_tokens(high_toks))
+        between_s = f'(({lhs}) >= ({low_s}) and ({lhs}) <= ({high_s}))'
+        out.append(f'(not {between_s})' if is_not_between else between_s)
+        i = next_i
+        continue
+      # `[NOT] LIKE / ILIKE <pattern>`
       if (tt == tokenize.NAME and tu == 'NOT' and i + 2 < n and
           toks[i + 1][0] == tokenize.NAME and
-          toks[i + 1][1].upper() == 'LIKE' and out):
-        lhs = _pop_trailing_atom(out)
-        pat = toks[i + 2][1]
-        out.append(f'(not sql_like({lhs}, {pat}))')
-        i += 3
+          toks[i + 1][1].upper() in ('LIKE', 'ILIKE') and out):
+        like_kw = toks[i + 1][1].upper()
+        fn_name = 'sql_ilike' if like_kw == 'ILIKE' else 'sql_like'
+        lhs = _pop_trailing_value_expr(out)
+        pat_toks, next_i = _scan_value_operand(toks, i + 2, stop_on_and=True)
+        if not lhs or not pat_toks:
+          raise ValueError(f'Invalid NOT {like_kw} syntax in {expr!r}')
+        pat_s = _join_expect_pieces(_norm_tokens(pat_toks))
+        out.append(f'(not {fn_name}(({lhs}), ({pat_s})))')
+        i = next_i
         continue
-      if tt == tokenize.NAME and tu == 'LIKE' and i + 1 < n and out:
-        lhs = _pop_trailing_atom(out)
-        pat = toks[i + 1][1]
-        out.append(f'sql_like({lhs}, {pat})')
-        i += 2
+      if (tt == tokenize.NAME and tu in ('LIKE', 'ILIKE') and i + 1 < n and
+          out and out[-1] != '.'):
+        fn_name = 'sql_ilike' if tu == 'ILIKE' else 'sql_like'
+        lhs = _pop_trailing_value_expr(out)
+        pat_toks, next_i = _scan_value_operand(toks, i + 1, stop_on_and=True)
+        if not lhs or not pat_toks:
+          raise ValueError(f'Invalid {tu} syntax in {expr!r}')
+        pat_s = _join_expect_pieces(_norm_tokens(pat_toks))
+        out.append(f'{fn_name}(({lhs}), ({pat_s}))')
+        i = next_i
         continue
       if tt == tokenize.OP and tv == '=':
         out.append('==')
@@ -658,6 +966,11 @@ def normalize_expectation_expression(expr: str) -> str:
         out.append('False')
       elif tt == tokenize.NAME and tu == 'NULL':
         out.append('None')
+      elif (tt == tokenize.NAME and keyword.iskeyword(tv) and
+            tv not in ('and', 'or', 'not', 'in', 'is', 'if', 'else', 'True',
+                       'False', 'None', 'lambda', 'await', 'async') and
+            not (out and out[-1] == '.')):
+        out.append(f'_cli_exp_col({tv!r})')
       else:
         out.append(tv)
       i += 1
@@ -725,7 +1038,13 @@ def parse_expectation_rule(
 
 def compile_expectation_expression(expr: str) -> Any:
   """AST-validates, applies SQL 3VL null-safety, and compiles an expectation."""
-  parsed = _validate_expectation_ast(expr)
+  if not isinstance(expr, str) or not expr.strip():
+    raise ValueError('Empty expectation rule specification')
+  try:
+    parsed = _validate_expectation_ast(expr)
+  except ValueError:
+    norm = normalize_expectation_expression(expr)
+    parsed = _validate_expectation_ast(norm)
   transformed = ast.fix_missing_locations(_Expect3VLTransformer().visit(parsed))
   return compile(transformed, '<expectation>', 'eval')
 
@@ -750,12 +1069,13 @@ def evaluate_record(
     row_dict = {k: getattr(row, k) for k in dir(row) if not k.startswith('_')}
 
   scope = dict(row_dict)
-  scope['row'] = row
-  scope['element'] = row
-  scope['record'] = row
+  scope.setdefault('row', row)
+  scope.setdefault('element', row)
+  scope.setdefault('record', row)
+  eval_builtins = {**_SAFE_BUILTINS, '_cli_exp_col': row_dict.get}
 
   try:
-    result = eval(compiled_code, {'__builtins__': _SAFE_BUILTINS}, scope)  # pylint: disable=eval-used
+    result = eval(compiled_code, {'__builtins__': eval_builtins}, scope)  # pylint: disable=eval-used
     return result is True or (result is not None and bool(result))
   except Exception:  # pylint: disable=broad-except
     return False

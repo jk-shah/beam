@@ -315,12 +315,12 @@ def run_tail(
         byte_budget=byte_budget,
         default_project=default_project,
         on_record=on_record)
-  if ep.kind in ('file', 'bigquery', 'delta', 'iceberg'):
-    if follow and ep.kind == 'bigquery':
+  if ep.kind in ('file', 'bigquery', 'postgres', 'delta', 'iceberg'):
+    if follow and ep.kind in ('bigquery', 'postgres'):
       raise TailError(
           'beam tail -f (--follow) is for streaming/file/lakehouse endpoints '
           '(pubsub://, kafka://, delta://, iceberg://, local paths, gs://); '
-          'omit -f to peek at bigquery:// tables.',
+          f'omit -f to peek at {ep.kind}:// tables.',
           2)
     eff_limit = 5 if limit is None else limit
     inspected = inspect_cmd.run_inspect(
@@ -393,6 +393,13 @@ def _is_local_tail_pid_alive(sub_name: str, now: float) -> bool:
     if not lease_file.is_file() or os.path.islink(lease_file):
       return False
     data = json.loads(lease_file.read_text(encoding='utf-8'))
+    lease_until = float(data.get('lease_until', 0))
+    if lease_until <= 0 or now > (lease_until + 60):
+      try:
+        lease_file.unlink(missing_ok=True)
+      except OSError:
+        pass
+      return False
     pid = int(data.get('pid', 0))
     if pid <= 0:
       return False
@@ -676,17 +683,19 @@ def _tail_pubsub(
           time.sleep(max(0.05, sleep_s))
           continue
 
-        ephemeral_ack_ids: list[str] = []
-        cycle_nack_ids: list[str] = []
-        for rm in received:
-          if ephemeral_sub:
-            if rm.ack_id:
-              ephemeral_ack_ids.append(rm.ack_id)
-          else:
-            if rm.ack_id:
-              cycle_nack_ids.append(rm.ack_id)
-              pending_nack_ids.append(rm.ack_id)
+        if ephemeral_sub:
+          ephemeral_ack_ids = [
+              rm.ack_id for rm in received if getattr(rm, 'ack_id', None)
+          ]
+          cycle_nack_ids = []
+        else:
+          ephemeral_ack_ids = []
+          cycle_nack_ids = [
+              rm.ack_id for rm in received if getattr(rm, 'ack_id', None)
+          ]
+          pending_nack_ids.extend(cycle_nack_ids)
 
+        for rm in received:
           msg = rm.message
           msg_id = str(getattr(msg, 'message_id', ''))
           if not ephemeral_sub and not _remember_msg_id(msg_id):
@@ -731,7 +740,7 @@ def _tail_pubsub(
             subscriber.modify_ack_deadline(
                 request={
                     'subscription': sub_path,
-                    'ack_ids': cycle_nack_ids,
+                    'ack_ids': list(dict.fromkeys(cycle_nack_ids)),
                     'ack_deadline_seconds': 0,
                 })
             pending_nack_ids.clear()
@@ -746,17 +755,18 @@ def _tail_pubsub(
       if not follow:
         raise
       interrupted = True
-
-    if not ephemeral_sub and pending_nack_ids and sub_path:
-      try:
-        subscriber.modify_ack_deadline(
-            request={
-                'subscription': sub_path,
-                'ack_ids': pending_nack_ids,
-                'ack_deadline_seconds': 0,
-            })
-      except Exception:  # pylint: disable=broad-except
-        pass
+    finally:
+      if not ephemeral_sub and pending_nack_ids and sub_path:
+        try:
+          subscriber.modify_ack_deadline(
+              request={
+                  'subscription': sub_path,
+                  'ack_ids': list(dict.fromkeys(pending_nack_ids)),
+                  'ack_deadline_seconds': 0,
+              })
+          pending_nack_ids.clear()
+        except Exception:  # pylint: disable=broad-except
+          pass
   finally:
     if installed_sigterm:
       try:
@@ -959,26 +969,55 @@ def _read_appended_bytes(
     return f.read(cap)
 
 
+def _ensure_csv_field_size_limit() -> None:
+  target = 16 * 1024 * 1024
+  try:
+    if csv.field_size_limit() >= target:
+      return
+  except Exception:  # pylint: disable=broad-except
+    pass
+  limit = target
+  while limit >= 131072:
+    try:
+      csv.field_size_limit(limit)
+      return
+    except OverflowError:
+      limit //= 2
+
+
 def _parse_text_lines_from_chunk(
     item_uri: str,
     chunk_text: str,
     csv_headers: dict[str, list[str]],
 ) -> list[Any]:
+  if not chunk_text or not chunk_text.strip():
+    return []
   lower = item_uri.lower()
   is_csv = lower.endswith('.csv') or '.csv-' in lower
-  lines = [ln for ln in chunk_text.splitlines() if ln.strip()]
-  if not lines:
-    return []
   if is_csv:
-    reader = list(csv.reader(io.StringIO('\n'.join(lines))))
+    _ensure_csv_field_size_limit()
+    if item_uri not in csv_headers:
+      dict_reader = csv.DictReader(io.StringIO(chunk_text))
+      if dict_reader.fieldnames:
+        csv_headers[item_uri] = list(dict_reader.fieldnames)
+      out_rows: list[dict[str, Any]] = []
+      for raw_d in dict_reader:
+        clean_d = {str(k): v for k, v in raw_d.items() if k is not None}
+        if any(val for val in clean_d.values()):
+          out_rows.append(clean_d)
+      return out_rows
+    reader = [
+        row for row in csv.reader(io.StringIO(chunk_text))
+        if any(cell.strip() for cell in row)
+    ]
     if not reader:
       return []
-    if item_uri not in csv_headers:
-      csv_headers[item_uri] = reader[0]
-      reader = reader[1:]
     hdr = csv_headers[item_uri]
     return [dict(zip(hdr, row)) for row in reader]
 
+  lines = [ln for ln in chunk_text.splitlines() if ln.strip()]
+  if not lines:
+    return []
   parsed: list[Any] = []
   for ln in lines:
     stripped = ln.strip()
@@ -1018,13 +1057,13 @@ def _tail_files_follow(
     lower = uri_item.lower()
     if sz > 0 and (lower.endswith('.csv') or '.csv-' in lower):
       try:
+        _ensure_csv_field_size_limit()
         head_bytes = _read_appended_bytes(
-            uri_item, 0, default_project, max_bytes=4096)
-        first_line = head_bytes.decode('utf-8', errors='replace').splitlines()
-        if first_line:
-          hdr_rows = list(csv.reader([first_line[0]]))
-          if hdr_rows:
-            csv_headers[uri_item] = hdr_rows[0]
+            uri_item, 0, default_project, max_bytes=65536)
+        head_text = head_bytes.decode('utf-8', errors='replace')
+        hdr_row = next(csv.reader(io.StringIO(head_text)), None)
+        if hdr_row:
+          csv_headers[uri_item] = hdr_row
       except Exception:  # pylint: disable=broad-except
         pass
 

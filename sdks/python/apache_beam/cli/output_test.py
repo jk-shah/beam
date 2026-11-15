@@ -124,6 +124,45 @@ class JsonOutputSessionTest(unittest.TestCase):
     self.assertIn('NOISY_PY_STDOUT', proc.stderr)
     self.assertIn('STRAY_C_ATEXIT_BYTES', proc.stderr)
 
+  def test_multiple_in_process_sessions_preserve_stdout_and_atexit_guard(self):
+    script = (
+        'import atexit, json, os\n'
+        'from apache_beam.cli import output\n'
+        'atexit.register(lambda: os.write(1, b"LATE_ATEXIT\\n"))\n'
+        'for idx in (1, 2):\n'
+        '  with output.JsonOutputSession(enabled=True) as s:\n'
+        '    print(f"INNER_{idx}")\n'
+        '    s.emit(output.build_envelope(\n'
+        '        ok=True, command=f"cmd_{idx}", exit_code=0))\n'
+        'print("AFTER_BOTH")\n'
+    )
+    proc = subprocess.run(
+        [sys.executable, '-c', script],
+        capture_output=True,
+        text=True,
+        check=False)
+    self.assertEqual(proc.returncode, 0, proc.stderr)
+    lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
+    self.assertEqual(len(lines), 3, proc.stdout)
+    self.assertEqual(json.loads(lines[0])['command'], 'cmd_1')
+    self.assertEqual(json.loads(lines[1])['command'], 'cmd_2')
+    self.assertEqual(lines[2], 'AFTER_BOTH')
+    self.assertIn('INNER_1', proc.stderr)
+    self.assertIn('INNER_2', proc.stderr)
+    self.assertIn('LATE_ATEXIT', proc.stderr)
+
+  def test_scrub_redacts_token_crossing_truncation_boundary_and_exit_3(self):
+    prefix = 'x' * 4088
+    secret = 'sk-abcdef1234567890abcdef1234'
+    scrubbed = output.scrub_error_message(prefix + secret)
+    self.assertNotIn('sk-abcdef', scrubbed)
+    err_obj, actions = output.classify_error(
+        'connector does not support streaming writes',
+        exit_code=3,
+        command='pipe')
+    self.assertEqual(err_obj['type'], 'UnsupportedCapabilityError')
+    self.assertTrue(actions)
+
 
 if __name__ == '__main__':
   unittest.main()

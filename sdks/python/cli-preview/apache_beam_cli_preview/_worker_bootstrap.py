@@ -19,4 +19,5 @@
 
 from . import launcher
 
-launcher.install_runtime_hooks()
+launcher.install_runtime_hooks(strict=False)
+launcher.canonicalize_cli_module_aliases()

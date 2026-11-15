@@ -118,6 +118,28 @@ class UrisTest(unittest.TestCase):
     with self.assertRaisesRegex(UriError, 'cannot tell the format'):
       uris.parse_endpoint(binary_blob, is_read=True, allow_sniff=True)
 
+  def test_ndjson_pq_tsv_and_compressed_extensions(self):
+    nd = uris.parse_endpoint('events.ndjson', is_read=True)
+    self.assertEqual(nd.format, 'json')
+    self.assertEqual(nd.yaml_type, 'ReadFromJson')
+
+    pq_ep = uris.parse_endpoint('events.pq', is_read=False)
+    self.assertEqual(pq_ep.format, 'parquet')
+    self.assertEqual(pq_ep.yaml_type, 'WriteToParquet')
+
+    tsv_ep = uris.parse_endpoint('users.tsv', is_read=True)
+    self.assertEqual(tsv_ep.format, 'csv')
+    self.assertEqual(tsv_ep.yaml_type, 'ReadFromCsv')
+    self.assertEqual(tsv_ep.config.get('delimiter'), '\t')
+
+    gz_ep = uris.parse_endpoint('events.jsonl.gz', is_read=True)
+    self.assertEqual(gz_ep.format, 'json')
+    self.assertEqual(gz_ep.yaml_type, 'ReadFromJson')
+
+    bz2_ep = uris.parse_endpoint('users.tsv.bz2', is_read=True)
+    self.assertEqual(bz2_ep.format, 'csv')
+    self.assertEqual(bz2_ep.config.get('delimiter'), '\t')
+
 
 if __name__ == '__main__':
   unittest.main()

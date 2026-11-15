@@ -42,7 +42,7 @@ def _ns(**kwargs):
 class ConfigTest(unittest.TestCase):
   def setUp(self):
     self.tmp = tempfile.mkdtemp()
-    self.addCleanup(shutil.rmtree, self.tmp)
+    self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
     self.cfg_path = os.path.join(self.tmp, '.beam', 'config.yaml')
     env_patcher = mock.patch.dict(
         os.environ,
@@ -157,18 +157,88 @@ class ConfigTest(unittest.TestCase):
     self.assertEqual(rc, 0)
     self.assertIn("did you mean 'temp_location'?", err)
 
-  def test_rejects_secret_options(self):
+  def test_rejects_secret_options_and_inline_secret_values(self):
     for secret in (
         'password',
         's3_secret_access_key',
         'sasl_jaas_config',
         'azure_connection_string',
+        'api-key',
+        'passphrase',
+        'signing-key',
+        'encryption_key',
+        'bearer',
+        'authorization',
+        'db_pwd',
+        'session_cookie',
+        'auth-token',
     ):
       with self.subTest(secret=secret):
         with self.assertRaises(config.ConfigError) as ctx:
           self._run(
-              config_action='set', option=secret, value='secret', profile=None)
+              config_action='set', option=secret, value='val', profile=None)
         self.assertEqual(ctx.exception.exit_code, 2)
+
+    for bad_val in (
+        'postgres://admin:s3cr3t@db.internal:5432/prod',
+        'sk-proj-1234567890abcdef1234',
+        'ya29.a0AfH6SMBx1234567890',
+        'AIzaSyA12345678901234567890123456',
+        'ghp_1234567890abcdef123456',
+        'hf_1234567890abcdef123456',
+    ):
+      with self.subTest(bad_val=bad_val):
+        with self.assertRaises(config.ConfigError) as ctx:
+          self._run(
+              config_action='set',
+              option='temp_location',
+              value=bad_val,
+              profile=None)
+        self.assertEqual(ctx.exception.exit_code, 2)
+
+  def test_rejects_symlink_target_and_recovers_from_corrupt_config(self):
+    os.makedirs(os.path.dirname(self.cfg_path), exist_ok=True)
+    # 1. Corrupt YAML recovers cleanly on `set`, `use`, and `reset`.
+    with open(self.cfg_path, 'w', encoding='utf-8') as f:
+      f.write(':::corrupt: [unclosed yaml')
+    if os.name == 'posix':
+      os.chmod(self.cfg_path, 0o600)
+
+    rc, _, err = self._run(
+        config_action='set', option='project', value='recovered-p', profile=None)
+    self.assertEqual(rc, 0)
+    self.assertIn('.corrupt', err)
+    self.assertTrue(os.path.isfile(self.cfg_path + '.corrupt'))
+    rc_g, out_g, _ = self._run(
+        config_action='get', option='project', profile=None)
+    self.assertEqual(rc_g, 0)
+    self.assertEqual(out_g.strip(), 'recovered-p')
+
+    # Corrupt again and recover via `use`
+    with open(self.cfg_path, 'w', encoding='utf-8') as f:
+      f.write('- not_a_mapping\n')
+    rc_u, _, _ = self._run(config_action='use', profile_name='staging')
+    self.assertEqual(rc_u, 0)
+
+    # Corrupt again and recover via `reset`
+    with open(self.cfg_path, 'w', encoding='utf-8') as f:
+      f.write(':::broken')
+    rc_r, out_r, _ = self._run(config_action='reset', profile=None)
+    self.assertEqual(rc_r, 0)
+    self.assertIn('Reset configuration', out_r)
+
+    # 2. Symlink config path is refused!
+    target_other = os.path.join(self.tmp, 'other.yaml')
+    with open(target_other, 'w', encoding='utf-8') as f:
+      f.write('active_profile: default\n')
+    os.remove(self.cfg_path)
+    try:
+      os.symlink(target_other, self.cfg_path)
+    except (OSError, NotImplementedError):
+      return
+    with self.assertRaises(config.ConfigError):
+      self._run(
+          config_action='set', option='project', value='p2', profile=None)
 
   def test_precedence_cli_override_no_config_and_cwd_isolation(self):
     self._run(

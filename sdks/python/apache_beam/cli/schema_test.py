@@ -37,13 +37,17 @@ class SchemaDiffTest(unittest.TestCase):
     shutil.rmtree(self.tmp, ignore_errors=True)
 
   def test_normalize_type_canonical_names(self):
-    self.assertEqual(schema.normalize_type('int'), 'INT32')
+    self.assertEqual(schema.normalize_type('int'), 'INT64')
+    self.assertEqual(schema.normalize_type('integer'), 'INT64')
     self.assertEqual(schema.normalize_type('int32'), 'INT32')
     self.assertEqual(schema.normalize_type('int64'), 'INT64')
     self.assertEqual(schema.normalize_type('bigint'), 'INT64')
-    self.assertEqual(schema.normalize_type('float'), 'FLOAT32')
+    self.assertEqual(schema.normalize_type('float'), 'FLOAT64')
+    self.assertEqual(schema.normalize_type('float32'), 'FLOAT32')
     self.assertEqual(schema.normalize_type('double'), 'FLOAT64')
-    self.assertEqual(schema.normalize_type('numeric'), 'FLOAT64')
+    self.assertEqual(schema.normalize_type('numeric'), 'DECIMAL')
+    self.assertEqual(schema.normalize_type('bignumeric'), 'DECIMAL')
+    self.assertEqual(schema.normalize_type('decimal128(38, 9)'), 'DECIMAL')
     self.assertEqual(schema.normalize_type('string'), 'STRING')
     self.assertEqual(schema.normalize_type('varchar'), 'STRING')
     self.assertEqual(schema.normalize_type('bool'), 'BOOLEAN')
@@ -55,16 +59,18 @@ class SchemaDiffTest(unittest.TestCase):
 
   def test_identical_schemas_are_compatible(self):
     src = [
-        {'name': 'id', 'type': 'int64', 'nullable': False},
+        {'name': 'id', 'type': 'int', 'nullable': False},
         {'name': 'name', 'type': 'string', 'nullable': True},
-        {'name': 'score', 'type': 'float64', 'nullable': True},
+        {'name': 'score', 'type': 'float', 'nullable': True},
+        {'name': 'amount', 'type': 'decimal(18, 2)', 'nullable': True},
     ]
     tgt = [
         {'name': 'id', 'type': 'INT64', 'nullable': False},
         {'name': 'name', 'type': 'STRING', 'nullable': True},
         {'name': 'score', 'type': 'FLOAT64', 'nullable': True},
+        {'name': 'amount', 'type': 'NUMERIC', 'nullable': True},
     ]
-    res = schema.diff_schemas(src, tgt, mode='BACKWARD')
+    res = schema.diff_schemas(src, tgt, mode='BACKWARD', strict=True)
     self.assertTrue(res['compatible'])
     self.assertEqual(res['violation_count'], 0)
     self.assertEqual(len(res['violations']), 0)

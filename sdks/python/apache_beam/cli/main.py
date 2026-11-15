@@ -40,6 +40,7 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -278,6 +279,10 @@ _CLI_ONE_FLAGS = {
         '--window',
         '--window-size',
         '--window_size',
+        '--window-period',
+        '--window_period',
+        '--window-gap',
+        '--window_gap',
         '--allowed-lateness',
         '--allow-lateness',
         '--trigger',
@@ -1255,9 +1260,11 @@ def _build_parser():
       help='path to a .sql query file (alternative to inline --sql)')
   g_xform.add_argument(
       '--sql-engine',
-      choices=['sqlite', 'duckdb'],
+      choices=['sqlite', 'duckdb', 'python'],
       default='sqlite',
-      help='local engine for --sql: sqlite (default) or duckdb')
+      help=(
+          'engine for --sql: sqlite (default local), duckdb (local), or '
+          'python (zero-JVM pure-Python Beam YAML lowering)'))
   g_xform.add_argument(
       '--where',
       '--filter',
@@ -1308,6 +1315,18 @@ def _build_parser():
       dest='window',
       metavar='SPEC',
       help='window spec: fixed:60s (or 60s), sliding:5m,1m, or session:30m')
+  g_stream.add_argument(
+      '--window-period',
+      '--window_period',
+      dest='window_period',
+      default=None,
+      help=argparse.SUPPRESS)
+  g_stream.add_argument(
+      '--window-gap',
+      '--window_gap',
+      dest='window_gap',
+      default=None,
+      help=argparse.SUPPRESS)
   g_stream.add_argument(
       '--allowed-lateness',
       '--allow-lateness',
@@ -3884,9 +3903,44 @@ def _pipe_impl(
       args, 'verify_keys', None) and getattr(args, 'primary_keys', None):
     args.verify_keys = list(args.primary_keys)
 
+  w_period = getattr(args, 'window_period', None)
+  w_gap = getattr(args, 'window_gap', None)
+  if w_gap is not None and w_period is not None:
+    raise _CliError(
+        '--window-gap and --window-period are mutually exclusive', EXIT_USAGE)
+  if w_gap is not None:
+    cur_w = str(args.window or '').strip()
+    if cur_w and cur_w.lower() not in ('session', 'sessions'):
+      raise _CliError(
+          '--window-gap cannot be combined with --window / --window-size '
+          '(use `--window-gap 30m` or `--window session:30m`)',
+          EXIT_USAGE)
+    args.window = f'session:{str(w_gap).strip()}'
+  elif w_period is not None:
+    cur_w = str(args.window or '').strip()
+    if not cur_w:
+      raise _CliError(
+          '--window-period requires --window / --window-size <DURATION> '
+          '(e.g. `--window-size 5m --window-period 1m` or `--window sliding:5m,1m`)',
+          EXIT_USAGE)
+    if ',' in cur_w or cur_w.lower().startswith(('session:', 'sessions:')):
+      raise _CliError(
+          f'--window-period cannot be combined with {cur_w!r} '
+          '(use `--window-size 5m --window-period 1m` or `--window sliding:5m,1m`)',
+          EXIT_USAGE)
+    for pfx in ('fixed:', 'sliding:'):
+      if cur_w.lower().startswith(pfx):
+        cur_w = cur_w[len(pfx):].strip()
+        break
+    args.window = f'sliding:{cur_w},{str(w_period).strip()}'
+
   if getattr(args, 'drop_bad', False):
-    if getattr(args, 'on_violation',
-               'dlq') == 'dlq' and not getattr(args, 'dlq', None):
+    if getattr(args, 'dlq', None):
+      raise _CliError(
+          '--drop-bad and --dlq are mutually exclusive; pass --dlq <URI> to '
+          'capture bad rows or --drop-bad to drop them',
+          EXIT_USAGE)
+    if getattr(args, 'on_violation', 'dlq') == 'dlq':
       args.on_violation = 'drop'
 
   if getattr(args, 'check_schema', False) and (args.sources or
@@ -3985,17 +4039,17 @@ def _pipe_impl(
           'multiple --from sources or --join requires --sql "SELECT ..." '
           'or --interval-join <SPEC>',
           EXIT_USAGE)
-    if (args.where or getattr(args, 'pre_select', None) or
-        getattr(args, 'post_where', None) or args.select or args.cdc or
-        args.zero_copy or args.window or has_b23_flags or
-        getattr(args, 'dedupe_by', None) or
+    if (getattr(args, 'pre_select', None) or
+        getattr(args, 'post_where', None) or args.cdc or args.zero_copy or
+        args.window or has_b23_flags or getattr(args, 'dedupe_by', None) or
         getattr(args, 'enrich_specs', None) or
-        getattr(args, 'infer_specs', None)):
+        getattr(args, 'infer_specs', None) or getattr(args, 'expect', None) or
+        getattr(args, 'dlq_redact_fields', None)):
       raise _CliError(
-          '--sql cannot be combined with --where, --pre-select, --enrich, '
-          '--infer, --post-where, --window, --allowed-lateness, --trigger, '
-          '--select, --cdc, --dedupe-by, or --zero-copy; '
-          'express filters and projections inside --sql (or omit --sql)',
+          '--sql cannot be combined with --pre-select, --enrich, --infer, '
+          '--post-where, --window, --allowed-lateness, --trigger, --expect, '
+          '--dlq-redact-fields, --cdc, --dedupe-by, or --zero-copy; '
+          'express those stages inside --sql (or omit --sql)',
           EXIT_USAGE)
     if getattr(args, 'limit', None) is not None:
       base_q = args.sql.strip().rstrip(';').strip()
@@ -4014,6 +4068,11 @@ def _pipe_impl(
           default_project=default_proj,
           allow_sniff=not allow_jinja,
           allow_jinja=allow_jinja)
+      if args.where and len(named_sources) > 1:
+        raise _CliError(
+            '--where with --sql is only supported on a single input source; '
+            'for multi-input SQL joins, move the filter into --sql WHERE ...',
+            EXIT_USAGE)
       sink_ep = (
           uris.parse_endpoint(
               args.sink,
@@ -4039,12 +4098,27 @@ def _pipe_impl(
               if_exists='append' if args.if_exists == 'append' else 'fail',
               default_project=default_proj,
               allow_jinja=allow_jinja) if args.dlq else None)
+      sql_null_values = _split_null_values(args.null_values)
+      if sql_null_values:
+        for ns in named_sources:
+          if ns.endpoint.kind == 'file' and ns.endpoint.format == 'csv':
+            ns.endpoint.config['null_values'] = sql_null_values
+      has_window_sql = pipe_sql.has_streaming_window_sql(args.sql)
       will_run_local_sql = bool(
+          args.sql_engine != 'python' and not has_window_sql and
           is_local_runner and not args.dry_run and
           not getattr(args, 'portable', False) and
           not any(ns.endpoint.is_unbounded for ns in named_sources) and
           not any(ns.endpoint.kind != 'file' for ns in named_sources) and
           (sink_ep is None or sink_ep.kind == 'file'))
+      strict_py_sql = args.sql_engine == 'python'
+      prefer_py_sql = bool(strict_py_sql or has_window_sql)
+      if not prefer_py_sql and not will_run_local_sql and not args.dry_run:
+        from . import sql as sql_mod
+        try:
+          sql_mod._find_java()
+        except sql_mod.SqlError:
+          prefer_py_sql = True
       sql_spec = pipe_sql.build_sql_yaml_spec(
           named_sources,
           args.sql,
@@ -4053,14 +4127,13 @@ def _pipe_impl(
           max_watermark_skew=getattr(args, 'max_watermark_skew', None),
           skew_action=getattr(args, 'skew_action', None),
           dlq_ep=dlq_ep,
-          for_local_only=will_run_local_sql)
+          for_local_only=will_run_local_sql,
+          prefer_python_lowering=prefer_py_sql,
+          strict_python_lowering=strict_py_sql,
+          pre_where=args.where,
+          post_select=args.select)
     except (uris.UriError, pipe_sql.SqlPipeError) as e:
       raise _CliError(str(e), EXIT_USAGE) from None
-    sql_null_values = _split_null_values(args.null_values)
-    if sql_null_values:
-      for ns in named_sources:
-        if ns.endpoint.kind == 'file' and ns.endpoint.format == 'csv':
-          ns.endpoint.config['null_values'] = sql_null_values
 
     if args.max_bytes:
       for ns in named_sources:
@@ -4112,12 +4185,31 @@ def _pipe_impl(
           '<DURATION> for a bounded local run or a remote runner '
           '(--runner=DataflowRunner)',
           EXIT_USAGE)
-    if args.assert_counts and (has_unbounded_sql or
-                               not sql_uses_calcite) and not args.dry_run:
-      raise _CliError(
-          '--assert-counts cannot be combined with unbounded or multi-stream '
-          'interval-join --sql queries',
-          EXIT_USAGE)
+    sql_clean_code = re.sub(
+        r"'[^']*'|\"[^\"]*\"|--[^\n]*|/\*[\s\S]*?\*/", ' ', args.sql or '')
+    sql_changes_cardinality = bool(
+        len(named_sources) > 1 or re.search(
+            r'\b(?:JOIN|GROUP\s+BY|HAVING|UNION|INTERSECT|EXCEPT|DISTINCT|'
+            r'COUNT|SUM|AVG|STDDEV_POP|STDDEV_SAMP|VAR_POP|VAR_SAMP)\s*(?:\(|\b)',
+            sql_clean_code,
+            re.IGNORECASE))
+    if args.assert_counts and not args.dry_run:
+      if has_unbounded_sql:
+        raise _CliError(
+            '--assert-counts cannot be combined with unbounded --sql queries',
+            EXIT_USAGE)
+      if sql_changes_cardinality:
+        raise _CliError(
+            '--assert-counts cannot be combined with multi-source, JOIN, '
+            'DISTINCT, or aggregating --sql queries because output row '
+            'cardinality differs from input rows',
+            EXIT_USAGE)
+      if not will_run_local_sql:
+        raise _CliError(
+            '--assert-counts with --sql is supported on bounded local file '
+            'runs (sqlite/duckdb) only; use --where / --select / --expect '
+            '(or --verify) on remote, portable, or --sql-engine=python runs',
+            EXIT_USAGE)
     if has_unbounded_sql and not is_local_runner and _runner_name(
         explicit_runner) == 'dataflow':
       if not any(a == '--streaming' or a.startswith('--streaming=')
@@ -4129,7 +4221,8 @@ def _pipe_impl(
         resolved_args.append('--enable_streaming_engine')
 
     non_portable_sql = pipe_sql.analyze_sql_portability(
-        args.sql, sql_engine=args.sql_engine)
+        args.sql,
+        sql_engine='sqlite' if args.sql_engine == 'python' else args.sql_engine)
     has_keyed_json = bool(sink_ep is not None and 'key' in (sink_ep.config or {}))
     if getattr(args, 'portable', False):
       if has_keyed_json:
@@ -4156,19 +4249,21 @@ def _pipe_impl(
             '--portable for local-only analytics)',
             EXIT_USAGE)
 
-    if (args.dry_run or not is_local_runner or has_unbounded_sql or
+    if (args.dry_run or args.sql_engine == 'python' or has_window_sql or
+        not is_local_runner or has_unbounded_sql or
         (getattr(args, 'portable', False) and not sql_uses_calcite) or
         (sink_ep is not None and sink_ep.kind != 'file')):
       if sink_ep is None and not args.dry_run:
         raise _CliError(
-            'remote or streaming --sql execution requires --to <SINK>',
+            'remote, streaming, or --sql-engine=python execution requires '
+            '--to <SINK>',
             EXIT_USAGE)
       if has_keyed_json:
         raise _CliError(
             '--to-opt key= (one keyed JSON document) is only for local --sql '
             'runs, not --emit-yaml or remote runners', EXIT_USAGE)
       sql_extra_warns: list[str] = []
-      if args.sql_engine != 'sqlite' and sql_uses_calcite:
+      if args.sql_engine not in ('sqlite', 'python') and sql_uses_calcite:
         note_eng = (
             f'--sql-engine {args.sql_engine} applies to local runs; the '
             "exported or remote pipeline uses Beam SQL's dialect (Calcite)")
@@ -4199,6 +4294,11 @@ def _pipe_impl(
       run_sql_yaml = (
           yaml.dump(staged_sql_spec, Dumper=dumper, sort_keys=False, width=100000)
           if (sql_stage_prefix or sql_dlq_stage) else sql_yaml_str)
+      sql_run_extra_out = (
+          None if args.dry_run else {
+              'sql_engine': ('calcite' if sql_uses_calcite else 'python'),
+              'execution_path': 'beam_runner',
+          })
       try:
         return _run_yaml(
             resolved_args,
@@ -4219,6 +4319,7 @@ def _pipe_impl(
             raw_argv_for_idem=raw_argv,
             plan_hash=sql_plan_hash,
             extra_warnings=sql_extra_warns,
+            extra_outputs=sql_run_extra_out,
             json_session=json_session,
             t0=t0)
       finally:
@@ -4255,9 +4356,11 @@ def _pipe_impl(
           named_sources,
           args.sql,
           default_project=default_proj,
-          enable_dlq=bool(dlq_ep is not None),
+          enable_dlq=bool(dlq_ep is not None or getattr(args, 'drop_bad', False)),
           engine=args.sql_engine,
-          warnings=sql_warnings)
+          warnings=sql_warnings,
+          pre_where=args.where,
+          post_select=args.select)
       written_sql: list[str] = []
       dlq_written: list[str] = []
       staged_sql_pairs: list[tuple[str, str]] = []
@@ -4317,12 +4420,23 @@ def _pipe_impl(
     non_portable_items = list(non_portable_sql)
     if has_keyed_json:
       non_portable_items.append('--to-opt key=')
+    eff_dlq_count = int(len(dlq_recs)) if dlq_ep is not None else 0
+    sql_filtered_out = (
+        max(0, int(total_read) - int(len(out_rows)) - eff_dlq_count)
+        if (len(named_sources) == 1 and not sql_changes_cardinality) else 0)
     sql_metrics = {
         'rows_read': int(total_read),
         'rows_written': int(len(out_rows)),
-        'rows_filtered_out': 0,
-        'dlq_rows': int(len(dlq_recs)),
+        'rows_filtered_out': int(sql_filtered_out),
+        'dlq_rows': eff_dlq_count,
     }
+    if args.assert_counts:
+      err_sql_cnt = jobs.check_assert_counts(sql_metrics)
+      if err_sql_cnt:
+        raise _CliError(
+            err_sql_cnt,
+            EXIT_PIPELINE_FAILED,
+            extra={'metrics': sql_metrics})
     sql_outputs: dict[str, Any] = {
         'files': written_sql,
         'file_count': len(written_sql),
@@ -4520,7 +4634,9 @@ def _pipe_impl(
         emit_pane_info=bool(getattr(args, 'emit_pane_info', False)),
         dlq_redact_fields=getattr(args, 'dlq_redact_fields', None),
         known_source_columns=known_src_cols,
-        limit=getattr(args, 'limit', None))
+        limit=getattr(args, 'limit', None),
+        drop_bad=bool(getattr(args, 'drop_bad', False)),
+        assert_counts=bool(getattr(args, 'assert_counts', False)))
   except pipe_spec.PipeSpecError as e:
     raise _CliError(str(e), EXIT_USAGE) from None
 
@@ -4614,24 +4730,27 @@ def _pipe_impl(
         resolved_args.append('--enable_streaming_engine')
 
   # Pre-flight `--max-bytes` guardrail (`EXIT_COST_LIMIT = 8`) before running!
-  if args.max_bytes and pipe.source_endpoint is not None:
-    try:
-      cost_guard.check_max_bytes(
-          pipe.source_endpoint, args.max_bytes, default_project=default_proj)
-    except cost_guard.CostLimitError as e:
-      raise _CliError(
-          str(e),
-          EXIT_COST_LIMIT,
-          extra={
-              'estimated_bytes': e.estimated_bytes,
-              'limit_bytes': e.limit_bytes,
-              'outputs': {
-                  'estimated_bytes': e.estimated_bytes,
-                  'limit_bytes': e.limit_bytes,
-              },
-          }) from None
-    except ValueError as e:
-      raise _CliError(str(e), EXIT_USAGE) from None
+  if args.max_bytes:
+    for guard_ep in (pipe.source_endpoint, pipe.right_endpoint):
+      if guard_ep is None:
+        continue
+      try:
+        cost_guard.check_max_bytes(
+            guard_ep, args.max_bytes, default_project=default_proj)
+      except cost_guard.CostLimitError as e:
+        raise _CliError(
+            str(e),
+            EXIT_COST_LIMIT,
+            extra={
+                'estimated_bytes': e.estimated_bytes,
+                'limit_bytes': e.limit_bytes,
+                'outputs': {
+                    'estimated_bytes': e.estimated_bytes,
+                    'limit_bytes': e.limit_bytes,
+                },
+            }) from None
+      except ValueError as e:
+        raise _CliError(str(e), EXIT_USAGE) from None
 
   # Zero-Copy Parquet / Delta Lake -> Apache Iceberg v2 metadata registration
   # (`<100 ms` pure-Python manifest synthesis with `bytes_copied == 0`).
@@ -5142,7 +5261,8 @@ def _run_fast_local_pipe(
         pipe,
         files,
         mixed_groups=mixed_groups,
-        assert_counts=bool(args.assert_counts))
+        assert_counts=bool(args.assert_counts),
+        drop_bad=bool(getattr(args, 'drop_bad', False)))
   except ImportError as e:
     if mixed_groups:
       raise _CliError(
@@ -5278,6 +5398,7 @@ def _run_yaml(
     post_checks: dict[str, Any] | None = None,
     explicit_sharding: bool = False,
     extra_warnings: list[str] | None = None,
+    extra_outputs: dict[str, Any] | None = None,
     ephemeral_preview: bool = False,
     preview_rows: bool = False,
     json_session=None,
@@ -5708,6 +5829,8 @@ def _run_yaml(
         raise _CliError(err_msg, EXIT_PIPELINE_FAILED)
 
     outputs_dict: dict[str, Any] = {}
+    if extra_outputs:
+      outputs_dict.update(extra_outputs)
     if destination and (not is_local or output_prefix is None):
       outputs_dict['destination'] = destination
     if console_url:

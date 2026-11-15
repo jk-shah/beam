@@ -31,6 +31,7 @@ Key guarantees:
 """
 
 import base64
+import collections
 import csv
 import decimal
 import io
@@ -49,13 +50,16 @@ TRANSFORMS_SUPPORTING_ERROR_HANDLING = frozenset([
     'MapToFields',
     'CliExpect',
     'ReadCsvWithDlq',
+    'ReadJsonWithDlq',
     'ReadFromJsonWithDlq',
     'ReadFromPubSub',
     'WriteToPubSub',
     'ReadFromKafka',
     'WriteToKafka',
     'WriteToBigQuery',
+    'CliWriteToBigQuery',
     'WriteToBigQueryCDC',
+    'CliWriteToBigQueryCDC',
     'ReadFromSpanner',
     'WriteToSpanner',
 ])
@@ -338,8 +342,12 @@ def cli_yaml_provider_spec() -> dict[str, Any]:
           'ReadCsvWithDlq': 'apache_beam.cli.dlq.read_csv_with_dlq',
           'ReadJsonWithDlq': 'apache_beam.cli.dlq.read_json_with_dlq',
           'CliCountRows': 'apache_beam.cli.dlq.cli_count_rows',
+          'CliDropRows': 'apache_beam.cli.dlq.cli_drop_rows',
           'CliWriteToBigQuery': 'apache_beam.cli.dlq.cli_write_to_bigquery',
+          'ReadFromDelta': 'apache_beam.cli.lakehouse.cli_read_from_delta',
           'ReadFromDeltaPy': 'apache_beam.cli.lakehouse.cli_read_from_delta',
+          'ReadFromDeltaCDC': (
+              'apache_beam.cli.lakehouse.cli_read_from_delta_cdc'),
           'ReadFromDeltaCdcPy': (
               'apache_beam.cli.lakehouse.cli_read_from_delta_cdc'),
           'ReadFromIcebergPy': (
@@ -351,6 +359,8 @@ def cli_yaml_provider_spec() -> dict[str, Any]:
           'CliMaterializeCdc': 'apache_beam.cli.cdc.cli_materialize_cdc',
           'CliRowifyNested': 'apache_beam.cli.dlq.cli_rowify_nested',
           'CliExpect': 'apache_beam.cli.expect.cli_expect',
+          'WriteToBigQueryCDC': (
+              'apache_beam.cli.cdc.cli_write_to_bigquery_cdc'),
           'CliWriteToBigQueryCDC': (
               'apache_beam.cli.cdc.cli_write_to_bigquery_cdc'),
           'CliIntervalJoin': (
@@ -374,6 +384,78 @@ def cli_yaml_provider_spec() -> dict[str, Any]:
           'CliLimitRows': 'apache_beam.cli.dlq.cli_limit_rows',
       },
   }
+
+
+DEFAULT_CSV_FIELD_SIZE_LIMIT = 64 * 1024 * 1024
+
+
+def ensure_csv_field_size_limit(
+    limit_bytes: int = DEFAULT_CSV_FIELD_SIZE_LIMIT,
+) -> int:
+  """Raises Python's `csv.field_size_limit` up to `limit_bytes` safely."""
+  current = csv.field_size_limit()
+  target = int(limit_bytes)
+  if current >= target:
+    return current
+  while target > current:
+    try:
+      csv.field_size_limit(target)
+      return csv.field_size_limit()
+    except OverflowError:
+      target //= 2
+  return csv.field_size_limit()
+
+
+ensure_csv_field_size_limit()
+
+
+def iter_csv_rows_recovering(
+    text_stream,
+    delimiter: str = ',',
+    *,
+    max_record_bytes: int = DEFAULT_CSV_FIELD_SIZE_LIMIT,
+):
+  """Yields `(cells, csv_err, raw_line)` without truncating remaining rows.
+
+  Preserves RFC-4180 multiline quoted fields while replaying buffered physical
+  lines if a malformed row (unclosed quote at EOF, field size overflow, or
+  invalid quote syntax) raises `csv.Error`.
+  """
+  ensure_csv_field_size_limit(max_record_bytes)
+  replay: collections.deque[str] = collections.deque()
+  attempt: list[str] = []
+
+  def _make_line_iter():
+    acc_bytes = 0
+    while True:
+      if replay:
+        ln = replay.popleft()
+      else:
+        ln = text_stream.readline()
+        if ln == '':
+          return
+      attempt.append(ln)
+      acc_bytes += len(ln)
+      if len(attempt) > 1 and acc_bytes > max_record_bytes:
+        raise csv.Error(
+            f'multiline CSV record exceeds {max_record_bytes} bytes '
+            '(likely unclosed quote)')
+      yield ln
+
+  reader = csv.reader(_make_line_iter(), delimiter=delimiter, strict=True)
+  while True:
+    attempt.clear()
+    try:
+      cells = next(reader)
+      yield cells, None, ''.join(attempt)
+    except StopIteration:
+      break
+    except csv.Error as exc:
+      bad_line = attempt[0] if attempt else ''
+      for extra_ln in reversed(attempt[1:]):
+        replay.appendleft(extra_ln)
+      reader = csv.reader(_make_line_iter(), delimiter=delimiter, strict=True)
+      yield None, exc, bad_line
 
 
 # Compressions Beam's CompressionTypes.AUTO handles that we open natively;
@@ -486,29 +568,43 @@ def _infer_scalar_kind(
 
 def _parse_cell(
     raw: str, kind: str, null_values=DEFAULT_CSV_NULL_VALUES) -> Any:
+  if kind == 'str':
+    if raw == '' or raw in null_values or (
+        raw.strip() and raw.strip() in null_values):
+      return None
+    return raw
   if _is_null_cell(raw, null_values):
     return None
-  if kind == 'str':
-    return raw
   stripped = raw.strip()
   if kind in ('int', 'float') and _has_leading_zero(stripped):
     # The column was typed from a sample without leading zeros; casting would
     # silently turn "00123" into 123. Fail this value instead (DLQ or error).
     raise ValueError(
-        f'value {stripped} has a leading zero but the column was typed {kind} '
-        'from the first rows; keep it as text with --from-opt '
-        'fields=COLUMN:str (or route such rows with --dlq)')
+        f'cell value (len={len(stripped)}) has a leading zero but the column '
+        f'was typed {kind} from the first rows; keep it as text with '
+        '--from-opt fields=COLUMN:str (or route such rows with --dlq)')
   if kind == 'int':
-    return int(stripped)
+    try:
+      return int(stripped)
+    except ValueError:
+      raise ValueError(
+          f'expected integer value, got non-integer text (len={len(stripped)})'
+      ) from None
   if kind == 'float':
-    return float(stripped)
+    try:
+      return float(stripped)
+    except ValueError:
+      raise ValueError(
+          f'expected float value, got non-numeric text (len={len(stripped)})'
+      ) from None
   if kind == 'bool':
     low = stripped.lower()
     if low == 'true':
       return True
     if low == 'false':
       return False
-    raise ValueError(f'expected boolean value, got {raw!r}')
+    raise ValueError(
+        f'expected boolean value, got invalid token (len={len(stripped)})')
   return raw
 
 
@@ -526,6 +622,7 @@ def _preflight_csv_schema(
   checked, and a numeric column with a leading-zero value anywhere ("00123")
   is typed as text so no value loses its zeros.
   """
+  ensure_csv_field_size_limit()
   matches = _match_paths(path)
   if not matches:
     raise ValueError(f'no CSV files matched {path!r}')
@@ -538,36 +635,41 @@ def _preflight_csv_schema(
     with _open_auto(match_path) as raw_stream:
       text_stream = io.TextIOWrapper(
           raw_stream, encoding='utf-8-sig', errors='replace', newline='')
-      reader = csv.reader(text_stream, delimiter=delimiter)
       try:
-        first_row = next(reader, None)
-      except csv.Error:
-        continue
-      if not first_row:
-        continue
-      norm = [col.strip() or f'col_{i}' for i, col in enumerate(first_row)]
-      order = None
-      if header is None:
-        header = norm
-        col_samples = {c: [] for c in header}
-      else:
-        order = header_order(norm, header)
-      while collected < sample_rows:
-        try:
-          row = next(reader, None)
-        except csv.Error:
-          # Skip malformed row during schema inference; runtime DoFn routes it
-          # to the DLQ output!
-          break
-        if row is None:
-          break
-        if len(row) != len(header):
+        rec_iter = iter_csv_rows_recovering(text_stream, delimiter=delimiter)
+        first_row = None
+        for cells, csv_err, _ in rec_iter:
+          if csv_err is not None:
+            continue
+          if cells:
+            first_row = cells
+            break
+        if not first_row:
           continue
-        if order is not None:
-          row = [row[i] for i in order]
-        for col_name, cell in zip(header, row):
-          col_samples[col_name].append(cell)
-        collected += 1
+        norm = [col.strip() or f'col_{i}' for i, col in enumerate(first_row)]
+        order = None
+        if header is None:
+          header = norm
+          col_samples = {c: [] for c in header}
+        else:
+          order = header_order(norm, header)
+        for row, csv_err, _ in rec_iter:
+          if collected >= sample_rows:
+            break
+          if csv_err is not None or row is None:
+            continue
+          if len(row) != len(header):
+            continue
+          if order is not None:
+            row = [row[i] for i in order]
+          for col_name, cell in zip(header, row):
+            col_samples[col_name].append(cell)
+          collected += 1
+      finally:
+        try:
+          text_stream.detach()
+        except Exception:  # pylint: disable=broad-except
+          pass
     if header is not None and collected >= sample_rows:
       break
 
@@ -589,31 +691,39 @@ def _preflight_csv_schema(
 
 def _columns_with_leading_zeros(files, header, columns, delimiter):
   """Columns (of `columns`) with a leading-zero value in any row of `files`."""
+  ensure_csv_field_size_limit()
   found: set[str] = set()
   for fp in files:
     with _open_auto(fp) as raw_stream:
-      reader = csv.reader(
-          io.TextIOWrapper(
-              raw_stream, encoding='utf-8-sig', errors='replace', newline=''),
-          delimiter=delimiter)
+      text_stream = io.TextIOWrapper(
+          raw_stream, encoding='utf-8-sig', errors='replace', newline='')
       try:
-        first = next(reader, None)
-      except csv.Error:
-        continue
-      if not first:
-        continue
-      norm = [col.strip() or f'col_{i}' for i, col in enumerate(first)]
-      positions = {c: norm.index(c) for c in columns if c in norm}
-      try:
-        for row in reader:
+        rec_iter = iter_csv_rows_recovering(text_stream, delimiter=delimiter)
+        first = None
+        for cells, csv_err, _ in rec_iter:
+          if csv_err is not None:
+            continue
+          if cells:
+            first = cells
+            break
+        if not first:
+          continue
+        norm = [col.strip() or f'col_{i}' for i, col in enumerate(first)]
+        positions = {c: norm.index(c) for c in columns if c in norm}
+        for row, csv_err, _ in rec_iter:
+          if csv_err is not None or row is None:
+            continue
           for c, i in positions.items():
             if c not in found and i < len(row) and _has_leading_zero(
                 row[i].strip()):
               found.add(c)
           if len(found) == len(positions):
             break
-      except csv.Error:
-        pass
+      finally:
+        try:
+          text_stream.detach()
+        except Exception:  # pylint: disable=broad-except
+          pass
   return found
 
 
@@ -781,6 +891,20 @@ def install_keyword_safe_row_hooks() -> None:
     _safe_exp._cli_preview_patched = True
     yaml_map_mod._expand_python_mapping_func = _safe_exp
 
+  orig_val = getattr(yaml_map_mod, '_validator', None)
+  if orig_val is not None and not getattr(orig_val, '_cli_preview_patched', False):
+
+    def _nullable_validator(beam_type):
+      inner_v = orig_val(beam_type)
+      try:
+        beam_type.nullable = True
+      except Exception:  # pylint: disable=broad-except
+        pass
+      return lambda x: x is None or inner_v(x)
+
+    _nullable_validator._cli_preview_patched = True
+    yaml_map_mod._validator = _nullable_validator
+
   _install_nested_row_attr_inference()
 
 
@@ -900,6 +1024,13 @@ def _install_nested_row_attr_inference() -> None:
   opcodes._getattr = _getattr
 
 
+def should_scan_local_csv_leading_zeros(path_or_files) -> bool:
+  """True when local CSV files <= 64 MB should be scanned for leading zeros."""
+  if os.environ.get('BEAM_CLI_NO_FAST_PATH'):
+    return False
+  return should_scan_all_local_json(path_or_files)
+
+
 def read_csv_with_dlq(
     path: str,
     *,
@@ -920,7 +1051,10 @@ def read_csv_with_dlq(
   install_keyword_safe_row_hooks()
   nulls = DEFAULT_CSV_NULL_VALUES | frozenset(null_values or ())
   header, kinds = _preflight_csv_schema(
-      path, delimiter=delimiter, null_values=nulls)
+      path,
+      delimiter=delimiter,
+      null_values=nulls,
+      scan_all_for_leading_zeros=should_scan_local_csv_leading_zeros(path))
   kinds = apply_type_overrides(kinds, types, path)
   py_type_map = {
       'int': Optional[int],
@@ -945,6 +1079,9 @@ def read_csv_with_dlq(
     def __init__(self):
       self._rows_read = Metrics.counter('beam_cli', 'rows_read')
       self._dlq_rows = Metrics.counter('beam_cli', 'source_dlq_rows')
+
+    def start_bundle(self):
+      self._rows_read.inc(0)
 
     def process(self, readable_file):
       file_path = readable_file.metadata.path
@@ -993,81 +1130,90 @@ def iter_csv_records(
   the same header handling, typing, and DLQ records. Every yielded item is
   one record read; a header row matching `header` and blank lines are skipped.
   """
+  ensure_csv_field_size_limit()
   wrapper = io.TextIOWrapper(
       raw_f, encoding='utf-8-sig', errors='replace', newline='')
-  reader = csv.reader(wrapper, delimiter=delimiter)
-  row_index = 0
-  order = None
-  while True:
-    try:
-      cells = next(reader)
-    except StopIteration:
-      break
-    except csv.Error as exc:
-      yield None, {
-          'step': 'ReadCsvWithDlq',
-          'error_type': 'CsvSyntaxError',
-          'error': str(exc),
-          'raw_payload': safe_json_dumps({
-              'file': file_path,
-              'row_index': row_index,
-          }),
-      }
-      break
-
-    if row_index == 0:
-      norm = [c.strip() or f'col_{i}' for i, c in enumerate(cells)]
-      order = header_order(norm, header)
-      if norm == header or order is not None:
+  try:
+    row_index = 0
+    order = None
+    for cells, csv_err, bad_line in iter_csv_rows_recovering(
+        wrapper, delimiter=delimiter):
+      if csv_err is not None:
         row_index += 1
+        yield None, {
+            'step': 'ReadCsvWithDlq',
+            'error_type': 'CsvSyntaxError',
+            'error': (
+                f'file {file_path!r} row {row_index}: {csv_err}'),
+            'raw_payload': safe_json_dumps({
+                'file': file_path,
+                'row_index': row_index,
+                'raw_line': (bad_line or '')[:4096],
+            }),
+        }
         continue
-    row_index += 1
-    if not cells or (len(cells) == 1 and cells[0] == '' and len(header) > 1):
-      continue
 
-    if len(cells) != len(header):
-      yield None, {
-          'step': 'ReadCsvWithDlq',
-          'error_type': 'ColumnCountMismatch',
-          'error': f'expected {len(header)} columns, got {len(cells)}',
-          'raw_payload': safe_json_dumps({
-              'file': file_path,
-              'row_index': row_index,
-              'cells': cells,
-          }),
-      }
-      continue
+      if row_index == 0:
+        norm = [c.strip() or f'col_{i}' for i, c in enumerate(cells)]
+        order = header_order(norm, header)
+        if norm == header or order is not None:
+          row_index += 1
+          continue
+      row_index += 1
+      if not cells or (len(cells) == 1 and cells[0] == '' and len(header) > 1):
+        continue
 
-    if order is not None:
-      cells = [cells[i] for i in order]
-    parsed_vals: dict[str, Any] = {}
-    conv_err: Exception | None = None
-    bad_col = ''
-    for col_name, raw_cell in zip(header, cells):
-      try:
-        parsed_vals[col_name] = _parse_cell(
-            raw_cell, kinds[col_name], null_values)
-      except Exception as exc:  # pylint: disable=broad-except
-        conv_err = exc
-        bad_col = col_name
-        break
-    if conv_err is not None:
-      yield None, {
-          'step': 'ReadCsvWithDlq',
-          'error_type': type(conv_err).__name__,
-          'error': f'column {bad_col!r}: {conv_err}',
-          'raw_payload': safe_json_dumps(dict(zip(header, cells))),
-      }
-      continue
-    yield parsed_vals, None
+      if len(cells) != len(header):
+        yield None, {
+            'step': 'ReadCsvWithDlq',
+            'error_type': 'ColumnCountMismatch',
+            'error': (
+                f'file {file_path!r} row {row_index}: '
+                f'expected {len(header)} columns, got {len(cells)}'),
+            'raw_payload': safe_json_dumps({
+                'file': file_path,
+                'row_index': row_index,
+                'cells': cells,
+            }),
+        }
+        continue
+
+      if order is not None:
+        cells = [cells[i] for i in order]
+      parsed_vals: dict[str, Any] = {}
+      conv_err: Exception | None = None
+      bad_col = ''
+      for col_name, raw_cell in zip(header, cells):
+        try:
+          parsed_vals[col_name] = _parse_cell(
+              raw_cell, kinds[col_name], null_values)
+        except Exception as exc:  # pylint: disable=broad-except
+          conv_err = exc
+          bad_col = col_name
+          break
+      if conv_err is not None:
+        yield None, {
+            'step': 'ReadCsvWithDlq',
+            'error_type': type(conv_err).__name__,
+            'error': (
+                f'file {file_path!r} row {row_index} '
+                f'column {bad_col!r}: {conv_err}'),
+            'raw_payload': safe_json_dumps(dict(zip(header, cells))),
+        }
+        continue
+      yield parsed_vals, None
+  finally:
+    try:
+      wrapper.detach()
+    except Exception:  # pylint: disable=broad-except
+      pass
 
 
 def csv_fail_fast_message(err: dict[str, Any], step: str = '') -> str:
   """The error for a bad CSV record when no `--dlq` is configured."""
   return (
-      f"{err['error_type']}: {err['error']}; CSV record: "
-      f"{err['raw_payload'][:200]}{step} (pass --dlq PATH to route bad "
-      'records instead of failing)')
+      f"{err['error_type']}: {err['error']}{step} (pass --dlq PATH to route "
+      'bad records or run `beam inspect` to review input)')
 
 
 MAX_JSON_NESTING_DEPTH = 32
@@ -1282,7 +1428,7 @@ def _coerce_json_value(
   else:  # 'str' or 'json'
     return value if isinstance(value, str) else json.dumps(value)
   raise ValueError(
-      f'field {path!r}: expected {kind}, got {type(value).__name__} {value!r}')
+      f'field {path!r}: expected {kind}, got {type(value).__name__}')
 
 
 def read_json_with_dlq(
@@ -1334,6 +1480,9 @@ def read_json_with_dlq(
       self._dlq_rows = Metrics.counter('beam_cli', 'source_dlq_rows')
       self._drift_rows = Metrics.counter('beam_cli', 'schema_drift_rows')
 
+    def start_bundle(self):
+      self._rows_read.inc(0)
+
     def process(self, line: str):
       stripped = line.strip()
       if not stripped:
@@ -1344,7 +1493,8 @@ def read_json_with_dlq(
             stripped, kinds, beam.Row, allow_unknown_fields=allow_unknown)
       except Exception as exc:  # pylint: disable=broad-except
         if not route_errors:
-          raise ValueError(json_fail_fast_message(stripped, exc)) from exc
+          raise ValueError(
+              json_fail_fast_message(stripped, exc, file_path=path)) from exc
         self._dlq_rows.inc()
         if isinstance(exc, SchemaDriftError):
           self._drift_rows.inc()
@@ -1380,6 +1530,7 @@ def infer_json_kinds(
     raise ValueError(f'no JSON files matched {path!r}')
 
   samples: list[dict[str, Any]] = []
+  has_non_empty_line = False
   for match_path in matches:
     with _open_auto(match_path) as raw_s, io.TextIOWrapper(
         raw_s, encoding='utf-8', errors='replace') as text_s:
@@ -1387,6 +1538,7 @@ def infer_json_kinds(
         line = raw_line.strip()
         if not line:
           continue
+        has_non_empty_line = True
         try:
           obj = json.loads(line)
         except ValueError:
@@ -1399,6 +1551,8 @@ def infer_json_kinds(
       break
 
   if not samples:
+    if not has_non_empty_line:
+      return {}
     raise ValueError(
         f'could not infer JSON object schema from {path!r} (no valid objects)')
   kinds = _infer_json_kind(samples)
@@ -1452,18 +1606,32 @@ def json_dlq_record(stripped: str, exc: Exception) -> dict[str, Any]:
 
 
 def json_fail_fast_message(
-    stripped: str, exc: Exception, step: str = '') -> str:
+    stripped: str,
+    exc: Exception,
+    step: str = '',
+    *,
+    line_number: Optional[int] = None,
+    file_path: Optional[str] = None,
+) -> str:
   """The error for a bad JSONL line when no `--dlq` is configured."""
+  del stripped  # Never interpolate untrusted raw payload into error.message.
+  loc_parts = []
+  if file_path:
+    loc_parts.append(f'file {file_path!r}')
+  if line_number is not None:
+    loc_parts.append(f'line {line_number}')
+  loc = f" ({', '.join(loc_parts)})" if loc_parts else ''
   if isinstance(exc, SchemaDriftError):
     return (
-        f'{type(exc).__name__}: {exc} in JSON line {stripped[:200]!r}{step} '
+        f'{type(exc).__name__}: {exc} in JSON input{loc}{step} '
         '(pass --dlq PATH to quarantine these records for review, '
         '--from-opt sample_rows=all to scan all records for schema, '
         '--from-opt fields=COL:TYPE to declare sparse fields, or '
         '--from-opt on_unknown_fields=ignore to drop extra fields)')
   return (
-      f'{type(exc).__name__}: {exc} in JSON line {stripped[:200]!r}{step} '
-      '(pass --dlq PATH to route bad records instead of failing)')
+      f'{type(exc).__name__}: {exc} in JSON input{loc}{step} '
+      '(pass --dlq PATH to route bad records or run `beam inspect` to review '
+      'input)')
 
 
 def cli_count_rows(counter: str = 'rows_read'):
@@ -1474,6 +1642,9 @@ def cli_count_rows(counter: str = 'rows_read'):
   class _CountDoFn(beam.DoFn):
     def __init__(self):
       self._counter = Metrics.counter('beam_cli', counter)
+
+    def start_bundle(self):
+      self._counter.inc(0)
 
     def process(self, element):
       self._counter.inc()
@@ -1486,6 +1657,33 @@ def cli_count_rows(counter: str = 'rows_read'):
           _CountDoFn()).with_output_types(elem_type)
 
   return _CliCountRowsTransform()
+
+
+def cli_drop_rows(counter: str = 'stage_dropped_rows'):
+  """Consumes bad records under `--drop-bad`, counting without emitting rows."""
+  import apache_beam as beam
+  from apache_beam.metrics import Metrics
+
+  class _DropDoFn(beam.DoFn):
+    def __init__(self):
+      self._counter = Metrics.counter('beam_cli', counter)
+
+    def start_bundle(self):
+      self._counter.inc(0)
+
+    def process(self, element):
+      del element
+      self._counter.inc()
+      if False:  # pylint: disable=using-constant-test
+        yield None
+
+  class _CliDropRowsTransform(beam.PTransform):
+    def expand(self, pcoll):
+      elem_type = pcoll.element_type
+      return pcoll | f'Drop_{counter}' >> beam.ParDo(
+          _DropDoFn()).with_output_types(elem_type)
+
+  return _CliDropRowsTransform()
 
 
 def cli_limit_rows(limit: int):
@@ -1694,13 +1892,17 @@ def cli_write_to_bigquery(
           if (use_streaming and write_disposition == 'WRITE_EMPTY') else
           write_disposition)
 
+      bq_write_kwargs: dict[str, Any] = {
+          'schema': bq_schema,
+          'create_disposition': create_disposition,
+          'write_disposition': effective_disp,
+          'method': method,
+      }
+      if use_streaming:
+        bq_write_kwargs['insert_retry_strategy'] = 'RETRY_ON_TRANSIENT_ERROR'
+
       dicts = pcoll | 'ToBqDict' >> beam.ParDo(_RowToBqDictDoFn())
-      write_res = dicts | 'WriteBq' >> WriteToBigQuery(
-          table,
-          schema=bq_schema,
-          create_disposition=create_disposition,
-          write_disposition=effective_disp,
-          method=method)
+      write_res = dicts | 'WriteBq' >> WriteToBigQuery(table, **bq_write_kwargs)
 
       if error_handling and 'output' in error_handling and use_streaming:
         errs = (

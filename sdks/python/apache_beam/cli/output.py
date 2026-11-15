@@ -246,7 +246,9 @@ def scrub_error_message(
     redact_long_quotes: bool = True,
 ) -> str:
   """Strips terminal escapes/BiDi chars and scrubs credentials & long literals."""
-  clean = sanitize_untrusted_text(message, max_chars=16384 if verbose else 4096)
+  redacted = redact_inline_secrets(message, placeholder='<redacted-value>')
+  clean = sanitize_untrusted_text(
+      redacted, max_chars=16384 if verbose else 4096)
   clean = redact_inline_secrets(clean, placeholder='<redacted-value>')
   if verbose or not redact_long_quotes:
     return clean
@@ -487,6 +489,16 @@ def classify_error(
             'requires_human': True,
         },
     ])
+  elif exit_code == 3:
+    error_type = 'UnsupportedCapabilityError'
+    if command:
+      next_actions.append({
+          'command': f'beam {command} --help',
+          'description': (
+              f'Inspect supported runner/connector capabilities for beam {command}.'
+          ),
+          'requires_human': False,
+      })
   elif exit_code == 2:
     error_type = 'UsageOrValidationError'
     if command:
@@ -606,29 +618,40 @@ def build_envelope(
   return payload
 
 
+_REAL_STDOUT_FD: int | None = None
+_RESTORED_PY_STDOUT: Any = None
+
+
 class JsonOutputSession:
   """Isolates stdout in `--json` mode and emits exactly one JSON document.
 
-  When `sys.stdout is sys.__stdout__` and OS file descriptors 1 and 2 are valid,
-  duplicates FD 1 to a private stream and calls `os.dup2(2, 1)` *permanently*
-  so C++/Go/Java subprocesses and `atexit` hooks can never pollute stdout after
-  the JSON envelope is written. When invoked inside in-process unit tests using
+  When `sys.stdout` targets the real process stdout and OS file descriptors 1
+  and 2 are valid, caches a duplicated real-stdout FD (`_REAL_STDOUT_FD`),
+  calls `os.dup2(2, 1)` *permanently* so C++/Go/Java subprocesses and `atexit`
+  hooks can never pollute stdout after the JSON envelope is written, and
+  restores `sys.stdout` to a Python stream backed by `_REAL_STDOUT_FD` on exit
+  so subsequent in-process `main()` or `print()` calls continue writing to
+  real stdout. When invoked inside unit tests using
   `contextlib.redirect_stdout(io.StringIO())`, falls back cleanly to Python
-  stream redirection without mutating process-global OS file descriptors.
+  stream redirection without mutating OS file descriptors.
   """
   def __init__(self, enabled: bool):
     self.enabled = bool(enabled)
     self._json_stream = None
     self._owns_fd = False
-    self._prev_stdout = None
+    self._restore_stdout = None
     self._emitted = False
 
   def __enter__(self):
+    global _REAL_STDOUT_FD
+    global _RESTORED_PY_STDOUT
     if not self.enabled:
       return self
-    self._prev_stdout = sys.stdout
+    prev_stdout = sys.stdout
+    self._restore_stdout = prev_stdout
     use_os_fd = False
-    if sys.stdout is sys.__stdout__:
+    if prev_stdout is sys.__stdout__ or (
+        _RESTORED_PY_STDOUT is not None and prev_stdout is _RESTORED_PY_STDOUT):
       try:
         os.fstat(1)
         os.fstat(2)
@@ -638,23 +661,31 @@ class JsonOutputSession:
 
     if use_os_fd:
       try:
-        sys.stdout.flush()
+        prev_stdout.flush()
         sys.stderr.flush()
       except OSError:
         pass
       try:
-        saved_fd = os.dup(1)
-        # Permanent redirection: intentionally NOT undone in `__exit__` so gRPC /
-        # Prism `atexit` teardown writes to FD 2 rather than corrupting FD 1.
-        os.dup2(2, 1)
-        self._json_stream = os.fdopen(saved_fd, 'w', encoding='utf-8')
+        if _REAL_STDOUT_FD is None:
+          _REAL_STDOUT_FD = os.dup(1)
+          # Permanent OS FD redirection: intentionally NOT undone in `__exit__`
+          # so C++/gRPC/Prism `atexit` teardown writes to FD 2 rather than FD 1.
+          os.dup2(2, 1)
+          _RESTORED_PY_STDOUT = os.fdopen(
+              os.dup(_REAL_STDOUT_FD),
+              'w',
+              buffering=1,
+              encoding='utf-8')
+        self._json_stream = os.fdopen(
+            os.dup(_REAL_STDOUT_FD), 'w', encoding='utf-8')
         self._owns_fd = True
+        self._restore_stdout = _RESTORED_PY_STDOUT
         sys.stdout = sys.stderr
       except OSError:
-        self._json_stream = self._prev_stdout
+        self._json_stream = prev_stdout
         sys.stdout = sys.stderr
     else:
-      self._json_stream = self._prev_stdout
+      self._json_stream = prev_stdout
       sys.stdout = sys.stderr
     return self
 
@@ -682,7 +713,7 @@ class JsonOutputSession:
         self._json_stream.close()
       except OSError:
         pass
-    elif self._prev_stdout is not None:
-      sys.stdout = self._prev_stdout
+    if self._restore_stdout is not None:
+      sys.stdout = self._restore_stdout
     return False
 

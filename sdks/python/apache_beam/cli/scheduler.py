@@ -86,6 +86,54 @@ def _sanitize_identifier(name: str) -> str:
   return sanitized
 
 
+_JINJA_PLACEHOLDER_RE = re.compile(r'\{\{.*?\}\}|\{%.*?%\}|\{#.*?#\}', re.DOTALL)
+_SECRET_VALUE_TOKEN_RE = re.compile(
+    r'(?:'
+    r'\bya29\.[A-Za-z0-9._-]{8,}|'
+    r'\bsk-[A-Za-z0-9_-]{12,}|'
+    r'\bAIza[0-9A-Za-z_-]{20,}|'
+    r'\bgh[pousr]_[A-Za-z0-9_]{12,}|'
+    r'\bgithub_pat_[A-Za-z0-9_]{12,}|'
+    r'\bhf_[A-Za-z0-9]{12,}|'
+    r'\bAKIA[0-9A-Z]{16}\b|'
+    r'\bxox[baprs]-[A-Za-z0-9-]{10,}|'
+    r'\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'
+    r')')
+
+
+def _parse_yaml_options_dict(raw_text: str, label: str) -> dict[str, Any]:
+  from . import output
+  try:
+    data = output.safe_yaml_load(raw_text)
+  except Exception as first_exc:  # pylint: disable=broad-except
+    if '{{' in raw_text or '{%' in raw_text:
+      try:
+        output.validate_safe_jinja_template(raw_text)
+        scrubbed = _JINJA_PLACEHOLDER_RE.sub(
+            '__BEAM_JINJA_PLACEHOLDER__', raw_text)
+        data = output.safe_yaml_load(scrubbed)
+      except Exception:  # pylint: disable=broad-except
+        raise SchedulerError(f'invalid YAML in {label}: {first_exc}') from None
+    else:
+      raise SchedulerError(f'invalid YAML in {label}: {first_exc}') from None
+
+  if not isinstance(data, dict):
+    if label == 'stdin YAML':
+      raise SchedulerError('stdin YAML must be a mapping')
+    return {}
+  opts = data.get('options', {}) or {}
+  if not isinstance(opts, dict):
+    return {}
+  normalized: dict[str, Any] = {}
+  for k, v in opts.items():
+    if v == '__BEAM_JINJA_PLACEHOLDER__' or (
+        isinstance(v, str) and '__BEAM_JINJA_PLACEHOLDER__' in v):
+      continue
+    norm_k = str(k).strip().lstrip('-').replace('-', '_')
+    normalized[norm_k] = v
+  return normalized
+
+
 def _load_pipeline_options_from_source(source: str) -> dict[str, Any]:
   """Extracts options block from a YAML pipeline file or stdin if provided."""
   import sys
@@ -100,13 +148,9 @@ def _load_pipeline_options_from_source(source: str) -> dict[str, Any]:
   if s_trim == '-':
     try:
       raw_text = output.read_bounded_text(sys.stdin, label='stdin YAML')
-      data = output.safe_yaml_load(raw_text)
     except Exception as exc:
       raise SchedulerError(f'invalid YAML on stdin: {exc}') from None
-    if isinstance(data, dict):
-      opts = data.get('options', {}) or {}
-      return opts if isinstance(opts, dict) else {}
-    raise SchedulerError('stdin YAML must be a mapping')
+    return _parse_yaml_options_dict(raw_text, 'stdin YAML')
 
   if s_trim.lower().endswith(('.yaml', '.yml')):
     if os.path.islink(s_trim):
@@ -116,24 +160,41 @@ def _load_pipeline_options_from_source(source: str) -> dict[str, Any]:
       raise SchedulerError(f'pipeline file not found: {s_trim}')
     try:
       raw_text = output.read_bounded_text(s_trim, label=s_trim)
-      data = output.safe_yaml_load(raw_text)
     except Exception as exc:
       raise SchedulerError(f'invalid YAML in {s_trim!r}: {exc}') from None
-    if isinstance(data, dict):
-      opts = data.get('options', {}) or {}
-      return opts if isinstance(opts, dict) else {}
-    return {}
+    return _parse_yaml_options_dict(raw_text, repr(s_trim))
 
   if os.path.isfile(s_trim) and not os.path.islink(s_trim):
     try:
       raw_text = output.read_bounded_text(s_trim, label=s_trim)
-      data = output.safe_yaml_load(raw_text)
-      if isinstance(data, dict):
-        opts = data.get('options', {}) or {}
-        return opts if isinstance(opts, dict) else {}
+      return _parse_yaml_options_dict(raw_text, repr(s_trim))
     except Exception:  # pylint: disable=broad-except
       return {}
   return {}
+
+
+def _is_truthy_opt(val: Any) -> bool:
+  if isinstance(val, bool):
+    return val
+  if val is None:
+    return False
+  return str(val).strip().lower() in ('1', 'true', 'yes')
+
+
+def _validate_param_value_no_secrets(key: str, val: str) -> None:
+  from . import output
+  from . import uris
+  try:
+    uris.reject_inline_credentials(val)
+  except uris.UriError as exc:
+    raise SchedulerError(
+        f'Refusing to bake inline credentials in parameter {key!r}: {exc}'
+    ) from None
+  if _SECRET_VALUE_TOKEN_RE.search(val) or (
+      output.redact_inline_secrets(val) != val):
+    raise SchedulerError(
+        f'Refusing to bake inline secret or token in parameter {key!r}; '
+        'pass a Secret Manager resource name instead')
 
 
 def generate_composer_dag(
@@ -280,6 +341,13 @@ def run_export_schedule(
     service_account_email: str | None = None,
     subnetwork: str | None = None,
     network: str | None = None,
+    temp_location: str | None = None,
+    staging_location: str | None = None,
+    no_use_public_ips: bool | None = None,
+    worker_machine_type: str | None = None,
+    max_num_workers: int | None = None,
+    num_workers: int | None = None,
+    enable_streaming_engine: bool | None = None,
     parameters: list[str] | None = None,
     catchup: bool = False,
     max_active_runs: int = 1,
@@ -306,6 +374,32 @@ def run_export_schedule(
       location or pipeline_opts.get('region') or
       os.environ.get('CLOUDSDK_COMPUTE_REGION') or 'us-central1').strip()
   eff_sa = service_account_email or pipeline_opts.get('service_account_email')
+  eff_subnetwork = subnetwork or pipeline_opts.get('subnetwork')
+  eff_network = network or pipeline_opts.get('network')
+  eff_temp = temp_location or pipeline_opts.get('temp_location')
+  eff_staging = staging_location or pipeline_opts.get('staging_location')
+  eff_machine = (
+      worker_machine_type or pipeline_opts.get('worker_machine_type') or
+      pipeline_opts.get('machine_type'))
+  eff_max_workers = (
+      max_num_workers if max_num_workers is not None else (
+          pipeline_opts.get('max_num_workers')
+          if pipeline_opts.get('max_num_workers') is not None else
+          pipeline_opts.get('max_workers')))
+  eff_num_workers = (
+      num_workers
+      if num_workers is not None else pipeline_opts.get('num_workers'))
+  if no_use_public_ips is not None:
+    eff_no_public = bool(no_use_public_ips)
+  else:
+    eff_no_public = _is_truthy_opt(pipeline_opts.get('no_use_public_ips')) or (
+        pipeline_opts.get('use_public_ips') is False or
+        str(pipeline_opts.get('use_public_ips', '')).strip().lower() == 'false')
+  if enable_streaming_engine is not None:
+    eff_streaming_engine = bool(enable_streaming_engine)
+  else:
+    eff_streaming_engine = _is_truthy_opt(
+        pipeline_opts.get('enable_streaming_engine'))
 
   if not re.fullmatch(r'[a-z0-9.:-]+', eff_project) or eff_project.startswith('-'):
     raise SchedulerError(f'Invalid GCP project identifier {eff_project!r}')
@@ -337,12 +431,36 @@ def run_export_schedule(
   env_block: dict[str, Any] = {}
   if eff_sa:
     env_block['serviceAccountEmail'] = str(eff_sa)
-  if subnetwork:
-    env_block['subnetwork'] = subnetwork
-  if network:
-    env_block['network'] = network
+  if eff_subnetwork:
+    env_block['subnetwork'] = str(eff_subnetwork)
+  if eff_network:
+    env_block['network'] = str(eff_network)
+  if eff_temp:
+    env_block['tempLocation'] = str(eff_temp)
+  if eff_staging:
+    env_block['stagingLocation'] = str(eff_staging)
+  if eff_no_public:
+    env_block['ipConfiguration'] = 'WORKER_IP_PRIVATE'
+  if eff_machine:
+    env_block['machineType'] = str(eff_machine)
+  if eff_max_workers is not None:
+    try:
+      env_block['maxWorkers'] = int(eff_max_workers)
+    except (TypeError, ValueError):
+      raise SchedulerError(
+          f'Invalid max_num_workers {eff_max_workers!r}; expected integer'
+      ) from None
+  if eff_num_workers is not None:
+    try:
+      env_block['numWorkers'] = int(eff_num_workers)
+    except (TypeError, ValueError):
+      raise SchedulerError(
+          f'Invalid num_workers {eff_num_workers!r}; expected integer'
+      ) from None
+  if eff_streaming_engine:
+    env_block['enableStreamingEngine'] = True
 
-  # Parse parameters (rejecting hardcoded secrets)
+  # Parse parameters (rejecting hardcoded secret keys and inline secret values)
   param_dict: dict[str, str] = {}
   if parameters:
     for p in parameters:
@@ -357,6 +475,8 @@ def run_export_schedule(
         raise SchedulerError(
             f'Refusing to bake secret parameter {ks!r} into exported schedule; '
             'pass a Secret Manager resource name instead')
+      if vs:
+        _validate_param_value_no_secrets(ks, vs)
       param_dict[ks] = vs
 
   if orch == 'composer':

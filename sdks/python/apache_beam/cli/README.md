@@ -43,9 +43,9 @@ This package implements the `beam` (and `apache-beam`) command-line interface tr
 | `uris.py` | Universal URI parser (`csv`, `json`, `parquet`, `avro`, `delta://`, `iceberg://`, `bigquery://`, `postgres://`, `mysql://`, `spanner://`, `pubsub://`, `kafka://`) |
 | `pipe_spec.py` | Declarative `beam pipe` -> Beam YAML compiler (`--where`, `--select`, `--dlq`, `--assert-counts`, `--cdc`, `--zero-copy`) |
 | `fast_local.py` | `<80 ms` zero-SDK local ETL & CDC materializer (`csv`, `json`/`jsonl`, `parquet`, `avro`, atomic `--if-exists replace`) |
-| `pipe_sql.py` | Local analytical `--sql` engine (`sqlite` built-in + optional `duckdb`), multi-source `--join`, `median`/`quantile`/`to_utc` |
-| `expressions.py` | Tokenized, AST-allowlisted, DoS-bounded `--where` / `--select` Python callable compiler |
-| `dlq.py` | RFC-4180 multi-shard `ReadCsvWithDlq`, schema-drift-aware `ReadJsonWithDlq`, and flat primitive DLQ normalizers |
+| `pipe_sql.py` | Local analytical `--sql` (`sqlite` + optional `duckdb`) & zero-JVM `--sql-engine python` lowering (`TUMBLE`/`HOP`/`SESSION` TVFs), `--join`, `median`/`quantile`/`to_utc` |
+| `expressions.py` | Tokenized, AST-allowlisted, DoS-bounded `--where` / `--select` compiler (`LIKE`/`ILIKE`/`BETWEEN`, UTC timestamp & JSON helpers) |
+| `dlq.py` | RFC-4180 multi-shard `ReadCsvWithDlq`, schema-drift-aware `ReadJsonWithDlq`, `--drop-bad`, and flat primitive DLQ normalizers |
 | `cost_guard.py` | Pre-flight `--max-bytes` cost estimator (`EXIT_COST_LIMIT = 8`) across files, Lakehouse logs, Postgres, and `$0` BigQuery metadata/`dryRun` |
 | `diff.py` | Distributed $O(1)$-RAM `CombinePerKey` multiset hash & float-tolerance dataset reconciliation (`--columns`, `--to`, `EXIT_DIFF_MISMATCH = 6`) |
 | `inspect_cmd.py` | Sub-second PyArrow, Lakehouse snapshot, and `$0` BigQuery schema/stats/sample inspector |
@@ -84,16 +84,16 @@ This package implements the `beam` (and `apache-beam`) command-line interface tr
 
 ---
 
-## 5. Feature-Complete Status, Documentation & Test Suite (`431` Tests Across 27 Modules)
+## 5. Production-Hardened Feature-Complete Status & Test Suite (`488` Tests Across 29 Modules)
 
-The `beam-cli-preview` (`v0.2.0`) feature set is **Feature Complete** across Core ETL, Lakehouse/CDC, Governance, Tier 1 (Joins, Deduplication, Online Enrichment, ML Inference), Tier 2 (Point-in-Time `ASOF JOIN`, Bounded CEP, Window Triggers & Late-Data Quarantine), and cross-subcommand Human UX / Agent DX ergonomics, with active engineering focused on incremental ~400-line upstream PRs into `apache/beam:master`.
+The `beam-cli-preview` (`v0.2.0`) feature set is **Feature Complete & Production-Hardened** across Core ETL, Lakehouse/CDC, Governance, Tier 1 (Joins, Deduplication, Online Enrichment, ML Inference), Tier 2 (Point-in-Time `ASOF JOIN`, Bounded CEP, Window Triggers & Late-Data Quarantine), Zero-JVM Pure-Python SQL Lowering (`--sql-engine python`), and cross-subcommand Human UX / Agent DX ergonomics, with active engineering focused on incremental ~400-line upstream PRs into `apache/beam:master`.
 
 * **Preview Quickstart & Recipes**: [`sdks/python/cli-preview/README.md`](../../cli-preview/README.md)
 * **Website CLI Reference**: [`website/www/site/content/en/documentation/sdks/cli.md`](../../../../website/www/site/content/en/documentation/sdks/cli.md)
 * **AI Agent Skill**: [`.agents/skills/apache-beam-cli/SKILL.md`](../../../../.agents/skills/apache-beam-cli/SKILL.md)
 * **Acknowledgements**: Thanks to **[Darsh Patel (`@darshpatel1052`)](https://github.com/darshpatel1052)** for preview dogfooding that caught and resolved 38-digit Parquet `Decimal` rounding in `beam diff` (`diff.py`, `interval_join.py`), failed post-validation `DONE` job reuse in the 30-minute idempotency ledger (`jobs.py`, `main.py`), and premature >15-minute ephemeral subscription GC across concurrent Pub/Sub `beam tail` sessions (`tail.py`).
 
-After installing the preview overlay (`sdks/python/cli-preview`) into a virtual environment, run the full `431`-test unit, `<90 ms` startup-isolation, stateful streaming, enrichment/ML, Lakehouse/CDC, ergonomics, and adversarial security/chaos suite from the repository root:
+After installing the preview overlay (`sdks/python/cli-preview`) into a virtual environment, run the full `488`-test unit, `<90 ms` startup-isolation, stateful streaming, enrichment/ML, Lakehouse/CDC, pure-Python SQL lowering, ergonomics, and adversarial security/chaos suite from the repository root:
 
 ```bash
 python -m unittest discover -s sdks/python/apache_beam/cli -p '*_test.py'

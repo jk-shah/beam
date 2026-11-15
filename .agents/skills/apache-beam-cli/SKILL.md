@@ -8,10 +8,10 @@ description: Universal data movement, verification, and streaming CLI (beam / ap
 Use `beam` (also installed as `apache-beam` if `beam` collides on `PATH`) for guardrailed batch and streaming data movement, cross-store dataset diff reconciliation, pre-flight schema compatibility checks, zero-copy Delta/Iceberg catalog registration, stateful streaming deduplication/enrichment/ML inference/late-data quarantine, and seamless local-to-Dataflow graduation.
 
 ## Package & Maturity Status
-- **Package**: `apache-beam-cli-preview` v0.2.0 (`Feature Complete` preview overlay; `428/428` tests across 27 modules).
+- **Package**: `apache-beam-cli-preview` v0.2.0 (`Feature Complete & Production-Hardened` preview overlay; `488/488` tests across 29 modules).
 - **Upstream vs. Preview Scope ([apache/beam#40891](https://github.com/apache/beam/issues/40891))**:
   - **Upstream `apache/beam:master`**: `beam run` ([#40968](https://github.com/apache/beam/pull/40968) merged) and file-to-file `beam pipe` ([#41040](https://github.com/apache/beam/pull/41040) approved).
-  - **Preview Overlay (`jk-shah/beam@beam-cli-preview`)**: Universal URIs (`bigquery://`, `iceberg://`, `delta://`, `kafka://`, `pubsub://`, `postgres://`, `spanner://`), `beam diff`, `beam schema diff`, `beam catalog sync`, `beam inspect`, `beam check`, `beam tail [-f|-i]`, `beam package`, `beam export-schedule`, `--cdc`, `--zero-copy`, `--expect`, `--dedupe-by`, `--enrich` (`--enrich-opt [STAGE:]K=V`), `--infer` (`--infer-opt [STAGE:]K=V`), `ASOF JOIN`, `--pattern` (`--pattern-opt`), and `--window` triggers / `--late-data-dlq`.
+  - **Preview Overlay (`jk-shah/beam@beam-cli-preview`)**: Universal URIs (`bigquery://`, `iceberg://`, `delta://`, `kafka://`, `pubsub://`, `postgres://`, `spanner://`), `beam diff`, `beam schema diff`, `beam catalog sync`, `beam inspect`, `beam check`, `beam tail [-f|-i]`, `beam package`, `beam export-schedule`, `--sql-engine python` (zero-JVM `TUMBLE`/`HOP`/`SESSION` TVF & `GROUP BY` lowering), `--drop-bad`/`--skip-errors`, `--cdc`, `--zero-copy`, `--expect`, `--dedupe-by`, `--enrich` (`--enrich-opt [STAGE:]K=V`), `--infer` (`--infer-opt [STAGE:]K=V`), `ASOF JOIN`, `--pattern` (`--pattern-opt`), and `--window` triggers / `--late-data-dlq`.
 
 ## When to Use `beam` vs. Dedicated Alternatives
 - **Choose `beam` when you need**:

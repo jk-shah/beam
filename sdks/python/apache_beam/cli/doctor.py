@@ -22,6 +22,7 @@ import os
 import platform
 import sqlite3
 import sys
+import sysconfig
 from typing import Any
 
 from . import config
@@ -55,22 +56,50 @@ def _detect_binary_resolution() -> tuple[dict[str, Any], list[str]]:
   seen_ab: set[str] = set()
   seen_smp: set[str] = set()
 
+  exts = ('.exe', '.cmd', '.bat', '') if os.name == 'nt' else ('', )
   for d in path_dirs:
     for name, bucket, seen in (
         ('beam', beam_bins, seen_beam),
         ('apache-beam', apache_beam_bins, seen_ab),
         ('beam.smp', beam_smp_bins, seen_smp),
     ):
-      cand = os.path.join(d, name)
-      if os.path.isfile(cand) and os.access(cand, os.X_OK):
-        norm = os.path.abspath(cand)
-        if norm not in seen:
-          seen.add(norm)
-          bucket.append(norm)
+      for ext in exts:
+        cand = os.path.join(d, name + ext)
+        if os.path.isfile(cand) and (
+            os.name == 'nt' or os.access(cand, os.X_OK)):
+          abs_cand = os.path.abspath(cand)
+          norm = os.path.normcase(abs_cand)
+          if norm not in seen:
+            seen.add(norm)
+            bucket.append(abs_cand)
 
   beam_client_ver = _package_version('beam-client')
+  script_dirs: list[str] = []
+  try:
+    sc_dir = sysconfig.get_path('scripts')
+    if sc_dir:
+      script_dirs.append(os.path.abspath(sc_dir))
+  except Exception:  # pylint: disable=broad-except
+    pass
   py_bin_dir = os.path.dirname(os.path.abspath(sys.executable))
-  expected_beam = os.path.join(py_bin_dir, 'beam')
+  if py_bin_dir not in script_dirs:
+    script_dirs.append(py_bin_dir)
+  if os.name == 'nt':
+    win_scripts = os.path.join(py_bin_dir, 'Scripts')
+    if win_scripts not in script_dirs:
+      script_dirs.append(win_scripts)
+
+  expected_beam: str | None = None
+  expected_dir = script_dirs[0] if script_dirs else py_bin_dir
+  for sd in script_dirs:
+    for ext in exts:
+      cand = os.path.join(sd, 'beam' + ext)
+      if os.path.isfile(cand):
+        expected_beam = cand
+        expected_dir = sd
+        break
+    if expected_beam:
+      break
 
   if beam_client_ver is not None:
     warnings.append(
@@ -78,12 +107,13 @@ def _detect_binary_resolution() -> tuple[dict[str, Any], list[str]]:
         "environment and also defines a 'beam' console script; invoke "
         "'apache-beam' in scripts/CI for unambiguous CLI resolution.")
 
-  if beam_bins and os.path.isfile(expected_beam):
-    if os.path.realpath(beam_bins[0]) != os.path.realpath(expected_beam):
+  if beam_bins and expected_beam and os.path.isfile(expected_beam):
+    if os.path.normcase(os.path.realpath(beam_bins[0])) != os.path.normcase(
+        os.path.realpath(expected_beam)):
       warnings.append(
           f"PATH resolves 'beam' to {beam_bins[0]!r} before this Python "
           f"environment's {expected_beam!r}; invoke 'apache-beam' or prepend "
-          f"{py_bin_dir!r} to PATH.")
+          f"{expected_dir!r} to PATH.")
     elif len(beam_bins) > 1:
       warnings.append(
           f"Multiple 'beam' executables exist on PATH ({', '.join(beam_bins[:3])}); "
@@ -132,6 +162,10 @@ def run_doctor() -> dict[str, Any]:
           **({} if duck_ver else {
               'install': pipe_sql.DUCKDB_INSTALL_HINT
           }),
+      },
+      'python': {
+          'available': True,
+          'zero_jvm': True,
       },
   }
 

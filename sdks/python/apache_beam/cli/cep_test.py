@@ -24,6 +24,10 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import date
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
 from unittest import mock
 
 import pyarrow.parquet as pq
@@ -460,6 +464,109 @@ class CliPatternMatchCliEndToEndTest(unittest.TestCase):
       ])
       self.assertEqual(rc_ok, 0, f'STDOUT: {out_ok}\nSTDERR: {err_ok}')
       self.assertEqual(json.loads(out_ok)['metrics']['patterns_matched'], 1)
+
+
+class CepProductionHardeningRegressionTest(unittest.TestCase):
+  def test_skip_past_last_out_of_order_arrival_and_single_terminal_consumption(
+      self):
+    # `A2` at ts=20 arrived FIRST (seq=1), while `A1` at ts=10 arrived LATE
+    # (seq=99). When `B1` at ts=30 (seq=2) fires:
+    # - `A1@10 -> B1@30` completes at `(30.0, 2)`.
+    # - `A2@20` has `(20.0, 1) <= (30.0, 2)` and MUST be pruned immediately
+    #   without also consuming `B1@30` or surviving to consume `B2@50`!
+    # - `A3@40 -> B2@50` then completes cleanly as the second match.
+    ts_ooo = (
+        _TestStream().advance_watermark_to(0).add_elements([
+            TimestampedValue(
+                beam.Row(uid='u1', ts=20, event_type='A', tag='A2'), 20),
+            TimestampedValue(
+                beam.Row(uid='u1', ts=30, event_type='B', tag='B1'), 30),
+            TimestampedValue(
+                beam.Row(uid='u1', ts=10, event_type='A', tag='A1'), 10),
+            TimestampedValue(
+                beam.Row(uid='u1', ts=40, event_type='A', tag='A3'), 40),
+            TimestampedValue(
+                beam.Row(uid='u1', ts=50, event_type='B', tag='B2'), 50),
+        ]).advance_watermark_to(100).advance_watermark_to_infinity())
+
+    opts = PipelineOptions(['--runner=DirectRunner', '--streaming'])
+    p = beam.Pipeline(options=opts)
+    matched = (
+        p
+        | 'InOOO' >> ts_ooo
+        | 'CepOOO' >> cep.CliPatternMatch(
+            key='uid',
+            timestamp_col='ts',
+            seq='A -> B within 60s',
+            after_match='skip_past_last',
+            select={
+                'a_tag': 'A.tag',
+                'b_tag': 'B.tag',
+            },
+            force_stateful=True,
+        ))
+    assert_that(
+        matched | beam.Map(lambda r: (r.a_tag, r.b_tag)),
+        equal_to([('A1', 'B1'), ('A3', 'B2')]),
+    )
+    p.run().wait_until_finish()
+
+    # Bounded unsorted input with duplicate timestamps and `skip_past_last`
+    # must also consume each terminal event at most once!
+    p_bnd = beam.Pipeline(runner=fn_runner.FnApiRunner())
+    out_bnd = (
+        p_bnd
+        | 'InBnd' >> beam.Create([
+            beam.Row(uid='u1', ts=20, event_type='A', tag='A2'),
+            beam.Row(uid='u1', ts=30, event_type='B', tag='B1'),
+            beam.Row(uid='u1', ts=10, event_type='A', tag='A1'),
+        ])
+        | 'CepBnd' >> cep.CliPatternMatch(
+            key='uid',
+            timestamp_col='ts',
+            seq='A -> B within 60s',
+            after_match='skip_past_last',
+            select={
+                'a_tag': 'A.tag',
+                'b_tag': 'B.tag',
+            },
+            force_stateful=False,
+        ))
+    assert_that(
+        out_bnd | beam.Map(lambda r: (r.a_tag, r.b_tag)),
+        equal_to([('A1', 'B1')]),
+    )
+    p_bnd.run().wait_until_finish()
+
+  def test_predicate_datetime_aware_naive_and_iso8601_string_comparisons(self):
+    dt_utc = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+    dt_naive = datetime(2026, 6, 1, 12, 0, 0)
+    dt_plus2 = datetime(
+        2026, 6, 1, 14, 0, 0, tzinfo=timezone(timedelta(hours=2)))
+    dt_earlier = datetime(2026, 6, 1, 11, 0, 0)
+    d_only = date(2026, 6, 1)
+
+    pred_eq_str = cep._CompiledPredicate("created_at == '2026-06-01T12:00:00Z'")
+    self.assertTrue(pred_eq_str.matches({'created_at': dt_utc}))
+    self.assertTrue(pred_eq_str.matches({'created_at': dt_naive}))
+    self.assertTrue(pred_eq_str.matches({'created_at': dt_plus2}))
+    self.assertFalse(pred_eq_str.matches({'created_at': dt_earlier}))
+
+    pred_cmp_cols = cep._CompiledPredicate('a_dt <= b_dt and a_dt == c_dt')
+    self.assertTrue(
+        pred_cmp_cols.matches({
+            'a_dt': dt_naive,
+            'b_dt': dt_utc,
+            'c_dt': dt_plus2,
+        }))
+
+    pred_gt_str = cep._CompiledPredicate("created_at > '2026-06-01T11:30:00Z'")
+    self.assertTrue(pred_gt_str.matches({'created_at': dt_naive}))
+    self.assertFalse(pred_gt_str.matches({'created_at': dt_earlier}))
+
+    pred_in_dates = cep._CompiledPredicate(
+        "biz_date in ['2026-05-31', '2026-06-01']")
+    self.assertTrue(pred_in_dates.matches({'biz_date': d_only}))
 
 
 if __name__ == '__main__':

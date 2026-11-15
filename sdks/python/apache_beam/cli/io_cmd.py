@@ -98,7 +98,7 @@ _CATALOG: list[dict[str, Any]] = [
         'uri_example': 'bigquery://PROJECT.DATASET.TABLE',
         'read_transform': 'ReadFromBigQuery',
         'write_transform': 'WriteToBigQuery',
-        'cdc_write_transform': 'WriteToBigQueryCDC',
+        'cdc_write_transform': 'CliWriteToBigQueryCDC',
         'runtime': 'python (Storage Read / Storage Write CDC / File Loads) or java xlang',
         'supports_dlq': True,
         'supports_cdc': True,
@@ -164,13 +164,14 @@ _CATALOG: list[dict[str, Any]] = [
         'supports_dlq': False,
         'supports_cdc': True,
         'options': [
-            'project_id',
-            'instance_id',
-            'database_id',
+            'project',
+            'instance',
+            'database',
             'table',
-            'change_stream_name',
-            'metadata_instance',
-            'metadata_database',
+            'query',
+            'change_stream',
+            'start_at',
+            'end_at',
         ],
         'description': 'Google Cloud Spanner tables and Change Streams (--cdc).',
     },
@@ -239,9 +240,9 @@ _CATALOG: list[dict[str, Any]] = [
     {
         'name': 'delta',
         'uri_example': 'delta://gs://BUCKET/tables/orders  or  delta:///path/to/table',
-        'read_transform': 'ReadFromDelta',
-        'cdc_read_transform': 'ReadFromDeltaCDC',
-        'write_transform': 'WriteToParquet',
+        'read_transform': 'ReadFromDeltaPy',
+        'cdc_read_transform': 'ReadFromDeltaCdcPy',
+        'write_transform': None,
         'runtime': 'python (zero-JVM _delta_log + pyarrow)',
         'supports_dlq': False,
         'supports_cdc': True,
@@ -252,8 +253,9 @@ _CATALOG: list[dict[str, Any]] = [
             'end_version',
         ],
         'description': (
-            'Delta Lake tables (snapshot reads, time-travel ?version=N, '
-            'Change Data Feed --cdc, and --zero-copy bridge to iceberg://).'),
+            'Delta Lake tables (read-only: snapshot reads, time-travel '
+            '?version=N, Change Data Feed --cdc, and --zero-copy bridge; '
+            'write to iceberg:// or parquet instead).'),
     },
 ]
 
@@ -264,9 +266,17 @@ def list_connectors() -> list[dict[str, Any]]:
   # present on disk alongside the CLI package.
   discovered = list(_CATALOG)
   known_transforms = {
-      item['read_transform']
+      t
       for item in _CATALOG
-  } | {item['write_transform'] for item in _CATALOG}
+      for t in (
+          item.get('read_transform'),
+          item.get('write_transform'),
+          item.get('cdc_read_transform'),
+          item.get('cdc_write_transform'),
+          item.get('zero_copy_transform'),
+      )
+      if t
+  }
   std_yaml = Path(__file__).resolve().parents[1] / 'yaml' / 'standard_io.yaml'
   extra_transforms: list[str] = []
   if std_yaml.is_file():
@@ -296,8 +306,15 @@ def list_connectors() -> list[dict[str, Any]]:
 def describe_connector(name: str) -> dict[str, Any]:
   key = name.strip().lower()
   for item in _CATALOG:
-    if (item['name'] == key or item['read_transform'].lower() == key or
-        item['write_transform'].lower() == key):
+    item_transforms = (
+        item.get('read_transform'),
+        item.get('write_transform'),
+        item.get('cdc_read_transform'),
+        item.get('cdc_write_transform'),
+        item.get('zero_copy_transform'),
+    )
+    if item['name'] == key or any(
+        isinstance(t, str) and t.lower() == key for t in item_transforms):
       return item
   transform = describe_transform(name)
   if transform is not None:
@@ -317,7 +334,17 @@ def describe_transform(name: str) -> dict[str, Any] | None:
   Returns None if `name` is not a Beam YAML transform.
   """
   from apache_beam.yaml import yaml_provider
-  providers = yaml_provider.standard_providers()
+
+  from . import dlq
+
+  providers = dict(yaml_provider.standard_providers())
+  cli_spec = dlq.cli_yaml_provider_spec()
+  try:
+    cli_provider = yaml_provider.parse_providers('cli', [cli_spec])[0]
+  except TypeError:
+    cli_provider = yaml_provider.parse_providers([cli_spec])[0]
+  for t_name in cli_spec.get('transforms', {}):
+    providers.setdefault(t_name, []).append(cli_provider)
   wanted = name.strip().lower()
   # Language-specific transforms are registered as e.g. 'Filter-python'.
   keys = [t for t in providers if t.lower().split('-')[0] == wanted]

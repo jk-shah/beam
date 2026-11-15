@@ -275,9 +275,10 @@ def normalize_argv(
     return tokens
 
   # First pass: locate `active_cmd` (if any) without misidentifying the value of
-  # a 1-arg flag (such as `--profile run` or `--runner direct`) as a subcommand.
+  # a 1-arg flag (such as `--profile sql` or `--runner direct`) as a subcommand.
   global_zero = cli_zero_flags_by_cmd.get(None, frozenset())
   global_one = cli_one_flags_by_cmd.get(None, frozenset())
+  pre_skip_one = global_one | frozenset(['--profile'])
   active_cmd: str | None = None
   cmd_index = -1
   i = 0
@@ -290,19 +291,25 @@ def normalize_argv(
       cmd_index = i
       break
     if tok.startswith('--') and '=' not in tok:
-      if tok in global_one or (tok not in global_zero and
-                               tok in _CANONICAL_ONE):
+      if tok in pre_skip_one or (tok not in global_zero and
+                                 tok in _CANONICAL_ONE):
         i += 2
         continue
     i += 1
 
-  if active_cmd is None or active_cmd not in passthrough_subcommands:
+  if active_cmd is None:
+    return tokens
+  is_passthrough = active_cmd in passthrough_subcommands
+  if not is_passthrough and cmd_index == 0:
     return tokens
 
-  cmd_zero = global_zero | cli_zero_flags_by_cmd.get(active_cmd, frozenset())
-  cmd_one = global_one | cli_one_flags_by_cmd.get(active_cmd, frozenset())
+  sub_zero = cli_zero_flags_by_cmd.get(active_cmd, frozenset())
+  sub_one = cli_one_flags_by_cmd.get(active_cmd, frozenset())
+  cmd_zero = global_zero | sub_zero
+  cmd_one = global_one | sub_one
 
   pre_cli: list[str] = []
+  pre_subcmd_cli: list[str] = []
   pre_pipeline: list[str] = []
   post_tokens: list[str] = []
 
@@ -319,7 +326,8 @@ def normalize_argv(
         idx += 1
         continue
       if not tok.startswith('--'):
-        # Short flags like `-h` stay untouched in CLI tokens.
+        # Short flags like `-h` stay in CLI tokens (after subcommand if is_pre
+        # and recognized on subcommand, else pre_cli).
         (pre_cli if is_pre else post_tokens).append(tok)
         idx += 1
         continue
@@ -327,11 +335,17 @@ def normalize_argv(
       flag_part, has_eq, eq_val = tok.partition('=')
       # 1. Subcommand / global CLI flags always take priority over PipelineOptions.
       if flag_part in cmd_zero:
-        (pre_cli if is_pre else post_tokens).append(tok)
+        if is_pre and flag_part not in global_zero:
+          pre_subcmd_cli.append(tok)
+        else:
+          (pre_cli if is_pre else post_tokens).append(tok)
         idx += 1
         continue
       if flag_part in cmd_one:
-        target = pre_cli if is_pre else post_tokens
+        if is_pre and flag_part not in global_one:
+          target = pre_subcmd_cli
+        else:
+          target = pre_cli if is_pre else post_tokens
         target.append(tok)
         if not has_eq and idx + 1 < len(seg):
           target.append(seg[idx + 1])
@@ -340,14 +354,14 @@ def normalize_argv(
           idx += 1
         continue
 
-      # 2. Known PipelineOptions / Beam YAML flags.
-      if flag_part in _CANONICAL_ZERO:
+      # 2. Known PipelineOptions / Beam YAML flags (passthrough subcommands only).
+      if is_passthrough and flag_part in _CANONICAL_ZERO:
         canon = _CANONICAL_ZERO[flag_part]
         rewritten = f'{canon}={eq_val}' if has_eq else canon
         (pre_pipeline if is_pre else post_tokens).append(rewritten)
         idx += 1
         continue
-      if flag_part in _CANONICAL_ONE:
+      if is_passthrough and flag_part in _CANONICAL_ONE:
         canon = _CANONICAL_ONE[flag_part]
         if has_eq:
           (pre_pipeline if is_pre else post_tokens).append(f'{canon}={eq_val}')
@@ -368,5 +382,8 @@ def normalize_argv(
       idx += 1
 
   _scan_segment(tokens[:cmd_index], is_pre=True)
-  _scan_segment(tokens[cmd_index + 1:], is_pre=False)
-  return pre_cli + [active_cmd] + pre_pipeline + post_tokens
+  if is_passthrough:
+    _scan_segment(tokens[cmd_index + 1:], is_pre=False)
+  else:
+    post_tokens.extend(tokens[cmd_index + 1:])
+  return pre_cli + [active_cmd] + pre_subcmd_cli + pre_pipeline + post_tokens

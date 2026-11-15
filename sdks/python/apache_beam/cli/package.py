@@ -174,6 +174,11 @@ _ALLOWED_TRANSFORM_SPEC_KEYS = frozenset({
     'input',
     'output',
     'config',
+    'transforms',
+    'source',
+    'sink',
+    'extra_transforms',
+    'output_schema',
     'error_handling',
     'windowing',
     'resource_hints',
@@ -218,34 +223,49 @@ def _validate_yaml_with_jinja_placeholders(yaml_text: str) -> dict[str, Any]:
 
 
 def _find_custom_python_providers(doc: dict[str, Any]) -> list[str]:
-  """Returns non-stock Python provider packages referenced in `providers:`."""
-  providers = doc.get('providers')
-  if not isinstance(providers, list):
-    return []
+  """Returns non-stock Python provider packages/constructors in YAML."""
   custom: list[str] = []
-  for prov in providers:
-    if not isinstance(prov, dict):
-      continue
-    ptype = str(prov.get('type', ''))
-    cfg = prov.get('config') or {}
-    if ptype == 'pythonPackage':
-      pkgs = cfg.get('packages') or []
-      custom.extend(str(p) for p in pkgs)
-    elif ptype == 'python':
-      transforms = prov.get('transforms') or {}
-      if isinstance(transforms, dict):
-        for fq in transforms.values():
-          fq_s = str(fq)
-          # Stock yaml-template image has standard apache_beam, but not local
-          # user modules or unreleased `apache_beam.cli.*` helpers.
-          if not fq_s.startswith('apache_beam.') or fq_s.startswith(
-              'apache_beam.cli.'):
-            custom.append(fq_s)
-  return custom
+  providers = doc.get('providers')
+  if isinstance(providers, list):
+    for prov in providers:
+      if not isinstance(prov, dict):
+        continue
+      ptype = str(prov.get('type', ''))
+      cfg = prov.get('config') or {}
+      if ptype == 'pythonPackage':
+        pkgs = cfg.get('packages') or []
+        custom.extend(str(p) for p in pkgs)
+      elif ptype == 'python':
+        transforms = prov.get('transforms') or {}
+        if isinstance(transforms, dict):
+          for fq in transforms.values():
+            fq_s = str(fq)
+            # Stock yaml-template image has standard apache_beam, but not local
+            # user modules or unreleased `apache_beam.cli.*` helpers.
+            if not fq_s.startswith('apache_beam.') or fq_s.startswith(
+                'apache_beam.cli.'):
+              custom.append(fq_s)
+
+  def _walk_py_transforms(node: Any) -> None:
+    if isinstance(node, dict):
+      if str(node.get('type') or '') == 'PyTransform':
+        t_cfg = node.get('config')
+        if isinstance(t_cfg, dict):
+          ctor = str(t_cfg.get('constructor') or '').strip()
+          if ctor.startswith('apache_beam.cli.'):
+            custom.append(ctor)
+      for val in node.values():
+        _walk_py_transforms(val)
+    elif isinstance(node, list):
+      for item in node:
+        _walk_py_transforms(item)
+
+  _walk_py_transforms(doc.get('pipeline'))
+  return list(dict.fromkeys(custom))
 
 
 def _detect_yaml_extra_packages(yaml_doc: Any) -> list[str]:
-  """Returns third-party runtime packages implied by YAML enrichment/ML stages."""
+  """Returns third-party runtime packages implied by YAML stages."""
   needed: list[str] = []
 
   def _walk(node: Any) -> None:
@@ -260,6 +280,8 @@ def _detect_yaml_extra_packages(yaml_doc: Any) -> list[str]:
           needed.append('feast[gcp]')
         if 'vertex' in handler:
           needed.append('google-cloud-aiplatform')
+        if 'bigtable' in handler or handler == 'bt' or cfg.get('bigtable'):
+          needed.append('google-cloud-bigtable')
         if cfg.get('redis') or cfg.get('redis_host'):
           needed.append('redis')
       elif t_type in ('RunInference', 'CliInfer'):
@@ -267,9 +289,21 @@ def _detect_yaml_extra_packages(yaml_doc: Any) -> list[str]:
         mh_type = str((mh.get('type') if isinstance(mh, dict) else None) or
                       cfg.get('provider') or cfg.get('handler') or '').lower()
         if 'huggingface' in mh_type or mh_type == 'hf':
-          needed.extend(['transformers', 'torch'])
+          needed.extend(['transformers', 'torch', 'safetensors'])
         if 'vertex' in mh_type:
           needed.append('google-cloud-aiplatform')
+      elif t_type in (
+          'ReadFromIcebergPy',
+          'ReadFromIcebergCdcPy',
+          'CliWriteToIceberg',
+          'IcebergAddFiles',
+      ):
+        needed.append('pyiceberg')
+      elif 'bigtable' in t_type.lower() and t_type not in (
+          'ReadFromBigTable',
+          'WriteToBigTable',
+      ):
+        needed.append('google-cloud-bigtable')
       for v in node.values():
         _walk(v)
     elif isinstance(node, list):
@@ -442,6 +476,7 @@ def generate_python_dockerfile(
     base_image: str = DEFAULT_PYTHON_LAUNCHER_BASE,
     has_requirements: bool = False,
     extra_wheels: list[str] | None = None,
+    extra_files: list[str] | None = None,
 ) -> str:
   """Generates a single-image Flex Template Dockerfile (launcher + worker)."""
   safe_base = _validate_image_uri(base_image, '--base-image')
@@ -464,7 +499,13 @@ def generate_python_dockerfile(
     lines.extend([
         'COPY requirements.txt /template/requirements.txt',
         'RUN pip install --no-cache-dir -r /template/requirements.txt',
+        'ENV FLEX_TEMPLATE_PYTHON_REQUIREMENTS_FILE="/template/requirements.txt"',
     ])
+  if extra_files:
+    for ef in extra_files:
+      if not re.fullmatch(r'[A-Za-z0-9_.-]+', ef) or '..' in ef:
+        raise PackageError(f'unsafe extra filename {ef!r}', EXIT_USAGE)
+      lines.append(f'COPY {ef} /template/{ef}')
   lines.extend([
       f'COPY {safe_ep} /template/{safe_ep}',
       f'ENV FLEX_TEMPLATE_PYTHON_PY_FILE="/template/{safe_ep}"',
@@ -487,21 +528,34 @@ def _generate_yaml_python_wrapper(
   return (
       '"""Auto-generated Beam YAML Flex Template launcher."""\n'
       'import json\n'
+      'import os\n'
       'from pathlib import Path\n'
       'import sys\n\n'
       'try:\n'
       '  from apache_beam_cli_preview import launcher as _prev\n'
-      '  _prev.install_runtime_hooks()\n'
+      '  _prev.install_runtime_hooks(strict=False)\n'
+      'except ImportError:\n'
+      '  pass\n\n'
+      'try:\n'
+      '  from apache_beam.cli import dlq as _cli_dlq\n'
+      '  _cli_dlq.install_keyword_safe_row_hooks()\n'
       'except ImportError:\n'
       '  pass\n\n'
       'from apache_beam.yaml import main as yaml_main\n\n'
-      f'_JINJA_PARAMS = set({names_literal})\n\n'
+      f'_JINJA_PARAMS = set({names_literal})\n'
+      '_SKIP_STAGE_FLAGS = {"--no-stage-cli-wheel", "--no_stage_cli_wheel"}\n\n'
       'def _split_jinja_argv(raw_argv):\n'
       '  jinja_vars = {}\n'
       '  passthrough = []\n'
+      '  skip_stage = os.environ.get(\n'
+      '      "BEAM_NO_STAGE_CLI_WHEEL", "").strip().lower() in ("1", "true", "yes")\n'
       '  i = 0\n'
       '  while i < len(raw_argv):\n'
       '    tok = raw_argv[i]\n'
+      '    if tok in _SKIP_STAGE_FLAGS:\n'
+      '      skip_stage = True\n'
+      '      i += 1\n'
+      '      continue\n'
       '    if tok.startswith("--") and "=" in tok:\n'
       '      k, v = tok[2:].split("=", 1)\n'
       '      if k in _JINJA_PARAMS:\n'
@@ -516,12 +570,224 @@ def _generate_yaml_python_wrapper(
       '    i += 1\n'
       '  if jinja_vars:\n'
       '    passthrough.append("--jinja_variables=" + json.dumps(jinja_vars))\n'
+      '  if not skip_stage:\n'
+      '    tmpl_dir = Path(__file__).resolve().parent\n'
+      '    whls = sorted(tmpl_dir.glob("apache_beam_cli_preview-*.whl"))\n'
+      '    if whls:\n'
+      '      if not any("apache_beam_cli_preview" in a for a in passthrough):\n'
+      '        passthrough.append("--extra_package=" + str(whls[0]))\n'
+      '      plugin_arg = "--beam_plugin=apache_beam_cli_preview._worker_bootstrap"\n'
+      '      if plugin_arg not in passthrough:\n'
+      '        passthrough.append(plugin_arg)\n'
       '  return passthrough\n\n'
       'if __name__ == "__main__":\n'
       f'  yaml_path = str(Path(__file__).resolve().with_name({yaml_filename!r}))\n'
       '  forwarded = _split_jinja_argv(sys.argv[1:])\n'
       '  yaml_main.run(argv=["--yaml_pipeline_file=" + yaml_path] + forwarded)\n'
   )
+
+
+_FALLBACK_LAUNCHER_SRC = (
+    '"""Minimal synthesized CLI runtime hook for Flex Template workers."""\n'
+    'import importlib.abc\n'
+    'import importlib.util\n'
+    'import sys\n'
+    'from pathlib import Path\n\n'
+    '_FAST_PKG = "_apache_beam_cli_pkg"\n\n'
+    'class _PreviewCliFinder(importlib.abc.MetaPathFinder):\n'
+    '  def __init__(self, cli_dir: Path):\n'
+    '    self._cli_dir = cli_dir\n'
+    '  def find_spec(self, fullname, path, target=None):\n'
+    '    del path, target\n'
+    '    if fullname in ("apache_beam.cli", _FAST_PKG):\n'
+    '      return importlib.util.spec_from_file_location(\n'
+    '          fullname,\n'
+    '          self._cli_dir / "__init__.py",\n'
+    '          submodule_search_locations=[str(self._cli_dir)])\n'
+    '    for pfx in ("apache_beam.cli.", _FAST_PKG + "."):\n'
+    '      if fullname.startswith(pfx):\n'
+    '        parts = fullname[len(pfx):].split(".")\n'
+    '        if not parts or not all(p.isidentifier() for p in parts):\n'
+    '          return None\n'
+    '        pkg_init = self._cli_dir.joinpath(*parts, "__init__.py")\n'
+    '        if pkg_init.is_file():\n'
+    '          return importlib.util.spec_from_file_location(\n'
+    '              fullname, pkg_init, submodule_search_locations=[str(pkg_init.parent)])\n'
+    '        mod_py = self._cli_dir.joinpath(*parts[:-1], f"{parts[-1]}.py")\n'
+    '        if mod_py.is_file():\n'
+    '          return importlib.util.spec_from_file_location(fullname, mod_py)\n'
+    '    return None\n\n'
+    'def canonicalize_cli_module_aliases() -> None:\n'
+    '  for k, m in list(sys.modules.items()):\n'
+    '    if m is not None and (k == _FAST_PKG or k.startswith(_FAST_PKG + ".")):\n'
+    '      sys.modules.setdefault("apache_beam.cli" + k[len(_FAST_PKG):], m)\n\n'
+    'def install_runtime_hooks(*, strict: bool = True):\n'
+    '  cli_dir = (Path(__file__).resolve().parent / "_bundled_cli").resolve()\n'
+    '  if not (cli_dir / "main.py").is_file():\n'
+    '    if strict:\n'
+    '      raise RuntimeError("bundled cli directory missing")\n'
+    '    return None\n'
+    '  sys.meta_path[:] = [\n'
+    '      f for f in sys.meta_path if type(f).__name__ != "_PreviewCliFinder"\n'
+    '  ]\n'
+    '  sys.meta_path.insert(0, _PreviewCliFinder(cli_dir))\n'
+    '  canonicalize_cli_module_aliases()\n'
+    '  return cli_dir\n'
+)
+
+
+def _ensure_cli_bundle_wheel() -> Path:
+  """Returns the CLI `.whl`, synthesizing one from `apache_beam/cli` if needed."""
+  try:
+    from apache_beam_cli_preview import launcher as _prev_launcher
+    return Path(_prev_launcher.ensure_preview_wheel())
+  except ImportError:
+    pass
+
+  import base64
+  import hashlib
+  import zipfile
+
+  cli_dir = Path(__file__).resolve().parent
+  repo_preview_pkg = (
+      cli_dir.parents[1] / 'cli-preview' / 'apache_beam_cli_preview')
+  version_str = '0.2.0'
+  entries: list[tuple[str, bytes]] = []
+  if (repo_preview_pkg / 'launcher.py').is_file():
+    for fname in ('__init__.py', 'launcher.py', '_worker_bootstrap.py', 'demo.py'):
+      fp = repo_preview_pkg / fname
+      if fp.is_file():
+        entries.append((f'apache_beam_cli_preview/{fname}', fp.read_bytes()))
+  else:
+    entries.extend([
+        (
+            'apache_beam_cli_preview/__init__.py',
+            f'__version__ = {version_str!r}\n'.encode('utf-8'),
+        ),
+        (
+            'apache_beam_cli_preview/launcher.py',
+            _FALLBACK_LAUNCHER_SRC.encode('utf-8'),
+        ),
+        (
+            'apache_beam_cli_preview/_worker_bootstrap.py',
+            (
+                'from . import launcher\n'
+                'launcher.install_runtime_hooks(strict=False)\n'
+                'try:\n'
+                '  from apache_beam.cli import dlq\n'
+                '  dlq.install_keyword_safe_row_hooks()\n'
+                'except Exception:\n'
+                '  pass\n').encode('utf-8'),
+        ),
+    ])
+
+  for py in sorted(cli_dir.rglob('*.py')):
+    if not py.name.endswith('_test.py') and '__pycache__' not in py.parts:
+      rel = py.relative_to(cli_dir).as_posix()
+      entries.append((
+          f'apache_beam_cli_preview/_bundled_cli/{rel}',
+          py.read_bytes(),
+      ))
+
+  pth_line = (
+      'import apache_beam_cli_preview.launcher as _bcp; '
+      '_bcp.install_runtime_hooks(strict=False)\n')
+  entries.append(('apache_beam_cli_preview.pth', pth_line.encode('utf-8')))
+
+  hasher = hashlib.sha256()
+  for arcname, data in entries:
+    hasher.update(arcname.encode('utf-8'))
+    hasher.update(data)
+  digest = hasher.hexdigest()[:12]
+
+  explicit_cache = os.environ.get('BEAM_CACHE_DIR')
+  beam_home_env = os.environ.get('BEAM_HOME')
+  if explicit_cache:
+    cache_root = Path(explicit_cache)
+  elif beam_home_env:
+    cache_root = Path(os.path.expanduser(beam_home_env)) / 'cache'
+  else:
+    cache_root = Path.home() / '.beam' / 'cache'
+  wheel_dir = cache_root / 'wheels' / digest
+  wheel_name = f'apache_beam_cli_preview-{version_str}-py3-none-any.whl'
+  try:
+    wheel_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+  except OSError:
+    uid_sfx = f'-{os.getuid()}' if hasattr(os, 'getuid') else ''
+    wheel_dir = (
+        Path(tempfile.gettempdir()) / f'beam-cli-cache{uid_sfx}' / 'wheels' /
+        digest)
+    wheel_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+  wheel_path = wheel_dir / wheel_name
+  if wheel_path.is_file() and not wheel_path.is_symlink():
+    return wheel_path
+
+  dist_info = f'apache_beam_cli_preview-{version_str}.dist-info'
+  all_files = entries + [
+      (
+          f'{dist_info}/METADATA',
+          (
+              'Metadata-Version: 2.1\n'
+              'Name: apache-beam-cli-preview\n'
+              f'Version: {version_str}\n'
+              'Summary: Pure-Python preview overlay for Apache Beam CLI\n'
+          ).encode('utf-8'),
+      ),
+      (
+          f'{dist_info}/WHEEL',
+          (
+              'Wheel-Version: 1.0\n'
+              'Generator: apache-beam-cli-package\n'
+              'Root-Is-Purelib: true\n'
+              'Tag: py3-none-any\n').encode('utf-8'),
+      ),
+      (f'{dist_info}/top_level.txt', b'apache_beam_cli_preview\n'),
+  ]
+  record_lines: list[str] = []
+  for arcname, data in all_files:
+    b64 = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(
+        b'=').decode('ascii')
+    record_lines.append(f'{arcname},sha256={b64},{len(data)}')
+  record_path = f'{dist_info}/RECORD'
+  record_lines.append(f'{record_path},,')
+  record_bytes = ('\n'.join(record_lines) + '\n').encode('utf-8')
+
+  fd, tmp_whl = tempfile.mkstemp(
+      prefix='.tmp-pkg-', suffix='.whl', dir=str(wheel_dir))
+  os.close(fd)
+  try:
+    with zipfile.ZipFile(tmp_whl, 'w', compression=zipfile.ZIP_DEFLATED) as zf:
+      for arcname, data in all_files:
+        zf.writestr(arcname, data)
+      zf.writestr(record_path, record_bytes)
+    os.replace(tmp_whl, wheel_path)
+  finally:
+    if os.path.exists(tmp_whl):
+      try:
+        os.unlink(tmp_whl)
+      except OSError:
+        pass
+  return wheel_path
+
+
+def _py_source_references_beam_cli(py_source: str) -> bool:
+  if 'apache_beam.cli' in py_source:
+    return True
+  try:
+    tree = ast.parse(py_source)
+  except SyntaxError:
+    return False
+  for node in ast.walk(tree):
+    if isinstance(node, ast.ImportFrom) and node.module == 'apache_beam':
+      if any(alias.name == 'cli' for alias in node.names):
+        return True
+    elif isinstance(node, ast.Import):
+      for alias in node.names:
+        if alias.name == 'apache_beam.cli' or alias.name.startswith(
+            'apache_beam.cli.'):
+          return True
+  return False
 
 
 def _atomic_write_text(target: Path, content: str) -> None:
@@ -820,6 +1086,18 @@ def run_package(
             EXIT_USAGE)
 
   if resolved_sdk == 'YAML':
+    needed_yaml_pkgs = _detect_yaml_extra_packages(yaml_doc)
+    opts_in_yaml = (
+        yaml_doc.get('options')
+        if isinstance(yaml_doc, dict) and isinstance(
+            yaml_doc.get('options'), dict) else {})
+    if (needed_yaml_pkgs and not opts_in_yaml.get('requirements_file') and
+        not opts_in_yaml.get('extra_packages')):
+      warnings_out.append(
+          'Pipeline references transforms requiring extra Python packages '
+          f'({", ".join(needed_yaml_pkgs)}) not preinstalled in the stock '
+          'Dataflow YAML container; consider `--sdk=python '
+          '--requirements=<requirements.txt>` for hermetic packaging.')
     parameters = extract_jinja_parameters(source_text)
     allow_net = bool(
         not dry_run or (to_location and to_location.startswith('gs://')))
@@ -911,6 +1189,9 @@ def run_package(
     entrypoint_name = source_basename
     entrypoint_code = source_text
     extra_yaml_name = None
+    if _py_source_references_beam_cli(source_text):
+      bundle_preview_wheel_path = _ensure_cli_bundle_wheel()
+      extra_wheels.append(bundle_preview_wheel_path.name)
   else:
     yaml_doc = _validate_yaml_with_jinja_placeholders(source_text)
     bad_sec_key = _mapping_has_literal_secret(yaml_doc)
@@ -924,17 +1205,12 @@ def run_package(
     entrypoint_name = 'flex_yaml_entrypoint.py'
     entrypoint_code = _generate_yaml_python_wrapper(
         extra_yaml_name, [p['name'] for p in parameters])
-    # If running inside `apache-beam-cli-preview` and YAML uses `apache_beam.cli.*`
-    # providers (such as `ReadCsvWithDlq`), automatically include the pure-Python
-    # preview wheel so the Flex container is 100% self-contained!
+    # Always bundle the pure-Python CLI wheel when YAML uses `apache_beam.cli.*`
+    # providers/constructors, synthesizing it directly if cli-preview is absent!
     custom_provs = _find_custom_python_providers(yaml_doc)
     if any(p.startswith('apache_beam.cli.') for p in custom_provs):
-      try:
-        from apache_beam_cli_preview import launcher as _prev_launcher
-        bundle_preview_wheel_path = Path(_prev_launcher.ensure_preview_wheel())
-        extra_wheels.append(bundle_preview_wheel_path.name)
-      except ImportError:
-        pass
+      bundle_preview_wheel_path = _ensure_cli_bundle_wheel()
+      extra_wheels.append(bundle_preview_wheel_path.name)
     if not requirements_file:
       needed_pkgs = _detect_yaml_extra_packages(yaml_doc)
       if needed_pkgs:
@@ -963,7 +1239,8 @@ def run_package(
       entrypoint_name,
       base_image=base_image,
       has_requirements=bool(requirements_file),
-      extra_wheels=extra_wheels)
+      extra_wheels=extra_wheels,
+      extra_files=[extra_yaml_name] if extra_yaml_name else None)
 
   # Single-image best practice: align worker `sdk_container_image` with the
   # Flex Template image so Dataflow workers skip runtime `pip install` cold starts.

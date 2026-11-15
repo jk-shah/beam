@@ -21,29 +21,52 @@ import os
 import shutil
 import subprocess
 import sys
-from pathlib import Path
 
 
 def main() -> int:
-  here = Path(__file__).resolve().parent
-  demo_sh = here / '_bundled_demo.sh'
-  if not demo_sh.is_file():
-    demo_sh = here.parent / 'demo_showcase.sh'
-  if not demo_sh.is_file():
+  here = os.path.dirname(os.path.abspath(__file__))
+  demo_sh = os.path.join(here, '_bundled_demo.sh')
+  if not os.path.isfile(demo_sh):
+    demo_sh = os.path.join(os.path.dirname(here), 'demo_showcase.sh')
+  if not os.path.isfile(demo_sh):
     sys.stderr.write('error: could not locate demo_showcase.sh\n')
     return 1
 
   env = dict(os.environ)
+  env.setdefault('PYTHON_BIN', sys.executable)
   if 'BEAM_BIN' not in env:
-    sibling_beam = Path(sys.executable).parent / 'beam'
-    if sibling_beam.is_file():
-      env['BEAM_BIN'] = str(sibling_beam)
+    py_dir = os.path.dirname(os.path.abspath(sys.executable))
+    search_dirs = [
+        py_dir,
+        os.path.join(py_dir, 'Scripts'),
+        os.path.join(os.path.dirname(py_dir), 'Scripts'),
+    ]
+    bin_names = (
+        ('beam.exe', 'beam.cmd', 'beam.bat', 'beam')
+        if os.name == 'nt' else ('beam', ))
+    resolved_bin: str | None = None
+    for cand_dir in search_dirs:
+      for bname in bin_names:
+        cand = os.path.join(cand_dir, bname)
+        if os.path.isfile(cand):
+          resolved_bin = cand
+          break
+      if resolved_bin:
+        break
+    if resolved_bin:
+      env['BEAM_BIN'] = resolved_bin
     else:
       found = shutil.which('beam')
       if found:
         env['BEAM_BIN'] = found
 
-  return subprocess.call(['bash', str(demo_sh)], env=env)
+  try:
+    return subprocess.call(['bash', demo_sh], env=env)
+  except FileNotFoundError:
+    sys.stderr.write(
+        "error: 'bash' was not found on PATH; install Git Bash or WSL to run "
+        'beam-demo on Windows.\n')
+    return 1
 
 
 if __name__ == '__main__':

@@ -73,21 +73,28 @@ ALL_SCHEMES = FILE_SCHEMES | NON_FILE_SCHEMES
 
 FILE_FORMATS = {
     'csv': 'Csv',
+    'tsv': 'Csv',
     'json': 'Json',
     'jsonl': 'Json',
+    'ndjson': 'Json',
     'parquet': 'Parquet',
+    'pq': 'Parquet',
     'avro': 'Avro',
     'text': 'Text',
 }
 EXTENSIONS = {
     '.csv': 'csv',
+    '.tsv': 'csv',
     '.json': 'json',
     '.jsonl': 'json',
+    '.ndjson': 'json',
     '.log': 'text',
     '.parquet': 'parquet',
+    '.pq': 'parquet',
     '.avro': 'avro',
     '.txt': 'text',
 }
+_COMPRESSION_EXTENSIONS = frozenset(['.gz', '.bz2'])
 
 
 def _looks_like_utf8_text(sample: bytes) -> bool:
@@ -142,7 +149,14 @@ def _strip_shard_or_glob_suffix(name: str) -> str:
 
 def extension_of(path: str) -> str:
   name = _strip_shard_or_glob_suffix(os.path.basename(path.replace('\\', '/')))
-  return os.path.splitext(name)[1].lower()
+  stem, ext = os.path.splitext(name)
+  ext_low = ext.lower()
+  if ext_low in _COMPRESSION_EXTENSIONS and stem:
+    inner_name = _strip_shard_or_glob_suffix(stem)
+    inner_ext = os.path.splitext(inner_name)[1].lower()
+    if inner_ext:
+      return inner_ext
+  return ext_low
 
 
 def local_format_groups(path: str) -> dict[str, list[str]]:
@@ -754,23 +768,30 @@ def parse_endpoint(
 
   # 1. Local or distributed file (`gs://`, `s3://`, `azfs://`, `hdfs://`, `file://`)
   if not scheme or scheme in FILE_SCHEMES:
-    fmt = (explicit_format or EXTENSIONS.get(extension_of(location), '')).lower()
-    if not fmt and allow_jinja and has_jinja:
-      fmt = _infer_jinja_file_format(location)
-    if not fmt and is_read and (allow_sniff or not has_jinja):
-      fmt = sniff_file_format(location) or ''
-    if not fmt:
+    ext_low = extension_of(location)
+    raw_fmt = (explicit_format or EXTENSIONS.get(ext_low, '')).lower()
+    if not raw_fmt and allow_jinja and has_jinja:
+      raw_fmt = _infer_jinja_file_format(location)
+    if not raw_fmt and is_read and (allow_sniff or not has_jinja):
+      raw_fmt = sniff_file_format(location) or ''
+    if not raw_fmt:
       jinja_hint = (
           '\n  (pass --emit-yaml to emit a parameterized Jinja2 YAML template)'
           if has_jinja and not allow_jinja else '')
       raise UriError(
           f'cannot tell the format of {location!r} (no known file extension)\n'
           f'  add {flag_hint}, for example: {flag_hint} json{jinja_hint}')
-    if fmt not in FILE_FORMATS:
+    if raw_fmt not in FILE_FORMATS:
       valid = ', '.join(k for k in ('csv', 'json', 'parquet', 'avro', 'text'))
       raise UriError(
-          f'unsupported format {fmt!r} for {location!r}; use one of: {valid}')
-    norm_fmt = 'json' if fmt == 'jsonl' else fmt
+          f'unsupported format {raw_fmt!r} for {location!r}; use one of: {valid}')
+    norm_fmt = {
+        'jsonl': 'json',
+        'ndjson': 'json',
+        'pq': 'parquet',
+        'tsv': 'csv',
+    }.get(raw_fmt, raw_fmt)
+    is_tsv = ext_low == '.tsv' or (explicit_format or '').strip().lower() == 'tsv'
     read_path = location
     if is_read and not (allow_jinja and has_jinja) and not any(
         c in location for c in '*?['):
@@ -789,6 +810,8 @@ def parse_endpoint(
         except Exception:  # pylint: disable=broad-except
           pass
     cfg = {'path': read_path, **opts}
+    if is_tsv and 'delimiter' not in cfg and 'sep' not in cfg:
+      cfg['delimiter'] = '\t'
     return ParsedEndpoint(
         kind='file',
         scheme=scheme or 'local',

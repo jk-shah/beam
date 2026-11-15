@@ -29,6 +29,7 @@ Supports:
 from __future__ import annotations
 
 import csv
+import datetime
 import decimal
 import glob
 import io
@@ -37,12 +38,19 @@ import math
 import os
 import re
 import sqlite3
+import threading
 from typing import Any
 from typing import Iterable
 from typing import NamedTuple
+from typing import Sequence
 
 from . import dlq
 from . import uris
+
+dlq.ensure_csv_field_size_limit()
+
+_SQL_THREAD_LOCAL = threading.local()
+_EMPTY_PLACEHOLDER_COL = '__beam_cli_empty_placeholder__'
 
 _ALIAS_PREFIX_RE = re.compile(r'^(?P<alias>[A-Za-z_][A-Za-z0-9_]*)=(?P<uri>.+)$')
 _SAFE_IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
@@ -66,7 +74,12 @@ def _derive_alias_from_uri(raw_uri: str, used: set[str]) -> str:
   stem = parts[-1] if parts else 'source'
   if any(ch in stem for ch in '*?['):
     stem = parts[-2] if len(parts) >= 2 else 'source'
-  # Strip known extensions or Iceberg namespace prefix (`analytics.events` -> `events`).
+  # Strip compression suffix first (`events.csv.gz` -> `events.csv`), then
+  # known extensions or Iceberg namespace prefix (`analytics.events` -> `events`).
+  for comp_ext in ('.gz', '.bz2'):
+    if stem.lower().endswith(comp_ext) and len(stem) > len(comp_ext):
+      stem = stem[:-len(comp_ext)]
+      break
   lower_stem = stem.lower()
   for ext in (
       '.parquet',
@@ -1358,6 +1371,1126 @@ def _lower_asof_join_sql(
   return spec_out
 
 
+def _merge_extra_sql_dlq_refs(
+    spec_out: dict[str, Any],
+    extra_refs: list[str],
+    dlq_ep: uris.ParsedEndpoint,
+) -> None:
+  """Merges source DLQ normalizer refs into a lowered SQL join's `WriteDlq`."""
+  if not extra_refs:
+    return
+  transforms = spec_out.setdefault('pipeline', {}).setdefault('transforms', [])
+  merge_node = next(
+      (t for t in transforms if t.get('name') == 'MergeDlq'), None)
+  write_node = next(
+      (t for t in transforms if t.get('name') == 'WriteDlq'), None)
+  if merge_node is not None:
+    cur_in = list(merge_node.get('input') or [])
+    for r in extra_refs:
+      if r not in cur_in:
+        cur_in.insert(0, r)
+    merge_node['input'] = cur_in
+  elif write_node is not None:
+    prev_in = write_node['input']
+    all_refs = list(extra_refs) + (
+        [prev_in] if isinstance(prev_in, str) else list(prev_in))
+    if len(all_refs) == 1:
+      write_node['input'] = all_refs[0]
+    else:
+      w_idx = transforms.index(write_node)
+      transforms.insert(
+          w_idx, {
+              'name': 'MergeDlq',
+              'type': 'Flatten',
+              'input': all_refs,
+          })
+      write_node['input'] = 'MergeDlq'
+  else:
+    if len(extra_refs) == 1:
+      dlq_in = extra_refs[0]
+    else:
+      transforms.append({
+          'name': 'MergeDlq',
+          'type': 'Flatten',
+          'input': list(extra_refs),
+      })
+      dlq_in = 'MergeDlq'
+    transforms.append({
+        'name': 'WriteDlq',
+        'type': dlq_ep.yaml_type,
+        'input': dlq_in,
+        'config': dict(dlq_ep.config),
+    })
+
+
+def _rewrite_sql_case_and_cast(code_seg: str) -> str:
+  """Lowers SQL CAST(...) and CASE WHEN ... END on placeholder-protected SQL."""
+  out = code_seg.replace('<>', '!=')
+  cast_re = re.compile(
+      r'\bCAST\s*\(\s*(?P<inner>(?:[^()]|\([^()]*\))+?)\s+AS\s+'
+      r'(?P<typ>[A-Za-z0-9_]+)(?:\s*\([^()]*\))?\s*\)',
+      re.I)
+  for _ in range(6):
+
+    def _rep_cast(m: re.Match[str]) -> str:
+      inner = m.group('inner').strip()
+      t = m.group('typ').upper()
+      if t in ('INT', 'INTEGER', 'BIGINT', 'SMALLINT', 'TINYINT', 'INT64'):
+        return f'int({inner})'
+      if t in ('FLOAT', 'DOUBLE', 'REAL', 'DECIMAL', 'NUMERIC', 'FLOAT64'):
+        return f'float({inner})'
+      if t in ('VARCHAR', 'CHAR', 'TEXT', 'STRING'):
+        return f'str({inner})'
+      if t in ('BOOL', 'BOOLEAN'):
+        return f'bool({inner})'
+      return m.group(0)
+
+    nxt = cast_re.sub(_rep_cast, out)
+    if nxt == out:
+      break
+    out = nxt
+
+  # Also lower simple searched `CASE x WHEN v1 THEN r1 ... END` and `CASE WHEN c1 THEN r1 ... END`
+  case_re = re.compile(r'\bCASE\b(?P<body>[\s\S]+?)\bEND\b', re.I)
+  when_re = re.compile(
+      r'\bWHEN\s+(?P<cond>[\s\S]+?)\s+THEN\s+(?P<val>[\s\S]+?)(?=\bWHEN\b|\bELSE\b|$)',
+      re.I)
+  else_re = re.compile(r'\bELSE\s+(?P<els>[\s\S]+)$', re.I)
+
+  def _rep_case(m: re.Match[str]) -> str:
+    body = m.group('body').strip()
+    if re.search(r'\bCASE\b', body, re.I):
+      return m.group(0)
+    first_when = re.search(r'\bWHEN\b', body, re.I)
+    if not first_when:
+      return m.group(0)
+    subject = body[:first_when.start()].strip()
+    rest_body = body[first_when.start():]
+    branches = list(when_re.finditer(rest_body))
+    if not branches:
+      return m.group(0)
+    em = else_re.search(rest_body[branches[-1].end():])
+    cur = f'({em.group("els").strip()})' if em else 'None'
+    for br in reversed(branches):
+      c_s = br.group('cond').strip()
+      if subject:
+        c_s = f'({subject}) == ({c_s})'
+      v_s = br.group('val').strip()
+      cur = f'({v_s} if ({c_s}) else {cur})'
+    return cur
+
+  for _ in range(6):
+    nxt = case_re.sub(_rep_case, out)
+    if nxt == out:
+      break
+    out = nxt
+  return out
+
+
+def _normalize_sql_scalar_expr(
+    raw_expr: str, table_aliases: set[str]) -> str:
+  low_aliases = {a.lower() for a in table_aliases if a}
+  qual_re = re.compile(
+      r'(?<![A-Za-z0-9_])(?P<qa>[A-Za-z_][A-Za-z0-9_]*|`[^`]+`|"[^"]+")\s*\.\s*'
+      r'(?P<qc>[A-Za-z_][A-Za-z0-9_]*|`[^`]+`|"[^"]+"|\*)')
+  lit_map: dict[str, str] = {}
+  protected_parts: list[str] = []
+  for is_c, seg in _scan_sql_outside_literals(raw_expr):
+    if not is_c:
+      tok = f'__SQLLIT_{len(lit_map)}__'
+      lit_map[tok] = seg
+      protected_parts.append(tok)
+      continue
+
+    def _sub_q(m: re.Match[str]) -> str:
+      qa = _unquote_sql_ident(m.group('qa')).lower()
+      if qa in low_aliases:
+        return m.group('qc')
+      return m.group(0)
+
+    protected_parts.append(qual_re.sub(_sub_q, seg))
+
+  rewritten = _rewrite_sql_case_and_cast(''.join(protected_parts))
+  for tok, orig_lit in lit_map.items():
+    rewritten = rewritten.replace(tok, orig_lit)
+  return rewritten.strip()
+
+
+def _parse_sql_interval_literal(raw_iv: str) -> float:
+  m = re.match(
+      r"^\s*INTERVAL\s+(?:'(?P<qn>[0-9.]+)'\s*(?P<qu>[A-Za-z]+)|'(?P<qn2>[0-9.]+)\s+(?P<qu2>[A-Za-z]+)'|(?P<n>[0-9.]+)\s+(?P<u>[A-Za-z]+))\s*$",
+      raw_iv.strip(),
+      re.I)
+  if not m:
+    raise SqlPipeError(f'unsupported SQL INTERVAL literal: {raw_iv!r}')
+  n_s = m.group('qn') or m.group('qn2') or m.group('n')
+  u_s = m.group('qu') or m.group('qu2') or m.group('u')
+  return _interval_unit_to_seconds(n_s, u_s)
+
+
+def has_streaming_window_sql(sql_query: str | None) -> bool:
+  """Returns True when `sql_query` uses Calcite TVF or GROUP BY windowing."""
+  if not sql_query:
+    return False
+  code_only = ' '.join(
+      seg for is_c, seg in _scan_sql_outside_literals(sql_query) if is_c)
+  return bool(
+      re.search(
+          r'\bTABLE\s*\(\s*(?:TUMBLE|HOP|SESSION)\s*\('
+          r'|\b(?:TUMBLE|HOP|SESSION)(?:_START|_END|_ROWTIME)?\s*\(',
+          code_only,
+          re.I))
+
+
+def _rewrite_sql_window_bound_calls(expr_s: str) -> str:
+  """Normalizes TUMBLE_START/END, HOP_START/END, SESSION_START/END & window_*."""
+  start_re = re.compile(
+      r'\b(?:TUMBLE|HOP|SESSION)_START\s*\((?:[^()]|\([^()]*\))+\)', re.I)
+  end_re = re.compile(
+      r'\b(?:TUMBLE|HOP|SESSION)_(?:END|ROWTIME)\s*\((?:[^()]|\([^()]*\))+\)',
+      re.I)
+  ws_re = re.compile(r'\bwindow_start\b', re.I)
+  we_re = re.compile(r'\b(?:window_end|window_time)\b', re.I)
+  literals: list[str] = []
+  masked_parts: list[str] = []
+  for is_c, seg in _scan_sql_outside_literals(expr_s):
+    if is_c:
+      masked_parts.append(seg)
+    else:
+      tok = f'__BEAM_WLIT_{len(literals)}__'
+      literals.append(seg)
+      masked_parts.append(tok)
+  s = ''.join(masked_parts)
+  s = start_re.sub('window_start', s)
+  s = end_re.sub('window_end', s)
+  s = ws_re.sub('window_start', s)
+  s = we_re.sub('window_end', s)
+  for idx, lit in enumerate(literals):
+    s = s.replace(f'__BEAM_WLIT_{idx}__', lit)
+  return s
+
+
+class LoweredSqlPlan(NamedTuple):
+  transforms: list[dict[str, Any]]
+  spec: dict[str, Any]
+
+
+def try_lower_sql_to_python_yaml(
+    sql_query: str,
+    source_aliases: Iterable[str] = ('source',),
+    *,
+    strict: bool = False,
+) -> LoweredSqlPlan | None:
+  """Unit-testable entrypoint returning pure-Python lowered YAML transforms."""
+  aliases = list(source_aliases) or ['source']
+  clean_q = validate_readonly_select_sql(sql_query, allow_jinja=False)
+  if len(aliases) != 1:
+    if strict:
+      raise SqlPipeError(
+          '--sql-engine=python single-source lowering expects 1 source alias')
+    return None
+  dummy_ep = uris.ParsedEndpoint(
+      kind='file',
+      scheme='memory',
+      raw='memory://input.jsonl',
+      format='json',
+      yaml_type='ReadFromJson',
+      config={'path': 'memory://input.jsonl'})
+  ns = NamedSource(alias=aliases[0], uri='memory://input.jsonl', endpoint=dummy_ep)
+  spec = _try_lower_single_source_sql(
+      ns,
+      clean_q,
+      [],
+      f'Read_{ns.alias}',
+      None,
+      has_unbounded=False,
+      wire_yaml_dlq=False,
+      dlq_ep=None,
+      sql_dlq_norm_refs=[],
+      allow_jinja=False,
+      strict=strict)
+  if spec is None:
+    return None
+  return LoweredSqlPlan(
+      transforms=list(spec['pipeline']['transforms']), spec=spec)
+
+
+def _try_lower_single_source_sql(
+    only_ns: NamedSource,
+    clean_q: str,
+    read_transforms: list[dict[str, Any]],
+    read_ref: str,
+    sink_ep: uris.ParsedEndpoint | None,
+    *,
+    has_unbounded: bool,
+    wire_yaml_dlq: bool,
+    dlq_ep: uris.ParsedEndpoint | None,
+    sql_dlq_norm_refs: list[str],
+    allow_jinja: bool,
+    strict: bool,
+) -> dict[str, Any] | None:
+  """Lowers single-source SQL into pure-Python Beam YAML transforms (zero JVM)."""
+  from . import expressions
+  from . import output
+  from . import pipe_spec
+
+  def _bail(reason: str) -> None:
+    if strict:
+      raise SqlPipeError(
+          f'--sql-engine=python cannot lower query ({reason}); supported pure-Python '
+          'constructs are single-source SELECT [DISTINCT] / WHERE / GROUP BY / '
+          'HAVING / TUMBLE / HOP / SESSION / LIMIT and 2-source ASOF / INTERVAL JOIN. '
+          'Omit --sql-engine=python to use Calcite SQL or local DuckDB/SQLite.')
+
+  code_upper = ' '.join(
+      seg for is_c, seg in _scan_sql_outside_literals(clean_q) if is_c)
+  if re.search(r'^\s*WITH\b', code_upper, re.I):
+    _bail('WITH CTEs require Calcite or local SQL engine')
+    return None
+  if re.search(r'\bOVER\s*\(', code_upper, re.I):
+    _bail('analytic OVER(...) window functions require Calcite or local SQL engine')
+    return None
+  if re.search(r'\b(?:UNION|INTERSECT)\b|\bEXCEPT\s+(?:ALL\s+|DISTINCT\s+)?SELECT\b',
+               code_upper, re.I):
+    _bail('set operations (UNION/INTERSECT/EXCEPT SELECT) require Calcite or local SQL engine')
+    return None
+
+  # Scan top-level clause boundaries outside string literals and parentheses.
+  kw_re = re.compile(
+      r'\b(?P<kw>SELECT|FROM|WHERE|GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT|JOIN)\b',
+      re.I)
+  clauses: list[tuple[str, int, int]] = []
+  depth = 0
+  pos = 0
+  for is_c, seg in _scan_sql_outside_literals(clean_q):
+    if not is_c:
+      pos += len(seg)
+      continue
+    i = 0
+    while i < len(seg):
+      ch = seg[i]
+      if ch == '(':
+        depth += 1
+        i += 1
+        continue
+      if ch == ')':
+        depth = max(0, depth - 1)
+        i += 1
+        continue
+      prev_ok = (i == 0 or not (seg[i - 1].isalnum() or seg[i - 1] == '_'))
+      if prev_ok:
+        km = kw_re.match(seg[i:])
+        if km:
+          kw_norm = re.sub(r'\s+', ' ', km.group('kw').upper())
+          if depth > 0 and kw_norm == 'SELECT':
+            _bail('nested subqueries require Calcite or local SQL engine')
+            return None
+          if depth == 0:
+            if kw_norm == 'JOIN':
+              _bail('non-temporal JOIN requires Calcite or local SQL engine')
+              return None
+            if kw_norm == 'ORDER BY':
+              _bail('ORDER BY is not supported on unordered distributed PCollections')
+              return None
+            clauses.append((kw_norm, pos + i, pos + i + len(km.group(0))))
+            i += len(km.group(0))
+            continue
+      i += 1
+    pos += len(seg)
+
+  if len(clauses) < 2 or clauses[0][0] != 'SELECT' or clauses[1][0] != 'FROM':
+    _bail('expected SELECT ... FROM ...')
+    return None
+  expected_order = ['SELECT', 'FROM', 'WHERE', 'GROUP BY', 'HAVING', 'LIMIT']
+  seen_order: list[str] = []
+  clause_bodies: dict[str, str] = {}
+  for idx, (kw_name, _s, e_pos) in enumerate(clauses):
+    if kw_name in clause_bodies or kw_name not in expected_order:
+      _bail(f'duplicate or unsupported clause {kw_name}')
+      return None
+    if seen_order and expected_order.index(kw_name) < expected_order.index(seen_order[-1]):
+      _bail(f'out-of-order SQL clause {kw_name}')
+      return None
+    seen_order.append(kw_name)
+    next_s = clauses[idx + 1][1] if idx + 1 < len(clauses) else len(clean_q)
+    clause_bodies[kw_name] = clean_q[e_pos:next_s].strip()
+
+  select_raw = clause_bodies['SELECT']
+  is_distinct = False
+  if re.match(r'^DISTINCT\b', select_raw, re.I):
+    is_distinct = True
+    select_raw = re.sub(r'^DISTINCT\s+', '', select_raw, count=1, flags=re.I).strip()
+  elif re.match(r'^ALL\b', select_raw, re.I):
+    select_raw = re.sub(r'^ALL\s+', '', select_raw, count=1, flags=re.I).strip()
+
+  from_raw = clause_bodies['FROM']
+  window_cfg: dict[str, Any] | None = None
+  ts_col: str | None = None
+  table_aliases: set[str] = {only_ns.alias, 'source', 'PCOLLECTION'}
+
+  tvf_m = re.match(
+      r'^TABLE\s*\(\s*(?P<fn>TUMBLE|HOP|SESSION)\s*\(\s*TABLE\s+(?P<tbl>[A-Za-z0-9_"`]+)\s*,\s*'
+      r'DESCRIPTOR\s*\(\s*(?P<ts>[A-Za-z0-9_"`]+)\s*\)\s*,\s*(?P<ivs>.+?)\s*\)\s*\)'
+      r'(?:\s+(?:AS\s+)?(?P<alias>[A-Za-z_][A-Za-z0-9_]*))?\s*$',
+      from_raw,
+      re.I | re.S)
+  if tvf_m:
+    tbl_ident = _unquote_sql_ident(tvf_m.group('tbl'))
+    if tbl_ident.lower() not in {a.lower() for a in table_aliases}:
+      _bail(f'unknown source table {tbl_ident!r}')
+      return None
+    if tvf_m.group('alias'):
+      table_aliases.add(_unquote_sql_ident(tvf_m.group('alias')))
+    ts_col = _unquote_sql_ident(tvf_m.group('ts'))
+    iv_parts = expressions._split_top_level_commas(tvf_m.group('ivs'))
+    w_fn = tvf_m.group('fn').upper()
+    if w_fn == 'TUMBLE' and len(iv_parts) == 1:
+      window_cfg = {
+          'type': 'fixed',
+          'size': _format_seconds_duration(_parse_sql_interval_literal(iv_parts[0])),
+      }
+    elif w_fn == 'HOP' and len(iv_parts) == 2:
+      window_cfg = {
+          'type': 'sliding',
+          'period': _format_seconds_duration(_parse_sql_interval_literal(iv_parts[0])),
+          'size': _format_seconds_duration(_parse_sql_interval_literal(iv_parts[1])),
+      }
+    elif w_fn == 'SESSION' and len(iv_parts) == 1:
+      window_cfg = {
+          'type': 'sessions',
+          'gap': _format_seconds_duration(_parse_sql_interval_literal(iv_parts[0])),
+      }
+    else:
+      _bail(f'invalid {w_fn} TVF interval arguments')
+      return None
+  else:
+    tbl_m = re.match(
+        r'^(?P<tbl>[A-Za-z0-9_"`]+)(?:\s+(?:AS\s+)?(?P<alias>(?!(?:WHERE|GROUP|HAVING|LIMIT|ORDER|JOIN)\b)[A-Za-z_][A-Za-z0-9_]*))?\s*$',
+        from_raw,
+        re.I)
+    if not tbl_m:
+      _bail(f'unsupported FROM clause {from_raw!r}')
+      return None
+    tbl_ident = _unquote_sql_ident(tbl_m.group('tbl'))
+    if tbl_ident.lower() not in {a.lower() for a in table_aliases}:
+      _bail(f'unknown source table {tbl_ident!r}')
+      return None
+    if tbl_m.group('alias'):
+      table_aliases.add(_unquote_sql_ident(tbl_m.group('alias')))
+
+  limit_val: int | None = None
+  if 'LIMIT' in clause_bodies:
+    if not re.fullmatch(r'[0-9]+', clause_bodies['LIMIT']):
+      _bail(f'LIMIT expects a non-negative integer, got {clause_bodies["LIMIT"]!r}')
+      return None
+    limit_val = int(clause_bodies['LIMIT'])
+
+  transforms = list(read_transforms)
+  dlq_refs = list(sql_dlq_norm_refs)
+  current_ref = read_ref
+
+  group_raw = clause_bodies.get('GROUP BY')
+  raw_group_exprs: list[str] = []
+  if group_raw:
+    leg_win_re = re.compile(
+        r'^(?P<fn>TUMBLE|HOP|SESSION)\s*\(\s*(?P<ts>[A-Za-z0-9_`".]+)\s*,\s*(?P<ivs>.+)\s*\)\s*$',
+        re.I | re.S)
+    for g_part in expressions._split_top_level_commas(group_raw):
+      gm = leg_win_re.match(g_part.strip())
+      if gm:
+        if window_cfg is not None:
+          _bail('cannot specify multiple windowing functions in FROM and GROUP BY')
+          return None
+        raw_ts = _normalize_sql_scalar_expr(gm.group('ts'), table_aliases)
+        ts_col = _unquote_sql_ident(raw_ts)
+        iv_parts = expressions._split_top_level_commas(gm.group('ivs'))
+        w_fn = gm.group('fn').upper()
+        if w_fn == 'TUMBLE' and len(iv_parts) == 1:
+          window_cfg = {
+              'type': 'fixed',
+              'size': _format_seconds_duration(_parse_sql_interval_literal(iv_parts[0])),
+          }
+        elif w_fn == 'HOP' and len(iv_parts) == 2:
+          window_cfg = {
+              'type': 'sliding',
+              'period': _format_seconds_duration(_parse_sql_interval_literal(iv_parts[0])),
+              'size': _format_seconds_duration(_parse_sql_interval_literal(iv_parts[1])),
+          }
+        elif w_fn == 'SESSION' and len(iv_parts) == 1:
+          window_cfg = {
+              'type': 'sessions',
+              'gap': _format_seconds_duration(_parse_sql_interval_literal(iv_parts[0])),
+          }
+        else:
+          _bail(f'invalid {w_fn} window arguments in GROUP BY')
+          return None
+      else:
+        raw_group_exprs.append(_normalize_sql_scalar_expr(g_part, table_aliases))
+
+  if ts_col is not None:
+    ts_cfg: dict[str, Any] = {'timestamp_col': ts_col}
+    if wire_yaml_dlq:
+      ts_cfg['error_handling'] = {'output': 'errors'}
+    transforms.append({
+        'name': 'AssignSqlTimestamps',
+        'type': 'CliAssignTimestamps',
+        'input': current_ref,
+        'config': ts_cfg,
+    })
+    if wire_yaml_dlq:
+      transforms.append(
+          dlq.build_dlq_normalizer_transform(
+              'NormalizeSqlTsDlq', 'AssignSqlTimestamps.errors', 'CliAssignTimestamps'))
+      dlq_refs.append('NormalizeSqlTsDlq')
+      current_ref = 'AssignSqlTimestamps.good'
+    else:
+      current_ref = 'AssignSqlTimestamps'
+
+  if 'WHERE' in clause_bodies:
+    norm_where = _normalize_sql_scalar_expr(clause_bodies['WHERE'], table_aliases)
+    try:
+      where_cfg = expressions.compile_where(
+          norm_where, known_columns=None, allow_jinja=allow_jinja, flag_name='--sql WHERE')[0]
+    except expressions.ExpressionError as e:
+      if strict:
+        raise SqlPipeError(f'unsupported WHERE expression in --sql-engine=python: {e}') from None
+      return None
+    if wire_yaml_dlq:
+      where_cfg = dict(where_cfg)
+      where_cfg['error_handling'] = {'output': 'errors'}
+    transforms.append({
+        'name': 'FilterSqlWhere',
+        'type': 'Filter',
+        'input': current_ref,
+        'config': where_cfg,
+    })
+    if wire_yaml_dlq:
+      transforms.append(
+          dlq.build_dlq_normalizer_transform(
+              'NormalizeSqlWhereDlq', 'FilterSqlWhere.errors', 'Filter'))
+      dlq_refs.append('NormalizeSqlWhereDlq')
+    current_ref = 'FilterSqlWhere'
+
+  if window_cfg is not None:
+    transforms.append({
+        'name': 'SqlWindowInto',
+        'type': 'WindowInto',
+        'input': current_ref,
+        'config': {'windowing': window_cfg},
+    })
+    current_ref = 'SqlWindowInto'
+
+  agg_head_re = re.compile(
+      r'^(?P<fn>COUNT|SUM|AVG|MIN|MAX|STDDEV_POP|STDDEV|VAR_POP)\s*\(',
+      re.I)
+
+  def _match_whole_agg_call(expr_text: str) -> tuple[str, str] | None:
+    s_ex = expr_text.strip()
+    mh = agg_head_re.match(s_ex)
+    if not mh or not s_ex.endswith(')'):
+      return None
+    open_pos = mh.end() - 1
+    p_depth = 0
+    in_q: str | None = None
+    for idx_c in range(open_pos, len(s_ex)):
+      ch = s_ex[idx_c]
+      if in_q is not None:
+        if ch == in_q:
+          in_q = None
+        continue
+      if ch in ("'", '"', '`'):
+        in_q = ch
+      elif ch == '(':
+        p_depth += 1
+      elif ch == ')':
+        p_depth -= 1
+        if p_depth == 0:
+          if idx_c != len(s_ex) - 1:
+            return None
+          return mh.group('fn'), s_ex[open_pos + 1:-1].strip()
+    return None
+
+  inl_agg_re = re.compile(
+      r'\b(?P<fn>COUNT|SUM|AVG|MIN|MAX|STDDEV_POP|STDDEV|VAR_POP)\s*\(\s*'
+      r'(?P<arg>\*|(?:[^()]|\([^()]*\))+?)\s*\)',
+      re.I)
+  bare_alias_re = re.compile(
+      r'^(?P<expr>.+?)\s+(?P<alias>(?!(?:AS|AND|OR|NOT|END|NULL|TRUE|FALSE)\b)[A-Za-z_][A-Za-z0-9_]*)\s*$',
+      re.I | re.S)
+  as_alias_re = re.compile(
+      r'^(?P<expr>.+?)\s+AS\s+(?P<alias>[A-Za-z_][A-Za-z0-9_]*|`[^`]+`|"[^"]+")\s*$',
+      re.I | re.S)
+
+  norm_select_str = _normalize_sql_scalar_expr(select_raw, table_aliases)
+  if window_cfg is not None:
+    norm_select_str = _rewrite_sql_window_bound_calls(norm_select_str)
+
+  select_items_raw = expressions._split_top_level_commas(norm_select_str)
+  parsed_select_items: list[tuple[str, str | None]] = []
+  has_agg_in_select = False
+  needs_window_bounds = False
+  select_alias_to_expr: dict[str, str] = {}
+  for s_item in select_items_raw:
+    st = s_item.strip()
+    if st == '*' or re.match(r'^\*\s+EXCEPT\s*\(', st, re.I):
+      parsed_select_items.append((st, None))
+      continue
+    ma = as_alias_re.match(st)
+    if ma:
+      e_part = ma.group('expr').strip()
+      a_part = _unquote_sql_ident(ma.group('alias'))
+    else:
+      mb = bare_alias_re.match(st)
+      if mb and not mb.group('expr').strip().upper().endswith(('IS', 'NOT')):
+        e_part = mb.group('expr').strip()
+        a_part = _unquote_sql_ident(mb.group('alias'))
+      else:
+        e_part = st
+        a_part = None
+    if _match_whole_agg_call(e_part) is not None or inl_agg_re.search(e_part):
+      has_agg_in_select = True
+    if window_cfg is not None and re.search(r'\b(?:window_start|window_end)\b', e_part):
+      needs_window_bounds = True
+    if a_part:
+      select_alias_to_expr[a_part.lower()] = e_part
+    parsed_select_items.append((e_part, a_part))
+
+  # Resolve GROUP BY ordinals (`GROUP BY 1, 2`), SELECT aliases, and window bounds.
+  group_exprs: list[str] = []
+  for g_raw_item in raw_group_exprs:
+    g_item = (
+        _rewrite_sql_window_bound_calls(g_raw_item)
+        if window_cfg is not None else g_raw_item).strip()
+    if g_item.isdigit():
+      ord_idx = int(g_item) - 1
+      if ord_idx < 0 or ord_idx >= len(parsed_select_items):
+        _bail(f'GROUP BY ordinal {g_item} out of range (1..{len(parsed_select_items)})')
+        return None
+      g_item = parsed_select_items[ord_idx][0]
+    elif g_item.lower() in select_alias_to_expr:
+      cand_expr = select_alias_to_expr[g_item.lower()]
+      if not (_match_whole_agg_call(cand_expr) is not None or
+              inl_agg_re.search(cand_expr)):
+        g_item = cand_expr
+    if window_cfg is not None and g_item in ('window_start', 'window_end'):
+      needs_window_bounds = True
+      continue
+    if g_item not in group_exprs:
+      group_exprs.append(g_item)
+
+  is_grouped_query = bool(
+      group_raw is not None or has_agg_in_select or 'HAVING' in clause_bodies)
+
+  if is_grouped_query:
+    pre_proj_exprs: list[str] = []
+    group_cols: list[str] = []
+    group_expr_to_col: dict[str, str] = {}
+    for idx_g, g_ex in enumerate(group_exprs):
+      plain_g = expressions._unwrap_plain_col(g_ex)
+      if plain_g is not None:
+        group_cols.append(plain_g)
+        group_expr_to_col[g_ex] = plain_g
+      else:
+        syn_g = f'sql_grp_{idx_g}'
+        pre_proj_exprs.append(f'{g_ex} AS {syn_g}')
+        group_cols.append(syn_g)
+        group_expr_to_col[g_ex] = syn_g
+
+    combines: dict[str, Any] = {}
+    agg_sig_to_alias: dict[str, str] = {}
+    post_proj_items: list[str] = []
+    need_post_proj = bool(needs_window_bounds)
+    syn_agg_counter = 0
+
+    def _register_agg(
+        fn_raw: str, arg_raw: str, preferred_alias: str | None = None
+    ) -> str | None:
+      nonlocal syn_agg_counter
+      fn_low = fn_raw.strip().lower()
+      arg_s = arg_raw.strip()
+      is_dist_arg = False
+      if re.match(r'^DISTINCT\b', arg_s, re.I):
+        if fn_low != 'count':
+          _bail(f'{fn_low.upper()}(DISTINCT ...) requires Calcite or local SQL engine')
+          return None
+        is_dist_arg = True
+        arg_s = re.sub(r'^DISTINCT\s+', '', arg_s, count=1, flags=re.I).strip()
+        if not arg_s or arg_s == '*' or expressions._split_top_level_commas(arg_s) != [arg_s]:
+          _bail('COUNT(DISTINCT ...) expects a single expression in --sql-engine=python')
+          return None
+
+      sig = (
+          f'count(distinct {arg_s})'.lower()
+          if is_dist_arg else f'{fn_low}({arg_s})'.lower())
+      if sig in agg_sig_to_alias:
+        return agg_sig_to_alias[sig]
+
+      if preferred_alias and output.SAFE_IDENTIFIER_RE.match(
+          preferred_alias) and preferred_alias not in combines and preferred_alias not in group_cols:
+        dest_col = preferred_alias
+      else:
+        dest_col = f'sql_agg_{syn_agg_counter}'
+        syn_agg_counter += 1
+
+      if is_dist_arg:
+        p_arg = expressions._unwrap_plain_col(arg_s)
+        if p_arg is None:
+          p_arg = f'sql_agg_in_{syn_agg_counter}'
+          syn_agg_counter += 1
+          pre_proj_exprs.append(f'{arg_s} AS {p_arg}')
+        combines[dest_col] = {
+            'value': p_arg,
+            'fn': {
+                'type': 'apache_beam.cli.windowing.COUNT_DISTINCT_COMBINE_FN'
+            },
+            '_needs_python': True,
+        }
+      elif fn_low == 'count':
+        if arg_s == '*':
+          c_src = 'lambda row: 1'
+        else:
+          p_arg = expressions._unwrap_plain_col(arg_s)
+          if p_arg is None:
+            p_arg = f'sql_agg_in_{syn_agg_counter}'
+            syn_agg_counter += 1
+            pre_proj_exprs.append(f'{arg_s} AS {p_arg}')
+          c_src = f'lambda row: 0 if getattr(row, {p_arg!r}, None) is None else 1'
+        combines[dest_col] = {
+            'value': {'callable': c_src, 'output_type': 'integer'},
+            'fn': 'sum',
+            '_needs_python': True,
+        }
+      elif fn_low in ('stddev_pop', 'stddev', 'var_pop'):
+        if arg_s == '*':
+          _bail(f'{fn_low.upper()}(*) is invalid')
+          return None
+        p_arg = expressions._unwrap_plain_col(arg_s)
+        if p_arg is None:
+          p_arg = f'sql_agg_in_{syn_agg_counter}'
+          syn_agg_counter += 1
+          pre_proj_exprs.append(f'{arg_s} AS {p_arg}')
+        comb_fqn = (
+            'apache_beam.cli.windowing.VAR_POP_COMBINE_FN'
+            if fn_low == 'var_pop' else
+            'apache_beam.cli.windowing.STDDEV_POP_COMBINE_FN')
+        combines[dest_col] = {
+            'value': p_arg,
+            'fn': {'type': comb_fqn},
+            '_needs_python': True,
+        }
+      else:
+        if arg_s == '*':
+          _bail(f'{fn_low.upper()}(*) is invalid')
+          return None
+        fn_clean = 'mean' if fn_low == 'avg' else fn_low
+        p_arg = expressions._unwrap_plain_col(arg_s)
+        if p_arg is None:
+          p_arg = f'sql_agg_in_{syn_agg_counter}'
+          syn_agg_counter += 1
+          pre_proj_exprs.append(f'{arg_s} AS {p_arg}')
+        combines[dest_col] = {'value': p_arg, 'fn': fn_clean}
+
+      agg_sig_to_alias[sig] = dest_col
+      return dest_col
+
+    for idx_s, (e_part, a_part) in enumerate(parsed_select_items):
+      whole_agg = _match_whole_agg_call(e_part)
+      if whole_agg is not None:
+        fn_low = whole_agg[0].lower()
+        arg_s = whole_agg[1].strip()
+        default_alias = (
+            expressions._unwrap_plain_col(arg_s) or
+            (fn_low if fn_low != 'mean' else 'avg'))
+        out_alias = a_part or default_alias or f'{fn_low}_{idx_s}'
+        if not output.SAFE_IDENTIFIER_RE.match(out_alias):
+          out_alias = f'{fn_low}_{idx_s}'
+        reg_col = _register_agg(fn_low, arg_s, preferred_alias=out_alias)
+        if reg_col is None:
+          return None
+        if reg_col != out_alias:
+          post_proj_items.append(f'{reg_col} AS {out_alias}')
+          need_post_proj = True
+        else:
+          post_proj_items.append(out_alias)
+      elif inl_agg_re.search(e_part):
+        if not a_part:
+          _bail(f'compound aggregate SELECT expression {e_part!r} requires AS <alias>')
+          return None
+        agg_failed = False
+
+        def _sub_sel_agg(sm: re.Match[str]) -> str:
+          nonlocal agg_failed
+          rc = _register_agg(sm.group('fn'), sm.group('arg'), preferred_alias=None)
+          if rc is None:
+            agg_failed = True
+            return sm.group(0)
+          return rc
+
+        rewritten_sel = ''.join(
+            inl_agg_re.sub(_sub_sel_agg, seg) if is_c else seg
+            for is_c, seg in _scan_sql_outside_literals(e_part))
+        if agg_failed:
+          return None
+        for g_orig, g_syn in group_expr_to_col.items():
+          if g_orig != g_syn:
+            rewritten_sel = rewritten_sel.replace(g_orig, g_syn)
+        post_proj_items.append(f'{rewritten_sel} AS {a_part}')
+        need_post_proj = True
+      else:
+        mapped_g = group_expr_to_col.get(e_part)
+        plain_e = mapped_g or expressions._unwrap_plain_col(e_part)
+        if window_cfg is not None and plain_e in ('window_start', 'window_end'):
+          needs_window_bounds = True
+          need_post_proj = True
+          if a_part and a_part != plain_e:
+            post_proj_items.append(f'{plain_e} AS {a_part}')
+          else:
+            post_proj_items.append(plain_e)
+        elif plain_e is not None and plain_e in group_cols:
+          if a_part and a_part != plain_e:
+            post_proj_items.append(f'{plain_e} AS {a_part}')
+            need_post_proj = True
+          else:
+            post_proj_items.append(plain_e)
+        else:
+          _bail(f'non-aggregated SELECT expression {e_part!r} must appear in GROUP BY')
+          return None
+
+    having_norm: str | None = None
+    if 'HAVING' in clause_bodies:
+      raw_hav = _normalize_sql_scalar_expr(clause_bodies['HAVING'], table_aliases)
+      if window_cfg is not None:
+        raw_hav = _rewrite_sql_window_bound_calls(raw_hav)
+        if re.search(r'\b(?:window_start|window_end)\b', raw_hav):
+          needs_window_bounds = True
+          need_post_proj = True
+      hav_failed = False
+
+      def _sub_hav_agg(hm: re.Match[str]) -> str:
+        nonlocal need_post_proj, hav_failed
+        sig_probe = (
+            f'count(distinct {re.sub(r"^DISTINCT\\s+", "", hm.group("arg").strip(), count=1, flags=re.I).strip()})'.lower()
+            if re.match(r'^DISTINCT\b', hm.group('arg').strip(), re.I) else
+            f'{hm.group("fn").lower()}({hm.group("arg").strip()})'.lower())
+        if sig_probe not in agg_sig_to_alias:
+          need_post_proj = True
+        rc = _register_agg(hm.group('fn'), hm.group('arg'), preferred_alias=None)
+        if rc is None:
+          hav_failed = True
+          return hm.group(0)
+        return rc
+
+      having_norm = ''.join(
+          inl_agg_re.sub(_sub_hav_agg, seg) if is_c else seg
+          for is_c, seg in _scan_sql_outside_literals(raw_hav))
+      if hav_failed:
+        return None
+
+    if not combines and group_cols and window_cfg is None:
+      # `SELECT region FROM s GROUP BY region` -> deduplicate by group_cols!
+      if pre_proj_exprs:
+        try:
+          pre_cfg = expressions.compile_select(
+              '*, ' + ', '.join(pre_proj_exprs),
+              known_columns=None,
+              allow_jinja=allow_jinja,
+              flag_name='--sql GROUP BY')[0]
+        except expressions.ExpressionError as e:
+          if strict:
+            raise SqlPipeError(str(e)) from None
+          return None
+        transforms.append({
+            'name': 'PreGroupProject',
+            'type': 'MapToFields',
+            'input': current_ref,
+            'config': pre_cfg,
+        })
+        current_ref = 'PreGroupProject'
+      transforms.append({
+          'name': 'GroupDistinct',
+          'type': 'CliDeduplicate',
+          'input': current_ref,
+          'config': {'keys': group_cols, 'keep': 'first'},
+      })
+      current_ref = 'GroupDistinct'
+      need_post_proj = True
+    else:
+      if not combines:
+        # Windowed GROUP BY without explicit agg (`SELECT window_start, region ... GROUP BY window_start, region`)
+        combines['sql_win_cnt'] = {
+            'value': {'callable': 'lambda row: 1', 'output_type': 'integer'},
+            'fn': 'sum',
+            '_needs_python': True,
+        }
+        need_post_proj = True
+      if pre_proj_exprs:
+        try:
+          pre_cfg = expressions.compile_select(
+              '*, ' + ', '.join(pre_proj_exprs),
+              known_columns=None,
+              allow_jinja=allow_jinja,
+              flag_name='--sql')[0]
+        except expressions.ExpressionError as e:
+          if strict:
+            raise SqlPipeError(str(e)) from None
+          return None
+        transforms.append({
+            'name': 'PreGroupProject',
+            'type': 'MapToFields',
+            'input': current_ref,
+            'config': pre_cfg,
+        })
+        current_ref = 'PreGroupProject'
+
+      comb_cfg = pipe_spec._build_combine_config(
+          {'group_by': group_cols, 'combine': combines})
+      transforms.append({
+          'name': 'SqlCombine',
+          'type': 'Combine',
+          'input': current_ref,
+          'config': comb_cfg,
+      })
+      current_ref = 'SqlCombine'
+
+    if needs_window_bounds:
+      transforms.append({
+          'name': 'AttachSqlWindowBounds',
+          'type': 'CliExtractPaneInfo',
+          'input': current_ref,
+      })
+      current_ref = 'AttachSqlWindowBounds'
+
+    if having_norm is not None:
+      try:
+        hav_cfg = expressions.compile_where(
+            having_norm,
+            known_columns=None,
+            allow_jinja=allow_jinja,
+            flag_name='--sql HAVING')[0]
+      except expressions.ExpressionError as e:
+        if strict:
+          raise SqlPipeError(f'unsupported HAVING expression: {e}') from None
+        return None
+      transforms.append({
+          'name': 'FilterSqlHaving',
+          'type': 'Filter',
+          'input': current_ref,
+          'config': hav_cfg,
+      })
+      current_ref = 'FilterSqlHaving'
+
+    if need_post_proj and post_proj_items:
+      try:
+        post_cfg = expressions.compile_select(
+            ', '.join(post_proj_items),
+            known_columns=None,
+            allow_jinja=allow_jinja,
+            flag_name='--sql SELECT')[0]
+      except expressions.ExpressionError as e:
+        if strict:
+          raise SqlPipeError(str(e)) from None
+        return None
+      transforms.append({
+          'name': 'PostGroupSelect',
+          'type': 'MapToFields',
+          'input': current_ref,
+          'config': post_cfg,
+      })
+      current_ref = 'PostGroupSelect'
+  else:
+    # Non-aggregated SELECT projection
+    if needs_window_bounds:
+      transforms.append({
+          'name': 'AttachSqlWindowBounds',
+          'type': 'CliExtractPaneInfo',
+          'input': current_ref,
+      })
+      current_ref = 'AttachSqlWindowBounds'
+
+    norm_sel_parts: list[str] = []
+    distinct_keys: list[str] = []
+    for e_part, a_part in parsed_select_items:
+      if e_part == '*' or re.match(r'^\*\s+EXCEPT\s*\(', e_part, re.I):
+        norm_sel_parts.append(e_part)
+      elif a_part:
+        norm_sel_parts.append(f'{e_part} AS {a_part}')
+        distinct_keys.append(a_part)
+      else:
+        plain_c = expressions._unwrap_plain_col(e_part)
+        if plain_c is None:
+          _bail(f'computed SELECT expression {e_part!r} requires AS <alias>')
+          return None
+        norm_sel_parts.append(e_part)
+        distinct_keys.append(plain_c)
+
+    if not (len(norm_sel_parts) == 1 and norm_sel_parts[0] == '*'):
+      try:
+        sel_cfg = expressions.compile_select(
+            ', '.join(norm_sel_parts),
+            known_columns=None,
+            allow_jinja=allow_jinja,
+            flag_name='--sql SELECT')[0]
+      except expressions.ExpressionError as e:
+        if strict:
+          raise SqlPipeError(f'unsupported SELECT expression in --sql-engine=python: {e}') from None
+        return None
+      if wire_yaml_dlq:
+        sel_cfg = dict(sel_cfg)
+        sel_cfg['error_handling'] = {'output': 'errors'}
+      transforms.append({
+          'name': 'SelectSqlFields',
+          'type': 'MapToFields',
+          'input': current_ref,
+          'config': sel_cfg,
+      })
+      if wire_yaml_dlq:
+        transforms.append(
+            dlq.build_dlq_normalizer_transform(
+                'NormalizeSqlSelectDlq', 'SelectSqlFields.errors', 'MapToFields'))
+        dlq_refs.append('NormalizeSqlSelectDlq')
+      current_ref = 'SelectSqlFields'
+
+    if is_distinct:
+      if not distinct_keys or any(
+          p == '*' or re.match(r'^\*\s+EXCEPT\s*\(', p, re.I) for p in norm_sel_parts):
+        _bail('SELECT DISTINCT with * requires explicit column names in --sql-engine=python')
+        return None
+      transforms.append({
+          'name': 'SelectSqlDistinct',
+          'type': 'CliDeduplicate',
+          'input': current_ref,
+          'config': {'keys': distinct_keys, 'keep': 'first'},
+      })
+      current_ref = 'SelectSqlDistinct'
+
+  if limit_val is not None:
+    transforms.append({
+        'name': 'LimitSqlRows',
+        'type': 'CliLimitRows',
+        'input': current_ref,
+        'config': {'limit': limit_val},
+    })
+    current_ref = 'LimitSqlRows'
+
+  if sink_ep is not None:
+    sink_cfg = dict(sink_ep.config)
+    if wire_yaml_dlq and sink_ep.yaml_type in dlq.TRANSFORMS_SUPPORTING_ERROR_HANDLING:
+      sink_cfg['error_handling'] = {'output': 'errors'}
+    transforms.append({
+        'name': 'WriteSink',
+        'type': sink_ep.yaml_type,
+        'input': current_ref,
+        'config': sink_cfg,
+    })
+    if 'error_handling' in sink_cfg:
+      transforms.append(
+          dlq.build_dlq_normalizer_transform(
+              'NormalizeSinkDlq', 'WriteSink.errors', sink_ep.yaml_type))
+      dlq_refs.append('NormalizeSinkDlq')
+
+  if dlq_ep is not None and dlq_refs:
+    if len(dlq_refs) == 1:
+      dlq_in = dlq_refs[0]
+    else:
+      transforms.append({
+          'name': 'MergeDlq',
+          'type': 'Flatten',
+          'input': dlq_refs,
+      })
+      dlq_in = 'MergeDlq'
+    transforms.append({
+        'name': 'WriteDlq',
+        'type': dlq_ep.yaml_type,
+        'input': dlq_in,
+        'config': dict(dlq_ep.config),
+    })
+
+  needs_cli_provider = bool(
+      dlq_refs or any(
+          str(t.get('type', '')).startswith(('Cli', 'ReadCsvWithDlq', 'ReadJsonWithDlq'))
+          for t in transforms))
+  spec_out: dict[str, Any] = {'pipeline': {'transforms': transforms}}
+  if needs_cli_provider:
+    spec_out['providers'] = [dlq.cli_yaml_provider_spec()]
+  if has_unbounded:
+    spec_out['options'] = {'streaming': True}
+  return spec_out
+
+
+def _parse_redact_fields(
+    dlq_redact_fields: Sequence[str] | str | None,
+) -> tuple[str, ...]:
+  if not dlq_redact_fields:
+    return ()
+  items = (
+      [dlq_redact_fields]
+      if isinstance(dlq_redact_fields, str) else list(dlq_redact_fields))
+  out: list[str] = []
+  seen: set[str] = set()
+  for item in items:
+    for part in str(item or '').split(','):
+      col = part.strip()
+      if col and col not in seen:
+        seen.add(col)
+        out.append(col)
+  return tuple(out)
+
+
+def _normalize_yaml_file_read_cfg(
+    s_type: str, cfg: dict[str, Any]) -> dict[str, Any]:
+  out = dict(cfg)
+  if s_type == 'ReadFromJson':
+    out.pop('sample_rows', None)
+    out.pop('on_unknown_fields', None)
+  if s_type == 'ReadFromCsv' and 'null_values' in out:
+    out['na_values'] = [''] + list(out.pop('null_values') or [])
+    out['keep_default_na'] = False
+  if s_type in ('ReadFromCsv', 'ReadFromJson') and 'types' in out:
+    dtype_map = {
+        'int': 'Int64',
+        'float': 'float64',
+        'bool': 'boolean',
+        'str': 'string',
+    }
+    out['dtype'] = {
+        c: dtype_map.get(t, 'string')
+        for c, t in dict(out.pop('types') or {}).items()
+    }
+  return out
+
+
+def _apply_dlq_redaction_to_spec(
+    spec_out: dict[str, Any], redact_fields: tuple[str, ...]
+) -> dict[str, Any]:
+  if not redact_fields:
+    return spec_out
+  transforms = spec_out.get('pipeline', {}).get('transforms', [])
+  step_ret_re = re.compile(r'return\s+([\'"][^\'"]*[\'"])')
+  for idx, t in enumerate(transforms):
+    if (t.get('type') == 'MapToFields' and
+        str(t.get('name', '')).startswith('Normalize')):
+      fields_cfg = (t.get('config') or {}).get('fields') or {}
+      if set(fields_cfg.keys()) >= {'step', 'error_type', 'error', 'raw_payload'}:
+        step_src = str((fields_cfg.get('step') or {}).get('callable') or '')
+        m = step_ret_re.search(step_src)
+        step_label = ast_literal_str(m.group(1)) if m else str(t.get('name'))
+        transforms[idx] = dlq.build_dlq_normalizer_transform(
+            str(t['name']),
+            str(t['input']),
+            step_label,
+            redact_fields=redact_fields)
+  return spec_out
+
+
+def ast_literal_str(raw_lit: str) -> str:
+  import ast
+  try:
+    val = ast.literal_eval(raw_lit)
+    return str(val)
+  except Exception:  # pylint: disable=broad-except
+    return raw_lit.strip('\'"')
+
+
 def build_sql_yaml_spec(
     named_sources: list[NamedSource],
     sql_query: str,
@@ -1367,13 +2500,23 @@ def build_sql_yaml_spec(
     max_watermark_skew: str | None = None,
     skew_action: str | None = None,
     dlq_ep: uris.ParsedEndpoint | None = None,
+    dlq_redact_fields: Sequence[str] | str | None = None,
     for_local_only: bool = False,
+    prefer_python_lowering: bool = False,
+    strict_python_lowering: bool = False,
+    pre_where: str | None = None,
+    post_select: str | None = None,
 ) -> dict[str, Any]:
-  """Builds portable Beam YAML spec (`type: Sql` or lowered `CliIntervalJoin`/`CliAsofJoin`)."""
+  """Builds portable Beam YAML spec (`type: Sql` or lowered pure-Python transforms)."""
+  redact_tuple = _parse_redact_fields(dlq_redact_fields)
+  if redact_tuple and dlq_ep is None:
+    raise SqlPipeError('--dlq-redact-fields requires --dlq <SINK>')
   clean_q = validate_readonly_select_sql(sql_query, allow_jinja=allow_jinja)
   has_unbounded = any(ns.endpoint.is_unbounded for ns in named_sources)
   transforms: list[dict[str, Any]] = []
   sql_inputs: dict[str, str] = {}
+  sql_dlq_norm_refs: list[str] = []
+  wire_yaml_dlq = bool(dlq_ep is not None and not for_local_only)
   for ns in named_sources:
     read_name = f'Read_{ns.alias}'
     mixed_groups = ns.endpoint.config.get('_mixed_groups')
@@ -1387,6 +2530,7 @@ def build_sql_yaml_spec(
             if not k.startswith('_')
         }
         sub_cfg['path'] = list(sub_files)
+        sub_cfg = _normalize_yaml_file_read_cfg(sub_yaml_type, sub_cfg)
         transforms.append({
             'name': sub_read_name,
             'type': sub_yaml_type,
@@ -1398,17 +2542,138 @@ def build_sql_yaml_spec(
           'type': 'Flatten',
           'input': sub_inputs,
       })
+      sql_inputs[ns.alias] = read_name
     else:
       cfg = {
           k: v for k, v in ns.endpoint.config.items()
           if not k.startswith('_')
       }
+      s_type = ns.endpoint.yaml_type
+      counts_int = False
+      if wire_yaml_dlq:
+        if ns.endpoint.kind == 'file' and ns.endpoint.format == 'csv':
+          s_type = 'ReadCsvWithDlq'
+          cfg = {
+              k: v
+              for k, v in cfg.items()
+              if k in ('path', 'delimiter', 'null_values', 'types')
+          }
+          cfg['error_handling'] = {'output': 'errors'}
+          counts_int = True
+        elif ns.endpoint.kind == 'file' and ns.endpoint.format == 'json':
+          s_type = 'ReadJsonWithDlq'
+          cfg = {
+              k: v
+              for k, v in cfg.items()
+              if k in ('path', 'types', 'sample_rows', 'on_unknown_fields')
+          }
+          cfg['error_handling'] = {'output': 'errors'}
+          counts_int = True
+        elif s_type in dlq.TRANSFORMS_SUPPORTING_ERROR_HANDLING:
+          cfg = _normalize_yaml_file_read_cfg(s_type, cfg)
+          cfg['error_handling'] = {'output': 'errors'}
+        else:
+          cfg = _normalize_yaml_file_read_cfg(s_type, cfg)
+      else:
+        cfg = _normalize_yaml_file_read_cfg(s_type, cfg)
       transforms.append({
           'name': read_name,
-          'type': ns.endpoint.yaml_type,
+          'type': s_type,
           'config': cfg,
       })
-    sql_inputs[ns.alias] = read_name
+      if 'error_handling' in cfg:
+        norm_read_dlq = f'NormalizeSourceDlq_{ns.alias}'
+        transforms.append(
+            dlq.build_dlq_normalizer_transform(
+                norm_read_dlq,
+                f'{read_name}.errors',
+                s_type,
+                redact_fields=redact_tuple))
+        sql_dlq_norm_refs.append(norm_read_dlq)
+        sql_inputs[ns.alias] = f'{read_name}.good' if counts_int else read_name
+      else:
+        sql_inputs[ns.alias] = read_name
+
+  from . import expressions
+  if pre_where:
+    if len(named_sources) != 1:
+      raise SqlPipeError(
+          '--where with --sql is only supported on a single input source; '
+          'for multi-input SQL joins, move the filter into --sql WHERE ...')
+    try:
+      pre_w_cfg = dict(
+          expressions.compile_where(
+              pre_where, known_columns=None, allow_jinja=allow_jinja)[0])
+    except expressions.ExpressionError as e:
+      raise SqlPipeError(str(e)) from None
+    only_a = named_sources[0].alias
+    if wire_yaml_dlq:
+      pre_w_cfg['error_handling'] = {'output': 'errors'}
+    transforms.append({
+        'name': 'PreSqlWhere',
+        'type': 'Filter',
+        'input': sql_inputs[only_a],
+        'config': pre_w_cfg,
+    })
+    if wire_yaml_dlq:
+      transforms.append(
+          dlq.build_dlq_normalizer_transform(
+              'NormalizePreSqlWhereDlq',
+              'PreSqlWhere.errors',
+              'Filter',
+              redact_fields=redact_tuple))
+      sql_dlq_norm_refs.append('NormalizePreSqlWhereDlq')
+    sql_inputs[only_a] = 'PreSqlWhere'
+
+  post_s_cfg: dict[str, Any] | None = None
+  if post_select:
+    try:
+      post_s_cfg = dict(
+          expressions.compile_select(
+              post_select, known_columns=None, allow_jinja=allow_jinja)[0])
+    except expressions.ExpressionError as e:
+      raise SqlPipeError(str(e)) from None
+
+  def _attach_post_select(spec_d: dict[str, Any]) -> dict[str, Any]:
+    if post_s_cfg is None:
+      return spec_d
+    t_list = spec_d.get('pipeline', {}).get('transforms')
+    if not isinstance(t_list, list) or 'local_asof_sql' in spec_d.get(
+        'pipeline', {}):
+      return spec_d
+    cfg_ps = dict(post_s_cfg)
+    sink_idx = next(
+        (i for i, t in enumerate(t_list) if t.get('name') == 'WriteSink'), None)
+    if sink_idx is not None:
+      prev_in = t_list[sink_idx]['input']
+      if wire_yaml_dlq:
+        cfg_ps['error_handling'] = {'output': 'errors'}
+      ps_step = {
+          'name': 'PostSqlSelect',
+          'type': 'MapToFields',
+          'input': prev_in,
+          'config': cfg_ps,
+      }
+      t_list.insert(sink_idx, ps_step)
+      t_list[sink_idx + 1]['input'] = 'PostSqlSelect'
+      if wire_yaml_dlq:
+        norm_ps = dlq.build_dlq_normalizer_transform(
+            'NormalizePostSqlSelectDlq',
+            'PostSqlSelect.errors',
+            'MapToFields',
+            redact_fields=redact_tuple)
+        t_list.insert(sink_idx + 1, norm_ps)
+        _merge_extra_sql_dlq_refs(spec_d, ['NormalizePostSqlSelectDlq'], dlq_ep)
+    elif t_list:
+      last_name = t_list[-1].get('name')
+      if last_name:
+        t_list.append({
+            'name': 'PostSqlSelect',
+            'type': 'MapToFields',
+            'input': last_name,
+            'config': cfg_ps,
+        })
+    return spec_d
 
   code_only = ' '.join(
       seg for is_c, seg in _scan_sql_outside_literals(clean_q) if is_c)
@@ -1429,7 +2694,7 @@ def build_sql_yaml_spec(
               'local_asof_sql': clean_q,
           }
       }
-    return _lower_asof_join_sql(
+    res_asof = _lower_asof_join_sql(
         named_sources,
         clean_q,
         transforms,
@@ -1440,10 +2705,14 @@ def build_sql_yaml_spec(
         skew_action=skew_action,
         dlq_ep=dlq_ep,
         allow_jinja=allow_jinja)
+    if sql_dlq_norm_refs and dlq_ep is not None:
+      _merge_extra_sql_dlq_refs(res_asof, sql_dlq_norm_refs, dlq_ep)
+    return _apply_dlq_redaction_to_spec(
+        _attach_post_select(res_asof), redact_tuple)
   if has_join and (has_interval or max_watermark_skew is not None or
                    skew_action is not None or
                    (has_unbounded and len(named_sources) >= 2)):
-    return _lower_temporal_interval_join_sql(
+    res_ij = _lower_temporal_interval_join_sql(
         named_sources,
         clean_q,
         transforms,
@@ -1454,6 +2723,35 @@ def build_sql_yaml_spec(
         skew_action=skew_action,
         dlq_ep=dlq_ep,
         allow_jinja=allow_jinja)
+    if sql_dlq_norm_refs and dlq_ep is not None:
+      _merge_extra_sql_dlq_refs(res_ij, sql_dlq_norm_refs, dlq_ep)
+    return _apply_dlq_redaction_to_spec(
+        _attach_post_select(res_ij), redact_tuple)
+
+  if prefer_python_lowering or strict_python_lowering:
+    if len(named_sources) != 1 or has_join:
+      if strict_python_lowering:
+        raise SqlPipeError(
+            '--sql-engine=python supports single-source SQL or 2-source ASOF / '
+            'temporal INTERVAL JOINs; omit --sql-engine=python to use Calcite '
+            'or local DuckDB/SQLite for general multi-table joins')
+    else:
+      only_ns = named_sources[0]
+      py_spec = _try_lower_single_source_sql(
+          only_ns,
+          clean_q,
+          transforms,
+          sql_inputs[only_ns.alias],
+          sink_ep,
+          has_unbounded=has_unbounded,
+          wire_yaml_dlq=wire_yaml_dlq,
+          dlq_ep=dlq_ep,
+          sql_dlq_norm_refs=sql_dlq_norm_refs,
+          allow_jinja=allow_jinja,
+          strict=strict_python_lowering)
+      if py_spec is not None:
+        return _apply_dlq_redaction_to_spec(
+            _attach_post_select(py_spec), redact_tuple)
 
   _SQL_RESERVED_TAGS = frozenset({
       'in', 'select', 'from', 'where', 'group', 'order', 'by', 'join', 'on',
@@ -1461,16 +2759,28 @@ def build_sql_yaml_spec(
       'or', 'not', 'null', 'is', 'true', 'false', 'case', 'when', 'then', 'end',
   })
   eff_sql_inputs = dict(sql_inputs)
+  calcite_query = clean_q
+  use_single_pcollection = False
   if len(eff_sql_inputs) == 1:
     only_alias, only_read = next(iter(eff_sql_inputs.items()))
     refs_source = bool(re.search(r'\bFROM\s+source\b', code_only, re.I))
     refs_alias = bool(
         re.search(rf'\bFROM\s+[`"]?{re.escape(only_alias)}[`"]?\b', code_only, re.I))
-    if refs_source and not refs_alias:
-      eff_sql_inputs = {'source': only_read}
+    if refs_source and not refs_alias and only_alias.lower() != 'source':
+      rw_parts: list[str] = []
+      for is_c, seg in _scan_sql_outside_literals(calcite_query):
+        if is_c:
+          s_rw = re.sub(r'\bFROM\s+source\b', 'FROM PCOLLECTION', seg, flags=re.I)
+          s_rw = re.sub(r'\bsource\s*\.', 'PCOLLECTION.', s_rw, flags=re.I)
+          rw_parts.append(s_rw)
+        else:
+          rw_parts.append(seg)
+      calcite_query = ''.join(rw_parts)
+      use_single_pcollection = True
     elif refs_source and 'source' not in eff_sql_inputs:
       eff_sql_inputs['source'] = only_read
-    if only_alias.lower() in _SQL_RESERVED_TAGS and only_alias in eff_sql_inputs:
+    if (not use_single_pcollection and only_alias.lower() in _SQL_RESERVED_TAGS
+        and only_alias in eff_sql_inputs):
       safe_alias = f'tbl_{only_alias}'
       if not refs_alias:
         del eff_sql_inputs[only_alias]
@@ -1479,31 +2789,81 @@ def build_sql_yaml_spec(
 
   sql_input_val: Any = (
       next(iter(eff_sql_inputs.values()))
-      if len(eff_sql_inputs) == 1 and 'pcollection' in code_only.lower() else
+      if len(eff_sql_inputs) == 1 and (
+          use_single_pcollection or 'pcollection' in code_only.lower()) else
       eff_sql_inputs)
   transforms.append({
       'name': 'SqlQuery',
       'type': 'Sql',
       'input': sql_input_val,
       'config': {
-          'query': clean_q
+          'query': calcite_query
       },
   })
+  sql_out_ref = 'SqlQuery'
+  if post_s_cfg is not None:
+    cfg_ps = dict(post_s_cfg)
+    if wire_yaml_dlq:
+      cfg_ps['error_handling'] = {'output': 'errors'}
+    transforms.append({
+        'name': 'PostSqlSelect',
+        'type': 'MapToFields',
+        'input': sql_out_ref,
+        'config': cfg_ps,
+    })
+    if wire_yaml_dlq:
+      transforms.append(
+          dlq.build_dlq_normalizer_transform(
+              'NormalizePostSqlSelectDlq',
+              'PostSqlSelect.errors',
+              'MapToFields',
+              redact_fields=redact_tuple))
+      sql_dlq_norm_refs.append('NormalizePostSqlSelectDlq')
+    sql_out_ref = 'PostSqlSelect'
   if sink_ep is not None:
+    sink_cfg = dict(sink_ep.config)
+    if wire_yaml_dlq and sink_ep.yaml_type in dlq.TRANSFORMS_SUPPORTING_ERROR_HANDLING:
+      sink_cfg['error_handling'] = {'output': 'errors'}
     transforms.append({
         'name': 'WriteSink',
         'type': sink_ep.yaml_type,
-        'input': 'SqlQuery',
-        'config': dict(sink_ep.config),
+        'input': sql_out_ref,
+        'config': sink_cfg,
+    })
+    if 'error_handling' in sink_cfg:
+      transforms.append(
+          dlq.build_dlq_normalizer_transform(
+              'NormalizeSinkDlq',
+              'WriteSink.errors',
+              sink_ep.yaml_type,
+              redact_fields=redact_tuple))
+      sql_dlq_norm_refs.append('NormalizeSinkDlq')
+  if dlq_ep is not None and sql_dlq_norm_refs:
+    if len(sql_dlq_norm_refs) == 1:
+      dlq_in = sql_dlq_norm_refs[0]
+    else:
+      transforms.append({
+          'name': 'MergeDlq',
+          'type': 'Flatten',
+          'input': sql_dlq_norm_refs,
+      })
+      dlq_in = 'MergeDlq'
+    transforms.append({
+        'name': 'WriteDlq',
+        'type': dlq_ep.yaml_type,
+        'input': dlq_in,
+        'config': dict(dlq_ep.config),
     })
   spec_out: dict[str, Any] = {
       'pipeline': {
           'transforms': transforms,
       }
   }
+  if sql_dlq_norm_refs:
+    spec_out['providers'] = [dlq.cli_yaml_provider_spec()]
   if has_unbounded:
     spec_out['options'] = {'streaming': True}
-  return spec_out
+  return _apply_dlq_redaction_to_spec(spec_out, redact_tuple)
 
 
 def _match_source_files(
@@ -1539,15 +2899,29 @@ def _match_source_files(
   return sorted(m.path for m in matches)
 
 
-def _open_binary(path: str):
+def _open_binary(path: str, *, decompress: bool = True):
+  low = path.lower()
   if '://' not in path:
+    if decompress and low.endswith('.gz'):
+      import gzip
+      return gzip.open(path, 'rb')
+    if decompress and low.endswith('.bz2'):
+      import bz2
+      return bz2.open(path, 'rb')
     return open(path, 'rb')
+  from apache_beam.io.filesystem import CompressionTypes
   from apache_beam.io.filesystems import FileSystems
-  return FileSystems.open(path)
+  comp = CompressionTypes.AUTO if decompress else CompressionTypes.UNCOMPRESSED
+  return FileSystems.open(path, compression_type=comp)
 
 
 def _coerce_csv_val(
     val: str, kind: str, null_values=dlq.DEFAULT_CSV_NULL_VALUES) -> Any:
+  if kind == 'str':
+    if val == '' or val in null_values or (
+        val.strip() and val.strip() in null_values):
+      return None
+    return val
   s = val.strip()
   if s == '' or val in null_values or s in null_values:
     return None
@@ -1556,7 +2930,7 @@ def _coerce_csv_val(
   if kind == 'float':
     v = float(s)
     if math.isnan(v) or math.isinf(v):
-      raise ValueError(f'non-finite float {val!r}')
+      raise ValueError(f'non-finite float token (len={len(s)})')
     return v
   if kind == 'bool':
     low = s.lower()
@@ -1564,8 +2938,107 @@ def _coerce_csv_val(
       return True
     if low in ('false', '0', 'f', 'no'):
       return False
-    raise ValueError(f'invalid boolean {val!r}')
+    raise ValueError(f'invalid boolean token (len={len(s)})')
   return val
+
+
+def _redact_dlq_entry(
+    entry: dict[str, Any],
+    redact_fields: tuple[str, ...],
+    *,
+    header: list[str] | None = None,
+    delim: str = ',',
+) -> dict[str, Any]:
+  if not redact_fields:
+    return entry
+  rk_set = set(redact_fields)
+  out = dict(entry)
+  err_msg = str(out.get('error', ''))
+  for col in redact_fields:
+    err_msg = re.sub(
+        r'([\'"]?' + re.escape(col) +
+        r'[\'"]?\s*[:=]\s*)(?:([\'"]).*?\2|[^,\s)\]}]+)',
+        r'\1<REDACTED>',
+        err_msg)
+  out['error'] = err_msg
+
+  raw_p = out.get('raw_payload')
+  if isinstance(raw_p, str):
+    scrubbed: str | None = None
+    try:
+      parsed_p = json.loads(raw_p)
+      if isinstance(parsed_p, dict):
+        scrubbed = json.dumps(
+            dlq.redact_nested_fields(parsed_p, redact_fields),
+            default=str,
+            allow_nan=False)
+      elif isinstance(parsed_p, list) and header:
+        masked_list = [
+            '<REDACTED>' if idx < len(header) and header[idx] in rk_set else val
+            for idx, val in enumerate(parsed_p)
+        ]
+        scrubbed = json.dumps(masked_list, default=str, allow_nan=False)
+      elif isinstance(parsed_p, list):
+        scrubbed = json.dumps(
+            dlq.redact_nested_fields(parsed_p, redact_fields),
+            default=str,
+            allow_nan=False)
+    except Exception:  # pylint: disable=broad-except
+      scrubbed = None
+    if scrubbed is None:
+      tmp_s = raw_p
+      replaced_any = False
+      for col in redact_fields:
+        nxt_s, cnt = re.subn(
+            r'([\'"]' + re.escape(col) +
+            r'[\'"]\s*:\s*)(?:"(?:\\.|[^"])*"|\'(?:\\.|[^\'])*\'|[^,\s}\]]+)',
+            r'\1"<REDACTED>"',
+            tmp_s)
+        if cnt:
+          replaced_any = True
+          tmp_s = nxt_s
+      if replaced_any:
+        scrubbed = tmp_s
+      elif header and any(h in rk_set for h in header):
+        parts = raw_p.split(delim)
+        for idx, col_n in enumerate(header):
+          if col_n in rk_set and idx < len(parts):
+            parts[idx] = '<REDACTED>'
+        scrubbed = delim.join(parts)
+      else:
+        scrubbed = tmp_s
+    out['raw_payload'] = scrubbed
+  return out
+
+
+def _lakehouse_type_to_arrow(ft: str):
+  import pyarrow as pa
+  low = ft.strip().lower()
+  if low in ('boolean', 'bool'):
+    return pa.bool_()
+  if low in ('int', 'integer', 'short', 'byte'):
+    return pa.int32()
+  if low == 'long':
+    return pa.int64()
+  if low == 'float':
+    return pa.float32()
+  if low == 'double':
+    return pa.float64()
+  m_dec = re.match(r'^decimal\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)$', low)
+  if m_dec:
+    p, s = int(m_dec.group(1)), int(m_dec.group(2))
+    return pa.decimal128(min(p, 38), s) if p <= 38 else pa.decimal256(p, s)
+  if low.startswith('decimal'):
+    return pa.decimal128(38, 9)
+  if low == 'date':
+    return pa.date32()
+  if low == 'timestamptz':
+    return pa.timestamp('us', tz='UTC')
+  if low.startswith('timestamp'):
+    return pa.timestamp('us')
+  if low in ('binary', 'bytes'):
+    return pa.binary()
+  return pa.string()
 
 
 def load_endpoint_rows(
@@ -1573,10 +3046,15 @@ def load_endpoint_rows(
     *,
     default_project: str | None = None,
     dlq_records: list[dict[str, Any]] | None = None,
+    dlq_redact_fields: Sequence[str] | str | None = None,
     warnings: list[str] | None = None,
 ) -> tuple[list[tuple[str, str]], list[dict[str, Any]], int]:
   """Reads `(columns_with_sqlite_types, rows, raw_rows_read)` from `ep`."""
   from . import lakehouse
+
+  dlq.ensure_csv_field_size_limit()
+  redact_tuple = _parse_redact_fields(dlq_redact_fields)
+  _SQL_THREAD_LOCAL.last_endpoint_arrow_types = {}
 
   if ep.kind == 'delta':
     table_root = ep.config.get('table') or ep.config.get('path')
@@ -1586,13 +3064,18 @@ def load_endpoint_rows(
         version=int(ver) if ver is not None else None,
         limit=None)
     cols = []
+    arrow_map = {}
     for f in snap.get('schema', []):
+      fname = str(f['name'])
       ft = str(f.get('type', 'string')).lower()
       sq_t = (
-          'INTEGER' if ft in ('long', 'integer', 'short', 'byte', 'boolean')
-          else 'REAL' if ft in ('double', 'float') or ft.startswith('decimal')
-          else 'TEXT')
-      cols.append((str(f['name']), sq_t))
+          'BOOLEAN' if ft in ('boolean', 'bool') else
+          'INTEGER' if ft in ('long', 'integer', 'short', 'byte') else
+          'REAL' if ft in ('double', 'float') or ft.startswith('decimal') else
+          'TEXT')
+      cols.append((fname, sq_t))
+      arrow_map[fname] = _lakehouse_type_to_arrow(ft)
+    _SQL_THREAD_LOCAL.last_endpoint_arrow_types = arrow_map
     return cols, rows, len(rows)
 
   if ep.kind == 'iceberg':
@@ -1601,12 +3084,17 @@ def load_endpoint_rows(
     state = lakehouse.load_iceberg_state(tdir)
     _, rows = lakehouse.read_iceberg_rows_local(state, limit=None)
     cols = []
+    arrow_map = {}
     for f in state.get('schema', []):
+      fname = str(f['name'])
       ft = str(f.get('type', 'string')).lower()
       sq_t = (
-          'INTEGER' if ft in ('long', 'int', 'boolean') else 'REAL'
+          'BOOLEAN' if ft in ('boolean', 'bool') else
+          'INTEGER' if ft in ('long', 'int') else 'REAL'
           if ft in ('double', 'float') or ft.startswith('decimal') else 'TEXT')
-      cols.append((str(f['name']), sq_t))
+      cols.append((fname, sq_t))
+      arrow_map[fname] = _lakehouse_type_to_arrow(ft)
+    _SQL_THREAD_LOCAL.last_endpoint_arrow_types = arrow_map
     return cols, rows, len(rows)
 
   if ep.kind != 'file':
@@ -1638,6 +3126,7 @@ def load_endpoint_rows(
           sub_ep,
           default_project=default_project,
           dlq_records=dlq_records,
+          dlq_redact_fields=redact_tuple,
           warnings=warnings)
       total_raw_count += sub_cnt
       rows.extend(sub_rows)
@@ -1665,25 +3154,31 @@ def load_endpoint_rows(
     import pyarrow.parquet as pq
     tables = []
     for fp in files:
-      with _open_binary(fp) as bf:
+      with _open_binary(fp, decompress=False) as bf:
         tables.append(pq.read_table(bf))
     if not tables:
       return [], [], 0
     full = pa.concat_tables(tables, promote_options='default')
     cols = []
+    arrow_map = {}
     for field in full.schema:
       t = field.type
-      if pa.types.is_integer(t) or pa.types.is_boolean(t):
+      arrow_map[field.name] = t
+      if pa.types.is_boolean(t):
+        sq_t = 'BOOLEAN'
+      elif pa.types.is_integer(t):
         sq_t = 'INTEGER'
       elif pa.types.is_floating(t) or pa.types.is_decimal(t):
         sq_t = 'REAL'
       else:
         sq_t = 'TEXT'
       cols.append((field.name, sq_t))
+    _SQL_THREAD_LOCAL.last_endpoint_arrow_types = arrow_map
     rows = full.to_pylist()
     return cols, rows, len(rows)
 
   if fmt == 'csv':
+    import pyarrow as pa
     delim = str(ep.config.get('delimiter', ',') or ',')
     nulls = dlq.DEFAULT_CSV_NULL_VALUES | frozenset(
         ep.config.get('null_values') or ())
@@ -1705,54 +3200,114 @@ def load_endpoint_rows(
     cols = [
         (
             c,
-            'INTEGER' if kinds.get(c) in ('int', 'bool') else
+            'BOOLEAN' if kinds.get(c) == 'bool' else
+            'INTEGER' if kinds.get(c) == 'int' else
             'REAL' if kinds.get(c) == 'float' else 'TEXT',
         ) for c in header
     ]
+    _SQL_THREAD_LOCAL.last_endpoint_arrow_types = {
+        c: (
+            pa.bool_() if kinds.get(c) == 'bool' else
+            pa.int64() if kinds.get(c) == 'int' else
+            pa.float64() if kinds.get(c) == 'float' else pa.string())
+        for c in header
+    }
     rows = []
     raw_count = 0
     for fp in files:
       with _open_binary(fp) as bf:
-        text = bf.read().decode('utf-8-sig', errors='replace')
-      reader = csv.reader(io.StringIO(text, newline=''), delimiter=delim)
-      first = True
-      for rec in reader:
-        if first:
-          first = False
-          continue
-        if not rec or (len(rec) == 1 and rec[0] == ''):
-          continue
-        raw_count += 1
-        if len(rec) != len(header):
-          err_msg = f'expected {len(header)} columns, got {len(rec)}'
-          if dlq_records is not None:
-            dlq_records.append({
-                'step': 'ReadCsvWithDlq',
-                'error_type': 'CsvColumnCountMismatch',
-                'error': err_msg,
-                'raw_payload': json.dumps(rec),
-            })
-            continue
-          raise SqlPipeError(f'malformed CSV row in {fp}: {err_msg}')
+        text_stream = io.TextIOWrapper(
+            bf, encoding='utf-8-sig', errors='replace', newline='')
         try:
-          row_d = {
-              col_n: _coerce_csv_val(val, kinds[col_n], nulls)
-              for col_n, val in zip(header, rec)
-          }
-          rows.append(row_d)
-        except Exception as e:  # pylint: disable=broad-except
-          if dlq_records is not None:
-            dlq_records.append({
-                'step': 'ReadCsvWithDlq',
-                'error_type': type(e).__name__,
-                'error': str(e),
-                'raw_payload': json.dumps(dict(zip(header, rec))),
-            })
-            continue
-          raise SqlPipeError(f'corrupt CSV value in {fp}: {e}') from None
+          first = True
+          for rec, csv_err, bad_line in dlq.iter_csv_rows_recovering(
+              text_stream, delimiter=delim):
+            if csv_err is not None:
+              if first:
+                first = False
+                if dlq_records is not None:
+                  dlq_records.append(
+                      _redact_dlq_entry(
+                          {
+                              'step': 'ReadCsvWithDlq',
+                              'error_type': type(csv_err).__name__,
+                              'error': str(csv_err),
+                              'raw_payload': bad_line.rstrip('\r\n'),
+                          },
+                          redact_tuple,
+                          header=header,
+                          delim=delim))
+                  continue
+                raise SqlPipeError(
+                    f'malformed CSV header in {fp}: {csv_err}') from None
+              raw_count += 1
+              if dlq_records is not None:
+                dlq_records.append(
+                    _redact_dlq_entry(
+                        {
+                            'step': 'ReadCsvWithDlq',
+                            'error_type': type(csv_err).__name__,
+                            'error': str(csv_err),
+                            'raw_payload': bad_line.rstrip('\r\n'),
+                        },
+                        redact_tuple,
+                        header=header,
+                        delim=delim))
+                continue
+              raise SqlPipeError(
+                  f'malformed CSV row in {fp}: {csv_err}') from None
+            if first:
+              first = False
+              continue
+            if not rec or (len(rec) == 1 and rec[0] == ''):
+              continue
+            raw_count += 1
+            if len(rec) != len(header):
+              err_msg = f'expected {len(header)} columns, got {len(rec)}'
+              if dlq_records is not None:
+                dlq_records.append(
+                    _redact_dlq_entry(
+                        {
+                            'step': 'ReadCsvWithDlq',
+                            'error_type': 'CsvColumnCountMismatch',
+                            'error': err_msg,
+                            'raw_payload': json.dumps(rec),
+                        },
+                        redact_tuple,
+                        header=header,
+                        delim=delim))
+                continue
+              raise SqlPipeError(f'malformed CSV row in {fp}: {err_msg}')
+            try:
+              row_d = {
+                  col_n: _coerce_csv_val(val, kinds[col_n], nulls)
+                  for col_n, val in zip(header, rec)
+              }
+              rows.append(row_d)
+            except Exception as e:  # pylint: disable=broad-except
+              if dlq_records is not None:
+                dlq_records.append(
+                    _redact_dlq_entry(
+                        {
+                            'step': 'ReadCsvWithDlq',
+                            'error_type': type(e).__name__,
+                            'error': str(e),
+                            'raw_payload': json.dumps(dict(zip(header, rec))),
+                        },
+                        redact_tuple,
+                        header=header,
+                        delim=delim))
+                continue
+              raise SqlPipeError(f'corrupt CSV value in {fp}: {e}') from None
+        finally:
+          try:
+            text_stream.detach()
+          except Exception:  # pylint: disable=broad-except
+            pass
     return cols, rows, raw_count
 
   if fmt == 'json':
+    import pyarrow as pa
     rows = []
     raw_count = 0
     col_types: dict[str, str] = {}
@@ -1794,7 +3349,8 @@ def load_endpoint_rows(
               for k, v in obj.items():
                 if v is not None and k not in col_types:
                   col_types[k] = (
-                      'INTEGER' if isinstance(v, (bool, int)) else
+                      'BOOLEAN' if isinstance(v, bool) else
+                      'INTEGER' if isinstance(v, int) else
                       'REAL' if isinstance(v, float) else 'TEXT')
                 elif k not in col_types:
                   col_types[k] = 'TEXT'
@@ -1815,7 +3371,8 @@ def load_endpoint_rows(
             if isinstance(e, dlq.SchemaDriftError):
               drift_count += 1
               drift_fields.update(e.extra_fields)
-            dlq_records.append(dlq.json_dlq_record(s, e))
+            dlq_records.append(
+                _redact_dlq_entry(dlq.json_dlq_record(s, e), redact_tuple))
           continue
         try:
           obj = json.loads(s)
@@ -1824,7 +3381,9 @@ def load_endpoint_rows(
           rows.append(obj)
           for k, v in obj.items():
             if v is not None and (k not in col_types or col_types[k] == 'TEXT'):
-              if isinstance(v, (bool, int)):
+              if isinstance(v, bool):
+                col_types.setdefault(k, 'BOOLEAN')
+              elif isinstance(v, int):
                 col_types.setdefault(k, 'INTEGER')
               elif isinstance(v, float):
                 col_types[k] = 'REAL'
@@ -1834,27 +3393,40 @@ def load_endpoint_rows(
               col_types[k] = 'TEXT'
         except Exception as e:  # pylint: disable=broad-except
           if dlq_records is not None:
-            dlq_records.append({
-                'step': 'ReadFromJsonWithDlq',
-                'error_type': type(e).__name__,
-                'error': str(e),
-                'raw_payload': s,
-            })
+            dlq_records.append(
+                _redact_dlq_entry(
+                    {
+                        'step': 'ReadFromJsonWithDlq',
+                        'error_type': type(e).__name__,
+                        'error': str(e),
+                        'raw_payload': s,
+                    },
+                    redact_tuple))
             continue
-          raise SqlPipeError(f'invalid JSON record in {fp}: {e}') from None
+          raise SqlPipeError(
+              f'invalid JSON record in {fp}: {type(e).__name__}') from None
     if drift_count > 0 and warnings is not None:
       warnings.append(dlq.schema_drift_warning(drift_count, drift_fields))
     if kinds is not None:
       col_types = {
-          k: ('INTEGER' if v in ('int', 'bool') else
+          k: ('BOOLEAN' if v == 'bool' else
+              'INTEGER' if v == 'int' else
               'REAL' if v == 'float' else 'TEXT')
           for k, v in kinds.items()
       }
+    _SQL_THREAD_LOCAL.last_endpoint_arrow_types = {
+        k: (
+            pa.bool_() if ct == 'BOOLEAN' else
+            pa.int64() if ct == 'INTEGER' else
+            pa.float64() if ct == 'REAL' else pa.string())
+        for k, ct in col_types.items()
+    }
     cols = list(col_types.items())
     return cols, rows, raw_count
 
   if fmt == 'avro':
     import fastavro
+    import pyarrow as pa
     rows = []
     col_types = {}
     for fp in files:
@@ -1865,10 +3437,18 @@ def load_endpoint_rows(
           for k, v in d.items():
             if k not in col_types and v is not None:
               col_types[k] = (
-                  'INTEGER' if isinstance(v, (bool, int)) else
-                  'REAL' if isinstance(v, float) else 'TEXT')
+                  'BOOLEAN' if isinstance(v, bool) else
+                  'INTEGER' if isinstance(v, int) else
+                  'REAL' if isinstance(v, (float, decimal.Decimal)) else 'TEXT')
             elif k not in col_types:
               col_types[k] = 'TEXT'
+    _SQL_THREAD_LOCAL.last_endpoint_arrow_types = {
+        k: (
+            pa.bool_() if ct == 'BOOLEAN' else
+            pa.int64() if ct == 'INTEGER' else
+            pa.float64() if ct == 'REAL' else pa.string())
+        for k, ct in col_types.items()
+    }
     return list(col_types.items()), rows, len(rows)
 
   raise SqlPipeError(f'unsupported local --sql input format {fmt!r}')
@@ -1900,10 +3480,27 @@ def _quote_ident(name: str) -> str:
 
 
 def _normalize_sqlite_param(v: Any) -> Any:
-  if v is None or isinstance(v, (int, float, str, bytes)):
-    return v
+  if v is None:
+    return None
   if isinstance(v, bool):
     return 1 if v else 0
+  if isinstance(v, (int, float, str, bytes)):
+    return v
+  if isinstance(v, decimal.Decimal):
+    if v.is_nan():
+      return None
+    if v.is_infinite():
+      return float('-inf') if v.is_signed() else float('inf')
+    if v == v.to_integral_value() and v.as_tuple().exponent >= 0:
+      iv = int(v)
+      if -(1 << 63) <= iv <= (1 << 63) - 1:
+        return iv
+    try:
+      return float(v)
+    except OverflowError:
+      return float('-inf') if v.is_signed() else float('inf')
+  if isinstance(v, (datetime.datetime, datetime.date, datetime.time)):
+    return v.isoformat()
   return json.dumps(v, default=str)
 
 
@@ -2050,10 +3647,18 @@ class _Quantile:
 
   def step(self, value, q=None):
     if q is not None:
+      qf = float(q)
+      if math.isnan(qf) or math.isinf(qf):
+        raise ValueError(f'quantile must be finite, got {q!r}')
       self._q_dec = (
           decimal.Decimal(str(q)) / decimal.Decimal(str(self.scale)))
     if value is not None:
-      self._values.append(float(value))
+      try:
+        fv = float(value)
+      except (ValueError, TypeError):
+        return
+      if not math.isnan(fv):
+        self._values.append(fv)
 
   def finalize(self):
     if not self._values or self._q_dec is None:
@@ -2088,9 +3693,11 @@ class _Stddev:
   def step(self, value):
     if value is not None:
       try:
-        self._values.append(float(value))
+        fv = float(value)
       except (ValueError, TypeError):
-        pass
+        return
+      if not math.isnan(fv):
+        self._values.append(fv)
 
   def finalize(self):
     if len(self._values) < 2:
@@ -2108,9 +3715,11 @@ class _StddevPop:
   def step(self, value):
     if value is not None:
       try:
-        self._values.append(float(value))
+        fv = float(value)
       except (ValueError, TypeError):
-        pass
+        return
+      if not math.isnan(fv):
+        self._values.append(fv)
 
   def finalize(self):
     if not self._values:
@@ -2127,9 +3736,11 @@ class _VarianceSamp:
   def step(self, value):
     if value is not None:
       try:
-        self._values.append(float(value))
+        fv = float(value)
       except (ValueError, TypeError):
-        pass
+        return
+      if not math.isnan(fv):
+        self._values.append(fv)
 
   def finalize(self):
     if len(self._values) < 2:
@@ -2146,9 +3757,11 @@ class _VariancePop:
   def step(self, value):
     if value is not None:
       try:
-        self._values.append(float(value))
+        fv = float(value)
       except (ValueError, TypeError):
-        pass
+        return
+      if not math.isnan(fv):
+        self._values.append(fv)
 
   def finalize(self):
     if not self._values:
@@ -2198,6 +3811,8 @@ class _RegrAccumulator:
       yf = float(y)
       xf = float(x)
     except (ValueError, TypeError):
+      return
+    if math.isnan(yf) or math.isnan(xf):
       return
     self.n += 1
     dx = xf - self.mean_x
@@ -2696,24 +4311,40 @@ def duckdb_version() -> str | None:
     return None
 
 
-_ARROW_TYPES_FOR_SQLITE = {'INTEGER': 'int64', 'REAL': 'float64'}
+_ARROW_TYPES_FOR_SQLITE = {
+    'INTEGER': 'int64',
+    'REAL': 'float64',
+    'BOOLEAN': 'bool',
+}
 
 
-def _arrow_table(cols, rows):
+def _arrow_table(cols, rows, arrow_hints: dict[str, Any] | None = None):
   """Builds a pyarrow Table from loaded rows, keeping nested values."""
   import pyarrow as pa
-  names = [c for c, _ in cols] or (list(rows[0]) if rows else ['_empty'])
+  names = [c for c, _ in cols] or (
+      list(rows[0]) if rows else [_EMPTY_PLACEHOLDER_COL])
   types = dict(cols)
+  hints = (
+      arrow_hints
+      if arrow_hints is not None else getattr(
+          _SQL_THREAD_LOCAL, 'last_endpoint_arrow_types', None) or {})
   arrays = []
   for name in names:
     values = [r.get(name) for r in rows]
+    exact_pa = hints.get(name)
     declared = _ARROW_TYPES_FOR_SQLITE.get(types.get(name, ''), None)
     try:
-      if declared and not any(isinstance(v, (dict, list)) for v in values):
+      if exact_pa is not None and not any(
+          isinstance(v, (dict, list)) for v in values):
+        arrays.append(pa.array(values, type=exact_pa))
+      elif declared and not any(
+          isinstance(v, (dict, list, decimal.Decimal)) for v in values):
         arrays.append(pa.array(values, type=declared))
       else:
-        arrays.append(pa.array(values) if values else pa.array(
-            [], type=pa.string()))
+        arr = pa.array(values) if values else pa.array([], type=pa.string())
+        if pa.types.is_null(arr.type):
+          arr = pa.array(values, type=pa.string())
+        arrays.append(arr)
     except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError, ValueError):
       # Mixed types in one column: keep the values as text.
       arrays.append(
@@ -2726,8 +4357,63 @@ def _arrow_table(cols, rows):
   return pa.Table.from_arrays(arrays, names=names)
 
 
+def _duckdb_type_to_arrow(type_desc: Any):
+  import pyarrow as pa
+  raw = str(type_desc or '').strip().upper()
+  if raw in ('BOOLEAN', 'BOOL'):
+    return pa.bool_()
+  if raw == 'TINYINT':
+    return pa.int8()
+  if raw == 'SMALLINT':
+    return pa.int16()
+  if raw in ('INTEGER', 'INT', 'INT4'):
+    return pa.int32()
+  if raw in ('BIGINT', 'INT8', 'HUGEINT'):
+    return pa.int64()
+  if raw == 'UTINYINT':
+    return pa.uint8()
+  if raw == 'USMALLINT':
+    return pa.uint16()
+  if raw == 'UINTEGER':
+    return pa.uint32()
+  if raw in ('UBIGINT', 'UHUGEINT'):
+    return pa.uint64()
+  if raw in ('FLOAT', 'REAL', 'FLOAT4'):
+    return pa.float32()
+  if raw in ('DOUBLE', 'FLOAT8'):
+    return pa.float64()
+  m_dec = re.match(r'^(?:DECIMAL|NUMERIC)\s*\(\s*(\d+)\s*,\s*(\d+)\s*\)$', raw)
+  if m_dec:
+    p, s = int(m_dec.group(1)), int(m_dec.group(2))
+    return pa.decimal128(min(p, 38), s) if p <= 38 else pa.decimal256(p, s)
+  if raw == 'DATE':
+    return pa.date32()
+  if raw.startswith('TIME') and not raw.startswith('TIMESTAMP'):
+    return pa.time64('us')
+  if 'WITH TIME ZONE' in raw or raw == 'TIMESTAMPTZ':
+    return pa.timestamp('us', tz='UTC')
+  if raw == 'TIMESTAMP_S':
+    return pa.timestamp('s')
+  if raw == 'TIMESTAMP_MS':
+    return pa.timestamp('ms')
+  if raw == 'TIMESTAMP_NS':
+    return pa.timestamp('ns')
+  if raw.startswith('TIMESTAMP') or raw == 'DATETIME':
+    return pa.timestamp('us')
+  if raw in ('BLOB', 'BYTEA', 'BINARY', 'VARBINARY'):
+    return pa.binary()
+  return pa.string()
+
+
 def _run_duckdb(
-    named_sources, clean_q, *, default_project, dlq_records, warnings=None):
+    named_sources,
+    clean_q,
+    *,
+    default_project,
+    dlq_records,
+    dlq_redact_fields=None,
+    warnings=None,
+    pre_where_fn=None):
   """Runs one read-only SELECT in a sandboxed in-memory DuckDB.
 
   Inputs are loaded by the same readers as the SQLite engine (typing, NULLs,
@@ -2743,6 +4429,7 @@ def _run_duckdb(
         '(check with: beam doctor)') from None
   clean_q = _rewrite_source_uri_table_refs(clean_q, named_sources)
   total_read = 0
+  injected_empty = False
   con = duckdb.connect(
       ':memory:',
       config={
@@ -2761,9 +4448,16 @@ def _run_duckdb(
           ns.endpoint,
           default_project=default_project,
           dlq_records=dlq_records,
+          dlq_redact_fields=dlq_redact_fields,
           warnings=warnings)
       total_read += raw_cnt
-      con.register(ns.alias, _arrow_table(cols, rows))
+      if pre_where_fn is not None:
+        rows = pre_where_fn(rows)
+      if not cols and not rows:
+        injected_empty = True
+      ep_hints = dict(
+          getattr(_SQL_THREAD_LOCAL, 'last_endpoint_arrow_types', None) or {})
+      con.register(ns.alias, _arrow_table(cols, rows, arrow_hints=ep_hints))
       used_lower.add(ns.alias.lower())
       first_alias = first_alias or ns.alias
     if first_alias is not None:
@@ -2802,7 +4496,6 @@ def _run_duckdb(
         END
       )
     ''')
-    import threading
     raw_mem = os.environ.get('BEAM_CLI_DUCKDB_MAX_MEMORY', '').strip() or '512MB'
     if not re.fullmatch(r'\d+\s*(?:KB|MB|GB|KiB|MiB|GiB)', raw_mem, re.I):
       raw_mem = '512MB'
@@ -2839,7 +4532,8 @@ def _run_duckdb(
     watchdog.start()
     try:
       cur = con.execute(clean_q)
-      out_cols = [d[0] for d in (cur.description or [])]
+      desc = list(cur.description or [])
+      out_cols = [d[0] for d in desc]
       fetched: list[Any] = []
       while True:
         chunk = cur.fetchmany(4096)
@@ -2860,16 +4554,121 @@ def _run_duckdb(
       if len(named_sources) == 1 and 'source' not in used_lower:
         avail_list.append('source')
       avail = ', '.join(avail_list)
-      first_line = str(e).splitlines()[0]
+      first_line = str(e).splitlines()[0].replace(
+          _EMPTY_PLACEHOLDER_COL, '<empty>')
       raise SqlPipeError(
           f'SQL execution error (DuckDB): {first_line} '
           f'(available tables: {avail})'
           f'{_sql_error_hint(first_line, clean_q)}') from None
     finally:
       watchdog.cancel()
+
+    if injected_empty and _EMPTY_PLACEHOLDER_COL in out_cols:
+      keep_idx = [
+          idx for idx, c in enumerate(out_cols) if c != _EMPTY_PLACEHOLDER_COL
+      ]
+      out_cols = [out_cols[i] for i in keep_idx]
+      desc = [desc[i] for i in keep_idx]
+      fetched = [tuple(t[i] for i in keep_idx) for t in fetched]
+
+    _SQL_THREAD_LOCAL.last_cols = tuple(out_cols)
+    _SQL_THREAD_LOCAL.last_arrow_types = {
+        d[0]: _duckdb_type_to_arrow(d[1])
+        for d in desc
+    }
     return out_cols, [dict(zip(out_cols, t)) for t in fetched], total_read
   finally:
     con.close()
+
+
+def _build_local_sql_pre_where_fn(
+    pre_where: str | None,
+    dlq_records: list[dict[str, Any]] | None,
+    dlq_redact_fields: Sequence[str] | str | None,
+):
+  if not pre_where:
+    return None
+  from . import expressions
+  from . import fast_local
+  redact_tuple = _parse_redact_fields(dlq_redact_fields)
+  try:
+    where_cfg = expressions.compile_where(pre_where, known_columns=None)[0]
+    keep_fn = fast_local._compile_field(where_cfg.get('keep'))
+  except (expressions.ExpressionError, fast_local.FastPipeError) as e:
+    raise SqlPipeError(str(e)) from None
+
+  def _filter_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    kept: list[dict[str, Any]] = []
+    for r in rows:
+      try:
+        if keep_fn(fast_local._rowify(r)):
+          kept.append(r)
+      except Exception as exc:  # pylint: disable=broad-except
+        if dlq_records is None:
+          raise SqlPipeError(
+              f"{type(exc).__name__}: {exc} [while running '--where']"
+          ) from None
+        dlq_records.append(
+            dlq.make_transform_dlq_row(
+                'Filter', exc, r, redact_fields=redact_tuple))
+    return kept
+
+  return _filter_rows
+
+
+def _apply_local_sql_post_select(
+    out_cols: list[str],
+    out_rows: list[dict[str, Any]],
+    post_select: str | None,
+    dlq_records: list[dict[str, Any]] | None,
+    dlq_redact_fields: Sequence[str] | str | None,
+) -> tuple[list[str], list[dict[str, Any]]]:
+  if not post_select:
+    return out_cols, out_rows
+  from . import expressions
+  from . import fast_local
+  redact_tuple = _parse_redact_fields(dlq_redact_fields)
+  try:
+    sel_cfg = expressions.compile_select(post_select, known_columns=None)[0]
+    raw_fields = sel_cfg.get('fields', {})
+    compiled_fields = {
+        name: fast_local._compile_field(spec)
+        for name, spec in raw_fields.items()
+    }
+  except (expressions.ExpressionError, fast_local.FastPipeError) as e:
+    raise SqlPipeError(str(e)) from None
+
+  is_append = bool(sel_cfg.get('append'))
+  drop_set = set(sel_cfg.get('drop') or ())
+  base_cols = ([
+      c for c in out_cols if c not in drop_set and c not in compiled_fields
+  ] if is_append else [])
+  final_cols = list(base_cols) + list(compiled_fields.keys())
+  projected: list[dict[str, Any]] = []
+  for r in out_rows:
+    try:
+      row_obj = fast_local._rowify(r)
+      computed = {
+          name: fast_local._plain(fn(row_obj))
+          for name, fn in compiled_fields.items()
+      }
+      if is_append:
+        merged = {c: r.get(c) for c in base_cols}
+        merged.update(computed)
+        projected.append(merged)
+      else:
+        projected.append(computed)
+    except Exception as exc:  # pylint: disable=broad-except
+      if dlq_records is None:
+        raise SqlPipeError(
+            f"{type(exc).__name__}: {exc} [while running '--select']"
+        ) from None
+      dlq_records.append(
+          dlq.make_transform_dlq_row(
+              'MapToFields', exc, r, redact_fields=redact_tuple))
+  _SQL_THREAD_LOCAL.last_cols = None
+  _SQL_THREAD_LOCAL.last_arrow_types = None
+  return final_cols, projected
 
 
 def run_in_memory_sql(
@@ -2878,8 +4677,11 @@ def run_in_memory_sql(
     *,
     default_project: str | None = None,
     enable_dlq: bool = False,
+    dlq_redact_fields: Sequence[str] | str | None = None,
     engine: str = 'sqlite',
     warnings: list[str] | None = None,
+    pre_where: str | None = None,
+    post_select: str | None = None,
 ) -> tuple[list[str], list[dict[str, Any]], list[dict[str, Any]], int]:
   """Executes `sql_query` in a sandboxed in-memory SQLite or DuckDB database.
 
@@ -2888,20 +4690,30 @@ def run_in_memory_sql(
   if engine not in SQL_ENGINES:
     raise SqlPipeError(
         f'unknown --sql-engine {engine!r}; use one of {", ".join(SQL_ENGINES)}')
+  if pre_where and len(named_sources) != 1:
+    raise SqlPipeError(
+        '--where with --sql is only supported on a single input source; '
+        'for multi-input SQL joins, move the filter into --sql WHERE ...')
   clean_q = validate_readonly_select_sql(sql_query)
+  orig_code_only = ' '.join(
+      seg for is_c, seg in _scan_sql_outside_literals(clean_q) if is_c)
   dlq_records: list[dict[str, Any]] | None = [] if enable_dlq else None
+  pre_where_fn = _build_local_sql_pre_where_fn(
+      pre_where, dlq_records, dlq_redact_fields)
   if engine == 'duckdb':
     out_cols, out_rows, total_read = _run_duckdb(
         named_sources,
         clean_q,
         default_project=default_project,
         dlq_records=dlq_records,
-        warnings=warnings)
+        dlq_redact_fields=dlq_redact_fields,
+        warnings=warnings,
+        pre_where_fn=pre_where_fn)
+    out_cols, out_rows = _apply_local_sql_post_select(
+        out_cols, out_rows, post_select, dlq_records, dlq_redact_fields)
     return out_cols, out_rows, (dlq_records or []), total_read
 
-  code_for_asof = ' '.join(
-      seg for is_c, seg in _scan_sql_outside_literals(clean_q) if is_c)
-  is_sqlite_asof = bool(re.search(r'\bASOF\b', code_for_asof, re.I))
+  is_sqlite_asof = bool(re.search(r'\bASOF\b', orig_code_only, re.I))
   parsed_asof: _ParsedAsofSql | None = None
   if is_sqlite_asof:
     parsed_asof = _parse_asof_sql_join(
@@ -2911,6 +4723,21 @@ def run_in_memory_sql(
       _normalize_sqlite_cast_types(
           _rewrite_source_uri_table_refs(clean_q, named_sources)))
   total_read = 0
+  injected_empty = False
+  src_arrow_types: dict[str, Any] = {}
+  ambiguous_arrow_cols: set[str] = set()
+
+  def _record_src_arrow(col_name: str, pa_type: Any) -> None:
+    if pa_type is None:
+      return
+    low_c = col_name.lower()
+    if low_c in ambiguous_arrow_cols:
+      return
+    if low_c in src_arrow_types and src_arrow_types[low_c] != pa_type:
+      del src_arrow_types[low_c]
+      ambiguous_arrow_cols.add(low_c)
+      return
+    src_arrow_types[low_c] = pa_type
 
   conn = sqlite3.connect(':memory:')
   try:
@@ -2926,17 +4753,36 @@ def run_in_memory_sql(
           parsed_asof.left_ns.endpoint,
           default_project=default_project,
           dlq_records=dlq_records,
+          dlq_redact_fields=dlq_redact_fields,
           warnings=warnings)
+      l_pa_map = dict(
+          getattr(_SQL_THREAD_LOCAL, 'last_endpoint_arrow_types', None) or {})
       r_cols, r_rows, r_raw = load_endpoint_rows(
           parsed_asof.right_ns.endpoint,
           default_project=default_project,
           dlq_records=dlq_records,
+          dlq_redact_fields=dlq_redact_fields,
           warnings=warnings)
+      r_pa_map = dict(
+          getattr(_SQL_THREAD_LOCAL, 'last_endpoint_arrow_types', None) or {})
       total_read = l_raw + r_raw
       if not l_cols and l_rows:
         l_cols = [(k, 'TEXT') for k in l_rows[0].keys()]
       if not r_cols and r_rows:
         r_cols = [(k, 'TEXT') for k in r_rows[0].keys()]
+
+      for cn, ct in l_cols:
+        _record_src_arrow(cn, l_pa_map.get(cn))
+        if ct == 'BOOLEAN':
+          bool_cols.add(cn.lower())
+        elif ct in ('INTEGER', 'REAL'):
+          non_bool_cols.add(cn.lower())
+      for cn, ct in r_cols:
+        _record_src_arrow(cn, r_pa_map.get(cn))
+        if ct == 'BOOLEAN':
+          bool_cols.add(cn.lower())
+        elif ct in ('INTEGER', 'REAL'):
+          non_bool_cols.add(cn.lower())
 
       l_names = [cn for cn, _ in l_cols]
       r_names = [cn for cn, _ in r_cols]
@@ -2971,7 +4817,8 @@ def run_in_memory_sql(
       joined_rows, _, _ = asof_join.join_bounded_asof(l_rows, r_rows, aj_cfg)
 
       if not synth_cols:
-        synth_cols = [('_empty', 'TEXT')]
+        synth_cols = [(_EMPTY_PLACEHOLDER_COL, 'TEXT')]
+        injected_empty = True
       col_defs = ', '.join(f'{_quote_ident(cn)} {ct}' for cn, ct in synth_cols)
       conn.execute(f'CREATE TABLE "_asof_joined" ({col_defs})')
       if joined_rows:
@@ -3023,7 +4870,7 @@ def run_in_memory_sql(
             out_n = f'{parsed_asof.right_sql_alias}_{cn}' if cn in conflicts else cn
             star_items.append(
                 f'{_quote_ident("__r__" + cn)} AS {_quote_ident(out_n)}')
-          return ', '.join(star_items) or '1'
+          return ', '.join(star_items) or _quote_ident(_EMPTY_PLACEHOLDER_COL)
 
         def _rep_qual(qm: re.Match) -> str:
           qa = qm.group('a').lower()
@@ -3098,13 +4945,25 @@ def run_in_memory_sql(
             ns.endpoint,
             default_project=default_project,
             dlq_records=dlq_records,
+            dlq_redact_fields=dlq_redact_fields,
             warnings=warnings)
+        ep_pa_map = dict(
+            getattr(_SQL_THREAD_LOCAL, 'last_endpoint_arrow_types', None) or {})
         total_read += raw_cnt
+        if pre_where_fn is not None:
+          rows = pre_where_fn(rows)
         if not cols and rows:
           cols = [(k, 'TEXT') for k in rows[0].keys()]
+        for cn, ct in cols:
+          _record_src_arrow(cn, ep_pa_map.get(cn))
+          if ct == 'BOOLEAN':
+            bool_cols.add(cn.lower())
+          elif ct in ('INTEGER', 'REAL'):
+            non_bool_cols.add(cn.lower())
         if not cols:
-          # Empty dataset with no schema columns -> dummy placeholder column
-          cols = [('_empty', 'TEXT')]
+          # Empty dataset with no schema columns -> internal placeholder column
+          cols = [(_EMPTY_PLACEHOLDER_COL, 'TEXT')]
+          injected_empty = True
         col_defs = ', '.join(f'{_quote_ident(cn)} {ct}' for cn, ct in cols)
         t_ident = _quote_ident(ns.alias)
         conn.execute(f'CREATE TABLE {t_ident} ({col_defs})')
@@ -3232,11 +5091,75 @@ def run_in_memory_sql(
       if len(named_sources) == 1 and 'source' not in used_lower:
         avail_list.append('source')
       avail = ', '.join(avail_list)
+      err_str = str(e).replace(_EMPTY_PLACEHOLDER_COL, '<empty>')
       raise SqlPipeError(
-          f'SQL execution error: {e} (available tables: {avail})'
-          f'{_sql_error_hint(str(e), clean_q)}') from None
+          f'SQL execution error: {err_str} (available tables: {avail})'
+          f'{_sql_error_hint(err_str, clean_q)}') from None
+
+    if injected_empty and _EMPTY_PLACEHOLDER_COL in out_cols:
+      keep_idx = [
+          idx for idx, c in enumerate(out_cols) if c != _EMPTY_PLACEHOLDER_COL
+      ]
+      out_cols = [out_cols[i] for i in keep_idx]
+      fetched = [tuple(t[i] for i in keep_idx) for t in fetched]
 
     out_rows = [dict(zip(out_cols, tup)) for tup in fetched]
+
+    # Restore boolean values and record Arrow types for unambiguous output cols.
+    try:
+      import pyarrow as pa
+    except ImportError:
+      pa = None
+    out_bool_cols: set[str] = set()
+    for oc in out_cols:
+      esc_oc = re.escape(oc)
+      cast_bool = bool(
+          re.search(
+              rf'\bCAST\s*\([^)]+\bAS\s+(?:BOOL|BOOLEAN)\s*\)\s+AS\s+[`"]?{esc_oc}[`"]?\b',
+              orig_code_only,
+              re.I))
+      non_bool_expr = bool(
+          re.search(
+              rf'\b(?:COUNT|SUM|AVG|TOTAL|CAST)\s*\([^)]*\)\s+AS\s+[`"]?{esc_oc}[`"]?\b',
+              orig_code_only,
+              re.I)) and not cast_bool
+      if (cast_bool or (oc.lower() in pure_bool_cols and not non_bool_expr)):
+        if all(
+            r.get(oc) is None or (isinstance(r.get(oc), int) and r.get(oc) in (0, 1))
+            for r in out_rows):
+          out_bool_cols.add(oc)
+          for r in out_rows:
+            val = r.get(oc)
+            if val is not None:
+              r[oc] = bool(val)
+
+    if pa is not None:
+      out_arrow_types: dict[str, Any] = {}
+      for oc in out_cols:
+        esc_oc = re.escape(oc)
+        if oc in out_bool_cols:
+          out_arrow_types[oc] = pa.bool_()
+        elif re.search(
+            rf'\bCOUNT\s*\([^)]*\)\s+AS\s+[`"]?{esc_oc}[`"]?\b'
+            rf'|\bCAST\s*\([^)]+\bAS\s+(?:INT|INTEGER|INT64|BIGINT)\s*\)\s+AS\s+[`"]?{esc_oc}[`"]?\b',
+            orig_code_only,
+            re.I):
+          out_arrow_types[oc] = pa.int64()
+        elif re.search(
+            rf'\b(?:AVG|MEDIAN|PERCENTILE|QUANTILE\w*|STDDEV\w*|VAR\w*|CORR|COVAR\w*|REGR_\w+)\s*\([^)]*\)\s+AS\s+[`"]?{esc_oc}[`"]?\b'
+            rf'|\bCAST\s*\([^)]+\bAS\s+(?:FLOAT|FLOAT64|DOUBLE|REAL|DECIMAL|NUMERIC|BIGNUMERIC)\s*\)\s+AS\s+[`"]?{esc_oc}[`"]?\b',
+            orig_code_only,
+            re.I):
+          out_arrow_types[oc] = pa.float64()
+        elif oc.lower() in src_arrow_types:
+          out_arrow_types[oc] = src_arrow_types[oc.lower()]
+        else:
+          out_arrow_types[oc] = pa.string()
+      _SQL_THREAD_LOCAL.last_cols = tuple(out_cols)
+      _SQL_THREAD_LOCAL.last_arrow_types = out_arrow_types
+
+    out_cols, out_rows = _apply_local_sql_post_select(
+        out_cols, out_rows, post_select, dlq_records, dlq_redact_fields)
     return out_cols, out_rows, (dlq_records or []), total_read
   finally:
     conn.close()
@@ -3318,11 +5241,24 @@ def _new_sql_stage_path(target: str, tag: str) -> str:
   return tmp_path
 
 
+def _sanitize_json_nan(val: Any) -> Any:
+  if isinstance(val, float):
+    return None if (math.isnan(val) or math.isinf(val)) else val
+  if isinstance(val, decimal.Decimal):
+    return None if (val.is_nan() or val.is_infinite()) else val
+  if isinstance(val, dict):
+    return {k: _sanitize_json_nan(v) for k, v in val.items()}
+  if isinstance(val, (list, tuple)):
+    return [_sanitize_json_nan(v) for v in val]
+  return val
+
+
 def write_json_document(path: str, doc: Any) -> str:
   tmp_path = _new_sql_stage_path(path, 'doc')
   try:
     with open(tmp_path, 'w', encoding='utf-8') as f:
-      json.dump(doc, f, indent=2, default=str)
+      json.dump(
+          _sanitize_json_nan(doc), f, indent=2, default=str, allow_nan=False)
       f.write('\n')
     os.replace(tmp_path, path)
   finally:
@@ -3340,7 +5276,10 @@ def _mixed_columns_as_text(columns, rows, warnings=None):
   for col in columns:
     values = [r.get(col) for r in rows]
     try:
-      arrays[col] = pa.array(values)
+      arr = pa.array(values)
+      if pa.types.is_null(arr.type):
+        arr = pa.array(values, type=pa.string())
+      arrays[col] = arr
     except (pa.ArrowInvalid, pa.ArrowTypeError):
       if warnings is not None:
         warnings.append(
@@ -3349,8 +5288,8 @@ def _mixed_columns_as_text(columns, rows, warnings=None):
             'NULL) or fix the source values')
       arrays[col] = pa.array([
           None if v is None else
-          json.dumps(v, default=str) if isinstance(v, (dict, list)) else str(v)
-          for v in values
+          json.dumps(_sanitize_json_nan(v), default=str, allow_nan=False)
+          if isinstance(v, (dict, list)) else str(v) for v in values
       ],
                              type=pa.string())
   return pa.table(arrays)
@@ -3364,6 +5303,7 @@ def stage_rows_to_local_file(
     if_exists: str = 'fail',
     warnings: list[str] | None = None,
     tag: str = 'sql',
+    column_types: dict[str, Any] | None = None,
 ) -> tuple[str, str]:
   """Writes `out_rows` to an exclusive sibling `.tmp` file, returning `(tmp_path, final_path)`."""
   target = sink_ep.output_prefix or sink_ep.config.get('path')
@@ -3378,7 +5318,8 @@ def stage_rows_to_local_file(
     tmp_path = _new_sql_stage_path(target, tag)
     try:
       with open(tmp_path, 'w', encoding='utf-8') as f:
-        json.dump(doc, f, indent=2, default=str)
+        json.dump(
+            _sanitize_json_nan(doc), f, indent=2, default=str, allow_nan=False)
         f.write('\n')
     except BaseException:
       if os.path.exists(tmp_path):
@@ -3414,33 +5355,57 @@ def stage_rows_to_local_file(
     if fmt == 'parquet':
       import pyarrow as pa
       import pyarrow.parquet as pq
+      eff_col_types: dict[str, Any] = {}
+      if column_types is not None:
+        eff_col_types = dict(column_types)
+      elif (tag != 'dlq' and
+            getattr(_SQL_THREAD_LOCAL, 'last_cols', None) == tuple(out_cols)):
+        eff_col_types = dict(
+            getattr(_SQL_THREAD_LOCAL, 'last_arrow_types', None) or {})
       if rows_to_write:
         try:
           tbl = pa.Table.from_pylist(rows_to_write)
+          if any(pa.types.is_null(f.type) for f in tbl.schema):
+            fixed_cols = {}
+            for f in tbl.schema:
+              if pa.types.is_null(f.type):
+                fb_t = eff_col_types.get(f.name, pa.string())
+                fixed_cols[f.name] = pa.array(
+                    [None] * len(rows_to_write), type=fb_t)
+              else:
+                fixed_cols[f.name] = tbl.column(f.name)
+            tbl = pa.table(fixed_cols)
         except (pa.ArrowInvalid, pa.ArrowTypeError):
           # A column holds mixed types (SQLite is dynamically typed): write
           # those columns as text rather than failing the whole run.
           tbl = _mixed_columns_as_text(out_cols, rows_to_write, warnings)
       else:
-        tbl = pa.table({c: pa.array([], type=pa.string()) for c in out_cols})
+        tbl = pa.table({
+            c: pa.array([], type=eff_col_types.get(c, pa.string()))
+            for c in out_cols
+        })
       pq.write_table(tbl, tmp_path)
     elif fmt == 'csv':
       delim = str(sink_ep.config.get('delimiter', ',') or ',')
       with open(tmp_path, 'w', encoding='utf-8', newline='') as f:
-        writer = csv.DictWriter(
-            f, fieldnames=out_cols, delimiter=delim, extrasaction='ignore')
-        writer.writeheader()
-        for r in rows_to_write:
-          writer.writerow({
-              k: ('' if v is None else json.dumps(v, default=str)
-                  if isinstance(v, (dict, list)) else v)
-              for k, v in r.items()
-          })
+        if out_cols or rows_to_write:
+          writer = csv.DictWriter(
+              f, fieldnames=out_cols, delimiter=delim, extrasaction='ignore')
+          writer.writeheader()
+          for r in rows_to_write:
+            writer.writerow({
+                k: ('' if v is None else json.dumps(
+                    _sanitize_json_nan(v), default=str, allow_nan=False)
+                    if isinstance(v, (dict, list)) else v)
+                for k, v in r.items()
+            })
     else:
       # Default JSONL (`json` / `text`).
       with open(tmp_path, 'w', encoding='utf-8') as f:
         for r in rows_to_write:
-          f.write(json.dumps(r, default=str) + '\n')
+          f.write(
+              json.dumps(_sanitize_json_nan(r), default=str, allow_nan=False) +
+              '\n')
   except BaseException:
     if os.path.exists(tmp_path):
       try:

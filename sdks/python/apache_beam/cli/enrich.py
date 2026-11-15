@@ -39,11 +39,13 @@ import concurrent.futures
 import csv
 import decimal
 import hashlib
+import io
 import json
 import logging
 import os
 import re
 import tempfile
+import threading
 import time
 import urllib.parse
 from typing import Any
@@ -58,6 +60,7 @@ from apache_beam.io.components.adaptive_throttler import AdaptiveThrottler
 from apache_beam.metrics import Metrics
 from apache_beam.typehints.row_type import RowTypeConstraint
 from apache_beam.typehints.schemas import named_fields_from_element_type
+from apache_beam.utils import shared
 from apache_beam.utils.windowed_value import WindowedValue
 
 from . import dlq
@@ -170,6 +173,7 @@ _COMMON_ENRICH_KEYS = frozenset([
     'redis_db',
     'redis_tls',
     'redis_ttl',
+    'ttl',
     'redis_password',
     'redis_password_env',
     'dlq_redact_fields',
@@ -471,6 +475,64 @@ def _parse_redis_endpoint(
   return host.strip('[]'), port, db, use_tls
 
 
+_OPT_KV_TOKEN_RE = re.compile(r'^([A-Za-z_][A-Za-z0-9_-]*)\s*=(.*)$', re.DOTALL)
+
+
+def _strip_matching_quotes(val: str) -> str:
+  s = val.strip()
+  if len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+    return s[1:-1]
+  return s
+
+
+def _expand_comma_grouped_opts(
+    raw_map: Mapping[str, Any]) -> list[tuple[str, Any]]:
+  """Splits comma-grouped `k=v` options (e.g. `on=user_id,on_miss=drop`).
+
+  Returns `(key, value)` pairs where explicit top-level keys come first for
+  their primary value, and trailing `,subkey=subval` tokens are extracted as
+  separate `(subkey, subval)` options instead of being swallowed into `on=`.
+  """
+  primary_pairs: list[tuple[str, Any]] = []
+  extracted_pairs: list[tuple[str, Any]] = []
+  all_known_keys = (
+      _COMMON_ENRICH_KEYS | _FORBIDDEN_CALLABLE_KEYS
+      | frozenset().union(*_HANDLER_SPECIFIC_KEYS.values()))
+
+  for raw_k, raw_v in raw_map.items():
+    key_str = str(raw_k).strip()
+    norm_k = key_str.lower().replace('-', '_')
+    if norm_k == 'row_restriction' or not isinstance(raw_v, str):
+      primary_pairs.append((key_str, raw_v))
+      continue
+    tokens = split_bracket_tokens(raw_v.strip())
+    if len(tokens) <= 1 or not any(_OPT_KV_TOKEN_RE.match(t)
+                                   for t in tokens[1:]):
+      primary_pairs.append((key_str, raw_v))
+      continue
+
+    grouped: list[tuple[str,
+                        str]] = [(key_str, _strip_matching_quotes(tokens[0]))]
+    for tok in tokens[1:]:
+      cur_norm = grouped[-1][0].strip().lower().replace('-', '_')
+      m = _OPT_KV_TOKEN_RE.match(tok)
+      if m is not None and (
+          cur_norm != 'row_restriction' or
+          m.group(1).strip().lower().replace('-', '_') in all_known_keys or
+          uris._SECRET_KEY_RE.search(m.group(1).strip().lower())):
+        sub_k = m.group(1).strip()
+        sub_v = _strip_matching_quotes(m.group(2))
+        grouped.append((sub_k, sub_v))
+      else:
+        prev_k, prev_v = grouped[-1]
+        grouped[-1] = (prev_k, f'{prev_v},{tok}' if prev_v else tok)
+
+    primary_pairs.append(grouped[0])
+    extracted_pairs.extend(grouped[1:])
+
+  return primary_pairs + extracted_pairs
+
+
 def parse_enrich_spec_str(
     spec_str: str,
     *,
@@ -569,9 +631,7 @@ def parse_enrich_spec_str(
             '(wrap multi-column lists in brackets, e.g. columns=[a,b])')
       k, v = tok.split('=', 1)
       key = k.strip().lower().replace('-', '_')
-      val = v.strip()
-      if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
-        val = val[1:-1]
+      val = _strip_matching_quotes(v)
       if uris._SECRET_KEY_RE.search(key):
         raise ValueError(
             f'refusing inline secret option {key!r} in --enrich; '
@@ -581,11 +641,16 @@ def parse_enrich_spec_str(
 
   if extra_opts:
     allowed_for_handler = _COMMON_ENRICH_KEYS | _HANDLER_SPECIFIC_KEYS[handler]
-    for ek, ev in extra_opts.items():
+    for ek, ev in _expand_comma_grouped_opts(extra_opts):
       norm_k = str(ek).strip().lower().replace('-', '_')
       if norm_k in _FORBIDDEN_CALLABLE_KEYS:
         raise ValueError(
             f'option {ek!r} is disallowed in CliEnrich for security')
+      if norm_k not in ('redis_password_env', 'redis_password') and (
+          uris._SECRET_KEY_RE.search(norm_k)):
+        raise ValueError(
+            f'refusing inline secret option {norm_k!r} in --enrich; '
+            'use environment variables (e.g. BEAM_REDIS_PASSWORD) or ADC')
       if norm_k not in allowed_for_handler:
         if single_stage:
           raise ValueError(
@@ -607,8 +672,12 @@ def parse_enrich_config(
   if not isinstance(raw_cfg, Mapping):
     raise ValueError('CliEnrich config must be a mapping')
 
+  explicit_top_keys = {
+      str(k).strip().lower().replace('-', '_')
+      for k in raw_cfg.keys()
+  }
   norm_cfg: dict[str, Any] = {}
-  for k, v in raw_cfg.items():
+  for idx, (k, v) in enumerate(_expand_comma_grouped_opts(raw_cfg)):
     nk = str(k).strip().lower().replace('-', '_')
     if nk in _FORBIDDEN_CALLABLE_KEYS:
       raise ValueError(
@@ -619,7 +688,10 @@ def parse_enrich_config(
       raise ValueError(
           f'CliEnrich forbids inline secret key {k!r}; '
           'configure credentials via environment variables or ADC')
-    norm_cfg[nk] = v
+    if idx < len(raw_cfg):
+      norm_cfg[nk] = v
+    elif nk not in explicit_top_keys:
+      norm_cfg.setdefault(nk, v)
 
   raw_h = str(
       norm_cfg.get('handler') or norm_cfg.get('enrichment_handler') or
@@ -645,11 +717,16 @@ def parse_enrich_config(
         f'unknown option(s) for CliEnrich ({handler}): '
         f'{", ".join(unknown)}{hint}')
 
-  # Input join fields.
+  # Input join fields: when an explicit join key alias (`on`, `key`, `row_key`,
+  # `left_key`, `entity_id`) is supplied alongside `fields=`, treat `fields` as
+  # the selected lookup columns; otherwise `fields` acts as the join key list.
+  explicit_join_key = (
+      norm_cfg.get('row_key') or norm_cfg.get('key') or norm_cfg.get('keys') or
+      norm_cfg.get('on') or norm_cfg.get('left_key') or
+      norm_cfg.get('entity_id'))
   raw_key = (
-      norm_cfg.get('fields') or norm_cfg.get('row_key') or
-      norm_cfg.get('key') or norm_cfg.get('keys') or norm_cfg.get('on') or
-      norm_cfg.get('left_key') or norm_cfg.get('entity_id'))
+      explicit_join_key
+      if explicit_join_key is not None else norm_cfg.get('fields'))
   fields = _validate_ident_list(
       parse_column_list(raw_key), 'CliEnrich key/fields')
   if not fields:
@@ -715,9 +792,12 @@ def parse_enrich_config(
       redis_port_opt=norm_cfg.get('redis_port'),
       redis_db_opt=norm_cfg.get('redis_db'),
       redis_tls_opt=norm_cfg.get('redis_tls'))
+  raw_ttl = (
+      norm_cfg['redis_ttl']
+      if norm_cfg.get('redis_ttl') is not None else norm_cfg.get('ttl'))
   r_ttl = (
-      int(_parse_positive_float(norm_cfg['redis_ttl'], 'redis_ttl'))
-      if norm_cfg.get('redis_ttl') is not None else 3600)
+      int(_parse_positive_float(raw_ttl, 'redis_ttl'))
+      if raw_ttl is not None else 3600)
   r_pass_env = str(norm_cfg.get('redis_password_env') or
                    'BEAM_REDIS_PASSWORD').strip()
   if not re.match(r'^[A-Za-z_][A-Za-z0-9_]{1,63}$', r_pass_env):
@@ -736,10 +816,13 @@ def parse_enrich_config(
       _parse_bool(
           norm_cfg.get('full_feature_names', False), 'full_feature_names')
       if handler == 'feast' else False)
-  raw_col_spec = (
+  explicit_col_spec = (
       norm_cfg.get('columns') or norm_cfg.get('column_names') or
       norm_cfg.get('feature_names') or norm_cfg.get('features') or
       norm_cfg.get('feature_ids'))
+  raw_col_spec = (
+      explicit_col_spec if explicit_col_spec is not None else
+      (norm_cfg.get('fields') if explicit_join_key is not None else None))
   cols, col_types, col_sources, clean_raw_specs, explicit_types = (
       _parse_typed_columns(
           raw_col_spec, handler=handler, full_feature_names=full_feat_names))
@@ -1135,6 +1218,7 @@ def _infer_local_file_schema(
       return (tuple(cols), types) if cols else None
 
     if fmt == 'csv':
+      _ensure_csv_field_size_limit()
       with dlq._open_auto(path) as bf:
         text_lines = [
             bf.readline().decode('utf-8-sig', errors='replace')
@@ -1143,7 +1227,7 @@ def _infer_local_file_schema(
       non_empty = [ln for ln in text_lines if ln]
       if not non_empty:
         return None
-      rdr = csv.DictReader(non_empty)
+      rdr = csv.DictReader(io.StringIO(''.join(non_empty)))
       if not rdr.fieldnames:
         return None
       cols = [
@@ -1157,15 +1241,7 @@ def _infer_local_file_schema(
           cell = (row.get(c) or '').strip()
           if not cell:
             continue
-          low = cell.lower()
-          if low in ('true', 'false'):
-            ct = 'bool'
-          elif dlq._is_int_cell(cell):
-            ct = 'int'
-          elif dlq._is_float_cell(cell):
-            ct = 'float'
-          else:
-            ct = 'str'
+          ct = _classify_csv_cell_type(cell)
           prev = types.get(c)
           if prev is None:
             types[c] = ct
@@ -1183,12 +1259,58 @@ def _infer_local_file_schema(
   return None
 
 
-def _coerce_csv_cell(raw_val: str | None) -> Any:
+_DISCOVERED_COLS_LOCK = threading.RLock()
+_FILE_INDEX_LOCK = threading.Lock()
+_SHARED_FILE_HANDLES: dict[tuple[Any, ...], shared.Shared] = {}
+
+
+def _ensure_csv_field_size_limit(target_bytes: int = 64 * 1024 * 1024) -> None:
+  try:
+    if csv.field_size_limit() < target_bytes:
+      csv.field_size_limit(target_bytes)
+  except OverflowError:
+    limit = target_bytes
+    while limit > 131072:
+      limit //= 2
+      try:
+        if csv.field_size_limit() < limit:
+          csv.field_size_limit(limit)
+        break
+      except OverflowError:
+        continue
+
+
+def _classify_csv_cell_type(cell: str) -> str:
+  low = cell.lower()
+  if low in ('true', 'false'):
+    return 'bool'
+  if dlq._is_int_cell(cell):
+    return 'int'
+  if dlq._is_float_cell(cell):
+    return 'float'
+  return 'str'
+
+
+def _coerce_csv_cell(raw_val: str | None, dtype: str | None = None) -> Any:
   if raw_val is None:
     return None
   s = raw_val.strip()
   if s == '':
     return None
+  if dtype == 'str':
+    return s
+  if dtype == 'bool':
+    low = s.lower()
+    if low == 'true':
+      return True
+    if low == 'false':
+      return False
+  elif dtype == 'int':
+    if dlq._is_int_cell(s):
+      return int(s)
+  elif dtype == 'float':
+    if dlq._is_int_cell(s) or dlq._is_float_cell(s):
+      return float(s)
   low = s.lower()
   if low == 'true':
     return True
@@ -1201,43 +1323,71 @@ def _coerce_csv_cell(raw_val: str | None) -> Any:
   return s
 
 
+def _infer_csv_column_types(
+    raw_rows: list[dict[str, Any]],
+    fieldnames: Iterable[str],
+    cfg: EnrichConfig,
+) -> dict[str, str]:
+  col_types: dict[str, str] = {}
+  all_cols = [c for c in fieldnames if c]
+  for c in all_cols:
+    if c in cfg.explicit_types and c in cfg.column_types:
+      col_types[c] = cfg.column_types[c]
+  infer_cols = [c for c in all_cols if c not in col_types]
+  for row in raw_rows:
+    for c in infer_cols:
+      val = row.get(c)
+      if val is None:
+        continue
+      cell = str(val).strip()
+      if not cell:
+        continue
+      ct = _classify_csv_cell_type(cell)
+      prev = col_types.get(c)
+      if prev is None:
+        col_types[c] = ct
+      elif prev != ct:
+        col_types[c] = 'float' if {prev, ct} == {'int', 'float'} else 'str'
+  for c in all_cols:
+    col_types.setdefault(c, cfg.column_types.get(c, 'str'))
+  return col_types
+
+
+class _SharedFileLookupTable:
+  """Weakref-able wrapper sharing an immutable lookup index across worker threads."""
+  def __init__(
+      self,
+      index: dict[bytes, dict[str, Any]],
+      str_fallback_index: dict[bytes, dict[str, Any]],
+      discovered_columns: tuple[str, ...],
+  ):
+    self.index = index
+    self.str_fallback_index = str_fallback_index
+    self.discovered_columns = discovered_columns
+
+
 class _FileEnrichmentCaller:
   """Deterministic in-memory lookup caller for `file:` (`csv`/`jsonl`/`parquet`)."""
   def __init__(self, cfg: EnrichConfig):
     self._cfg = cfg
+    self._shared_table: _SharedFileLookupTable | None = None
     self._index: dict[bytes, dict[str, Any]] = {}
+    self._str_fallback_index: dict[bytes, dict[str, Any]] = {}
     self.discovered_columns: tuple[str, ...] = cfg.columns
 
-  def __enter__(self):
-    path = str(self._cfg.handler_params['path'])
-    max_bytes = int(
-        self._cfg.handler_params.get('max_file_bytes', DEFAULT_FILE_MAX_BYTES))
-    matched = dlq._match_paths(path)
-    if not matched:
-      raise FileNotFoundError(
-          f'CliEnrich (file): lookup path not found or empty: {path!r}')
-    total_size = 0
-    for mp in matched:
-      if '://' not in mp:
-        if not os.path.isfile(mp):
-          raise ValueError(
-              f'CliEnrich (file): lookup path {mp!r} is not a regular file')
-        total_size += os.path.getsize(mp)
-    if total_size > max_bytes:
-      raise ValueError(
-          f'CliEnrich (file): lookup table {path!r} ({total_size:,} bytes) '
-          f'exceeds max_file_bytes ({max_bytes:,}); use bigquery:/bigtable: '
-          'or --interval-join for large tables')
-
+  def _load_lookup_table(
+      self, matched: list[str], max_bytes: int) -> _SharedFileLookupTable:
     lookup_fields = self._cfg.lookup_fields
     lookup_set = set(lookup_fields)
     req_cols = self._cfg.columns
     seen_cols: list[str] = list(req_cols)
     index: dict[bytes, dict[str, Any]] = {}
+    str_fallback_index: dict[bytes, dict[str, Any]] = {}
 
     for mp in matched:
       fmt = uris.EXTENSIONS.get(
           uris.extension_of(mp)) or uris.sniff_file_format(mp)
+      csv_raw_rows: list[dict[str, Any]] | None = None
       if fmt == 'parquet':
         import pyarrow.parquet as pq
         with dlq._open_auto(mp) as pf:
@@ -1263,18 +1413,27 @@ class _FileEnrichmentCaller:
             if ln.strip():
               rows.append(json.loads(ln))
       else:
-        rows = []
+        _ensure_csv_field_size_limit()
         with dlq._open_auto(mp) as cf:
           raw_bytes = cf.read(max_bytes + 1)
         if len(raw_bytes) > max_bytes:
           raise ValueError(
               f'CliEnrich (file): lookup file {mp!r} exceeds {max_bytes:,} bytes'
           )
-        rdr = csv.DictReader(raw_bytes.decode('utf-8-sig').splitlines())
-        for r in rdr:
-          rows.append({k: _coerce_csv_cell(v) for k, v in r.items() if k})
+        csv_text = raw_bytes.decode('utf-8-sig')
+        rdr = csv.DictReader(io.StringIO(csv_text))
+        csv_raw_rows = [{
+            k: v
+            for k, v in r.items() if k
+        } for r in rdr if isinstance(r, dict)]
+        csv_col_types = _infer_csv_column_types(
+            csv_raw_rows, rdr.fieldnames or (), self._cfg)
+        rows = [{
+            k: _coerce_csv_cell(v, csv_col_types.get(k))
+            for k, v in raw_r.items()
+        } for raw_r in csv_raw_rows]
 
-      for r in rows:
+      for row_idx, r in enumerate(rows):
         if not isinstance(r, dict):
           continue
         if any(lf not in r for lf in lookup_fields):
@@ -1297,19 +1456,85 @@ class _FileEnrichmentCaller:
               seen_cols.append(k)
         # First match wins (consistent with SQL lookup / dimension tables).
         index.setdefault(ckey, payload)
+        if csv_raw_rows is not None and row_idx < len(csv_raw_rows):
+          raw_src_row = csv_raw_rows[row_idx]
+          raw_k_strs = [
+              str(raw_src_row.get(lf, '')).strip() for lf in lookup_fields
+          ]
+          if all(s != '' for s in raw_k_strs):
+            str_ckey = encode_canonical_key_values(raw_k_strs)
+            if str_ckey != ckey:
+              str_fallback_index.setdefault(str_ckey, payload)
 
-    self._index = index
-    self.discovered_columns = tuple(seen_cols)
+    return _SharedFileLookupTable(index, str_fallback_index, tuple(seen_cols))
+
+  def __enter__(self):
+    path = str(self._cfg.handler_params['path'])
+    max_bytes = int(
+        self._cfg.handler_params.get('max_file_bytes', DEFAULT_FILE_MAX_BYTES))
+    matched = dlq._match_paths(path)
+    if not matched:
+      raise FileNotFoundError(
+          f'CliEnrich (file): lookup path not found or empty: {path!r}')
+    total_size = 0
+    stat_sigs: list[tuple[str, int, int]] = []
+    for mp in matched:
+      if '://' not in mp:
+        if not os.path.isfile(mp):
+          raise ValueError(
+              f'CliEnrich (file): lookup path {mp!r} is not a regular file')
+        st = os.stat(mp)
+        total_size += st.st_size
+        stat_sigs.append(
+            (os.path.abspath(mp), int(st.st_size), int(st.st_mtime_ns)))
+      else:
+        stat_sigs.append((mp, -1, -1))
+    if total_size > max_bytes:
+      raise ValueError(
+          f'CliEnrich (file): lookup table {path!r} ({total_size:,} bytes) '
+          f'exceeds max_file_bytes ({max_bytes:,}); use bigquery:/bigtable: '
+          'or --interval-join for large tables')
+
+    cache_key = (
+        path,
+        tuple(self._cfg.lookup_fields),
+        tuple(self._cfg.columns),
+        tuple(sorted(self._cfg.column_types.items())),
+        tuple(sorted(self._cfg.explicit_types)),
+        max_bytes,
+        tuple(stat_sigs),
+    )
+    with _FILE_INDEX_LOCK:
+      sh = _SHARED_FILE_HANDLES.get(cache_key)
+      if sh is None:
+        sh = shared.Shared()
+        _SHARED_FILE_HANDLES[cache_key] = sh
+
+    table = sh.acquire(lambda: self._load_lookup_table(matched, max_bytes))
+    self._shared_table = table
+    self._index = table.index
+    self._str_fallback_index = table.str_fallback_index
+    with _DISCOVERED_COLS_LOCK:
+      self.discovered_columns = table.discovered_columns
     return self
 
   def __exit__(self, exc_type, exc_val, exc_tb):
+    self._shared_table = None
     self._index = {}
+    self._str_fallback_index = {}
     return None
 
   def lookup_batch(
       self, requests: list[tuple[bytes, tuple[Any, ...], beam.Row]]
   ) -> dict[bytes, dict[str, Any] | None]:
-    return {ckey: self._index.get(ckey) for ckey, _, _ in requests}
+    out: dict[bytes, dict[str, Any] | None] = {}
+    fallback = self._str_fallback_index
+    for ckey, _, _ in requests:
+      hit = self._index.get(ckey)
+      if hit is None and fallback:
+        hit = fallback.get(ckey)
+      out[ckey] = hit
+    return out
 
 
 def _bq_scalar_type(val: Any) -> tuple[str, Any]:
@@ -1440,8 +1665,20 @@ class _ParameterizedBigQueryCaller:
             dyn_cols.append(k)
       found.setdefault(ckey, payload)
 
-    if dyn_cols and not self.discovered_columns:
-      self.discovered_columns = tuple(dyn_cols)
+    if not dyn_cols:
+      iter_schema = getattr(rows_iter, 'schema', None)
+      if iter_schema is not None:
+        for f_obj in iter_schema:
+          fname = getattr(f_obj, 'name', None)
+          if (fname and fname not in stripped_join_cols and
+              output.SAFE_IDENTIFIER_RE.match(str(fname)) and
+              fname not in dyn_cols):
+            dyn_cols.append(str(fname))
+
+    if dyn_cols:
+      with _DISCOVERED_COLS_LOCK:
+        if not self.discovered_columns:
+          self.discovered_columns = tuple(dyn_cols)
 
     return {ckey: found.get(ckey) for ckey, _, _ in requests}
 
@@ -1553,8 +1790,10 @@ class _BigTableCaller:
                                                 for v in flat.values())):
         results[ckey] = None
       else:
-        if not self.discovered_columns and flat:
-          self.discovered_columns = tuple(flat.keys())
+        if flat:
+          with _DISCOVERED_COLS_LOCK:
+            if not self.discovered_columns:
+              self.discovered_columns = tuple(flat.keys())
         results[ckey] = flat
     return results
 
@@ -1615,8 +1854,9 @@ class _VertexFSCaller:
       if not payload or all(v is None for v in payload.values()):
         results[ckey] = None
       else:
-        if not self.discovered_columns:
-          self.discovered_columns = tuple(payload.keys())
+        with _DISCOVERED_COLS_LOCK:
+          if not self.discovered_columns:
+            self.discovered_columns = tuple(payload.keys())
         results[ckey] = payload
     return results
 
@@ -1652,13 +1892,15 @@ def validate_feast_yaml_content(
 
 
 class _FeastCaller:
-  """Safe Feast caller with YAML allowlist, temp cleanup, and miss detection."""
+  """Safe Feast caller with single-thread SQLite affinity, YAML allowlist & cleanup."""
   def __init__(self, cfg: EnrichConfig, store_factory=None):
     self._cfg = cfg
     self._store_factory = store_factory
     self._store = None
     self._features = None
     self._temp_yaml_path: str | None = None
+    self._worker: concurrent.futures.ThreadPoolExecutor | None = None
+    self._in_flight = False
     self.discovered_columns: tuple[str, ...] = cfg.columns
 
   def __enter__(self):
@@ -1674,23 +1916,45 @@ class _FeastCaller:
         yaml_text, trust_providers=self._cfg.trust_providers)
 
     fd, tmp_path = tempfile.mkstemp(prefix='beam_cli_feast_', suffix='.yaml')
+    self._temp_yaml_path = tmp_path
+    fd_closed = False
     try:
       os.chmod(tmp_path, 0o600)
       with os.fdopen(fd, 'w', encoding='utf-8') as tf:
+        fd_closed = True
         tf.write(yaml_text)
-      self._temp_yaml_path = tmp_path
-      if self._store_factory is not None:
-        self._store = self._store_factory(tmp_path)
-      else:
-        from pathlib import Path
-        from feast import FeatureStore
-        self._store = FeatureStore(fs_yaml_file=Path(tmp_path))
-      if hp.get('feature_service_name'):
-        self._features = self._store.get_feature_service(
-            hp['feature_service_name'])
-      else:
-        self._features = list(hp.get('feature_names') or ())
+
+      # Feast's `sqlite` online store binds `sqlite3.Connection` to the thread
+      # that created `FeatureStore` / executed the first query. Run store init,
+      # `get_online_features`, and close on the exact same dedicated worker thread.
+      self._worker = concurrent.futures.ThreadPoolExecutor(
+          max_workers=1, thread_name_prefix='beam-cli-feast')
+
+      def _init_on_worker():
+        if self._store_factory is not None:
+          store = self._store_factory(tmp_path)
+        else:
+          from pathlib import Path
+          from feast import FeatureStore
+          store = FeatureStore(fs_yaml_file=Path(tmp_path))
+        if hp.get('feature_service_name'):
+          feats = store.get_feature_service(hp['feature_service_name'])
+        else:
+          feats = list(hp.get('feature_names') or ())
+        return store, feats
+
+      self._store, self._features = self._worker.submit(_init_on_worker).result()
     except BaseException:
+      if not fd_closed:
+        try:
+          os.close(fd)
+        except OSError:
+          pass
+      if self._worker is not None:
+        self._worker.shutdown(wait=True, cancel_futures=True)
+        self._worker = None
+      self._store = None
+      self._features = None
       self._cleanup_temp()
       raise
     return self
@@ -1704,8 +1968,34 @@ class _FeastCaller:
     self._temp_yaml_path = None
 
   def __exit__(self, exc_type, exc_val, exc_tb):
-    self._store = None
-    self._features = None
+    worker = self._worker
+    self._worker = None
+    if worker is not None:
+      if not self._in_flight:
+
+        def _close_on_worker():
+          store = self._store
+          self._store = None
+          self._features = None
+          if store is not None and callable(getattr(store, 'close', None)):
+            try:
+              store.close()
+            except Exception:  # pylint: disable=broad-except
+              pass
+
+        try:
+          worker.submit(_close_on_worker).result(timeout=5.0)
+        except Exception:  # pylint: disable=broad-except
+          self._store = None
+          self._features = None
+        worker.shutdown(wait=True, cancel_futures=True)
+      else:
+        self._store = None
+        self._features = None
+        worker.shutdown(wait=False, cancel_futures=True)
+    else:
+      self._store = None
+      self._features = None
     self._cleanup_temp()
     return None
 
@@ -1718,10 +2008,21 @@ class _FeastCaller:
     lookup_entity = self._cfg.lookup_fields[0]
     full_names = bool(self._cfg.handler_params.get('full_feature_names', False))
     entity_rows = [{lookup_entity: kt[0]} for _, kt, _ in requests]
-    feat_dict = self._store.get_online_features(
-        features=self._features,
-        entity_rows=entity_rows,
-        full_feature_names=full_names).to_dict()
+
+    def _fetch_on_worker():
+      return self._store.get_online_features(
+          features=self._features,
+          entity_rows=entity_rows,
+          full_feature_names=full_names).to_dict()
+
+    self._in_flight = True
+    try:
+      if self._worker is not None:
+        feat_dict = self._worker.submit(_fetch_on_worker).result()
+      else:
+        feat_dict = _fetch_on_worker()
+    finally:
+      self._in_flight = False
 
     results: dict[bytes, dict[str, Any] | None] = {}
     req_cols = self._cfg.columns
@@ -1738,8 +2039,9 @@ class _FeastCaller:
       if not row_vals or all(v is None for v in row_vals.values()):
         results[ckey] = None
       else:
-        if not self.discovered_columns:
-          self.discovered_columns = tuple(row_vals.keys())
+        with _DISCOVERED_COLS_LOCK:
+          if not self.discovered_columns:
+            self.discovered_columns = tuple(row_vals.keys())
         results[ckey] = row_vals
     return results
 
@@ -1837,18 +2139,65 @@ class _SafeRedisCache:
             type(e).__name__)
 
 
-def _is_retryable_rpc_error(exc: Exception) -> bool:
+class _SharedTokenBucketRateLimiter:
+  """Thread-safe process-wide rate limiter shared across worker threads per stage."""
+  def __init__(self, rate_per_sec: float):
+    self._rate = float(rate_per_sec)
+    self._lock = threading.Lock()
+    self._next_allowed_t = 0.0
+
+  def acquire(self, permits: int = 1) -> None:
+    if self._rate <= 0:
+      return
+    step = max(1, int(permits)) / self._rate
+    with self._lock:
+      now = time.monotonic()
+      if now >= self._next_allowed_t:
+        self._next_allowed_t = now + step
+        return
+      wait_s = self._next_allowed_t - now
+      self._next_allowed_t += step
+    if wait_s > 0:
+      time.sleep(wait_s)
+
+
+_RATE_LIMITER_LOCK = threading.Lock()
+_SHARED_ENRICH_RATE_LIMITERS: dict[tuple[str, float],
+                                   _SharedTokenBucketRateLimiter] = {}
+
+
+def _get_shared_enrich_rate_limiter(
+    stage_fp: str, rate_limit: float) -> _SharedTokenBucketRateLimiter:
+  key = (stage_fp, float(rate_limit))
+  with _RATE_LIMITER_LOCK:
+    limiter = _SHARED_ENRICH_RATE_LIMITERS.get(key)
+    if limiter is None:
+      limiter = _SharedTokenBucketRateLimiter(float(rate_limit))
+      _SHARED_ENRICH_RATE_LIMITERS[key] = limiter
+    return limiter
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
   if isinstance(exc, (TimeoutError, concurrent.futures.TimeoutError)):
     return True
+  return type(exc).__name__ in (
+      'DeadlineExceeded',
+      'UserCodeTimeoutException',
+      'ReadTimeout',
+      'ConnectTimeout',
+  )
+
+
+def _is_retryable_rpc_error(exc: Exception) -> bool:
+  if _is_timeout_error(exc):
+    return False
   cls_name = type(exc).__name__
   return cls_name in (
       'TooManyRequests',
       'ServiceUnavailable',
-      'DeadlineExceeded',
       'InternalServerError',
       'Aborted',
       'UserCodeQuotaException',
-      'UserCodeTimeoutException',
   )
 
 
@@ -1859,6 +2208,7 @@ class _CliEnrichDoFn(beam.DoFn):
       cfg: EnrichConfig,
       *,
       has_error_handling: bool = False,
+      error_output_tag: str = 'errors',
       static_columns: tuple[str, ...] = (),
       static_column_types: Mapping[str, str] | None = None,
       caller_factory=None,
@@ -1866,6 +2216,7 @@ class _CliEnrichDoFn(beam.DoFn):
   ):
     self._cfg = cfg
     self._has_error_handling = has_error_handling
+    self._error_output_tag = error_output_tag or 'errors'
     self._static_columns = static_columns
     self._static_col_types = dict(static_column_types or cfg.column_types)
     self._caller_factory = caller_factory
@@ -1888,47 +2239,109 @@ class _CliEnrichDoFn(beam.DoFn):
 
     self._executor: concurrent.futures.ThreadPoolExecutor | None = None
     self._throttler: AdaptiveThrottler | None = None
+    self._rate_limiter: _SharedTokenBucketRateLimiter | None = None
     self._caller: Any = None
     self._cache: _SafeRedisCache | None = None
+    self._state_lock: threading.Lock | None = None
+    self._caller_lock: threading.Lock | None = None
+    self._in_flight_count: int = 0
+    self.discovered_columns: tuple[str, ...] = static_columns or cfg.columns
     self._buffer: list[tuple[beam.Row, Any, Any]] = []
     self._bundle_start_t: float = 0.0
-    self._last_rpc_t: float = 0.0
+
+  def __getstate__(self) -> dict[str, Any]:
+    state = dict(self.__dict__)
+    state['_executor'] = None
+    state['_throttler'] = None
+    state['_rate_limiter'] = None
+    state['_caller'] = None
+    state['_cache'] = None
+    state['_state_lock'] = None
+    state['_caller_lock'] = None
+    state['_in_flight_count'] = 0
+    state['_buffer'] = []
+    return state
 
   def setup(self):
+    self._state_lock = threading.Lock()
+    self._caller_lock = threading.Lock()
+    self._in_flight_count = 0
+    self._rate_limiter = (
+        _get_shared_enrich_rate_limiter(self._stage_fp, self._cfg.rate_limit)
+        if self._cfg.rate_limit else None)
     self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
     self._throttler = AdaptiveThrottler(
         window_ms=120_000, bucket_ms=1000, overload_ratio=2.0)
-    if self._caller_factory is not None:
-      self._caller = self._caller_factory(self._cfg)
-    elif self._cfg.handler == 'file':
-      self._caller = _FileEnrichmentCaller(self._cfg)
-    elif self._cfg.handler == 'bigquery':
-      self._caller = _ParameterizedBigQueryCaller(self._cfg)
-    elif self._cfg.handler == 'bigtable':
-      self._caller = _BigTableCaller(self._cfg)
-    elif self._cfg.handler == 'vertexai':
-      self._caller = _VertexFSCaller(self._cfg)
-    elif self._cfg.handler == 'feast':
-      self._caller = _FeastCaller(self._cfg)
-    else:  # pragma: no cover
-      raise ValueError(f'unsupported handler {self._cfg.handler!r}')
-    self._caller.__enter__()
+    caller_entered = False
+    cache_entered = False
+    try:
+      if self._caller_factory is not None:
+        self._caller = self._caller_factory(self._cfg)
+      elif self._cfg.handler == 'file':
+        self._caller = _FileEnrichmentCaller(self._cfg)
+      elif self._cfg.handler == 'bigquery':
+        self._caller = _ParameterizedBigQueryCaller(self._cfg)
+      elif self._cfg.handler == 'bigtable':
+        self._caller = _BigTableCaller(self._cfg)
+      elif self._cfg.handler == 'vertexai':
+        self._caller = _VertexFSCaller(self._cfg)
+      elif self._cfg.handler == 'feast':
+        self._caller = _FeastCaller(self._cfg)
+      else:  # pragma: no cover
+        raise ValueError(f'unsupported handler {self._cfg.handler!r}')
+      self._caller.__enter__()
+      caller_entered = True
+      self._sync_caller_discovered_columns()
 
-    if self._cfg.redis_host and self._cfg.redis_port:
-      self._cache = _SafeRedisCache(
-          self._cfg, self._stage_fp, client=self._injected_redis)
-      self._cache.__enter__()
+      if self._cfg.redis_host and self._cfg.redis_port:
+        self._cache = _SafeRedisCache(
+            self._cfg, self._stage_fp, client=self._injected_redis)
+        self._cache.__enter__()
+        cache_entered = True
+    except BaseException:
+      if self._executor is not None:
+        self._executor.shutdown(wait=True, cancel_futures=True)
+        self._executor = None
+      if cache_entered and self._cache is not None:
+        try:
+          self._cache.__exit__(None, None, None)
+        except Exception:  # pylint: disable=broad-except
+          pass
+      self._cache = None
+      if self._caller is not None:
+        if caller_entered:
+          try:
+            self._caller.__exit__(None, None, None)
+          except Exception:  # pylint: disable=broad-except
+            pass
+        elif hasattr(self._caller, '_cleanup_temp'):
+          try:
+            self._caller._cleanup_temp()
+          except Exception:  # pylint: disable=broad-except
+            pass
+      self._caller = None
+      raise
 
   def teardown(self):
-    if self._cache is not None:
-      self._cache.__exit__(None, None, None)
-      self._cache = None
-    if self._caller is not None:
-      self._caller.__exit__(None, None, None)
-      self._caller = None
-    if self._executor is not None:
-      self._executor.shutdown(wait=False)
-      self._executor = None
+    try:
+      if self._executor is not None:
+        state_lock = self._state_lock
+        if state_lock is not None:
+          with state_lock:
+            has_hung = self._in_flight_count > 0
+        else:
+          has_hung = False
+        self._executor.shutdown(wait=not has_hung, cancel_futures=True)
+        self._executor = None
+    finally:
+      try:
+        if self._caller is not None:
+          self._caller.__exit__(None, None, None)
+          self._caller = None
+      finally:
+        if self._cache is not None:
+          self._cache.__exit__(None, None, None)
+          self._cache = None
 
   def start_bundle(self):
     self._buffer = []
@@ -1946,12 +2359,69 @@ class _CliEnrichDoFn(beam.DoFn):
         self._cfg.max_batch_duration_secs is not None and
         (now - self._bundle_start_t) >= self._cfg.max_batch_duration_secs)
     if len(self._buffer) >= self._cfg.max_batch_size or dur_exceeded:
-      yield from self._flush_buffer()
+      try:
+        yield from self._flush_buffer()
+      finally:
+        self._buffer.clear()
       self._bundle_start_t = time.monotonic()
 
   def finish_bundle(self):
     if self._buffer:
-      yield from self._flush_buffer()
+      try:
+        yield from self._flush_buffer()
+      finally:
+        self._buffer.clear()
+
+  def _record_discovered_columns(self, cols: Iterable[str]) -> None:
+    if self._static_columns:
+      return
+    with _DISCOVERED_COLS_LOCK:
+      cur = list(self.discovered_columns)
+      changed = False
+      for c in cols:
+        cs = str(c)
+        if cs not in cur and output.SAFE_IDENTIFIER_RE.match(cs):
+          cur.append(cs)
+          changed = True
+      if changed:
+        self.discovered_columns = tuple(cur)
+
+  def _sync_caller_discovered_columns(self) -> None:
+    with _DISCOVERED_COLS_LOCK:
+      caller_cols = tuple(getattr(self._caller, 'discovered_columns', ()) or ())
+    if caller_cols:
+      self._record_discovered_columns(caller_cols)
+
+  def _get_known_columns(self) -> tuple[str, ...]:
+    if self._static_columns:
+      return self._static_columns
+    self._sync_caller_discovered_columns()
+    with _DISCOVERED_COLS_LOCK:
+      return self.discovered_columns or self._cfg.columns
+
+  def _invoke_serialized_lookup(
+      self,
+      req_list: list[tuple[bytes, tuple[Any, ...], beam.Row]],
+      deadline_mono: float,
+  ) -> dict[bytes, dict[str, Any] | None]:
+    if self._caller_lock is None:
+      self._caller_lock = threading.Lock()
+    if self._state_lock is None:
+      self._state_lock = threading.Lock()
+
+    rem = max(0.0, deadline_mono - time.monotonic())
+    if not self._caller_lock.acquire(timeout=rem):
+      raise TimeoutError(
+          f'CliEnrich ({self._cfg.handler}) caller busy from prior timed-out request'
+      )
+    with self._state_lock:
+      self._in_flight_count += 1
+    try:
+      return self._caller.lookup_batch(req_list)
+    finally:
+      with self._state_lock:
+        self._in_flight_count = max(0, self._in_flight_count - 1)
+      self._caller_lock.release()
 
   def _call_with_retry_and_timeout(
       self, req_list: list[tuple[bytes, tuple[Any, ...], beam.Row]]
@@ -1959,11 +2429,8 @@ class _CliEnrichDoFn(beam.DoFn):
     assert self._executor is not None
     assert self._throttler is not None
 
-    if self._cfg.rate_limit:
-      min_interval = 1.0 / self._cfg.rate_limit
-      wait_s = min_interval - (time.monotonic() - self._last_rpc_t)
-      if wait_s > 0:
-        time.sleep(min(wait_s, 2.0))
+    if self._rate_limiter is not None:
+      self._rate_limiter.acquire(permits=1)
 
     throttle_deadline = time.monotonic() + min(self._cfg.timeout, 2.0)
     while self._throttler.throttle_request(int(time.time() * 1000)):
@@ -1975,12 +2442,18 @@ class _CliEnrichDoFn(beam.DoFn):
     backoff = 0.05
     while True:
       req_ms = int(time.time() * 1000)
-      self._last_rpc_t = time.monotonic()
-      fut = self._executor.submit(self._caller.lookup_batch, req_list)
+      deadline_mono = time.monotonic() + self._cfg.timeout
+      fut = self._executor.submit(
+          self._invoke_serialized_lookup, req_list, deadline_mono)
       try:
-        res = fut.result(timeout=self._cfg.timeout)
+        rem = max(0.001, deadline_mono - time.monotonic())
+        res = fut.result(timeout=rem)
         self._throttler.successful_request(req_ms)
         return res
+      except concurrent.futures.TimeoutError as t_exc:
+        raise TimeoutError(
+            f'CliEnrich ({self._cfg.handler}) lookup timed out after '
+            f'{self._cfg.timeout}s') from t_exc
       except Exception as exc:  # pylint: disable=broad-except
         if attempt < 2 and _is_retryable_rpc_error(exc):
           attempt += 1
@@ -1994,9 +2467,7 @@ class _CliEnrichDoFn(beam.DoFn):
       right_dict: Mapping[str, Any] | None) -> beam.Row:
     merged = dict(left_row._asdict())
     prefix = self._cfg.prefix
-    known_cols = (
-        self._static_columns or getattr(self._caller, 'discovered_columns',
-                                        ()) or self._cfg.columns)
+    known_cols = self._get_known_columns()
 
     if right_dict is None:
       # `on_miss == 'null'` padding
@@ -2006,13 +2477,18 @@ class _CliEnrichDoFn(beam.DoFn):
           merged[out_k] = None
       return beam.Row(**merged)
 
-    iter_cols = self._static_columns if self._static_columns else tuple(
-        right_dict.keys())
+    if self._static_columns:
+      iter_cols = self._static_columns
+    elif known_cols:
+      extra = tuple(k for k in right_dict.keys() if k not in known_cols)
+      iter_cols = known_cols + extra
+    else:
+      iter_cols = tuple(right_dict.keys())
     for c in iter_cols:
       raw_v = right_dict.get(c)
       coerced = _coerce_typed_value(raw_v, self._static_col_types.get(c))
       out_k = f'{prefix}{c}' if prefix else c
-      if prefix or out_k not in merged:
+      if prefix or merged.get(out_k) is None:
         merged[out_k] = coerced
     return beam.Row(**merged)
 
@@ -2035,12 +2511,13 @@ class _CliEnrichDoFn(beam.DoFn):
           msg,
           row,
           redact_fields=self._cfg.dlq_redact_fields)
-      return pvalue.TaggedOutput('errors', WindowedValue(dlq_row, ts, (win, )))
+      return pvalue.TaggedOutput(
+          self._error_output_tag, WindowedValue(dlq_row, ts, (win, )))
     raise RuntimeError(msg)
 
   def _flush_buffer(self):
-    batch = self._buffer
-    self._buffer = []
+    batch = list(self._buffer)
+    self._buffer.clear()
     if not batch:
       return
 
@@ -2080,39 +2557,64 @@ class _CliEnrichDoFn(beam.DoFn):
       cache_hits = self._cache.get_many(pending_keys)
       for ck, payload in cache_hits.items():
         resolved[ck] = payload
+        if isinstance(payload, Mapping) and payload:
+          self._record_discovered_columns(payload.keys())
       pending_keys = [ck for ck in pending_keys if ck not in resolved]
 
-    # 3. Execute batch RPC for cache misses, with singleton fallback on error!
+    # 3. Execute batch RPC for cache misses, with bounded singleton fallback on fast data errors!
     if pending_keys:
       req_list = [unique_reqs[ck] for ck in pending_keys]
       fresh_hits_to_cache: dict[bytes, dict[str, Any]] = {}
       try:
         batch_out = self._call_with_retry_and_timeout(req_list)
+        self._sync_caller_discovered_columns()
         for ck in pending_keys:
           val = batch_out.get(ck)
           resolved[ck] = val
           if val is not None:
             fresh_hits_to_cache[ck] = val
+            self._record_discovered_columns(val.keys())
       except Exception as batch_exc:  # pylint: disable=broad-except
-        if len(req_list) == 1:
-          only_ck = pending_keys[0]
-          key_errors[only_ck] = (
-              type(batch_exc).__name__,
-              _sanitize_enrich_error(batch_exc, self._cfg.handler))
+        batch_err_pair = (
+            type(batch_exc).__name__,
+            _sanitize_enrich_error(batch_exc, self._cfg.handler))
+        if len(req_list) == 1 or _is_timeout_error(batch_exc):
+          # On singleton OR deadline/timeout exceedance, fail/DLQ the batch
+          # directly without triggering N sequential 30s singleton timeouts.
+          for ck in pending_keys:
+            key_errors[ck] = batch_err_pair
         else:
-          # Singleton fallback: isolate poison element(s) without failing N-1 good rows!
-          for single_req in req_list:
+          # Singleton fallback for fast data/poison-pill errors, bounded by a
+          # total wall-clock budget so a degraded backend cannot stall bundles.
+          fallback_budget_s = min(max(self._cfg.timeout * 2.0, 5.0), 60.0)
+          fallback_deadline = time.monotonic() + fallback_budget_s
+          for s_idx, single_req in enumerate(req_list):
+            if time.monotonic() >= fallback_deadline:
+              budget_err = (
+                  'TimeoutError',
+                  f'CliEnrich ({self._cfg.handler}) singleton fallback budget '
+                  f'({fallback_budget_s:.2f}s) exceeded')
+              for rem_req in req_list[s_idx:]:
+                key_errors[rem_req[0]] = budget_err
+              break
             s_ck = single_req[0]
             try:
               s_out = self._call_with_retry_and_timeout([single_req])
+              self._sync_caller_discovered_columns()
               s_val = s_out.get(s_ck)
               resolved[s_ck] = s_val
               if s_val is not None:
                 fresh_hits_to_cache[s_ck] = s_val
+                self._record_discovered_columns(s_val.keys())
             except Exception as single_exc:  # pylint: disable=broad-except
-              key_errors[s_ck] = (
+              s_err = (
                   type(single_exc).__name__,
                   _sanitize_enrich_error(single_exc, self._cfg.handler))
+              key_errors[s_ck] = s_err
+              if _is_timeout_error(single_exc):
+                for rem_req in req_list[s_idx + 1:]:
+                  key_errors[rem_req[0]] = s_err
+                break
 
       if self._cache is not None and fresh_hits_to_cache:
         self._cache.put_many(fresh_hits_to_cache)
@@ -2196,7 +2698,7 @@ def _infer_enriched_row_type(
     if out_k not in field_map:
       field_order.append(out_k)
       field_map[out_k] = opt_t
-    elif prefix:
+    elif prefix or field_map[out_k] is type(None):
       field_map[out_k] = opt_t
   return RowTypeConstraint.from_fields([(n, field_map[n]) for n in field_order])
 
@@ -2208,12 +2710,34 @@ class CliEnrich(beam.PTransform):
       config: Mapping[str, Any],
       *,
       has_error_handling: bool = False,
+      error_handling: Optional[Mapping[str, Any]] = None,
       caller_factory=None,
       redis_client=None,
   ):
     super().__init__()
     self._cfg = parse_enrich_config(config)
-    self._has_error_handling = has_error_handling
+    raw_eh = error_handling if error_handling is not None else (
+        config.get('error_handling') if isinstance(config, Mapping) else None)
+    if raw_eh is not None:
+      if not isinstance(raw_eh, Mapping):
+        raise ValueError('CliEnrich error_handling must be a mapping')
+      err_out = str(raw_eh.get('output') or 'errors').strip()
+      if not err_out or not output.SAFE_IDENTIFIER_RE.match(err_out):
+        raise ValueError(
+            f'invalid CliEnrich error_handling.output tag {err_out!r}')
+      if err_out == 'good':
+        raise ValueError(
+            "CliEnrich error_handling.output cannot collide with 'good'")
+      self._has_error_handling = True
+      self._error_output_tag = err_out
+    else:
+      self._has_error_handling = bool(has_error_handling)
+      self._error_output_tag = 'errors'
+
+    if self._cfg.on_miss == 'dlq' and not self._has_error_handling:
+      raise ValueError(
+          "CliEnrich on_miss='dlq' requires --dlq / error_handling")
+
     self._caller_factory = caller_factory
     self._redis_client = redis_client
 
@@ -2235,6 +2759,7 @@ class CliEnrich(beam.PTransform):
     dofn = _CliEnrichDoFn(
         self._cfg,
         has_error_handling=self._has_error_handling,
+        error_output_tag=self._error_output_tag,
         static_columns=static_cols,
         static_column_types=static_types,
         caller_factory=self._caller_factory,
@@ -2253,13 +2778,14 @@ class CliEnrich(beam.PTransform):
         res_pc.element_type = out_row_type
       return res_pc
 
-    if self._has_error_handling or self._cfg.on_miss == 'dlq':
-      pardo = beam.ParDo(dofn).with_outputs('errors', main='good')
+    if self._has_error_handling:
+      err_tag = self._error_output_tag
+      pardo = beam.ParDo(dofn).with_outputs(err_tag, main='good')
       if out_row_type is not None:
         pardo = pardo.with_output_types(out_row_type)
       res = pcoll | 'Enrich' >> pardo
       good = _materialize(res['good'])
-      return {'good': good, 'errors': res['errors']}
+      return {'good': good, err_tag: res[err_tag]}
 
     pardo = beam.ParDo(dofn)
     if out_row_type is not None:
@@ -2273,13 +2799,19 @@ def cli_enrich(
     enrichment_handler: Optional[str] = None,
     provider: Optional[str] = None,
     key: Optional[Any] = None,
+    keys: Optional[Any] = None,
+    on: Optional[Any] = None,
+    left_key: Optional[Any] = None,
     row_key: Optional[Any] = None,
     fields: Optional[Any] = None,
     entity_id: Optional[Any] = None,
     lookup_key: Optional[Any] = None,
+    right_key: Optional[Any] = None,
+    table_fields: Optional[Any] = None,
     columns: Optional[Any] = None,
     column_names: Optional[Any] = None,
     features: Optional[Any] = None,
+    feature_ids: Optional[Any] = None,
     feature_names: Optional[Any] = None,
     feature_service: Optional[str] = None,
     feature_service_name: Optional[str] = None,
@@ -2297,6 +2829,7 @@ def cli_enrich(
     redis_db: Optional[int] = None,
     redis_tls: Optional[bool] = None,
     redis_ttl: Optional[int] = None,
+    ttl: Optional[int] = None,
     redis_password: Optional[str] = None,
     redis_password_env: Optional[str] = None,
     dlq_redact_fields: Optional[Any] = None,
@@ -2322,7 +2855,7 @@ def cli_enrich(
     feature_view: Optional[str] = None,
     feature_view_name: Optional[str] = None,
     feature_store_yaml_path: Optional[str] = None,
-    error_handling: Optional[dict[str, Any]] = None,
+    error_handling: Optional[Mapping[str, Any]] = None,
 ) -> beam.PTransform:
   """Beam YAML provider constructor for `type: CliEnrich`."""
   raw_locals = {
@@ -2336,4 +2869,4 @@ def cli_enrich(
     raw_locals['trust_providers'] = True
   if redis_tls is False:
     raw_locals['redis_tls'] = False
-  return CliEnrich(raw_locals, has_error_handling=bool(error_handling))
+  return CliEnrich(raw_locals, error_handling=error_handling)

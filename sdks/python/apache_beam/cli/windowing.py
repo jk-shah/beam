@@ -95,6 +95,10 @@ _PANE_INFO_FIELDS: tuple[tuple[str, Any], ...] = (
 )
 
 
+class WindowSpecError(ValueError):
+  """Raised when a `--window` / `CliWindowInto` specification is invalid."""
+
+
 class SubTriggerSpec(NamedTuple):
   kind: str  # 'every', 'count', 'any'
   delay_sec: int | None = None
@@ -132,6 +136,20 @@ class WindowingConfig(NamedTuple):
   watermark_lag: str | None
   watermark_lag_sec: float | None
   dlq_redact_fields: tuple[str, ...]
+
+  @property
+  def is_multi_pane(self) -> bool:
+    return emits_multiple_panes(self)
+
+
+def emits_multiple_panes(cfg: WindowingConfig) -> bool:
+  """Returns True when `cfg` can emit more than one pane per window."""
+  return bool(
+      cfg.parsed_trigger.is_multi_pane or
+      (cfg.parsed_trigger.mode == 'watermark' and
+       cfg.allowed_lateness_sec > 0) or (
+           cfg.accumulation_mode == 'accumulating' and
+           cfg.allowed_lateness_sec > 0))
 
 
 def _parse_non_negative_duration(raw: Any,
@@ -354,14 +372,150 @@ def build_window_fn(cfg: WindowingConfig) -> window.WindowFn:
   raise ValueError(f'unsupported window type {cfg.window_type!r}')
 
 
-def parse_windowing_config(raw_cfg: Mapping[str, Any]) -> WindowingConfig:
+def parse_window_spec(spec: str | Mapping[str, Any]) -> dict[str, Any]:
+  """Parses a `--window` shorthand (`sliding:60s,30s` / `sliding:60s:30s`) into a dict."""
+  if isinstance(spec, Mapping):
+    res = dict(spec)
+    w_type = str(res.get('type') or res.get('window_type') or
+                 '').strip().lower()
+    if w_type == 'session':
+      res['type'] = 'sessions'
+    elif w_type:
+      res['type'] = w_type
+    if (res.get('type') == 'sliding' and not res.get('period') and
+        isinstance(res.get('size'), str)):
+      raw_sz = res['size'].strip()
+      sep = ':' if ':' in raw_sz else (',' if ',' in raw_sz else None)
+      if sep is not None:
+        parts = [p.strip() for p in raw_sz.split(sep) if p.strip()]
+        if len(parts) >= 2:
+          res['size'] = parts[0]
+          res['period'] = parts[1]
+          if len(parts) >= 3 and 'offset' not in res:
+            res['offset'] = parts[2]
+    return res
+
+  s = str(spec or '').strip()
+  if not s:
+    raise WindowSpecError('--window specification cannot be empty')
+  if s.startswith('{') and s.endswith('}'):
+    try:
+      loaded = json.loads(s)
+    except Exception as e:
+      raise WindowSpecError(f'malformed JSON in --window: {e}') from None
+    if not isinstance(loaded, Mapping):
+      raise WindowSpecError('--window JSON must be an object')
+    return parse_window_spec(loaded)
+
+  prefix = ''
+  rest = s
+  if ':' in s and '=' not in s.split(':', 1)[0]:
+    cand_prefix, cand_rest = s.split(':', 1)
+    if cand_prefix.strip().lower() in ('fixed',
+                                       'sliding',
+                                       'session',
+                                       'sessions',
+                                       'global'):
+      prefix = cand_prefix.strip().lower()
+      rest = cand_rest.strip()
+
+  raw_tokens = interval_join.split_bracket_tokens(rest) if rest else []
+  tokens: list[str] = []
+  for rtok in raw_tokens:
+    if ':' in rtok and '=' in rtok:
+      tokens.extend(p.strip() for p in rtok.split(':') if p.strip())
+    else:
+      tokens.append(rtok)
+  kv_tokens: dict[str, str] = {}
+  pos_tokens: list[str] = []
+  for tok in tokens:
+    if '=' in tok:
+      rk, rv = tok.split('=', 1)
+      rk_clean = rk.strip().lower()
+      if rk_clean in ('key', 'keys', 'by', 'group_by'):
+        continue
+      kv_tokens[rk_clean] = rv.strip()
+    else:
+      pos_tokens.append(tok.strip())
+
+  if not prefix:
+    prefix = kv_tokens.pop('type', 'fixed').lower()
+  else:
+    kv_tokens.pop('type', None)
+
+  if prefix in ('fixed',
+                'sliding') and len(pos_tokens) == 1 and (':' in pos_tokens[0]):
+    pos_tokens = [p.strip() for p in pos_tokens[0].split(':') if p.strip()]
+
+  if prefix == 'fixed':
+    size_val = kv_tokens.pop('size',
+                             None) or (pos_tokens[0] if pos_tokens else None)
+    if not size_val:
+      raise WindowSpecError(
+          f'invalid fixed window specification {s!r}; expected fixed:DURATION')
+    _parse_positive_duration(size_val, 'fixed window size')
+    out: dict[str, Any] = {'type': 'fixed', 'size': size_val}
+    off_val = kv_tokens.pop(
+        'offset', None) or (pos_tokens[1] if len(pos_tokens) > 1 else None)
+    if off_val is not None:
+      _parse_non_negative_duration(off_val, 'window offset')
+      out['offset'] = off_val
+  elif prefix == 'sliding':
+    size_val = kv_tokens.pop('size',
+                             None) or (pos_tokens[0] if pos_tokens else None)
+    period_val = kv_tokens.pop(
+        'period', None) or (pos_tokens[1] if len(pos_tokens) > 1 else None)
+    if not period_val and size_val and ':' in size_val:
+      s_parts = [p.strip() for p in size_val.split(':') if p.strip()]
+      if len(s_parts) >= 2:
+        size_val, period_val = s_parts[0], s_parts[1]
+        if len(s_parts) >= 3 and 'offset' not in kv_tokens and len(
+            pos_tokens) <= 2:
+          kv_tokens['offset'] = s_parts[2]
+    if not size_val or not period_val:
+      raise WindowSpecError(
+          f'invalid sliding window specification {s!r}; expected '
+          'sliding:SIZE,PERIOD or sliding:SIZE:PERIOD')
+    _parse_positive_duration(size_val, 'sliding window size')
+    _parse_positive_duration(period_val, 'sliding window period')
+    out = {'type': 'sliding', 'size': size_val, 'period': period_val}
+    off_val = kv_tokens.pop(
+        'offset', None) or (pos_tokens[2] if len(pos_tokens) > 2 else None)
+    if off_val is not None:
+      _parse_non_negative_duration(off_val, 'window offset')
+      out['offset'] = off_val
+  elif prefix in ('session', 'sessions'):
+    gap_val = kv_tokens.pop('gap',
+                            None) or (pos_tokens[0] if pos_tokens else None)
+    if not gap_val:
+      raise WindowSpecError(
+          f'invalid session window specification {s!r}; expected session:GAP')
+    _parse_positive_duration(gap_val, 'session window gap')
+    out = {'type': 'sessions', 'gap': gap_val}
+  elif prefix == 'global':
+    out = {'type': 'global'}
+  else:
+    raise WindowSpecError(
+        f'unknown window type in --window {s!r}; expected fixed:DURATION, '
+        'sliding:SIZE,PERIOD, sliding:SIZE:PERIOD, or session:GAP')
+
+  out.update(kv_tokens)
+  return out
+
+
+def parse_windowing_config(raw_cfg: Mapping[str, Any] | str) -> WindowingConfig:
   """Validates a `CliWindowInto` config mapping and returns `WindowingConfig`."""
-  if not isinstance(raw_cfg, Mapping):
-    raise ValueError('CliWindowInto config must be a mapping')
+  if isinstance(raw_cfg, str):
+    raw_cfg = {'windowing': parse_window_spec(raw_cfg)}
+  elif not isinstance(raw_cfg, Mapping):
+    raise WindowSpecError('CliWindowInto config must be a mapping')
 
   flat: dict[str, Any] = {}
-  if isinstance(raw_cfg.get('windowing'), Mapping):
-    for wk, wv in raw_cfg['windowing'].items():
+  raw_win_block = raw_cfg.get('windowing')
+  if isinstance(raw_win_block, str):
+    raw_win_block = parse_window_spec(raw_win_block)
+  if isinstance(raw_win_block, Mapping):
+    for wk, wv in raw_win_block.items():
       flat[str(wk).strip().lower().replace('-', '_')] = wv
   for k, v in raw_cfg.items():
     nk = str(k).strip().lower().replace('-', '_')
@@ -381,6 +535,7 @@ def parse_windowing_config(raw_cfg: Mapping[str, Any]) -> WindowingConfig:
       'accumulation_mode',
       'accumulation',
       'late_action',
+      'late_data',
       'late_shards',
       'watermark_lag',
       'dlq_redact_fields',
@@ -388,14 +543,15 @@ def parse_windowing_config(raw_cfg: Mapping[str, Any]) -> WindowingConfig:
   }
   unknown = [k for k in flat if k not in allowed_keys]
   if unknown:
-    raise ValueError(f'unknown option(s) {sorted(unknown)} in CliWindowInto')
+    raise WindowSpecError(
+        f'unknown option(s) {sorted(unknown)} in CliWindowInto')
 
   raw_wtype = str(flat.get('window_type') or flat.get('type') or
                   '').strip().lower()
   if raw_wtype == 'session':
     raw_wtype = 'sessions'
   if raw_wtype not in _ALLOWED_WINDOW_TYPES:
-    raise ValueError(
+    raise WindowSpecError(
         f'invalid window type {raw_wtype!r}; expected fixed, sliding, '
         'sessions, or global')
 
@@ -405,31 +561,48 @@ def parse_windowing_config(raw_cfg: Mapping[str, Any]) -> WindowingConfig:
   period_sec: float | None = None
   gap_s: str | None = None
   gap_sec: float | None = None
-  offset_s, offset_sec = _parse_non_negative_duration(
-      flat.get('offset'), 'window offset')
+  raw_offset = flat.get('offset')
 
   if raw_wtype == 'fixed':
-    size_s, size_sec = _parse_positive_duration(flat.get('size'), 'fixed window size')
+    raw_fsize = flat.get('size')
+    if raw_offset is None and isinstance(raw_fsize, str) and ':' in raw_fsize:
+      f_parts = [p.strip() for p in raw_fsize.split(':', 1)]
+      if len(f_parts) == 2 and f_parts[0] and f_parts[1]:
+        raw_fsize, raw_offset = f_parts[0], f_parts[1]
+    size_s, size_sec = _parse_positive_duration(raw_fsize, 'fixed window size')
   elif raw_wtype == 'sliding':
+    raw_ssize = flat.get('size')
+    raw_speriod = flat.get('period')
+    if raw_speriod is None and isinstance(raw_ssize, str):
+      sep = ':' if ':' in raw_ssize else (',' if ',' in raw_ssize else None)
+      if sep is not None:
+        s_parts = [p.strip() for p in raw_ssize.split(sep) if p.strip()]
+        if len(s_parts) >= 2:
+          raw_ssize, raw_speriod = s_parts[0], s_parts[1]
+          if len(s_parts) >= 3 and raw_offset is None:
+            raw_offset = s_parts[2]
     size_s, size_sec = _parse_positive_duration(
-        flat.get('size'), 'sliding window size')
+        raw_ssize, 'sliding window size')
     period_s, period_sec = _parse_positive_duration(
-        flat.get('period'), 'sliding window period')
+        raw_speriod, 'sliding window period')
   elif raw_wtype == 'sessions':
     gap_s, gap_sec = _parse_positive_duration(
         flat.get('gap'), 'session window gap')
 
+  offset_s, offset_sec = _parse_non_negative_duration(
+      raw_offset, 'window offset')
+
   lat_s, lat_sec = _parse_non_negative_duration(
       flat.get('allowed_lateness'), '--allowed-lateness')
   if raw_wtype == 'global' and lat_sec > 0:
-    raise ValueError(
+    raise WindowSpecError(
         '--allowed-lateness > 0 is not applicable to global windows '
         '(use fixed:, sliding:, or session: windows)')
 
   raw_trig = flat.get('trigger')
   parsed_trig = parse_trigger_spec(raw_trig)
   if raw_wtype == 'global' and parsed_trig.mode == 'watermark':
-    raise ValueError(
+    raise WindowSpecError(
         'watermark trigger is not applicable to global windows; '
         'use --trigger every:<DURATION> or --trigger count:<N>')
   trig_str = None if parsed_trig.mode == 'default' else parsed_trig.canonical
@@ -441,24 +614,37 @@ def parse_windowing_config(raw_cfg: Mapping[str, Any]) -> WindowingConfig:
   if raw_acc is not None and str(raw_acc).strip() != '':
     acc_mode = str(raw_acc).strip().lower()
     if acc_mode not in _ALLOWED_ACCUMULATION_MODES:
-      raise ValueError(
+      raise WindowSpecError(
           f'invalid --accumulation {raw_acc!r}; expected discarding or '
           'accumulating')
   elif trig_str is not None:
     acc_mode = 'discarding'
 
-  late_action = str(flat.get('late_action') or 'allow').strip().lower()
+  if not parsed_trig.is_multi_pane and (
+      (parsed_trig.mode == 'watermark' and lat_sec > 0) or
+      (acc_mode == 'accumulating' and lat_sec > 0)):
+    parsed_trig = parsed_trig._replace(is_multi_pane=True)
+
+  late_action = str(
+      flat.get('late_action') or flat.get('late_data') or
+      'allow').strip().lower()
   if late_action not in _ALLOWED_LATE_ACTIONS:
-    raise ValueError(
+    raise WindowSpecError(
         f'invalid --late-action {late_action!r}; expected allow, drop, or dlq')
   if raw_wtype == 'global' and late_action != 'allow':
-    raise ValueError(
+    raise WindowSpecError(
         f'--late-action={late_action} requires bounded-horizon windows '
-        '(fixed:, sliding:, or session:)')
+        '(fixed: or sliding:)')
+  if raw_wtype == 'sessions' and late_action != 'allow':
+    raise WindowSpecError(
+        f'--late-action={late_action} (and --late-data-dlq) is not supported '
+        'with session: windows because session windows merge dynamically '
+        'during GroupByKey; use --late-action=allow with --allowed-lateness '
+        'or fixed:/sliding: windows')
 
   late_shards = int(flat.get('late_shards', 1))
   if late_shards < 1 or late_shards > 256:
-    raise ValueError(
+    raise WindowSpecError(
         f'late_shards must be between 1 and 256, got {late_shards}')
 
   wm_lag_s: str | None = None
@@ -706,8 +892,13 @@ class CliWindowInto(beam.PTransform):
       w_kwargs['accumulation_mode'] = acc_mode
 
     if self._cfg.late_action in ('dlq', 'drop'):
+      if self._cfg.window_type == 'sessions':
+        raise WindowSpecError(
+            f'--late-action={self._cfg.late_action} is not supported with '
+            'session: windows because session windows merge dynamically '
+            'during GroupByKey')
       if self._cfg.late_action == 'dlq' and not has_dlq:
-        raise ValueError(
+        raise WindowSpecError(
             'CliWindowInto late_action="dlq" requires error_handling / --dlq / '
             '--late-data-dlq')
       sharded = (
@@ -857,3 +1048,76 @@ def cli_window_into(
 def cli_extract_pane_info() -> CliExtractPaneInfo:
   """Beam YAML provider entrypoint for `type: CliExtractPaneInfo`."""
   return CliExtractPaneInfo()
+
+
+@beam.typehints.with_output_types(int)
+class CountDistinctCombineFn(beam.CombineFn):
+  """Pure-Python non-null distinct count CombineFn for zero-JVM SQL lowering."""
+  def create_accumulator(self):
+    return set()
+
+  def add_input(self, acc, element):
+    if element is not None:
+      acc.add(element)
+    return acc
+
+  def merge_accumulators(self, accumulators):
+    merged = set()
+    for acc in accumulators:
+      merged.update(acc)
+    return merged
+
+  def extract_output(self, acc) -> int:
+    return int(len(acc))
+
+
+@beam.typehints.with_output_types(Optional[float])
+class VarPopCombineFn(beam.CombineFn):
+  """Parallel Welford population variance (`VAR_POP`) CombineFn."""
+  def create_accumulator(self):
+    return (0, 0.0, 0.0)
+
+  def add_input(self, acc, element):
+    if element is None:
+      return acc
+    n, mean, m2 = acc
+    x = float(element)
+    n += 1
+    delta = x - mean
+    mean += delta / n
+    m2 += delta * (x - mean)
+    return (n, mean, m2)
+
+  def merge_accumulators(self, accumulators):
+    n_a, mean_a, m2_a = 0, 0.0, 0.0
+    for n_b, mean_b, m2_b in accumulators:
+      if n_b == 0:
+        continue
+      if n_a == 0:
+        n_a, mean_a, m2_a = n_b, mean_b, m2_b
+        continue
+      delta = mean_b - mean_a
+      n_ab = n_a + n_b
+      mean_a = mean_a + delta * (n_b / n_ab)
+      m2_a = m2_a + m2_b + delta * delta * (n_a * n_b / n_ab)
+      n_a = n_ab
+    return (n_a, mean_a, m2_a)
+
+  def extract_output(self, acc) -> Optional[float]:
+    n, _, m2 = acc
+    return None if n == 0 else float(m2 / n)
+
+
+@beam.typehints.with_output_types(Optional[float])
+class StddevPopCombineFn(VarPopCombineFn):
+  """Parallel Welford population standard deviation (`STDDEV_POP`) CombineFn."""
+  def extract_output(self, acc) -> Optional[float]:
+    import math
+    v = super().extract_output(acc)
+    return None if v is None else float(math.sqrt(max(0.0, v)))
+
+
+COUNT_DISTINCT_COMBINE_FN = CountDistinctCombineFn()
+VAR_POP_COMBINE_FN = VarPopCombineFn()
+STDDEV_POP_COMBINE_FN = StddevPopCombineFn()
+

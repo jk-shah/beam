@@ -427,7 +427,9 @@ def _extract_untyped_python_map_fields(transform: dict[str, Any]) -> list[str]:
     if isinstance(fval, str):
       untyped.append(str(fname))
     elif isinstance(fval, dict) and not fval.get('output_type') and not fval.get('type'):
-      untyped.append(str(fname))
+      c_src = str(fval.get('callable') or '')
+      if '->' not in c_src.splitlines()[0] if c_src else True:
+        untyped.append(str(fname))
   return untyped
 
 
@@ -564,6 +566,10 @@ _SAFE_BUILTINS_COMBINE_FNS = frozenset([
     'all',
     'mean',
     'concat',
+    'group',
+    'apache_beam.cli.windowing.count_distinct_combine_fn',
+    'apache_beam.cli.windowing.var_pop_combine_fn',
+    'apache_beam.cli.windowing.stddev_pop_combine_fn',
 ])
 
 
@@ -649,14 +655,26 @@ def _is_safe_inline_callable(src: str) -> bool:
   except SyntaxError:
     return False
   if len(mod.body) != 1 or not _ast_within_budget(
-      mod, max_nodes=1024, max_depth=32):
+      mod, max_nodes=2048, max_depth=32):
     return False
   stmt = mod.body[0]
   if isinstance(stmt, ast.FunctionDef):
     args = stmt.args
-    if (stmt.decorator_list or stmt.returns is not None or args.defaults or
+    if (stmt.decorator_list or args.defaults or
         any(d is not None for d in args.kw_defaults)):
       return False
+    if stmt.returns is not None:
+      for rnode in ast.walk(stmt.returns):
+        if isinstance(rnode, (ast.Load, ast.BitOr)):
+          continue
+        if isinstance(rnode, ast.BinOp) and isinstance(rnode.op, ast.BitOr):
+          continue
+        if isinstance(rnode, ast.Constant) and rnode.value is None:
+          continue
+        if isinstance(rnode, ast.Name) and rnode.id in (
+            'int', 'float', 'str', 'bool'):
+          continue
+        return False
     all_arg_nodes = (
         list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs) +
         ([args.vararg] if args.vararg else []) +

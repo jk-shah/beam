@@ -618,5 +618,107 @@ class CliWindowIntoEndToEndPipeTest(unittest.TestCase):
       self.assertIn('pane_timing', rows[1])
 
 
+class WindowingProductionHardeningRegressionTest(unittest.TestCase):
+  def test_parse_window_spec_accepts_comma_and_colon_sliding_shorthands(self):
+    spec_comma = windowing.parse_window_spec('sliding:60s,30s')
+    spec_colon = windowing.parse_window_spec('sliding:60s:30s')
+    self.assertEqual(
+        spec_comma, {
+            'type': 'sliding', 'size': '60s', 'period': '30s'
+        })
+    self.assertEqual(spec_colon, spec_comma)
+
+    cfg_comma = windowing.parse_windowing_config('sliding:60s,30s')
+    cfg_colon = windowing.parse_windowing_config('sliding:60s:30s')
+    self.assertEqual(cfg_comma.window_type, 'sliding')
+    self.assertEqual(cfg_comma.size_sec, 60.0)
+    self.assertEqual(cfg_comma.period_sec, 30.0)
+    self.assertEqual(cfg_colon.size_sec, 60.0)
+    self.assertEqual(cfg_colon.period_sec, 30.0)
+
+  def test_implicit_multi_pane_detection_for_watermark_lateness_and_accumulating(
+      self):
+    # 1. Explicit `trigger=watermark` + `allowed_lateness > 0` injects
+    # `late=AfterCount(1)`, which emits multiple panes!
+    cfg_wm_late = windowing.parse_windowing_config({
+        'type': 'fixed',
+        'size': '60s',
+        'trigger': 'watermark',
+        'allowed_lateness': '10s',
+    })
+    self.assertTrue(cfg_wm_late.is_multi_pane)
+    self.assertTrue(cfg_wm_late.parsed_trigger.is_multi_pane)
+    self.assertTrue(windowing.emits_multiple_panes(cfg_wm_late))
+
+    # 2. `accumulation=accumulating` + `allowed_lateness > 0` is multi-pane.
+    cfg_acc_late = windowing.parse_windowing_config({
+        'type': 'fixed',
+        'size': '60s',
+        'accumulation': 'accumulating',
+        'allowed_lateness': '10s',
+    })
+    self.assertTrue(cfg_acc_late.is_multi_pane)
+    self.assertTrue(cfg_acc_late.parsed_trigger.is_multi_pane)
+    self.assertTrue(windowing.emits_multiple_panes(cfg_acc_late))
+
+    # 3. Default 1:1 `fixed:60s` + `allowed_lateness: 10s` without explicit
+    # `watermark` trigger or `accumulating` remains single-pane per element.
+    cfg_plain_late = windowing.parse_windowing_config({
+        'type': 'fixed',
+        'size': '60s',
+        'allowed_lateness': '10s',
+    })
+    self.assertFalse(cfg_plain_late.is_multi_pane)
+    self.assertFalse(windowing.emits_multiple_panes(cfg_plain_late))
+
+    # End-to-end CLI `--assert-counts` guard catches implicit multi-pane!
+    with tempfile.TemporaryDirectory() as tmp:
+      src = os.path.join(tmp, 'in.jsonl')
+      dst = os.path.join(tmp, 'out.jsonl')
+      with open(src, 'w', encoding='utf-8') as f:
+        f.write('{"ts": 1000, "v": 1}\n')
+      rc, out, _ = _run_cli([
+          'pipe',
+          '--from',
+          src,
+          '--to',
+          dst,
+          '--timestamp-col',
+          'ts',
+          '--window',
+          'fixed:60s',
+          '--trigger',
+          'watermark',
+          '--allowed-lateness',
+          '10s',
+          '--assert-counts',
+          '--json',
+      ])
+      self.assertEqual(rc, 2, out)
+
+  def test_sessions_reject_pre_gbk_late_data_drop_or_dlq_with_window_spec_error(
+      self):
+    self.assertTrue(issubclass(windowing.WindowSpecError, ValueError))
+    for bad_action in ('drop', 'dlq'):
+      with self.subTest(late_data=bad_action):
+        with self.assertRaisesRegex(windowing.WindowSpecError,
+                                    'merge dynamically'):
+          windowing.parse_windowing_config({
+              'type': 'sessions',
+              'gap': '30m',
+              'allowed_lateness': '5m',
+              'late_data': bad_action,
+          })
+
+    cfg_allow = windowing.parse_windowing_config({
+        'type': 'sessions',
+        'gap': '30m',
+        'allowed_lateness': '5m',
+        'late_data': 'allow',
+    })
+    self.assertEqual(cfg_allow.window_type, 'sessions')
+    self.assertEqual(cfg_allow.late_action, 'allow')
+
+
 if __name__ == '__main__':
   unittest.main()

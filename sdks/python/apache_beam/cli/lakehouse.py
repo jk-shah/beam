@@ -27,10 +27,12 @@ import datetime
 import decimal
 import io
 import json
+import math
 import os
 import pathlib
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -214,7 +216,9 @@ def _delta_type_to_py_type(dtype: Any) -> Any:
     low = dtype.lower()
     if low in ('byte', 'short', 'integer', 'int', 'long'):
       return int
-    if low in ('float', 'double') or low.startswith('decimal'):
+    if low.startswith('decimal'):
+      return decimal.Decimal
+    if low in ('float', 'double'):
       return float
     if low == 'boolean':
       return bool
@@ -229,7 +233,9 @@ def _iceberg_type_to_py_type(itype: Any) -> Any:
     low = itype.lower()
     if low in ('int', 'long'):
       return int
-    if low in ('float', 'double') or low.startswith('decimal'):
+    if low.startswith('decimal'):
+      return decimal.Decimal
+    if low in ('float', 'double'):
       return float
     if low == 'boolean':
       return bool
@@ -280,8 +286,9 @@ def _iceberg_type_to_arrow_type(itype: Any):
   if low.startswith('decimal'):
     m = re.match(r'decimal\(\s*(\d+)\s*,\s*(\d+)\s*\)', low)
     if m:
-      return pa.decimal128(int(m.group(1)), int(m.group(2)))
-    return pa.float64()
+      p, s = int(m.group(1)), int(m.group(2))
+      return pa.decimal128(p, s) if p <= 38 else pa.decimal256(p, s)
+    return pa.decimal128(38, 9)
   if low == 'date':
     return pa.date32()
   if low == 'timestamptz':
@@ -296,8 +303,12 @@ def _iceberg_type_to_arrow_type(itype: Any):
 def _coerce_scalar_for_py(val: Any, py_t: Any) -> Any:
   if val is None:
     return None
+  if py_t is decimal.Decimal:
+    if isinstance(val, decimal.Decimal):
+      return val
+    return decimal.Decimal(str(val))
   if isinstance(val, decimal.Decimal):
-    return float(val) if py_t is float else str(val)
+    return float(val) if py_t is float else val
   if isinstance(val, (datetime.datetime, datetime.date)):
     return val.isoformat()
   if py_t is int and not isinstance(val, bool):
@@ -317,6 +328,79 @@ def _coerce_scalar_for_py(val: Any, py_t: Any) -> Any:
   if py_t is str and not isinstance(val, str):
     return str(val)
   return val
+
+
+_ISO_DATE_ONLY_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+_ISO_DATETIME_PREFIX_RE = re.compile(r'^\d{4}-\d{2}-\d{2}[T ]')
+
+
+def _format_utc_datetime_key(dt: datetime.datetime) -> str:
+  dt_utc = (
+      dt.replace(tzinfo=datetime.timezone.utc)
+      if dt.tzinfo is None else dt.astimezone(datetime.timezone.utc))
+  if dt_utc.microsecond == 0:
+    return dt_utc.strftime('%Y-%m-%dT%H:%M:%SZ')
+  return dt_utc.isoformat().replace('+00:00', 'Z')
+
+
+def _canonical_iceberg_key_atom(val: Any) -> tuple[int, str]:
+  """Canonicalizes an equality-delete / primary-key value with full precision."""
+  if val is None:
+    return (0, '')
+  if isinstance(val, bool):
+    return (1, '1' if val else '0')
+  if isinstance(val, (int, float, decimal.Decimal)):
+    if isinstance(val, float):
+      if math.isnan(val):
+        return (2, 'NaN')
+      if math.isinf(val):
+        return (2, '-Inf' if val < 0 else 'Inf')
+      if val == 0.0:
+        return (2, '0')
+      d = decimal.Decimal(str(val))
+    elif isinstance(val, decimal.Decimal):
+      if val.is_nan():
+        return (2, 'NaN')
+      if val.is_infinite():
+        return (2, '-Inf' if val.is_signed() else 'Inf')
+      if val.is_zero():
+        return (2, '0')
+      d = val
+    else:
+      if val == 0:
+        return (2, '0')
+      d = decimal.Decimal(val)
+    ctx = decimal.Context(prec=max(80, len(d.as_tuple().digits) + 8))
+    return (2, str(ctx.normalize(d)))
+  if isinstance(val, (bytes, bytearray, memoryview)):
+    return (3, bytes(val).hex())
+  if isinstance(val, datetime.datetime):
+    return (4, _format_utc_datetime_key(val))
+  if isinstance(val, datetime.date):
+    return (5, val.isoformat())
+  if isinstance(val, str):
+    s = val.strip()
+    if _ISO_DATE_ONLY_RE.match(s):
+      try:
+        d_obj = datetime.date.fromisoformat(s)
+        return (5, d_obj.isoformat())
+      except ValueError:
+        pass
+    elif _ISO_DATETIME_PREFIX_RE.match(s):
+      try:
+        iso_s = s[:-1] + '+00:00' if s.endswith(('Z', 'z')) else s
+        dt_obj = datetime.datetime.fromisoformat(iso_s)
+        return (4, _format_utc_datetime_key(dt_obj))
+      except ValueError:
+        pass
+    return (6, val)
+  return (7, str(val))
+
+
+def _canonical_iceberg_key_tuple(
+    row_map: dict[str, Any], cols: Iterable[str]
+) -> tuple[tuple[int, str], ...]:
+  return tuple(_canonical_iceberg_key_atom(row_map.get(c)) for c in cols)
 
 
 def _row_matches_search(row: dict[str, Any], needle_lower: str) -> bool:
@@ -981,9 +1065,18 @@ def _resolve_via_bigquery_api(
         loc = str(payload['location'])
         _check_no_dotdot_or_controls(loc, 'BigQuery table location')
         return _normalize_fs_root(loc)
-  except Exception:  # pylint: disable=broad-except
-    pass
+  except Exception as exc:  # pylint: disable=broad-except
+    _close_http_error(exc)
   return None
+
+
+def _close_http_error(err: BaseException) -> None:
+  """Closes `urllib.error.HTTPError` response streams to avoid socket leaks."""
+  if isinstance(err, urllib.error.HTTPError):
+    try:
+      err.close()
+    except Exception:  # pylint: disable=broad-except
+      pass
 
 
 def _is_googleapis_https_uri(uri: str) -> bool:
@@ -1052,8 +1145,8 @@ def _resolve_via_biglake_catalog(
         loc = str(payload['metadata']['location']).rstrip('/')
         _check_no_dotdot_or_controls(loc, 'Iceberg table location')
         return loc
-  except Exception:  # pylint: disable=broad-except
-    pass
+  except Exception as exc:  # pylint: disable=broad-except
+    _close_http_error(exc)
   return None
 
 
@@ -1098,8 +1191,8 @@ def _resolve_via_generic_rest_catalog(
         loc = str(payload['metadata']['location']).rstrip('/')
         _check_no_dotdot_or_controls(loc, 'Iceberg table location')
         return loc
-  except Exception:  # pylint: disable=broad-except
-    pass
+  except Exception as exc:  # pylint: disable=broad-except
+    _close_http_error(exc)
   return None
 
 
@@ -1175,7 +1268,10 @@ def register_iceberg_catalog_table(
             'storage_uri': table_dir,
         }
     except urllib.error.HTTPError as e:
-      if e.code == 409:  # Conflict / Table already exists -> PATCH
+      err_code = e.code
+      err_str = str(e)
+      _close_http_error(e)
+      if err_code == 409:  # Conflict / Table already exists -> PATCH
         try:
           patch_url = f"{post_url}/{urllib.parse.quote(tbl, safe='')}"
           req_patch = urllib.request.Request(
@@ -1190,10 +1286,14 @@ def register_iceberg_catalog_table(
                 'storage_uri': table_dir,
             }
         except Exception as p_err:  # pylint: disable=broad-except
-          return {'catalog': 'bigquery', 'status': 'patch_failed', 'error': str(p_err)}
-      return {'catalog': 'bigquery', 'status': 'failed', 'error': str(e)}
+          p_str = str(p_err)
+          _close_http_error(p_err)
+          return {'catalog': 'bigquery', 'status': 'patch_failed', 'error': p_str}
+      return {'catalog': 'bigquery', 'status': 'failed', 'error': err_str}
     except Exception as e:  # pylint: disable=broad-except
-      return {'catalog': 'bigquery', 'status': 'failed', 'error': str(e)}
+      err_str = str(e)
+      _close_http_error(e)
+      return {'catalog': 'bigquery', 'status': 'failed', 'error': err_str}
 
   # 2. BigLake REST Catalog
   cand_uri = str(
@@ -1245,7 +1345,9 @@ def register_iceberg_catalog_table(
         with opener.open(req, timeout=10) as resp:
           return {'catalog': 'biglake', 'status': 'registered', 'uri': rest_uri, 'table': table_ident}
       except Exception as e:  # pylint: disable=broad-except
-        return {'catalog': 'biglake', 'status': 'failed', 'error': str(e)}
+        err_str = str(e)
+        _close_http_error(e)
+        return {'catalog': 'biglake', 'status': 'failed', 'error': err_str}
 
   # 3. Generic Iceberg REST Catalog
   if cat_type == 'rest' and cat_props.get('uri'):
@@ -1277,7 +1379,9 @@ def register_iceberg_catalog_table(
           del resp
           return {'catalog': 'rest', 'status': 'registered', 'uri': rest_uri, 'table': table_ident}
       except Exception as e:  # pylint: disable=broad-except
-        return {'catalog': 'rest', 'status': 'failed', 'error': str(e)}
+        err_str = str(e)
+        _close_http_error(e)
+        return {'catalog': 'rest', 'status': 'failed', 'error': err_str}
 
   return {'catalog': 'none', 'status': 'local_metadata_only'}
 
@@ -1375,9 +1479,36 @@ def resolve_iceberg_table_dir(
   return _join_fs(wh_norm, *parts)
 
 
+def _max_existing_iceberg_metadata_version(table_dir: str) -> int:
+  """Returns the highest `vN.metadata.json` version in `table_dir`, or 0."""
+  norm_dir = _normalize_fs_root(table_dir)
+  meta_dir = _join_fs(norm_dir, 'metadata')
+  best_ver = 0
+  hint_path = _join_fs(meta_dir, 'version-hint.text')
+  try:
+    if _fs_exists(hint_path):
+      hint = _fs_read_bytes(hint_path).decode('utf-8').strip()
+      if hint.isdigit():
+        best_ver = max(best_ver, int(hint))
+  except Exception:  # pylint: disable=broad-except
+    pass
+  try:
+    files = _fs_list_files(_join_fs(meta_dir, '*.metadata.json'))
+    for fpath, _ in files:
+      bname = os.path.basename(fpath.replace('\\', '/'))
+      m = re.match(r'^v?(\d+)(?:-[A-Za-z0-9-]+)?\.metadata\.json$', bname)
+      if m:
+        best_ver = max(best_ver, int(m.group(1)))
+  except Exception:  # pylint: disable=broad-except
+    pass
+  return best_ver
+
+
 def find_latest_iceberg_metadata_path(table_dir: str) -> tuple[int, str]:
   """Finds `(version_num, metadata_json_path)` for an Iceberg table directory."""
   meta_dir = _join_fs(table_dir, 'metadata')
+  hint_ver = -1
+  hint_cand: Optional[str] = None
   hint_path = _join_fs(meta_dir, 'version-hint.text')
   if _fs_exists(hint_path):
     try:
@@ -1386,17 +1517,22 @@ def find_latest_iceberg_metadata_path(table_dir: str) -> tuple[int, str]:
         ver = int(hint)
         cand = _join_fs(meta_dir, f'v{ver}.metadata.json')
         if _fs_exists(cand):
-          return ver, cand
+          hint_ver = ver
+          hint_cand = cand
+          if '://' in table_dir:
+            return ver, cand
     except Exception:  # pylint: disable=broad-except
       pass
 
   files = _fs_list_files(_join_fs(meta_dir, '*.metadata.json'))
   if not files:
+    if hint_cand is not None:
+      return max(hint_ver, 1), hint_cand
     raise FileNotFoundError(
         f'no Iceberg metadata files (*.metadata.json) found in {meta_dir!r}')
 
-  best_ver = -1
-  best_path = files[-1][0]
+  best_ver = hint_ver
+  best_path = hint_cand or files[-1][0]
   for fpath, _ in files:
     bname = os.path.basename(fpath.replace('\\', '/'))
     m = re.match(r'^v?(\d+)(?:-[A-Za-z0-9-]+)?\.metadata\.json$', bname)
@@ -1546,7 +1682,7 @@ def _load_iceberg_deletes(
       key_set: set[tuple[Any, ...]] = set()
       for batch in pf.iter_batches():
         for r in batch.to_pylist():
-          key_set.add(tuple(r.get(c) for c in eq_cols))
+          key_set.add(_canonical_iceberg_key_tuple(r, eq_cols))
       if key_set:
         eq_deletes.append((int(ef_info['sequence_number']), eq_cols, key_set))
 
@@ -1601,7 +1737,7 @@ def read_iceberg_rows_local(
             rec[fname] = _coerce_scalar_for_py(val, type_map[fname])
           deleted = False
           for cols, kset in applicable_eq:
-            if tuple(rec.get(c) for c in cols) in kset:
+            if _canonical_iceberg_key_tuple(rec, cols) in kset:
               deleted = True
               break
           if deleted:
@@ -1762,6 +1898,55 @@ def _write_avro_bytes(
   return buf.getvalue()
 
 
+def _resolve_iceberg_write_fields(
+    existing_state: Optional[dict[str, Any]],
+    incoming_fields: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+  """Assigns stable Iceberg `field_id`s before Parquet data files are written.
+
+  Existing columns keep their table `id`; newly evolved columns receive
+  monotonically increasing `last_column_id + 1, +2, ...` and `nullable=True`
+  so embedded `PARQUET:field_id` metadata matches `vN.metadata.json` 1-for-1.
+  """
+  if existing_state is None:
+    return [
+        {
+            **f,
+            'id': int(f.get('id') or idx),
+        }
+        for idx, f in enumerate(incoming_fields, start=1)
+    ]
+
+  existing_by_low = {
+      str(f['name']).lower(): f
+      for f in (existing_state.get('schema') or [])
+  }
+  old_meta = existing_state.get('metadata') or {}
+  next_col_id = max(
+      [int(f.get('id', 0)) for f in (existing_state.get('schema') or [])] +
+      [int(old_meta.get('last-column-id') or 0)],
+      default=0)
+  resolved: list[dict[str, Any]] = []
+  for f in incoming_fields:
+    fname = str(f['name'])
+    ex = existing_by_low.get(fname.lower())
+    if ex is not None:
+      resolved.append({
+          **f,
+          'id': int(ex['id']),
+          'name': str(ex['name']),
+      })
+    else:
+      next_col_id += 1
+      resolved.append({
+          **f,
+          'id': next_col_id,
+          'name': fname,
+          'nullable': True,
+      })
+  return resolved
+
+
 def commit_iceberg_snapshot(
     table_dir: str,
     *,
@@ -1771,6 +1956,7 @@ def commit_iceberg_snapshot(
     new_eq_delete_files: Optional[list[dict[str, Any]]] = None,
     partition_spec: Optional[dict[str, Any]] = None,
     replace_table: bool = False,
+    cdc_seq_state: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
   """Atomically writes Iceberg v2 manifests, manifest-list, and `vN.metadata.json`."""
   table_dir = _normalize_fs_root(table_dir)
@@ -1785,7 +1971,9 @@ def commit_iceberg_snapshot(
       existing = None
 
   if existing is not None:
-    meta_ver = existing['metadata_version'] + 1
+    meta_ver = max(
+        existing['metadata_version'],
+        _max_existing_iceberg_metadata_version(table_dir)) + 1
     old_meta = existing['metadata']
     old_fmt = int(old_meta.get('format-version') or 2)
     if old_fmt != 2:
@@ -1851,7 +2039,11 @@ def commit_iceberg_snapshot(
     for f in iceberg_fields:
       f_name = str(f['name'])
       if f_name.lower() not in existing_names:
-        last_col_id += 1
+        cand_id = int(f.get('id') or 0)
+        if cand_id > last_col_id:
+          last_col_id = cand_id
+        else:
+          last_col_id += 1
         cur_fields.append({
             'id': last_col_id,
             'name': f_name,
@@ -1863,7 +2055,7 @@ def commit_iceberg_snapshot(
     if evolved:
       cur_schema['schema-id'] = int(cur_schema.get('schema-id', 0)) + 1
   else:
-    meta_ver = 1
+    meta_ver = _max_existing_iceberg_metadata_version(table_dir) + 1
     table_uuid = str(uuid.uuid4())
     seq_num = 1
     parent_snap_id = None
@@ -2054,7 +2246,9 @@ def commit_iceberg_snapshot(
       'sequence-number': seq_num,
       'timestamp-ms': now_ms,
       'summary': {
-          'operation': 'overwrite' if eq_files else 'append',
+          'operation': (
+              'replace' if replace_table else
+              ('overwrite' if eq_files else 'append')),
           'added-data-files': str(len(new_data_files)),
           'added-delete-files': str(len(eq_files)),
       },
@@ -2085,6 +2279,23 @@ def commit_iceberg_snapshot(
   else:
     all_specs = [part_spec]
 
+  props = {
+      'write.format.default': 'parquet',
+      'schema.name-mapping.default': json.dumps(name_mapping),
+  }
+  if existing is not None:
+    old_seq_file = (old_meta.get('properties') or {}).get(
+        'beam.cli.cdc.seq-file')
+    if old_seq_file:
+      props['beam.cli.cdc.seq-file'] = str(old_seq_file)
+  if cdc_seq_state is not None:
+    seq_fname = f'beam-cdc-seq-v{meta_ver}.json'
+    _fs_write_bytes(
+        _join_fs(meta_dir, seq_fname),
+        json.dumps(cdc_seq_state, separators=(',', ':')).encode('utf-8'),
+        mime_type='application/json')
+    props['beam.cli.cdc.seq-file'] = seq_fname
+
   meta_json_obj = {
       'format-version': 2,
       'table-uuid': table_uuid,
@@ -2099,10 +2310,7 @@ def commit_iceberg_snapshot(
       'last-partition-id': last_part_id,
       'default-sort-order-id': 0,
       'sort-orders': [{'order-id': 0, 'fields': []}],
-      'properties': {
-          'write.format.default': 'parquet',
-          'schema.name-mapping.default': json.dumps(name_mapping),
-      },
+      'properties': props,
       'current-snapshot-id': snap_id,
       'snapshots': prior_snapshots + [snap_obj],
       'snapshot-log': prior_snap_log + [{
@@ -2132,6 +2340,49 @@ def commit_iceberg_snapshot(
   }
 
 
+def _coerce_value_for_arrow(val: Any, pa_t) -> Any:
+  import pyarrow as pa
+  if val is None:
+    return None
+  if pa.types.is_date(pa_t):
+    if isinstance(val, datetime.datetime):
+      return val.date()
+    if isinstance(val, datetime.date):
+      return val
+    if isinstance(val, str):
+      return datetime.date.fromisoformat(val.strip()[:10])
+    return val
+  if pa.types.is_timestamp(pa_t):
+    if isinstance(val, datetime.datetime):
+      if getattr(pa_t, 'tz', None) and val.tzinfo is None:
+        return val.replace(tzinfo=datetime.timezone.utc)
+      return val
+    if isinstance(val, datetime.date):
+      dt = datetime.datetime(val.year, val.month, val.day)
+      return (
+          dt.replace(tzinfo=datetime.timezone.utc)
+          if getattr(pa_t, 'tz', None) else dt)
+    if isinstance(val, str):
+      s = val.strip()
+      iso_s = s[:-1] + '+00:00' if s.endswith(('Z', 'z')) else s
+      dt = datetime.datetime.fromisoformat(iso_s)
+      if getattr(pa_t, 'tz', None) and dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+      return dt
+    if hasattr(val, 'to_utc_datetime'):
+      dt = val.to_utc_datetime()
+      if getattr(pa_t, 'tz', None) and dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+      return dt
+    return val
+  if pa.types.is_decimal(pa_t):
+    d = val if isinstance(val, decimal.Decimal) else decimal.Decimal(str(val))
+    ctx = decimal.Context(prec=max(80, pa_t.precision + 8))
+    quant = decimal.Decimal(1).scaleb(-pa_t.scale, context=ctx)
+    return ctx.quantize(d, quant)
+  return val
+
+
 def write_parquet_with_field_ids(
     dest_path: str,
     rows: list[dict[str, Any]],
@@ -2142,10 +2393,12 @@ def write_parquet_with_field_ids(
   import pyarrow.parquet as pq
 
   pa_fields = []
+  pa_types: dict[str, Any] = {}
   cols_data: dict[str, list[Any]] = {f['name']: [] for f in iceberg_fields}
   for idx, f in enumerate(iceberg_fields, start=1):
     fid = int(f.get('id') or idx)
     pa_t = _iceberg_type_to_arrow_type(f['type'])
+    pa_types[f['name']] = pa_t
     pa_fields.append(
         pa.field(
             f['name'],
@@ -2155,11 +2408,12 @@ def write_parquet_with_field_ids(
 
   for r in rows:
     for f in iceberg_fields:
-      cols_data[f['name']].append(r.get(f['name']))
+      fname = f['name']
+      cols_data[fname].append(_coerce_value_for_arrow(r.get(fname), pa_types[fname]))
 
   pa_schema = pa.schema(pa_fields)
   arrays = [
-      pa.array(cols_data[f['name']], type=_iceberg_type_to_arrow_type(f['type']))
+      pa.array(cols_data[f['name']], type=pa_types[f['name']])
       for f in iceberg_fields
   ]
   tbl = pa.Table.from_arrays(arrays, schema=pa_schema)
@@ -2226,6 +2480,7 @@ def register_zero_copy_to_iceberg(
 
   table_dir = resolve_iceberg_table_dir(
       sink_ep.config, default_project=default_project)
+  existing_st: Optional[dict[str, Any]] = None
   if if_exists == 'fail':
     try:
       find_latest_iceberg_metadata_path(table_dir)
@@ -2234,6 +2489,11 @@ def register_zero_copy_to_iceberg(
           '--if-exists=append or --if-exists=replace')
     except FileNotFoundError:
       pass
+  elif if_exists != 'replace':
+    try:
+      existing_st = load_iceberg_state(table_dir)
+    except FileNotFoundError:
+      existing_st = None
 
   seen_fields: dict[str, dict[str, Any]] = {}
   file_field_presence: dict[str, int] = {}
@@ -2246,11 +2506,17 @@ def register_zero_copy_to_iceberg(
       for field in pf.schema_arrow:
         fname = field.name
         file_field_presence[fname] = file_field_presence.get(fname, 0) + 1
+        raw_fid = (field.metadata or {}).get(b'PARQUET:field_id')
+        parsed_fid = (
+            int(raw_fid.decode('ascii'))
+            if raw_fid and raw_fid.decode('ascii', errors='ignore').isdigit()
+            else None)
         if fname not in seen_fields:
           seen_fields[fname] = {
               'name': fname,
               'type': _arrow_type_to_iceberg_type(field.type),
               'nullable': bool(field.nullable),
+              'id': parsed_fid,
           }
         elif field.nullable:
           seen_fields[fname]['nullable'] = True
@@ -2288,15 +2554,29 @@ def register_zero_copy_to_iceberg(
   # schema evolution across Delta commits or Parquet batches) MUST be marked
   # nullable. Historical files lack data for that field, so readers will
   # produce NULL when reading older files.
-  iceberg_fields: list[dict[str, Any]] = []
-  for idx, (fname, fdict) in enumerate(seen_fields.items(), start=1):
-    is_nullable = fdict['nullable'] or (file_field_presence.get(fname, 0) < num_files) or (fname in partition_cols)
-    iceberg_fields.append({
-        'id': idx,
+  raw_iceberg_fields: list[dict[str, Any]] = []
+  used_fids: set[int] = set()
+  next_auto_fid = 1
+  for fname, fdict in seen_fields.items():
+    is_nullable = (
+        fdict['nullable'] or (file_field_presence.get(fname, 0) < num_files) or
+        (fname in partition_cols))
+    cand_fid = fdict.get('id')
+    if cand_fid and cand_fid not in used_fids:
+      fid = int(cand_fid)
+    else:
+      while next_auto_fid in used_fids:
+        next_auto_fid += 1
+      fid = next_auto_fid
+      next_auto_fid += 1
+    used_fids.add(fid)
+    raw_iceberg_fields.append({
+        'id': fid,
         'name': fname,
         'type': fdict['type'],
         'nullable': is_nullable,
     })
+  iceberg_fields = _resolve_iceberg_write_fields(existing_st, raw_iceberg_fields)
 
   partition_spec = None
   if partition_cols:
@@ -2681,7 +2961,7 @@ def cli_read_from_iceberg(
                 val = part_map[fname]
               rec[fname] = _coerce_scalar_for_py(val, type_map[fname])
             if any(
-                tuple(rec.get(c) for c in cols) in kset
+                _canonical_iceberg_key_tuple(rec, cols) in kset
                 for cols, kset in applicable_eq):
               continue
             yield beam.Row(**rec)
@@ -2753,21 +3033,33 @@ def _beam_element_type_to_iceberg_fields(
       continue
     ft = f.type
     nullable = bool(ft.nullable)
-    atom = ft.atomic_type
-    if atom == schema_pb2.BOOLEAN:
-      itype = 'boolean'
-    elif atom in (schema_pb2.INT16, schema_pb2.INT32):
-      itype = 'int'
-    elif atom == schema_pb2.INT64:
-      itype = 'long'
-    elif atom == schema_pb2.FLOAT:
-      itype = 'float'
-    elif atom == schema_pb2.DOUBLE:
-      itype = 'double'
-    elif atom == schema_pb2.BYTES:
-      itype = 'binary'
+    info_kind = ft.WhichOneof('type_info')
+    if info_kind == 'logical_type':
+      urn = str(ft.logical_type.urn or '').lower()
+      if 'decimal' in urn:
+        itype = 'decimal(38, 9)'
+      elif 'date' in urn and 'time' not in urn:
+        itype = 'date'
+      elif 'instant' in urn or 'timestamp' in urn:
+        itype = 'timestamptz'
+      else:
+        itype = 'string'
     else:
-      itype = 'string'
+      atom = ft.atomic_type
+      if atom == schema_pb2.BOOLEAN:
+        itype = 'boolean'
+      elif atom in (schema_pb2.INT16, schema_pb2.INT32):
+        itype = 'int'
+      elif atom == schema_pb2.INT64:
+        itype = 'long'
+      elif atom == schema_pb2.FLOAT:
+        itype = 'float'
+      elif atom == schema_pb2.DOUBLE:
+        itype = 'double'
+      elif atom == schema_pb2.BYTES:
+        itype = 'binary'
+      else:
+        itype = 'string'
     out.append({
         'id': idx,
         'name': f.name,
@@ -2776,6 +3068,63 @@ def _beam_element_type_to_iceberg_fields(
     })
     idx += 1
   return out
+
+
+def _comparable_iceberg_cdc_seq(raw_seq: Any) -> tuple[int, str]:
+  from . import cdc as cdc_mod
+  if isinstance(raw_seq, (datetime.datetime, datetime.date)):
+    raw_seq = raw_seq.isoformat()
+  elif isinstance(raw_seq, decimal.Decimal):
+    if raw_seq.is_nan() or raw_seq.is_infinite():
+      raw_seq = None
+    elif (raw_seq == raw_seq.to_integral_value() and
+          raw_seq.as_tuple().exponent >= 0):
+      raw_seq = int(raw_seq)
+    else:
+      raw_seq = float(raw_seq)
+  return cdc_mod.to_bq_hex_sequence(raw_seq)
+
+
+def _load_prior_cdc_seq_map(
+    table_dir: str,
+    st: dict[str, Any],
+    eq_cols: list[str],
+    seq_col: Optional[str],
+) -> dict[tuple[tuple[int, str], ...], tuple[int, str]]:
+  prior_map: dict[tuple[tuple[int, str], ...], tuple[int, str]] = {}
+  props = (st.get('metadata') or {}).get('properties') or {}
+  seq_fname = props.get('beam.cli.cdc.seq-file')
+  if seq_fname:
+    seq_path = _join_fs(
+        _join_fs(_normalize_fs_root(table_dir), 'metadata'), str(seq_fname))
+    try:
+      if _fs_exists(seq_path):
+        raw_obj = json.loads(_fs_read_bytes(seq_path).decode('utf-8'))
+        if isinstance(raw_obj, dict):
+          for k_str, v_pair in raw_obj.items():
+            parsed_k = tuple(
+                (int(item[0]), str(item[1])) for item in json.loads(k_str))
+            prior_map[parsed_k] = (int(v_pair[0]), str(v_pair[1]))
+    except Exception:  # pylint: disable=broad-except
+      pass
+
+  schema_col_names = {str(f['name']) for f in (st.get('schema') or [])}
+  if seq_col and seq_col in schema_col_names:
+    try:
+      _, live_rows = read_iceberg_rows_local(st)
+      for lr in live_rows:
+        sv = lr.get(seq_col)
+        if sv is None:
+          continue
+        ck = _canonical_iceberg_key_tuple(lr, eq_cols)
+        cseq = _comparable_iceberg_cdc_seq(sv)
+        prev = prior_map.get(ck)
+        if prev is None or cseq > prev:
+          prior_map[ck] = cseq
+    except Exception:  # pylint: disable=broad-except
+      pass
+
+  return prior_map
 
 
 def cli_write_to_iceberg(
@@ -2811,22 +3160,48 @@ def cli_write_to_iceberg(
     except FileNotFoundError:
       pass
 
+  internal_seq_cols = {
+      'beam_cdc_seq',
+      'beam_cdc_hex_seq',
+      '__beam_cdc_seq',
+      '__beam_cdc_hex_seq',
+      '_commit_version',
+      '_commit_snapshot_sequence_number',
+      '_change_sequence_number',
+  }
+  eq_cols = list(equality_columns or [])
+  eq_col_set = set(eq_cols)
+  drop_seq_col = (
+      sequence_number_column
+      if (sequence_number_column and (
+          sequence_number_column in internal_seq_cols or
+          sequence_number_column.startswith(('beam_cdc_', '__beam_cdc_'))))
+      else None)
   meta_drop = {
       c for c in (
           change_type_column,
-          sequence_number_column,
+          drop_seq_col,
           'beam_cdc_op',
           'beam_cdc_seq',
           'beam_cdc_hex_seq',
-      ) if c
+          '__beam_cdc_op',
+          '__beam_cdc_seq',
+          '__beam_cdc_hex_seq',
+          '_change_type',
+          '_commit_version',
+          '_commit_snapshot_sequence_number',
+      ) if c and c not in eq_col_set
   }
-  eq_cols = list(equality_columns or [])
   is_mor = (mode == 'merge-on-read')
+  replace_up_to_ver = (
+      _max_existing_iceberg_metadata_version(table_dir)
+      if if_exists == 'replace' else -1)
 
   class _CommitIcebergBatchDoFn(beam.DoFn):
-    def __init__(self, fields_spec: list[dict[str, Any]], replace_first: bool):
+    def __init__(
+        self, fields_spec: list[dict[str, Any]], replace_max_ver: int):
       self._fields = fields_spec
-      self._replace_first = replace_first
+      self._replace_max_ver = replace_max_ver
 
     def process(self, kv):
       _, rows_iter = kv
@@ -2836,24 +3211,26 @@ def cli_write_to_iceberg(
       if not raw_list:
         return
 
-      # Check if table already has field IDs on disk so IDs remain stable!
-      eff_fields = list(self._fields)
+      cur_max_ver = _max_existing_iceberg_metadata_version(table_dir)
+      should_replace = (
+          self._replace_max_ver >= 0 and cur_max_ver <= self._replace_max_ver)
+
+      st: Optional[dict[str, Any]] = None
       table_exists = False
-      if not self._replace_first:
+      if not should_replace:
         try:
           st = load_iceberg_state(table_dir)
           table_exists = True
-          existing_id_by_name = {f['name']: f['id'] for f in st['schema']}
-          eff_fields = [{
-              **f, 'id': existing_id_by_name.get(f['name'], f['id'])
-          } for f in eff_fields]
         except FileNotFoundError:
+          st = None
           table_exists = False
+      eff_fields = _resolve_iceberg_write_fields(st, list(self._fields))
 
       batch_id = uuid.uuid4().hex
       data_dir = _join_fs(table_dir, 'data')
       new_data: list[dict[str, Any]] = []
       new_eq_del: list[dict[str, Any]] = []
+      cdc_seq_state_out: Optional[dict[str, Any]] = None
 
       if not is_mor:
         clean_rows = [{
@@ -2866,26 +3243,48 @@ def cli_write_to_iceberg(
         if not eq_cols:
           raise ValueError(
               'Iceberg merge-on-read CDC requires --primary-key / equality_columns')
+        prior_seqs = (
+            _load_prior_cdc_seq_map(
+                table_dir, st, eq_cols, sequence_number_column)
+            if (table_exists and st is not None) else {})
+        eff_seq_col = sequence_number_column or 'beam_cdc_seq'
         # Deduplicate per primary key within this commit window by max sequence.
-        latest_by_key: dict[tuple[Any, ...], tuple[int, int, dict[str, Any]]] = {}
+        latest_by_key: dict[
+            tuple[tuple[int, str], ...],
+            tuple[tuple[int, str], int, dict[str, Any], dict[str, Any]]] = {}
         for arrival_idx, r in enumerate(raw_list):
           op_raw = str(
               r.get(change_type_column or 'beam_cdc_op', 'UPSERT')).upper()
           if op_raw in ('UPDATE_BEFORE', 'UPDATE_PREIMAGE'):
             continue
-          seq_val = int(r.get(sequence_number_column or 'beam_cdc_seq') or 0)
-          k_tup = tuple(r.get(c) for c in eq_cols)
-          prev = latest_by_key.get(k_tup)
-          if prev is None or (seq_val, arrival_idx) >= (prev[0], prev[1]):
-            latest_by_key[k_tup] = (seq_val, arrival_idx, r)
+          for pk_c in eq_cols:
+            if r.get(pk_c) is None:
+              raise ValueError(
+                  'Iceberg merge-on-read CDC event has null/missing primary '
+                  f'key column {pk_c!r}')
+          if eff_seq_col == 'beam_cdc_seq' and r.get('beam_cdc_hex_seq'):
+            cand_seq = (
+                int(r.get('beam_cdc_seq') or 0),
+                str(r['beam_cdc_hex_seq']))
+          else:
+            cand_seq = _comparable_iceberg_cdc_seq(r.get(eff_seq_col))
+          ck = _canonical_iceberg_key_tuple(r, eq_cols)
+          key_rec = {c: r.get(c) for c in eq_cols}
+          prev = latest_by_key.get(ck)
+          if prev is None or (cand_seq, arrival_idx) >= (prev[0], prev[1]):
+            latest_by_key[ck] = (cand_seq, arrival_idx, key_rec, r)
 
         upserts: list[dict[str, Any]] = []
         eq_delete_keys: list[dict[str, Any]] = []
-        for k_tup, (_, _, winner) in latest_by_key.items():
+        for ck, (cand_seq, _, key_rec, winner) in latest_by_key.items():
+          if ck in prior_seqs and cand_seq < prior_seqs[ck]:
+            # Stale out-of-order event from an earlier sequence than already
+            # committed in a previous snapshot/window: ignore safely.
+            continue
+          prior_seqs[ck] = cand_seq
           op_w = str(
               winner.get(change_type_column or 'beam_cdc_op', 'UPSERT')).upper()
-          key_rec = {c: val for c, val in zip(eq_cols, k_tup)}
-          if op_w == 'DELETE':
+          if op_w in ('DELETE', 'D'):
             eq_delete_keys.append(key_rec)
           else:
             upserts.append({
@@ -2896,12 +3295,16 @@ def cli_write_to_iceberg(
               # (`data_seq < current_snap_seq`) while keeping this snapshot's row!
               eq_delete_keys.append(key_rec)
 
+        cdc_seq_state_out = {
+            json.dumps(ck, separators=(',', ':')): [s[0], s[1]]
+            for ck, s in prior_seqs.items()
+        }
         if upserts:
           d_path = _join_fs(data_dir, f'00000-0-{batch_id}.parquet')
           new_data.append(
               write_parquet_with_field_ids(d_path, upserts, eff_fields))
         if eq_delete_keys:
-          eq_field_specs = [f for f in eff_fields if f['name'] in set(eq_cols)]
+          eq_field_specs = [f for f in eff_fields if f['name'] in eq_col_set]
           del_path = _join_fs(data_dir, f'00000-0-{batch_id}-eq-del.parquet')
           new_eq_del.append(
               write_parquet_with_field_ids(
@@ -2914,8 +3317,8 @@ def cli_write_to_iceberg(
             identifier_columns=eq_cols if is_mor else None,
             new_data_files=new_data,
             new_eq_delete_files=new_eq_del,
-            replace_table=self._replace_first)
-        self._replace_first = False
+            replace_table=should_replace,
+            cdc_seq_state=cdc_seq_state_out)
 
   class _CliWriteIcebergTransform(beam.PTransform):
     def expand(self, pcoll):
@@ -2935,8 +3338,7 @@ def cli_write_to_iceberg(
                 accumulation_mode=trigger.AccumulationMode.DISCARDING)
             | 'GroupStreamCommit' >> beam.GroupByKey())
       _ = grouped | 'CommitIcebergSnapshot' >> beam.ParDo(
-          _CommitIcebergBatchDoFn(
-              fields_spec, replace_first=(if_exists == 'replace')))
+          _CommitIcebergBatchDoFn(fields_spec, replace_up_to_ver))
       return None
 
   return _CliWriteIcebergTransform()

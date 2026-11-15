@@ -31,6 +31,7 @@ Security & reliability invariants:
    idempotency ledger prevents duplicate job submissions on agent retries.
 """
 
+import contextlib
 import hashlib
 import json
 import os
@@ -123,6 +124,44 @@ def _jobs_dir() -> Path:
   return d
 
 
+@contextlib.contextmanager
+def _file_lock(lock_path: Path):
+  lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+  fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+  try:
+    if os.name == 'nt':
+      import msvcrt
+      os.lseek(fd, 0, os.SEEK_SET)
+      try:
+        if os.fstat(fd).st_size == 0:
+          os.write(fd, b'\0')
+          os.lseek(fd, 0, os.SEEK_SET)
+      except OSError:
+        pass
+      while True:
+        try:
+          msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+          break
+        except OSError:
+          time.sleep(0.05)
+    else:
+      import fcntl
+      fcntl.flock(fd, fcntl.LOCK_EX)
+    yield
+  finally:
+    try:
+      if os.name == 'nt':
+        import msvcrt
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+      else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+      pass
+    os.close(fd)
+
+
 def validate_job_id(job_id: str) -> str:
   """Validates `job_id` against `SAFE_JOB_ID_RE` and blocks path traversal."""
   cleaned = (job_id or '').strip()
@@ -152,6 +191,11 @@ def _atomic_write_json(target: Path, payload: dict[str, Any]) -> None:
     with os.fdopen(fd, 'w', encoding='utf-8') as f:
       json.dump(payload, f, indent=2, sort_keys=True)
       f.write('\n')
+      f.flush()
+      try:
+        os.fsync(f.fileno())
+      except OSError:
+        pass
     os.replace(tmp_path, target)
   finally:
     if os.path.exists(tmp_path):
@@ -170,13 +214,17 @@ def lookup_recent_submission(
     idem_key: str, ttl_seconds: int = 1800) -> dict[str, Any] | None:
   """Returns an active/recent remote job record if submitted within `ttl_seconds`."""
   from . import output as out_mod
-  ledger_path = _jobs_dir() / '_idempotency_ledger.json'
+  jobs_d = _jobs_dir()
+  ledger_path = jobs_d / '_idempotency_ledger.json'
   if not ledger_path.is_file() or os.path.islink(ledger_path):
     return None
   try:
-    ledger = json.loads(
-        out_mod.read_bounded_text(ledger_path, label=str(ledger_path)))
+    with _file_lock(jobs_d / '.ledger.lock'):
+      ledger = json.loads(
+          out_mod.read_bounded_text(ledger_path, label=str(ledger_path)))
   except (OSError, ValueError):
+    return None
+  if not isinstance(ledger, dict):
     return None
   entry = ledger.get(idem_key)
   if not isinstance(entry, dict):
@@ -235,27 +283,31 @@ def record_job_submission(
       'outputs': outputs or {},
       'metrics': {},
   }
-  job_path = _jobs_dir() / f'{safe_id}.json'
+  jobs_d = _jobs_dir()
+  job_path = jobs_d / f'{safe_id}.json'
   _atomic_write_json(job_path, record)
 
   if idem_key:
-    ledger_path = _jobs_dir() / '_idempotency_ledger.json'
-    ledger: dict[str, Any] = {}
-    if ledger_path.is_file() and not os.path.islink(ledger_path):
-      try:
-        ledger = json.loads(
-            out_mod.read_bounded_text(ledger_path, label=str(ledger_path)))
-      except (OSError, ValueError):
+    ledger_path = jobs_d / '_idempotency_ledger.json'
+    with _file_lock(jobs_d / '.ledger.lock'):
+      ledger: dict[str, Any] = {}
+      if ledger_path.is_file() and not os.path.islink(ledger_path):
+        try:
+          ledger = json.loads(
+              out_mod.read_bounded_text(ledger_path, label=str(ledger_path)))
+        except (OSError, ValueError):
+          ledger = {}
+      if not isinstance(ledger, dict):
         ledger = {}
-    # Prune entries older than 2 hours.
-    cutoff = now - 7200
-    ledger = {
-        k: v
-        for k, v in ledger.items()
-        if isinstance(v, dict) and float(v.get('submitted_at', 0)) >= cutoff
-    }
-    ledger[idem_key] = {'job_id': safe_id, 'submitted_at': now}
-    _atomic_write_json(ledger_path, ledger)
+      # Prune entries older than 2 hours.
+      cutoff = now - 7200
+      ledger = {
+          k: v
+          for k, v in ledger.items()
+          if isinstance(v, dict) and float(v.get('submitted_at', 0)) >= cutoff
+      }
+      ledger[idem_key] = {'job_id': safe_id, 'submitted_at': now}
+      _atomic_write_json(ledger_path, ledger)
   return record
 
 
@@ -721,10 +773,31 @@ def wait_for_job(
 
   while True:
     state_str, counters = fetch(safe_id, proj, reg)
-    record['state'] = state_str
+    upper = state_str.upper()
+    try:
+      latest_disk = load_job_record(safe_id)
+      if isinstance(latest_disk, dict):
+        disk_state = str(latest_disk.get('state') or '').upper()
+        record.update(latest_disk)
+        if console_url:
+          merged_out = dict(record.get('outputs') or {})
+          merged_out.setdefault('console_url', console_url)
+          record['outputs'] = merged_out
+        if (disk_state in ('JOB_STATE_CANCELLED', 'CANCELLED', 'CANCELED',
+                           'JOB_STATE_DRAINING', 'DRAINING') and
+            upper not in (_TERMINAL_SUCCESS_STATES | _TERMINAL_FAILURE_STATES)):
+          record['state'] = latest_disk['state']
+        else:
+          record['state'] = state_str
+      else:
+        record['state'] = state_str
+    except JobError:
+      record['state'] = state_str
+
     record['updated_at'] = time.time()
-    if counters:
-      record['metrics'] = counters
+    eff_counters = counters if counters else dict(record.get('metrics') or {})
+    if eff_counters:
+      record['metrics'] = eff_counters
     _atomic_write_json(_jobs_dir() / f'{safe_id}.json', record)
 
     now_m = time.monotonic()
@@ -739,7 +812,6 @@ def wait_for_job(
       last_logged_state = state_str
       last_logged_at = now_m
 
-    upper = state_str.upper()
     if upper in _TERMINAL_SUCCESS_STATES:
       outputs_obj = dict(record.get('outputs') or {})
       out_pfx = outputs_obj.get('output_prefix')
@@ -769,7 +841,7 @@ def wait_for_job(
       # Run deferred post-checks (`assert_counts` / `verify_diff`) if persisted!
       post = record.get('post_checks') or {}
       if post.get('assert_counts'):
-        err_msg = check_assert_counts(counters)
+        err_msg = check_assert_counts(eff_counters)
         if err_msg:
           record['validation_state'] = 'FAILED'
           record['validation_exit_code'] = EXIT_PIPELINE_FAILED
@@ -784,6 +856,9 @@ def wait_for_job(
             v_cfg['left'],
             v_right,
             keys=v_cfg.get('keys'),
+            left_opts=v_cfg.get('left_opts'),
+            right_opts=v_cfg.get('right_opts'),
+            pipeline_args=v_cfg.get('pipeline_args'),
             default_project=proj)
         diff_report.pop('untrusted_data', None)
         outputs_obj['verify'] = diff_report
@@ -862,25 +937,43 @@ def cancel_job(
       verb='cancel')
 
   target_state = 'JOB_STATE_DRAINING' if drain else 'JOB_STATE_CANCELLED'
+  already_terminal = False
+  current_state: str | None = None
   if cancel_fn is not None:
     ok = bool(cancel_fn(safe_id, proj, reg, target_state))
   else:
-    ok = _DataflowPoller(proj, reg).modify_state(safe_id, target_state)
+    poller = _DataflowPoller(proj, reg)
+    ok = poller.modify_state(safe_id, target_state)
+    if not ok:
+      try:
+        q_state, _ = poller.query(safe_id)
+        current_state = str(q_state or '').upper()
+        if current_state in (_TERMINAL_SUCCESS_STATES |
+                             _TERMINAL_FAILURE_STATES):
+          ok = True
+          already_terminal = True
+      except Exception:  # pylint: disable=broad-except
+        pass
 
   if not ok:
+    hint = f' (current state: {current_state})' if current_state else ''
     raise JobError(
-        f'runner rejected state transition to {target_state} for job {safe_id!r}',
+        f'runner rejected state transition to {target_state} for job {safe_id!r}{hint}',
         EXIT_PIPELINE_FAILED)
 
   if record:
-    record['state'] = target_state
+    record['state'] = current_state if already_terminal else target_state
     record['updated_at'] = time.time()
     _atomic_write_json(_jobs_dir() / f'{safe_id}.json', record)
 
-  return {
+  out_res: dict[str, Any] = {
       'job_id': safe_id,
       'project': proj,
       'region': reg,
       'requested_state': target_state,
       'mode': 'drain' if drain else 'cancel',
   }
+  if already_terminal and current_state:
+    out_res['already_terminal'] = True
+    out_res['current_state'] = current_state
+  return out_res

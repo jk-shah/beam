@@ -52,6 +52,7 @@ class PipeSpec(NamedTuple):
   requires_java_xlang: bool = False
   is_unbounded: bool = False
   late_dlq_endpoint: uris.ParsedEndpoint | None = None
+  right_endpoint: uris.ParsedEndpoint | None = None
 
 
 def _normalize_primary_keys(primary_keys: Iterable[str] | None) -> list[str]:
@@ -81,6 +82,19 @@ _AGG_CALL_RE = re.compile(
 )
 
 
+def _split_colon_kv_tokens(tokens: list[str]) -> list[str]:
+  """Expands colon-delimited `k=v` window tokens (`gap=30m:key=user_id`)."""
+  expanded: list[str] = []
+  for tok in tokens:
+    if ':' in tok and '=' in tok:
+      parts = [p.strip() for p in tok.split(':') if p.strip()]
+      if len(parts) > 1:
+        expanded.extend(parts)
+        continue
+    expanded.append(tok)
+  return expanded
+
+
 def _split_window_tokens(s: str) -> list[str]:
   """Splits window specification tokens by commas outside brackets and quotes."""
   from . import interval_join as ij_mod
@@ -108,8 +122,8 @@ def _parse_inline_aggregations(
   group_by: list[str] = []
   remaining: list[str] = []
   for t in tokens:
-    # 1. Parse optional grouping key specification: group_by=... or by=...
-    if t.startswith(('group_by=', 'by=')):
+    # 1. Parse optional grouping key specification: group_by=..., by=..., key=...
+    if t.startswith(('group_by=', 'by=', 'key=', 'keys=')):
       val = t.split('=', 1)[1]
       cols = [c.strip("[] '\"") for c in val.split(',') if c.strip("[] '\"")]
       group_by.extend(cols)
@@ -244,7 +258,7 @@ def parse_window_spec(spec: str | dict[str, Any]) -> dict[str, Any]:
       prefix = cand_prefix.lower()
       rest = cand_rest.strip()
 
-  tokens = _split_window_tokens(rest)
+  tokens = _split_colon_kv_tokens(_split_window_tokens(rest))
   combines, group_by, rem_tokens = _parse_inline_aggregations(tokens)
 
   kv_tokens: dict[str, str] = {}
@@ -277,6 +291,10 @@ def parse_window_spec(spec: str | dict[str, Any]) -> dict[str, Any]:
                              None) or (pos_tokens[0] if pos_tokens else None)
     period_val = kv_tokens.pop(
         'period', None) or (pos_tokens[1] if len(pos_tokens) > 1 else None)
+    if not period_val and size_val and ':' in size_val:
+      s_parts = [p.strip() for p in size_val.split(':', 1)]
+      if len(s_parts) == 2 and s_parts[0] and s_parts[1]:
+        size_val, period_val = s_parts[0], s_parts[1]
     if not size_val or not period_val:
       raise PipeSpecError(
           f"invalid sliding window specification {s!r}; expected sliding:SIZE,PERIOD (e.g. 'sliding:5m,1m')")
@@ -302,6 +320,8 @@ def parse_window_spec(spec: str | dict[str, Any]) -> dict[str, Any]:
   out.update(kv_tokens)
   if combines:
     out['aggregations'] = {'group_by': group_by, 'combine': combines}
+  elif group_by:
+    out['group_by'] = group_by
   return out
 
 
@@ -380,6 +400,8 @@ def build_pipe_spec(
     watermark_lag: str | None = None,
     dlq_redact_fields: Iterable[str] | str | None = None,
     limit: int | None = None,
+    drop_bad: bool = False,
+    assert_counts: bool = False,
 ) -> PipeSpec:
   """Returns the `PipeSpec` for `beam pipe`."""
   if limit is not None:
@@ -529,16 +551,18 @@ def build_pipe_spec(
       late_dlq_ep is not None or emit_pane_info or watermark_lag is not None)
 
   if zero_copy:
+    if limit is not None:
+      raise PipeSpecError('--limit cannot be combined with --zero-copy')
     if (cdc or where or pre_select or post_where or select or
-        dlq_ep is not None or window or has_b23_window_opts or timestamp_col or
-        expect or interval_join or asof_join or pattern or
+        dlq_ep is not None or drop_bad or window or has_b23_window_opts or
+        timestamp_col or expect or interval_join or asof_join or pattern or
         allowed_lateness is not None or dedupe_by or enrich or infer):
       raise PipeSpecError(
           '--zero-copy registers existing Parquet files in-place without '
           'rewriting data, so it cannot be combined with --cdc, --where, '
           '--pre-select, --enrich, --infer, --post-where, --pattern, --select, '
           '--window, --allowed-lateness, --trigger, --timestamp-col, --expect, '
-          '--interval-join, --asof-join, --dedupe-by, or --dlq')
+          '--interval-join, --asof-join, --dedupe-by, --drop-bad, or --dlq')
     if dst_ep.kind != 'iceberg':
       raise PipeSpecError(
           f'--zero-copy requires an iceberg:// destination, got {dst_ep.raw!r}')
@@ -637,12 +661,25 @@ def build_pipe_spec(
         'immutable shards (use a new prefix or --if-exists=replace)')
 
   window_spec = parse_window_spec(window) if window else None
+  window_group_by = window_spec.pop('group_by', None) if window_spec else None
   window_aggs = window_spec.pop('aggregations', None) if window_spec else None
   if window_spec is not None and window_aggs is None and select:
     inferred_aggs = _extract_sql_select_window_aggs(select)
     if inferred_aggs is not None:
+      if window_group_by:
+        merged_gb = list(window_group_by)
+        for c in inferred_aggs.get('group_by', []):
+          if c not in merged_gb:
+            merged_gb.append(c)
+        inferred_aggs['group_by'] = merged_gb
       window_aggs = inferred_aggs
       select = None
+  elif window_group_by and window_aggs is not None:
+    merged_gb = list(window_group_by)
+    for c in window_aggs.get('group_by', []):
+      if c not in merged_gb:
+        merged_gb.append(c)
+    window_aggs['group_by'] = merged_gb
   clean_timestamp_col = str(timestamp_col).strip() if timestamp_col else None
   if clean_timestamp_col == '':
     raise PipeSpecError('--timestamp-col cannot be empty')
@@ -837,10 +874,19 @@ def build_pipe_spec(
       num_stages: int,
       opt_flag: str,
   ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    from . import interval_join as ij_mod
     global_map: dict[str, Any] = {}
     per_stage: list[dict[str, Any]] = [{} for _ in range(num_stages)]
+
+    def _assign_stage_kv(target_idx: int | None, key_name: str, val_obj: Any):
+      if target_idx is None:
+        global_map[key_name] = val_obj
+      else:
+        per_stage[target_idx][key_name] = val_obj
+
     for rk, rv in raw_opts_map.items():
       m_st = re.match(r'^(\d+):(.+)$', str(rk).strip())
+      target_stage: int | None = None
       if m_st:
         s_idx = int(m_st.group(1))
         sub_k = m_st.group(2).strip()
@@ -848,9 +894,31 @@ def build_pipe_spec(
           raise PipeSpecError(
               f'{opt_flag} stage prefix {m_st.group(1)}: out of range for '
               f'{num_stages} configured stage(s) (use 1..{num_stages})')
-        per_stage[s_idx - 1][sub_k] = rv
+        target_stage = s_idx - 1
       else:
-        global_map[str(rk)] = rv
+        sub_k = str(rk)
+
+      if isinstance(rv, str) and ',' in rv and '=' in rv:
+        segs = ij_mod.split_bracket_tokens(rv)
+        lead_parts: list[str] = []
+        extra_pairs: list[tuple[str, str]] = []
+        for idx_s, seg in enumerate(segs):
+          m_kv = (
+              re.match(r'^([A-Za-z_][A-Za-z0-9_]*)=(.*)$', seg)
+              if idx_s > 0 else None)
+          if m_kv:
+            extra_pairs.append((m_kv.group(1), m_kv.group(2).strip()))
+          elif extra_pairs:
+            prev_k, prev_v = extra_pairs[-1]
+            extra_pairs[-1] = (prev_k, f'{prev_v},{seg}')
+          else:
+            lead_parts.append(seg)
+        if extra_pairs:
+          _assign_stage_kv(target_stage, sub_k, ','.join(lead_parts))
+          for ek, ev in extra_pairs:
+            _assign_stage_kv(target_stage, ek, ev)
+          continue
+      _assign_stage_kv(target_stage, sub_k, rv)
     return global_map, per_stage
 
   enrich_yaml_cfgs: list[dict[str, Any]] = []
@@ -1503,24 +1571,38 @@ def build_pipe_spec(
     needs_cli_provider = True
 
   # Pure Java-to-Java fast path: skip Python counter stages unless explicitly
-  # requested (`include_counters=True` when `--assert-counts` or Python stage).
+  # requested (`assert_counts=True` or Python transform stage active).
   pure_java_pipe = (
       src_java and sink_java and cdc_norm_cfg is None and not where_cfg and
       not pre_select_cfg and not post_where_cfg and not enrich_yaml_cfgs and
-      not infer_yaml_cfgs and not select_cfg and not dlq_ep and
+      not infer_yaml_cfgs and not select_cfg and not dlq_ep and not drop_bad and
       not late_dlq_ep and two_stream_cfg is None and dedupe_yaml_cfg is None and
       pattern_yaml_cfg is None and cli_window_yaml_cfg is None and
-      not window_aggs)
-  inject_counters = bool(include_counters) and not pure_java_pipe
+      not window_aggs and not parsed_expect_rules and limit is None)
+  inject_counters = bool(include_counters) and (
+      bool(assert_counts) or not pure_java_pipe)
   if inject_counters:
     needs_cli_provider = True
 
-  # Simple linear chain when neither `--dlq` nor a 2-stream join is active!
-  if dlq_ep is None and late_dlq_ep is None and two_stream_cfg is None:
+  # Simple linear chain when neither `--dlq`, `--drop-bad`, nor a 2-stream join is active!
+  if (dlq_ep is None and not drop_bad and late_dlq_ep is None and
+      two_stream_cfg is None):
     chain_steps: list[dict[str, Any]] = [{
         'type': src_type,
         'config': src_cfg,
     }]
+    if cdc and src_type == 'ReadFromText':
+      chain_steps.append({
+          'name': 'FilterBlankCdcLines',
+          'type': 'Filter',
+          'config': {
+              'language': 'python',
+              'keep': {
+                  'callable':
+                  "lambda row: bool(getattr(row, 'line', str(row)).strip())"
+              },
+          },
+      })
     if rowify_nested:
       # Must directly follow the source: a schema-typed step in between would
       # encode the nested dicts with RowCoder and fail.
@@ -1690,10 +1772,11 @@ def build_pipe_spec(
         sink_endpoint=dst_ep,
         dlq_endpoint=None,
         requires_java_xlang=src_java or sink_java,
-        is_unbounded=is_unbounded)
+        is_unbounded=is_unbounded,
+        right_endpoint=right_ep)
 
-  # Non-linear DAG when `--dlq` or `--interval-join` IS active!
-  has_dlq = dlq_ep is not None
+  # Non-linear DAG when `--dlq`, `--drop-bad`, or a 2-stream join IS active!
+  has_dlq = (dlq_ep is not None) or bool(drop_bad)
   needs_cli_provider = True
   dag_transforms: list[dict[str, Any]] = []
   dlq_norm_refs: list[str] = []
@@ -1746,8 +1829,19 @@ def build_pipe_spec(
     })
     if 'error_handling' in cfg_copy:
       out_ref = f'{node_name}.good' if counts_internally else node_name
-      dag_transforms.append(
-          _norm_dlq(norm_dlq_name, f'{node_name}.errors', s_type))
+      err_ref = f'{node_name}.errors'
+      if inject_counters and not counts_internally:
+        err_count_name = f'Count{node_name}ErrorsRead'
+        dag_transforms.append({
+            'name': err_count_name,
+            'type': 'CliCountRows',
+            'input': err_ref,
+            'config': {
+                'counter': 'rows_read'
+            },
+        })
+        err_ref = err_count_name
+      dag_transforms.append(_norm_dlq(norm_dlq_name, err_ref, s_type))
       dlq_norm_refs.append(norm_dlq_name)
     else:
       out_ref = node_name
@@ -1885,6 +1979,20 @@ def build_pipe_spec(
   else:
     current_ref, source_counts_internally = _attach_source_node(
         'ReadSource', src_ep, src_type, src_cfg, 'NormalizeSourceDlq')
+    if cdc and src_type == 'ReadFromText':
+      dag_transforms.append({
+          'name': 'FilterBlankCdcLines',
+          'type': 'Filter',
+          'input': current_ref,
+          'config': {
+              'language': 'python',
+              'keep': {
+                  'callable':
+                  "lambda row: bool(getattr(row, 'line', str(row)).strip())"
+              },
+          },
+      })
+      current_ref = 'FilterBlankCdcLines'
     if rowify_nested:
       # Must directly follow the source (see the chain form above).
       dag_transforms.append({
@@ -2293,8 +2401,20 @@ def build_pipe_spec(
         'input': current_ref,
         'config': dst_cfg,
     })
+    sink_err_ref = 'WriteSink.errors'
+    if inject_counters and sink_type not in (
+        'CliWriteToBigQuery', 'CliWriteToBigQueryCDC'):
+      dag_transforms.append({
+          'name': 'CountSinkDlq',
+          'type': 'CliCountRows',
+          'input': sink_err_ref,
+          'config': {
+              'counter': 'sink_dlq_rows'
+          },
+      })
+      sink_err_ref = 'CountSinkDlq'
     dag_transforms.append(
-        _norm_dlq('NormalizeSinkDlq', 'WriteSink.errors', dst_ep.yaml_type))
+        _norm_dlq('NormalizeSinkDlq', sink_err_ref, dst_ep.yaml_type))
     dlq_norm_refs.append('NormalizeSinkDlq')
   else:
     dag_transforms.append({
@@ -2305,7 +2425,6 @@ def build_pipe_spec(
     })
 
   if has_dlq and dlq_norm_refs:
-    assert dlq_ep is not None
     if len(dlq_norm_refs) == 1:
       dlq_input_ref = dlq_norm_refs[0]
     else:
@@ -2316,27 +2435,48 @@ def build_pipe_spec(
       })
       dlq_input_ref = 'MergeDlq'
 
-    if inject_counters:
+    if dlq_ep is not None:
+      if inject_counters:
+        dag_transforms.append({
+            'name': 'CountDlq',
+            'type': 'CliCountRows',
+            'input': dlq_input_ref,
+            'config': {
+                'counter': 'dlq_rows'
+            },
+        })
+        dlq_input_ref = 'CountDlq'
+
+      dlq_sink_type = (
+          'CliWriteToBigQuery' if
+          (prefer_python_bigquery_sink and dlq_ep.kind == 'bigquery') else
+          dlq_ep.yaml_type)
       dag_transforms.append({
-          'name': 'CountDlq',
-          'type': 'CliCountRows',
+          'name': 'WriteDlq',
+          'type': dlq_sink_type,
+          'input': dlq_input_ref,
+          'config': dict(dlq_ep.config),
+      })
+    else:
+      if inject_counters:
+        dag_transforms.append({
+            'name': 'CountDroppedBad',
+            'type': 'CliCountRows',
+            'input': dlq_input_ref,
+            'config': {
+                'counter': 'stage_dropped_rows'
+            },
+        })
+        dlq_input_ref = 'CountDroppedBad'
+      dag_transforms.append({
+          'name': 'DropBadRows',
+          'type': 'Filter',
           'input': dlq_input_ref,
           'config': {
-              'counter': 'dlq_rows'
+              'language': 'python',
+              'keep': 'False',
           },
       })
-      dlq_input_ref = 'CountDlq'
-
-    dlq_sink_type = (
-        'CliWriteToBigQuery' if
-        (prefer_python_bigquery_sink and dlq_ep.kind == 'bigquery') else
-        dlq_ep.yaml_type)
-    dag_transforms.append({
-        'name': 'WriteDlq',
-        'type': dlq_sink_type,
-        'input': dlq_input_ref,
-        'config': dict(dlq_ep.config),
-    })
 
   if late_dlq_ep is not None and late_dlq_norm_ref is not None:
     late_input_ref = late_dlq_norm_ref
@@ -2380,7 +2520,8 @@ def build_pipe_spec(
           (dlq_ep is not None and dlq_ep.is_java_xlang) or
           (late_dlq_ep is not None and late_dlq_ep.is_java_xlang)),
       is_unbounded=is_unbounded,
-      late_dlq_endpoint=late_dlq_ep)
+      late_dlq_endpoint=late_dlq_ep,
+      right_endpoint=right_ep)
 
 
 def _redact_spec_secrets(

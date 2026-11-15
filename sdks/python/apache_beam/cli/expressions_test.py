@@ -336,6 +336,55 @@ class SqlNullSemanticsTest(unittest.TestCase):
     self.assertIs(value('ca', rows[4]), False)  # 'C' is not in ('CA')
     self.assertIs(value('ca', rows[2]), None)
 
+  def test_between_and_like_ilike_match_sqlite_and_pass_ast_guard(self):
+    from apache_beam.cli import check_cmd
+    sql_cases = [
+        'amount BETWEEN 50 AND 150',
+        'amount NOT BETWEEN 50 AND 150',
+        "state LIKE 'C%'",
+        "state NOT LIKE 'C%'",
+        "state LIKE '_A'",
+    ]
+    for expr in sql_cases:
+      cfg, _ = expressions.compile_where(expr)
+      if isinstance(cfg['keep'], dict):
+        self.assertTrue(
+            check_cmd._is_safe_inline_callable(cfg['keep']['callable']), expr)
+      got = sorted(r['id'] for r in self.ROWS if _eval_keep(cfg['keep'], r))
+      self.assertEqual(got, self._sqlite_ids(expr), expr)
+
+    ilike_cfg, _ = expressions.compile_where(
+        "city ILIKE 'm%' AND code NOT ILIKE 'x_%'")
+    self.assertTrue(
+        check_cmd._is_safe_inline_callable(ilike_cfg['keep']['callable']))
+    self.assertTrue(
+        _eval_keep(ilike_cfg['keep'], {'city': 'Munich', 'code': 'a1'}))
+    self.assertFalse(
+        _eval_keep(ilike_cfg['keep'], {'city': 'Munich', 'code': 'X99'}))
+    self.assertFalse(
+        _eval_keep(ilike_cfg['keep'], {'city': None, 'code': 'a1'}))
+
+  def test_temporal_comparisons_iso_str_and_aware_vs_naive(self):
+    import datetime
+    from apache_beam.cli import check_cmd
+    cfg, _ = expressions.compile_where(
+        "created_at >= '2026-01-01' AND updated_at > created_at")
+    self.assertIsInstance(cfg['keep'], dict)
+    self.assertTrue(check_cmd._is_safe_inline_callable(cfg['keep']['callable']))
+    self.assertTrue(
+        _eval_keep(
+            cfg['keep'], {
+                'created_at': datetime.datetime(2026, 2, 1, 0, 0),
+                'updated_at': datetime.datetime(
+                    2026, 2, 1, 1, 0, tzinfo=datetime.timezone.utc),
+            }))
+    self.assertFalse(
+        _eval_keep(
+            cfg['keep'], {
+                'created_at': datetime.date(2025, 12, 31),
+                'updated_at': datetime.datetime(2026, 2, 1, 1, 0),
+            }))
+
 
 if __name__ == '__main__':
   unittest.main()

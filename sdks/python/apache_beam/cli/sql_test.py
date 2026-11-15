@@ -24,6 +24,7 @@ import subprocess
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
+import zipfile
 from unittest import mock
 
 from apache_beam.cli import sql
@@ -35,10 +36,16 @@ def _proc(returncode=0, stdout='', stderr=''):
       args=[], returncode=returncode, stdout=stdout, stderr=stderr)
 
 
+def _write_dummy_jar(path: str) -> None:
+  os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+  with zipfile.ZipFile(path, 'w') as zf:
+    zf.writestr('META-INF/MANIFEST.MF', 'Manifest-Version: 1.0\n')
+
+
 class SqlShellTest(unittest.TestCase):
   def setUp(self):
     self.tmp = tempfile.mkdtemp()
-    self.addCleanup(shutil.rmtree, self.tmp)
+    self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
     self.beam_home = os.path.join(self.tmp, '.beam')
 
   def test_cache_hit_skips_maven_and_matches_beam_sql_sh_filename(self):
@@ -53,8 +60,7 @@ class SqlShellTest(unittest.TestCase):
     for runner, ios, expected_name in cases:
       with self.subTest(runner=runner, ios=ios):
         jar_path = os.path.join(cache_dir, expected_name)
-        with open(jar_path, 'wb') as f:
-          f.write(b'cached-jar')
+        _write_dummy_jar(jar_path)
         calls = []
 
         def fake_run(cmd, **kwargs):
@@ -87,25 +93,24 @@ class SqlShellTest(unittest.TestCase):
                 'SELECT 1',
             ])
 
-  def test_cache_miss_builds_shaded_jar_and_caches_atomically(self):
+  def test_cache_miss_builds_shaded_jar_via_maven_wrapper_main(self):
     pom_captured = []
+    wrapper_cmds = []
 
-    def fake_download(url, dest):
-      with open(dest, 'wb') as f:
-        f.write(b'stub')
+    def fake_download(url, dest, **kwargs):
+      _write_dummy_jar(dest)
 
     def fake_run(cmd, **kwargs):
       if cmd[-1] == '-version':
         return _proc(0, stderr='openjdk version "21.0.2"')
-      if cmd[0].endswith('mvnw'):
+      if 'org.apache.maven.wrapper.MavenWrapperMain' in cmd:
+        wrapper_cmds.append(cmd)
         pom_file = cmd[cmd.index('-f') + 1]
         with open(pom_file, encoding='utf-8') as f:
           pom_captured.append(f.read())
         target = os.path.join(os.path.dirname(pom_file), 'target')
         os.makedirs(target)
-        with open(os.path.join(target, 'beam-sql-shell-runner-1.0.jar'),
-                  'wb') as f:
-          f.write(b'built-uber-jar')
+        _write_dummy_jar(os.path.join(target, 'beam-sql-shell-runner-1.0.jar'))
         return _proc(0)
       return _proc(0)
 
@@ -123,14 +128,77 @@ class SqlShellTest(unittest.TestCase):
           beam_home=self.beam_home)
 
     self.assertEqual(rc, 0)
+    self.assertEqual(len(wrapper_cmds), 1)
+    self.assertEqual(wrapper_cmds[0][0], '/opt/jdk21/bin/java')
+    self.assertTrue(
+        wrapper_cmds[0][1].startswith('-Dmaven.multiModuleProjectDirectory='))
+    self.assertFalse(
+        os.path.exists(os.path.join(self.beam_home, 'maven-wrapper', 'mvnw')))
     cached = os.path.join(
         self.beam_home, 'cache', 'beam-2.75.0_runner-dataflow_ios-csv.jar')
-    self.assertTrue(os.path.isfile(cached))
+    self.assertTrue(zipfile.is_zipfile(cached))
     # Generated POM must parse as valid XML and shade ServiceLoader entries.
     ET.fromstring(pom_captured[0])
     self.assertIn('beam-sdks-java-io-csv', pom_captured[0])
     self.assertIn('beam-runners-google-cloud-dataflow-java', pom_captured[0])
     self.assertIn('ServicesResourceTransformer', pom_captured[0])
+
+  def test_corrupt_cached_jar_is_rebuilt_not_trusted(self):
+    cache_dir = os.path.join(self.beam_home, 'cache')
+    os.makedirs(cache_dir)
+    corrupt_jar = os.path.join(
+        cache_dir, 'beam-2.75.0_runner-direct_ios-.jar')
+    with open(corrupt_jar, 'wb') as f:
+      f.write(b'corrupt-truncated-not-a-zip')
+
+    rebuilt = []
+
+    def fake_download(url, dest, **kwargs):
+      _write_dummy_jar(dest)
+
+    def fake_run(cmd, **kwargs):
+      if cmd[-1] == '-version':
+        return _proc(0, stderr='openjdk version "21.0.2"')
+      if 'org.apache.maven.wrapper.MavenWrapperMain' in cmd:
+        rebuilt.append(True)
+        pom_file = cmd[cmd.index('-f') + 1]
+        _write_dummy_jar(
+            os.path.join(
+                os.path.dirname(pom_file),
+                'target',
+                'beam-sql-shell-runner-1.0.jar'))
+        return _proc(0)
+      return _proc(0)
+
+    with (
+        mock.patch.dict(os.environ, {}, clear=True),
+        mock.patch('shutil.which', return_value='/opt/jdk21/bin/java'),
+        mock.patch.object(sql, '_download_https', side_effect=fake_download),
+        mock.patch('subprocess.run', side_effect=fake_run),
+        contextlib.redirect_stderr(io.StringIO()),
+    ):
+      rc = sql.run(version='2.75.0', beam_home=self.beam_home)
+    self.assertEqual(rc, 0)
+    self.assertEqual(rebuilt, [True])
+    self.assertTrue(zipfile.is_zipfile(corrupt_jar))
+
+  def test_windows_java_home_resolves_java_exe(self):
+    fake_jdk = os.path.join(self.tmp, 'jdk21')
+    os.makedirs(os.path.join(fake_jdk, 'bin'))
+    java_exe = os.path.join(fake_jdk, 'bin', 'java.exe')
+    with open(java_exe, 'wb') as f:
+      f.write(b'MZ')
+
+    with (
+        mock.patch.dict(os.environ, {'JAVA_HOME': fake_jdk}, clear=True),
+        mock.patch.object(sql.os, 'name', 'nt'),
+        mock.patch(
+            'subprocess.run',
+            return_value=_proc(0, stderr='openjdk version "21.0.2"')),
+    ):
+      found_bin, found_home = sql._find_java()
+    self.assertTrue(found_bin.endswith('java.exe'))
+    self.assertEqual(found_home, fake_jdk)
 
   def test_java_prerequisite_checks_exit_with_4(self):
     cases = [
@@ -160,9 +228,8 @@ class SqlShellTest(unittest.TestCase):
   def test_warns_on_bleeding_edge_java(self):
     cache_dir = os.path.join(self.beam_home, 'cache')
     os.makedirs(cache_dir)
-    with open(os.path.join(cache_dir, 'beam-2.75.0_runner-direct_ios-.jar'),
-              'wb') as f:
-      f.write(b'jar')
+    _write_dummy_jar(
+        os.path.join(cache_dir, 'beam-2.75.0_runner-direct_ios-.jar'))
     err = io.StringIO()
     with (
         mock.patch.dict(os.environ, {}, clear=True),

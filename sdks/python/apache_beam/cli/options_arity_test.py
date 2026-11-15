@@ -35,6 +35,7 @@ def _all_subclasses(cls):
 
 class OptionAritySyncTest(unittest.TestCase):
   def test_static_tables_match_pipeline_options_subclasses(self):
+    import apache_beam
     from apache_beam.yaml import options as _yaml_options
     self.assertIsNotNone(_yaml_options)
     parser = argparse.ArgumentParser(add_help=False, conflict_handler='resolve')
@@ -55,9 +56,33 @@ class OptionAritySyncTest(unittest.TestCase):
       else:
         live_one.update(action.option_strings)
 
-    self.assertEqual(set(_option_arity.PIPELINE_ZERO_ARG_FLAGS), live_zero)
-    self.assertEqual(set(_option_arity.PIPELINE_ONE_ARG_FLAGS), live_one)
-    self.assertEqual(set(_option_arity.PIPELINE_MULTI_ARG_FLAGS), live_multi)
+    static_zero = set(_option_arity.PIPELINE_ZERO_ARG_FLAGS)
+    static_one = set(_option_arity.PIPELINE_ONE_ARG_FLAGS)
+    static_multi = set(_option_arity.PIPELINE_MULTI_ARG_FLAGS)
+
+    if '.dev' in str(getattr(apache_beam, '__version__', '')):
+      self.assertEqual(static_zero, live_zero)
+      self.assertEqual(static_one, live_one)
+      self.assertEqual(static_multi, live_multi)
+    else:
+      # On released Beam wheels (e.g. 2.71-2.78), guarantee zero cross-arity
+      # misclassification plus strong coverage across core flags.
+      self.assertEqual(live_zero & static_one, set())
+      self.assertEqual(live_one & static_zero, set())
+      self.assertEqual(live_zero & static_multi, set())
+      self.assertEqual(live_multi & static_zero, set())
+      self.assertEqual(live_one & static_multi, set())
+      self.assertEqual(live_multi & static_one, set())
+      self.assertGreaterEqual(
+          len(live_zero & static_zero) / max(1, len(live_zero)), 0.85)
+      self.assertGreaterEqual(
+          len(live_one & static_one) / max(1, len(live_one)), 0.85)
+      self.assertTrue(
+          {'--streaming', '--no_use_public_ips'}.issubset(
+              live_zero & static_zero))
+      self.assertTrue(
+          {'--runner', '--project', '--region', '--temp_location'}.issubset(
+              live_one & static_one))
 
   def test_space_separated_and_kebab_pipeline_options_anywhere(self):
     cases = [

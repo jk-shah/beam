@@ -95,6 +95,21 @@ _DELETE_OPS = frozenset(['d', 'delete'])
 _SKIP_PREIMAGE_OPS = frozenset(['update_before', 'update_preimage'])
 
 
+_INT64_MIN = -(1 << 63)
+_INT64_MAX = (1 << 63) - 1
+_EPOCH_UTC = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
+_ONE_MICROSECOND = datetime.timedelta(microseconds=1)
+_ISO_HEX_BIAS_US = 1 << 62
+
+
+def _clamp_int64(val: int) -> int:
+  if val < _INT64_MIN:
+    return _INT64_MIN
+  if val > _INT64_MAX:
+    return _INT64_MAX
+  return int(val)
+
+
 def to_bq_hex_sequence(raw_seq: Any, fallback_int: int = 0) -> tuple[int, str]:
   """Converts a sequence/LSN/timestamp into `(int64_seq, bq_hex_sequence_str)`.
 
@@ -105,7 +120,7 @@ def to_bq_hex_sequence(raw_seq: Any, fallback_int: int = 0) -> tuple[int, str]:
   """
   if raw_seq is None or raw_seq == '':
     v = max(int(fallback_int), 0)
-    return v, f'{v & 0xFFFFFFFFFFFFFFFF:016X}'
+    return _clamp_int64(v), f'{v & 0xFFFFFFFFFFFFFFFF:016X}'
 
   if isinstance(raw_seq, bool):
     v = 1 if raw_seq else 0
@@ -114,38 +129,52 @@ def to_bq_hex_sequence(raw_seq: Any, fallback_int: int = 0) -> tuple[int, str]:
   if isinstance(raw_seq, int):
     v = max(raw_seq, 0)
     if v <= 0xFFFFFFFFFFFFFFFF:
-      return v, f'{v:016X}'
+      return _clamp_int64(v), f'{v:016X}'
     hi = (v >> 64) & 0xFFFFFFFFFFFFFFFF
     lo = v & 0xFFFFFFFFFFFFFFFF
-    return (v & 0x7FFFFFFFFFFFFFFF), f'{hi:016X}/{lo:016X}'
+    return _clamp_int64(v), f'{hi:016X}/{lo:016X}'
 
   if isinstance(raw_seq, float):
-    v = max(int(raw_seq * 1000), 0)
-    return (v & 0x7FFFFFFFFFFFFFFF), f'{v & 0xFFFFFFFFFFFFFFFF:016X}'
+    if math.isnan(raw_seq) or math.isinf(raw_seq):
+      v = max(int(fallback_int), 0)
+    else:
+      v = int(raw_seq * 1000)
+    clamped = _clamp_int64(v)
+    unsigned_hex = max(v, 0) & 0xFFFFFFFFFFFFFFFF
+    return clamped, f'{unsigned_hex:016X}'
 
   s = str(raw_seq).strip()
   if s.isdigit():
     return to_bq_hex_sequence(int(s), fallback_int=fallback_int)
 
-  if s.lower().startswith('0x') and all(c in '0123456789abcdefABCDEF' for c in s[2:]):
+  if s.lower().startswith('0x') and all(
+      c in '0123456789abcdefABCDEF' for c in s[2:]):
     return to_bq_hex_sequence(int(s[2:], 16), fallback_int=fallback_int)
 
-  # Postgres WAL LSN (`0/16B3748`) or explicit BigQuery hex sequence (`AAA/2`).
+  # Postgres WAL LSN (`0/16B3748`, `1/100000000`) or BigQuery hex (`AAA/2`).
   if _HEX_SEGMENTS_RE.match(s):
-    segs = [seg.upper().zfill(16) for seg in s.split('/')]
-    combined_int = 0
-    for seg in segs[-2:]:
-      combined_int = ((combined_int << 32) ^ int(seg, 16)) & 0x7FFFFFFFFFFFFFFF
+    raw_segs = s.split('/')
+    segs = [seg.upper().zfill(16) for seg in raw_segs]
+    seg_ints = [int(seg, 16) for seg in raw_segs]
+    if len(seg_ints) == 1:
+      combined_int = _clamp_int64(seg_ints[0])
+    else:
+      acc = 0
+      for sv in seg_ints:
+        acc = (acc << 32) | sv
+      combined_int = _clamp_int64(acc)
     return combined_int, '/'.join(segs)
 
-  # ISO-8601 timestamp string (`2026-11-08T16:45:00.123456Z`).
+  # ISO-8601 timestamp string (`2026-11-08T16:45:00.123456Z` or pre-1970).
   try:
-    iso = s[:-1] + '+00:00' if s.endswith('Z') else s
+    iso = s[:-1] + '+00:00' if s.endswith(('Z', 'z')) else s
     dt = datetime.datetime.fromisoformat(iso)
-    if dt.tzinfo is None:
-      dt = dt.replace(tzinfo=datetime.timezone.utc)
-    us = max(int(dt.timestamp() * 1_000_000), 0)
-    return (us & 0x7FFFFFFFFFFFFFFF), f'{us & 0xFFFFFFFFFFFFFFFF:016X}'
+    dt_utc = (
+        dt.replace(tzinfo=datetime.timezone.utc)
+        if dt.tzinfo is None else dt.astimezone(datetime.timezone.utc))
+    us = (dt_utc - _EPOCH_UTC) // _ONE_MICROSECOND
+    biased = max(0, min(0xFFFFFFFFFFFFFFFF, us + _ISO_HEX_BIAS_US))
+    return _clamp_int64(us), f'{biased:016X}'
   except ValueError:
     pass
 
@@ -166,6 +195,7 @@ def parse_cdc_event(
     op_col: Optional[str] = None,
     seq_col: Optional[str] = None,
     primary_keys: Iterable[str] = (),
+    fallback_seq: int = 0,
 ) -> Optional[tuple[str, int, str, dict[str, Any]]]:
   """Parses one CDC event into `(op, int_seq, hex_seq, payload_dict)` or `None`.
 
@@ -226,11 +256,21 @@ def parse_cdc_event(
     elif seq_col and seq_col in img:
       seq_raw = img[seq_col]
     else:
-      seq_raw = (
-          src_meta.get('lsn') or src_meta.get('sequence') or
-          src_meta.get('ts_us') or src_meta.get('ts_ms') or d.get('ts_us') or
-          d.get('ts_ms'))
-    int_seq, hex_seq = to_bq_hex_sequence(seq_raw)
+      seq_raw = next(
+          (
+              v
+              for v in (
+                  src_meta.get('lsn'),
+                  src_meta.get('sequence'),
+                  src_meta.get('ts_us'),
+                  src_meta.get('ts_ms'),
+                  d.get('ts_us'),
+                  d.get('ts_ms'),
+              )
+              if v is not None and v != ''
+          ),
+          None)
+    int_seq, hex_seq = to_bq_hex_sequence(seq_raw, fallback_int=fallback_seq)
     payload = dict(img)
   else:
     eff_op_col = op_col
@@ -252,7 +292,7 @@ def parse_cdc_event(
     if not eff_seq_col:
       eff_seq_col = next((c for c in _DEFAULT_SEQ_COLS if c in d), None)
     seq_raw = d.get(eff_seq_col) if eff_seq_col else None
-    int_seq, hex_seq = to_bq_hex_sequence(seq_raw)
+    int_seq, hex_seq = to_bq_hex_sequence(seq_raw, fallback_int=fallback_seq)
     drop_meta = {
         c for c in (
             eff_op_col,
@@ -509,7 +549,8 @@ def cli_normalize_cdc(
             cdc_format=cdc_format,
             op_col=op_col,
             seq_col=seq_col,
-            primary_keys=pks)
+            primary_keys=pks,
+            fallback_seq=fallback_us)
         if parsed is None:
           self._skip_ctr.inc()
           return
@@ -523,8 +564,6 @@ def cli_normalize_cdc(
                 f'new CDC field(s) {shown} appeared after schema sampling '
                 f'(inferred fields: {known})',
                 extra_fields=extra)
-        if int_seq == 0 and fallback_us > 0:
-          int_seq, hex_seq = to_bq_hex_sequence(fallback_us)
         out_dict: dict[str, Any] = {}
         for cname, ckind in self._cols:
           out_dict[cname] = _coerce_value(payload.get(cname), ckind)
@@ -642,8 +681,13 @@ def cli_materialize_cdc(
     def process(self, keyed):
       key, rows = keyed
       rows = list(rows)
-      top = max(r.beam_cdc_seq for r in rows)
-      tied = [r for r in rows if r.beam_cdc_seq == top]
+      top = max(
+          (int(r.beam_cdc_seq), str(getattr(r, 'beam_cdc_hex_seq', '')))
+          for r in rows)
+      tied = [
+          r for r in rows
+          if (int(r.beam_cdc_seq), str(getattr(r, 'beam_cdc_hex_seq', ''))) == top
+      ]
       # Exact duplicates (same values and operation) are one change.
       distinct = {
           tuple(getattr(r, n) for n in self._names) + (r.beam_cdc_op, )
@@ -742,7 +786,8 @@ def materialize_cdc_records(
   check_unknown = bool(
       strict_inferred_fields and
       dlq.parse_unknown_fields_opt(on_unknown_fields) != 'ignore')
-  grouped: dict[tuple[Any, ...], list[tuple[str, int, dict[str, Any]]]] = {}
+  grouped: dict[
+      tuple[Any, ...], list[tuple[str, tuple[int, str], dict[str, Any]]]] = {}
   preimage_skipped = 0
   drift_rows = 0
   drift_fields: set[str] = set()
@@ -758,7 +803,7 @@ def materialize_cdc_records(
       if parsed is None:
         preimage_skipped += 1
         continue
-      canon_op, int_seq, _hex_seq, payload = parsed
+      canon_op, int_seq, hex_seq, payload = parsed
       if check_unknown:
         extra = [k for k in payload if k not in known]
         if extra:
@@ -773,7 +818,8 @@ def materialize_cdc_records(
           for cname, ckind in col_specs
       }
       key = tuple(coerced[k] for k in pks)
-      grouped.setdefault(key, []).append((canon_op, int(int_seq), coerced))
+      grouped.setdefault(key, []).append(
+          (canon_op, (int(int_seq), str(hex_seq)), coerced))
     except Exception as exc:  # pylint: disable=broad-except
       if not route_errors:
         if isinstance(exc, dlq.SchemaDriftError):
@@ -981,6 +1027,15 @@ def cli_write_to_bigquery_cdc(
       self._client = bigquery_storage_v1.BigQueryWriteClient()
       self._desc_proto, self._msg_cls = _build_bq_cdc_proto_bundle(
           self._col_specs)
+
+    def teardown(self):
+      if self._client is not None:
+        transport = getattr(self._client, 'transport', None)
+        if transport is not None and hasattr(transport, 'close'):
+          transport.close()
+        elif hasattr(self._client, 'close'):
+          self._client.close()
+        self._client = None
 
     def process(self, kv):
       from google.cloud.bigquery_storage_v1 import types as bqs_types

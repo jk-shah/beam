@@ -34,9 +34,11 @@ Supports:
 
 from __future__ import annotations
 
+import datetime
 import decimal
 import math
 import struct
+import time
 from typing import Any
 from typing import NamedTuple
 
@@ -62,6 +64,7 @@ _make_dlq_row = interval_join._make_dlq_row
 
 _MIN_BEAM_TS = -9_000_000_000_000.0
 _MAX_BEAM_TS = 9_000_000_000_000.0
+_UTC_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
 
 
 def _record_to_dict(elem: Any) -> dict[str, Any]:
@@ -130,6 +133,10 @@ def parse_deduplicate_config(cfg: dict[str, Any]) -> DeduplicateConfig:
   time_domain = str(
       cfg.get('time_domain') or cfg.get('dedupe_time_domain') or
       'auto').strip().lower()
+  if time_domain == 'event_time':
+    time_domain = 'event'
+  elif time_domain == 'processing_time':
+    time_domain = 'processing'
   if time_domain not in ('auto', 'event', 'processing'):
     raise ValueError(
         f'time_domain must be "auto", "event", or "processing" (got {time_domain!r})'
@@ -156,6 +163,24 @@ def parse_deduplicate_config(cfg: dict[str, Any]) -> DeduplicateConfig:
   )
 
 
+def _datetime_to_utc_epoch_decimal(
+    dt_or_date: datetime.date) -> decimal.Decimal:
+  if isinstance(dt_or_date, datetime.datetime):
+    dt = (
+        dt_or_date.astimezone(datetime.timezone.utc) if dt_or_date.tzinfo
+        is not None else dt_or_date.replace(tzinfo=datetime.timezone.utc))
+  else:
+    dt = datetime.datetime(
+        dt_or_date.year,
+        dt_or_date.month,
+        dt_or_date.day,
+        tzinfo=datetime.timezone.utc)
+  delta = dt - _UTC_EPOCH
+  return (
+      decimal.Decimal(delta.days) * 86400 + decimal.Decimal(delta.seconds) +
+      (decimal.Decimal(delta.microseconds) / decimal.Decimal(1_000_000)))
+
+
 def _sortable_order_key(record: Any, order_col: str | None) -> tuple[int, Any]:
   """Returns a total-order-safe tuple `(non_null_rank, comparable_val)`."""
   if not order_col:
@@ -166,14 +191,31 @@ def _sortable_order_key(record: Any, order_col: str | None) -> tuple[int, Any]:
     return (0, '')
   if isinstance(val, bool):
     return (1, int(val))
-  if isinstance(val, (int, float, decimal.Decimal)):
-    f = float(val)
-    if math.isnan(f):
+  if isinstance(val, int):
+    return (2, decimal.Decimal(val))
+  if isinstance(val, float):
+    if math.isnan(val):
       return (0, '')
-    return (2, f)
+    if math.isinf(val):
+      return (2, decimal.Decimal('Infinity' if val > 0 else '-Infinity'))
+    return (2, decimal.Decimal(str(val)))
+  if isinstance(val, decimal.Decimal):
+    if val.is_nan():
+      return (0, '')
+    if val.is_infinite():
+      return (
+          2, decimal.Decimal('-Infinity' if val.is_signed() else 'Infinity'))
+    return (2, decimal.Decimal(0) if val.is_zero() else val)
+  if isinstance(val, datetime.date):
+    return (2, _datetime_to_utc_epoch_decimal(val))
   if hasattr(val, 'timestamp'):
     try:
-      return (2, float(val.timestamp()))
+      ts_f = float(val.timestamp())
+      if math.isnan(ts_f):
+        return (0, '')
+      if math.isinf(ts_f):
+        return (2, decimal.Decimal('Infinity' if ts_f > 0 else '-Infinity'))
+      return (2, decimal.Decimal(str(ts_f)))
     except Exception:  # pylint: disable=broad-except
       pass
   return (3, str(val))
@@ -368,6 +410,10 @@ def cli_deduplicate(
       self.use_buckets = use_buckets
       self.use_elem_ts = use_elem_ts
       self.wrap_ts = wrap_ts
+      self._bundle_wall_ts: float | None = None
+
+    def start_bundle(self):
+      self._bundle_wall_ts = time.time()
 
     def process(self, element, elem_ts=beam.DoFn.TimestampParam):
       try:
@@ -386,9 +432,22 @@ def cli_deduplicate(
             t = interval_join.extract_record_timestamp(
                 element, self.cfg.timestamp_col)
           elif self.use_elem_ts:
-            t = float(elem_ts)
+            et_val = float(elem_ts)
+            if not math.isfinite(et_val) or et_val <= _MIN_BEAM_TS:
+              if self.cfg.time_domain == 'event':
+                raise ValueError(
+                    'CliDeduplicate event-time windowing requires event '
+                    'timestamps; pass --timestamp-col <COL> (or timestamp_col '
+                    'in YAML)')
+              t = (
+                  self._bundle_wall_ts
+                  if self._bundle_wall_ts is not None else time.time())
+            else:
+              t = et_val
           else:
-            t = 0.0
+            t = (
+                self._bundle_wall_ts
+                if self._bundle_wall_ts is not None else time.time())
           if not math.isfinite(t) or t <= _MIN_BEAM_TS or t >= _MAX_BEAM_TS:
             raise ValueError(f'out-of-range deduplication timestamp {t!r}')
           bucket_idx = int(math.floor(t / self.cfg.window_sec))

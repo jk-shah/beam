@@ -35,6 +35,7 @@ CANONICAL_TYPES = frozenset([
     'INT64',
     'FLOAT32',
     'FLOAT64',
+    'DECIMAL',
     'STRING',
     'BYTES',
     'BOOLEAN',
@@ -50,6 +51,8 @@ CANONICAL_TYPES = frozenset([
 _SAFE_WIDENINGS = {
     ('INT32', 'INT64'),
     ('INT32', 'FLOAT64'),
+    ('INT32', 'DECIMAL'),
+    ('INT64', 'DECIMAL'),
     ('FLOAT32', 'FLOAT64'),
     ('DATE', 'TIMESTAMP'),
 }
@@ -58,6 +61,12 @@ _SAFE_WIDENINGS = {
 _TYPE_NARROWINGS = {
     ('INT64', 'INT32'): 'INTEGER_OVERFLOW_RISK',
     ('FLOAT64', 'FLOAT32'): 'PRECISION_LOSS',
+    ('FLOAT64', 'DECIMAL'): 'PRECISION_LOSS',
+    ('FLOAT32', 'DECIMAL'): 'PRECISION_LOSS',
+    ('DECIMAL', 'FLOAT64'): 'PRECISION_LOSS',
+    ('DECIMAL', 'FLOAT32'): 'PRECISION_LOSS',
+    ('DECIMAL', 'INT64'): 'FRACTIONAL_TRUNCATION',
+    ('DECIMAL', 'INT32'): 'FRACTIONAL_TRUNCATION_AND_OVERFLOW',
     ('FLOAT64', 'INT64'): 'FRACTIONAL_TRUNCATION',
     ('FLOAT64', 'INT32'): 'FRACTIONAL_TRUNCATION_AND_OVERFLOW',
     ('FLOAT32', 'INT64'): 'FRACTIONAL_TRUNCATION',
@@ -67,6 +76,7 @@ _TYPE_NARROWINGS = {
     ('STRING', 'INT32'): 'PARSE_CAST_FAILURE_RISK',
     ('STRING', 'FLOAT64'): 'PARSE_CAST_FAILURE_RISK',
     ('STRING', 'FLOAT32'): 'PARSE_CAST_FAILURE_RISK',
+    ('STRING', 'DECIMAL'): 'PARSE_CAST_FAILURE_RISK',
     ('STRING', 'BOOLEAN'): 'PARSE_CAST_FAILURE_RISK',
     ('STRING', 'TIMESTAMP'): 'PARSE_CAST_FAILURE_RISK',
     ('STRING', 'DATE'): 'PARSE_CAST_FAILURE_RISK',
@@ -74,6 +84,7 @@ _TYPE_NARROWINGS = {
     ('INT32', 'STRING'): 'NUMERIC_TO_TEXT_COERCION',
     ('FLOAT64', 'STRING'): 'NUMERIC_TO_TEXT_COERCION',
     ('FLOAT32', 'STRING'): 'NUMERIC_TO_TEXT_COERCION',
+    ('DECIMAL', 'STRING'): 'NUMERIC_TO_TEXT_COERCION',
     ('BOOLEAN', 'STRING'): 'BOOLEAN_TO_TEXT_COERCION',
 }
 
@@ -100,22 +111,25 @@ def normalize_type(raw: Any) -> str:
       return 'ARRAY'
     if base in ('struct', 'map', 'record'):
       return 'RECORD'
+    if base.startswith('decimal') or base in ('numeric', 'bignumeric'):
+      return 'DECIMAL'
     s = base
 
   # Integer mappings
   if s in (
-      'int', 'integer', 'int32', 'int16', 'int8', 'uint8', 'uint16',
-      'uint32', 'smallint', 'tinyint', 'short', 'byte'):
+      'int32', 'int16', 'int8', 'uint8', 'uint16', 'uint32', 'smallint',
+      'tinyint', 'short', 'byte'):
     return 'INT32'
-  if s in ('int64', 'uint64', 'bigint', 'long'):
+  if s in ('int', 'integer', 'int64', 'uint64', 'bigint', 'long'):
     return 'INT64'
 
-  # Floating / numeric mappings
-  if s in ('float', 'float32', 'real'):
+  # Floating / decimal mappings
+  if s in ('float32', 'real'):
     return 'FLOAT32'
-  if s in (
-      'float64', 'double', 'numeric', 'bignumeric', 'decimal', 'number'):
+  if s in ('float', 'float64', 'double', 'number'):
     return 'FLOAT64'
+  if s.startswith('decimal') or s in ('numeric', 'bignumeric'):
+    return 'DECIMAL'
 
   # Text mappings
   if s in (

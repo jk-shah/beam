@@ -72,7 +72,7 @@ def render_llms_txt() -> str:
     text `.txt` (`Row(line: str)`), mixed-format directory globs like `data/*`,
     `delta://`, and `iceberg://` in `<100ms` locally or `type: Sql` on Dataflow;
     `--join` is accepted as an alias for repeating `--from` or as the right stream for `--interval-join`),
-    apply event-time windowing, speculative/late triggers & late-data quarantine (`--window fixed:60s`, `sliding:5m,1m`, `session:30m` with `--timestamp-col COL` and optional `--allowed-lateness 10m --trigger "watermark,early=every:10s,late=count:1" --accumulation accumulating|discarding --late-action dlq|drop --late-data-dlq URI --emit-pane-info`; `--window-size` is accepted),
+    apply event-time windowing, speculative/late triggers & late-data quarantine (`--window fixed:60s`, `sliding:5m,1m`, `session:30m`, or `session:gap=30m:key=user_id` with `--timestamp-col COL` and optional `--allowed-lateness 10m --trigger "watermark,early=every:10s,late=count:1" --accumulation accumulating|discarding --late-action dlq|drop --late-data-dlq URI --emit-pane-info`; `--window-size` is accepted),
     correlate event streams with declarative interval or point-in-time ASOF joins (`--from o=URI --join s=URI --interval-join "on=id,left_time=o_ts,right_time=s_ts,between=0s..15m,type=left"` or `--asof-join "on=sym,left_time=t_ts,right_time=q_ts,direction=backward|forward|nearest,within=5m"`, or 2-source SQL `BETWEEN ... INTERVAL` / `ASOF [LEFT|INNER] JOIN`) and watermark skew circuit breaking (`--max-watermark-skew 30m --skew-action dlq|drop|warn|fail`),
     detect ordered event sequences, bounded repetitions, and missing follow-up events (`--timestamp-col event_ts --pattern "on=user_id,seq=login -> mfa -> purchase within 5m"` or `--timestamp-col event_ts --pattern "checkout -> !payment within 15m" --pattern-opt key=order_id`),
     deduplicate at-least-once streams or batches (`--dedupe-by|--dedup-by COL[,COL2] [--dedupe-window 10m] [--dedupe-keep first|last] [--dedupe-order COL] [--dedupe-dlq [URI]]`),
@@ -162,11 +162,13 @@ def render_llms_txt() -> str:
 - `--where "status = 'PAID' AND amount >= 100 AND deleted_at IS NULL"`
   (Supports SQL `=` / `<>` and Python `==` / `!=`, `AND`/`OR`/`NOT`, `<`, `<=`,
   `>`, `>=`, `IN (...)`, `IS [NOT] NULL`, `CAST(col AS INT|FLOAT|STRING|BOOL)`,
-  keyword/backticked columns like `` `class` ``, and scalar helpers `lower`,
+  keyword/backticked columns like `` `class` ``, scalar helpers `lower`,
   `upper`, `strip`/`trim`, `len`/`length`, `coalesce`/`ifnull`, `abs`, `round`,
-  `int`, `float`, `str`, `bool`.)
-- `--select "CAST(user_id AS INT) AS user_id, lower(email) AS email, `class`, round(amount * 1.08, 2) AS total"`
+  `int`, `float`, `str`, `bool`, and UTC timestamp helpers `parse_timestamp`/`to_utc`,
+  `epoch_ms`/`to_epoch_ms`, `year`, `month`, `day`, `hour`, `date_part`.)
+- `--select "CAST(user_id AS INT) AS user_id, lower(email) AS email, `class`, parse_timestamp(ts) AS utc_ts, round(amount * 1.08, 2) AS total"`
 - `--from o=orders.parquet --from c=customers.csv --sql "SELECT COALESCE(c.tier, 'UNMAPPED') AS tier, COUNT(*) AS n, ROUND(SUM(o.amount), 2) AS rev FROM o LEFT JOIN c ON o.cid = c.cid GROUP BY 1"`
+  (`--sql` composes with `--where` pre-filter, `--select` post-projection, `--drop-bad` / `--dlq`, and exports portable Beam Calcite `Sql` YAML via `--emit-yaml` or `--runner=DataflowRunner`.)
 - NULLs follow SQL three-valued logic everywhere: any comparison (`=`, `!=`, `<`, `IN`, `NOT IN`), arithmetic,
   `NOT`, nested access, string helpers and casts on NULL give NULL, and a row is kept only if the filter is TRUE.
   So `--where "state != 'CA'"` drops rows with no state, as in SQL. Test for NULL with `IS [NOT] NULL`
@@ -204,6 +206,7 @@ def render_llms_txt() -> str:
   shows `sql_engines`) runs the same inputs (same typing, NULLs and `--dlq`) in a sandboxed in-memory DuckDB with
   file access disabled: ANSI `PERCENTILE_CONT ... WITHIN GROUP`, `QUALIFY`, `median`, `quantile_cont`, struct fields
   (`u."user".tier`). Without DuckDB the command exits `4` with the install command.
+- Zero-JVM pure-Python SQL lowering: `--sql-engine python` (and automatic fallback for `TABLE(TUMBLE|HOP|SESSION(TABLE src, DESCRIPTOR(ts_col), INTERVAL '5' MINUTE))` TVFs or when no JVM is installed) lowers `SELECT ... FROM ... WHERE ... GROUP BY ... HAVING ...` (`COUNT`, `SUM`, `MIN`, `MAX`, `AVG`, `STDDEV_POP`, `VAR_POP`, `window_start`, `window_end`) directly into pure-Python Beam YAML (`AssignTimestamps` + `Filter` + `WindowInto` + `Combine` + `MapToFields`) with zero Java expansion service required.
 - `--cdc --primary-key K` into plain files (Parquet/CSV/JSON/Avro) writes the latest live row per key in `<250 ms` locally (`local_fast`),
   ordered by `lsn` / `ts_ms` / `seq_ts` / `seq` / `updated_at` / `event_ts` / `timestamp` or `--cdc-seq-col COL`; deleted keys are dropped.
 

@@ -252,5 +252,109 @@ class ExpectBeamRunnerExecutionTest(unittest.TestCase):
       )
 
 
+class ExpectHardeningTest(unittest.TestCase):
+  """Regression tests for short-circuit 3VL, reserved columns, and fast_local parity."""
+
+  def test_short_circuit_and_or_prevents_zero_division_and_null_attr(self):
+    div_rule = expect.parse_expectation_rule('amount != 0 AND 10 / amount > 0.5')
+    div_code = expect.compile_expectation_expression(div_rule.expression)
+    self.assertFalse(expect.evaluate_record(div_code, {'amount': 0}))
+    self.assertFalse(expect.evaluate_record(div_code, {'amount': None}))
+    self.assertTrue(expect.evaluate_record(div_code, {'amount': 5}))
+
+    null_or = expect.parse_expectation_rule(
+        "name IS NULL OR name.startswith('A')")
+    or_code = expect.compile_expectation_expression(null_or.expression)
+    self.assertTrue(expect.evaluate_record(or_code, {'name': None}))
+    self.assertTrue(expect.evaluate_record(or_code, {'name': 'Alice'}))
+    self.assertFalse(expect.evaluate_record(or_code, {'name': 'Bob'}))
+
+  def test_reserved_columns_and_backtick_identifiers(self):
+    col_code = expect.compile_expectation_expression(
+        "`class` = 'gold' AND `order-id` BETWEEN 100 AND 200 "
+        "AND row = 7 AND element = 'H' AND record = 'ok'")
+    self.assertTrue(
+        expect.evaluate_record(
+            col_code, {
+                'class': 'gold',
+                'order-id': 150,
+                'row': 7,
+                'element': 'H',
+                'record': 'ok',
+            }))
+    self.assertFalse(
+        expect.evaluate_record(
+            col_code, {
+                'class': 'silver',
+                'order-id': 150,
+                'row': 7,
+                'element': 'H',
+                'record': 'ok',
+            }))
+
+  def test_ilike_and_temporal_comparisons(self):
+    import datetime
+    expr = (
+        "city ILIKE 'm%' AND created_at >= '2026-01-01' "
+        'AND updated_at >= created_at')
+    code = expect.compile_expectation_expression(expr)
+    self.assertTrue(
+        expect.evaluate_record(
+            code, {
+                'city': 'Munich',
+                'created_at': datetime.datetime(2026, 5, 1, 12, 0),
+                'updated_at': datetime.datetime(
+                    2026, 5, 1, 13, 0, tzinfo=datetime.timezone.utc),
+            }))
+
+  def test_fast_local_short_circuit_where_multi_rule_metrics_and_drop_bad(self):
+    tmp_dir = tempfile.mkdtemp()
+    self.addCleanup(shutil.rmtree, tmp_dir, True)
+    src = os.path.join(tmp_dir, 'in.csv')
+    out_pq = os.path.join(tmp_dir, 'out.parquet')
+    out_jl = os.path.join(tmp_dir, 'out.jsonl')
+    with open(src, 'w', encoding='utf-8', newline='') as f:
+      f.write('id,amount,score\n1,0,10.0\n2,4,20.0\n3,5,30.0\n4,bad_int,5.0\n')
+
+    pipe = pipe_spec.build_pipe_spec(
+        source=src,
+        sink=out_pq,
+        where='amount != 0 AND 10 / amount > 0.5',
+        select='id, amount * 2 AS doubled',
+        expect=['r1: id > 0 -> drop', 'r2: doubled > 0 -> drop'],
+        drop_bad=True,
+    )
+    files = fast_local.plan(
+        pipe,
+        explicit_runner=None,
+        dry_run=False,
+        cdc=False,
+        zero_copy=False,
+        verify=False,
+        if_exists='replace',
+        wait_timeout_sec=None)
+    self.assertEqual(files, [src])
+    res = fast_local.run(pipe, files)
+    self.assertEqual(res.metrics['rows_read'], 4)
+    self.assertEqual(res.metrics['rows_written'], 2)
+    # 2 rows reached CliExpect (rows 2 & 3), evaluated once per row (2, not 4!).
+    self.assertEqual(res.metrics['expectations_evaluated'], 2)
+    # 1 bad CSV row dropped + 1 filtered by WHERE (id=1, amount=0) = 2.
+    self.assertEqual(res.metrics['rows_filtered_out'], 2)
+
+    # RFC-8259 JSONL NaN -> null check.
+    jl_src = os.path.join(tmp_dir, 'nan.parquet')
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    pq.write_table(
+        pa.Table.from_pydict({'id': [1], 'v': [float('nan')]}), jl_src)
+    pipe_jl = pipe_spec.build_pipe_spec(source=jl_src, sink=out_jl)
+    fast_local.run(pipe_jl, [jl_src])
+    with open(out_jl, encoding='utf-8') as f:
+      line = f.readline().strip()
+    self.assertNotIn('NaN', line)
+    self.assertIsNone(json.loads(line)['v'])
+
+
 if __name__ == '__main__':
   unittest.main()

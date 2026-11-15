@@ -17,6 +17,8 @@
 
 """Tests for Proposal 5: Iceberg Catalog Hierarchy and Partition-Aware Zero-Copy."""
 
+import datetime
+import decimal
 import io
 import json
 import os
@@ -29,6 +31,7 @@ from unittest import mock
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from apache_beam.cli import diff
 from apache_beam.cli import lakehouse
 from apache_beam.cli import pipe_spec
 from apache_beam.cli import uris
@@ -81,6 +84,7 @@ class IcebergCatalogHierarchyAndPartitionTest(unittest.TestCase):
     # BigQuery API returns 404 (Not Found)
     err_404 = urllib.error.HTTPError(
         'https://bigquery.googleapis.com/...', 404, 'Not Found', {}, io.BytesIO(b'{}'))
+    self.addCleanup(err_404.close)
 
     # BigLake REST catalog returns table metadata location
     bl_payload = {
@@ -485,6 +489,152 @@ class CatalogSyncTest(unittest.TestCase):
           'iceberg://test_catalog/ns',
           catalog='../malicious')
     self.assertIn('path separators or ".."', str(ctx2.exception))
+
+  def test_zero_copy_preserves_38_digit_decimal_precision(self):
+    delta_dir = os.path.join(self.tmp, 'delta_dec38')
+    os.makedirs(os.path.join(delta_dir, '_delta_log'), exist_ok=True)
+    d1 = decimal.Decimal('1234567890123456789012345678.0000000001')
+    d2 = decimal.Decimal('1234567890123456789012345678.0000000002')
+    pq_path = os.path.join(delta_dir, 'part-0.parquet')
+    pq.write_table(
+        pa.Table.from_pydict(
+            {
+                'id': [1, 2],
+                'amount': [d1, d2],
+            },
+            schema=pa.schema([
+                ('id', pa.int64()),
+                ('amount', pa.decimal128(38, 10)),
+            ])),
+        pq_path)
+    commit = [
+        {
+            'metaData': {
+                'id': 'dec38-tbl',
+                'schemaString': json.dumps({
+                    'type': 'struct',
+                    'fields': [
+                        {'name': 'id', 'type': 'long', 'nullable': False},
+                        {
+                            'name': 'amount',
+                            'type': 'decimal(38,10)',
+                            'nullable': False,
+                        },
+                    ],
+                }),
+                'partitionColumns': [],
+            }
+        },
+        {
+            'add': {
+                'path': 'part-0.parquet',
+                'size': os.path.getsize(pq_path),
+                'modificationTime': 1700000000000,
+                'dataChange': True,
+                'partitionValues': {},
+            }
+        },
+    ]
+    with open(
+        os.path.join(delta_dir, '_delta_log', '00000000000000000000.json'),
+        'w',
+        encoding='utf-8') as f:
+      for entry in commit:
+        f.write(json.dumps(entry) + '\n')
+
+    iceberg_dir = os.path.join(self.tmp, 'iceberg_dec38')
+    src_ep = uris.parse_endpoint(f'delta://{delta_dir}', is_read=True)
+    sink_ep = uris.parse_endpoint(f'iceberg://{iceberg_dir}', is_read=False)
+    lakehouse.register_zero_copy_to_iceberg(src_ep, sink_ep)
+
+    state = lakehouse.load_iceberg_state(iceberg_dir)
+    _, ice_rows = lakehouse.read_iceberg_rows_local(state)
+    self.assertIsInstance(ice_rows[0]['amount'], decimal.Decimal)
+    self.assertEqual(ice_rows[0]['amount'], d1)
+    self.assertEqual(ice_rows[1]['amount'], d2)
+    self.assertNotEqual(ice_rows[0]['amount'], ice_rows[1]['amount'])
+
+    rc, report = diff.run_diff(
+        f'delta://{delta_dir}', f'iceberg://{iceberg_dir}', keys=['id'])
+    self.assertEqual(rc, 0, report)
+    self.assertTrue(report['match'])
+
+  def test_equality_deletes_match_decimal_date_and_timestamp_keys(self):
+    ice_dir = os.path.join(self.tmp, 'ice_eq_del_types')
+    data_dir = os.path.join(ice_dir, 'data')
+    fields = [
+        {'id': 1, 'name': 'dec_k', 'type': 'decimal(38, 4)', 'nullable': False},
+        {'id': 2, 'name': 'dt_k', 'type': 'date', 'nullable': False},
+        {'id': 3, 'name': 'ts_k', 'type': 'timestamptz', 'nullable': False},
+        {'id': 4, 'name': 'label', 'type': 'string', 'nullable': True},
+    ]
+    k1_dec = decimal.Decimal('9999999999999999999999999999999999.1234')
+    k2_dec = decimal.Decimal('9999999999999999999999999999999999.1235')
+    dt_val = datetime.date(2026, 11, 10)
+    ts_val = datetime.datetime(
+        2026, 11, 10, 12, 30, 0, tzinfo=datetime.timezone.utc)
+
+    df1 = lakehouse.write_parquet_with_field_ids(
+        os.path.join(data_dir, 'd1.parquet'),
+        [
+            {'dec_k': k1_dec, 'dt_k': dt_val, 'ts_k': ts_val, 'label': 'drop'},
+            {'dec_k': k2_dec, 'dt_k': dt_val, 'ts_k': ts_val, 'label': 'keep'},
+        ],
+        fields)
+    lakehouse.commit_iceberg_snapshot(
+        ice_dir,
+        iceberg_fields=fields,
+        identifier_columns=['dec_k', 'dt_k', 'ts_k'],
+        new_data_files=[df1])
+
+    eq_fields = fields[:3]
+    ef1 = lakehouse.write_parquet_with_field_ids(
+        os.path.join(data_dir, 'del1.parquet'),
+        [{'dec_k': k1_dec, 'dt_k': dt_val, 'ts_k': ts_val}],
+        eq_fields)
+    lakehouse.commit_iceberg_snapshot(
+        ice_dir,
+        iceberg_fields=fields,
+        identifier_columns=['dec_k', 'dt_k', 'ts_k'],
+        new_data_files=[],
+        new_eq_delete_files=[ef1])
+
+    st = lakehouse.load_iceberg_state(ice_dir)
+    cnt, live = lakehouse.read_iceberg_rows_local(st)
+    self.assertEqual(cnt, 1)
+    self.assertEqual(len(live), 1)
+    self.assertEqual(live[0]['label'], 'keep')
+    self.assertEqual(live[0]['dec_k'], k2_dec)
+
+  def test_if_exists_replace_advances_metadata_version_above_max_vN(self):
+    ice_dir = os.path.join(self.tmp, 'ice_replace_ver')
+    data_dir = os.path.join(ice_dir, 'data')
+    fields = [{'id': 1, 'name': 'id', 'type': 'long', 'nullable': False}]
+    for ver_idx in range(1, 4):
+      df = lakehouse.write_parquet_with_field_ids(
+          os.path.join(data_dir, f'b{ver_idx}.parquet'),
+          [{'id': ver_idx}],
+          fields)
+      res = lakehouse.commit_iceberg_snapshot(
+          ice_dir, iceberg_fields=fields, new_data_files=[df])
+      self.assertEqual(res['metadata_version'], ver_idx)
+
+    rep_df = lakehouse.write_parquet_with_field_ids(
+        os.path.join(data_dir, 'replaced.parquet'), [{'id': 999}], fields)
+    rep_res = lakehouse.commit_iceberg_snapshot(
+        ice_dir,
+        iceberg_fields=fields,
+        new_data_files=[rep_df],
+        replace_table=True)
+    self.assertEqual(rep_res['metadata_version'], 4)
+    self.assertTrue(rep_res['metadata_path'].endswith('v4.metadata.json'))
+
+    # Even if version-hint.text is absent, max(vN.metadata.json) finds v4!
+    os.unlink(os.path.join(ice_dir, 'metadata', 'version-hint.text'))
+    st = lakehouse.load_iceberg_state(ice_dir)
+    self.assertEqual(st['metadata_version'], 4)
+    _, rows = lakehouse.read_iceberg_rows_local(st)
+    self.assertEqual([r['id'] for r in rows], [999])
 
 
 if __name__ == '__main__':

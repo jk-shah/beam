@@ -39,7 +39,9 @@ import math
 import re
 from collections.abc import Iterable
 from collections.abc import Mapping
+from datetime import date
 from datetime import datetime
+from datetime import timedelta
 from datetime import timezone
 from typing import Any
 from typing import NamedTuple
@@ -270,6 +272,62 @@ def _parse_select_spec(raw: Any) -> dict[str, str] | None:
   return out or None
 
 
+_UTC_EPOCH_DT = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _temporal_to_utc_micros(val: date) -> int:
+  if isinstance(val, datetime):
+    dt = (
+        val.astimezone(timezone.utc) if val.tzinfo is not None else val.replace(
+            tzinfo=timezone.utc))
+  else:
+    dt = datetime(val.year, val.month, val.day, tzinfo=timezone.utc)
+  return (dt - _UTC_EPOCH_DT) // timedelta(microseconds=1)
+
+
+def _parse_iso_temporal_micros(raw_s: str) -> int | None:
+  s = raw_s.strip()
+  if not s:
+    return None
+  norm_s = (s[:-1] + '+00:00') if s[-1] in ('Z', 'z') else s
+  try:
+    dt = datetime.fromisoformat(norm_s)
+    return _temporal_to_utc_micros(dt)
+  except ValueError:
+    pass
+  try:
+    d = date.fromisoformat(s)
+    return _temporal_to_utc_micros(d)
+  except ValueError:
+    return None
+
+
+def _coerce_temporal_compare_pair(left_v: Any,
+                                  right_v: Any) -> tuple[Any, Any, bool]:
+  """Normalizes `(left_v, right_v)` to UTC microseconds when either is `date`/`datetime`."""
+  l_is_dt = isinstance(left_v, date)
+  r_is_dt = isinstance(right_v, date)
+  if not l_is_dt and not r_is_dt:
+    return left_v, right_v, False
+  l_us = (
+      _temporal_to_utc_micros(left_v) if l_is_dt else
+      (_parse_iso_temporal_micros(left_v) if isinstance(left_v, str) else None))
+  r_us = (
+      _temporal_to_utc_micros(right_v) if r_is_dt else (
+          _parse_iso_temporal_micros(right_v)
+          if isinstance(right_v, str) else None))
+  if l_us is not None and r_us is not None:
+    return l_us, r_us, False
+  return left_v, right_v, True
+
+
+def _values_equal_safe(left_v: Any, right_v: Any) -> bool:
+  norm_l, norm_r, incompatible = _coerce_temporal_compare_pair(left_v, right_v)
+  if incompatible:
+    return False
+  return bool(norm_l == norm_r)
+
+
 class _CompiledPredicate:
   """Zero-`eval` recursive AST evaluator validated via `expressions.compile_where`."""
   def __init__(self, expr_str: str):
@@ -372,7 +430,8 @@ class _CompiledPredicate:
             return None
           seq = right_v if isinstance(right_v, (list, tuple, set,
                                                 frozenset)) else (right_v, )
-          has_match = any(x is not None and left_v == x for x in seq)
+          has_match = any(
+              x is not None and _values_equal_safe(left_v, x) for x in seq)
           has_null = any(x is None for x in seq)
           if isinstance(op, ast.In):
             if has_match:
@@ -391,18 +450,27 @@ class _CompiledPredicate:
         else:
           if left_v is None or right_v is None:
             return None
-          if isinstance(op, ast.Eq):
-            ok = left_v == right_v
+          cmp_l, cmp_r, incompatible = _coerce_temporal_compare_pair(
+              left_v, right_v)
+          if incompatible:
+            if isinstance(op, ast.Eq):
+              ok = False
+            elif isinstance(op, ast.NotEq):
+              ok = True
+            else:
+              return False
+          elif isinstance(op, ast.Eq):
+            ok = cmp_l == cmp_r
           elif isinstance(op, ast.NotEq):
-            ok = left_v != right_v
+            ok = cmp_l != cmp_r
           elif isinstance(op, ast.Lt):
-            ok = left_v < right_v
+            ok = cmp_l < cmp_r
           elif isinstance(op, ast.LtE):
-            ok = left_v <= right_v
+            ok = cmp_l <= cmp_r
           elif isinstance(op, ast.Gt):
-            ok = left_v > right_v
+            ok = cmp_l > cmp_r
           elif isinstance(op, ast.GtE):
-            ok = left_v >= right_v
+            ok = cmp_l >= cmp_r
           else:
             raise ValueError('unsupported comparison op')
         if not ok:
@@ -863,20 +931,29 @@ def _advance_nfa_runs(
   num_steps = len(compiled_steps)
   has_trailing_neg = compiled_steps[-1][0].negated
 
+  def _run_start_pos(r: Mapping[str, Any]) -> tuple[float, int]:
+    return (float(r['start_ts']), int(r['start_seq']))
+
+  def _run_last_pos(r: Mapping[str, Any]) -> tuple[float, int]:
+    last_t = r.get('last_ts')
+    if last_t is None:
+      last_t = r['events'][-1][2] if r.get('events') else r['start_ts']
+    return (float(last_t), int(r['last_seq']))
+
   def _flush_horizon_up_to(cutoff_ts: float,
                            runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Resolves timeouts (`< cutoff_ts`) and `!absence` completions (`<= cutoff_ts`)."""
     nonlocal expired_cnt
     kept: list[dict[str, Any]] = []
-    consumed_through_seq: int | None = None
+    consumed_through_pos: tuple[float, int] | None = None
     # Sort runs by `(start_ts, start_seq)` so earliest non-overlapping match wins!
-    runs.sort(key=lambda r: (r['start_ts'], r['start_seq']))
+    runs.sort(key=_run_start_pos)
     for run in runs:
       if (cfg.after_match == 'skip_past_last' and
-          consumed_through_seq is not None and
-          run['start_seq'] <= consumed_through_seq):
+          consumed_through_pos is not None and
+          _run_start_pos(run) <= consumed_through_pos):
         continue
-      deadline = run['start_ts'] + cfg.within_sec
+      deadline = float(run['start_ts']) + cfg.within_sec
       nxt_i = run['next_idx']
       st_obj, _ = compiled_steps[nxt_i]
       if st_obj.negated:
@@ -887,9 +964,10 @@ def _advance_nfa_runs(
           emitted.append(
               (deadline, _project_match_row(cfg, ev_tuples, deadline)))
           if cfg.after_match == 'skip_past_last':
-            consumed_through_seq = (
-                run['last_seq'] if consumed_through_seq is None else max(
-                    consumed_through_seq, run['last_seq']))
+            l_pos = _run_last_pos(run)
+            consumed_through_pos = (
+                l_pos if consumed_through_pos is None else max(
+                    consumed_through_pos, l_pos))
           continue
         kept.append(run)
       else:
@@ -897,8 +975,8 @@ def _advance_nfa_runs(
           expired_cnt += 1
           continue
         kept.append(run)
-    if cfg.after_match == 'skip_past_last' and consumed_through_seq is not None:
-      kept = [r for r in kept if r['start_seq'] > consumed_through_seq]
+    if cfg.after_match == 'skip_past_last' and consumed_through_pos is not None:
+      kept = [r for r in kept if _run_start_pos(r) > consumed_through_pos]
     return kept
 
   runs = list(active_runs)
@@ -906,17 +984,27 @@ def _advance_nfa_runs(
     # Before processing `ev_ts`, resolve any runs whose window already closed before `ev_ts`!
     # Note: for `!S_m`, if `ev_ts > start_ts + within_sec`, the absence window `[start, start+within]`
     # ALREADY elapsed strictly before `ev_ts`, so an `S_m` at `ev_ts > deadline` does NOT cancel it!
+    ev_pos = (float(ev_ts), int(ev_seq))
     next_runs: list[dict[str, Any]] = []
-    consumed_up_to_seq: int | None = None
+    consumed_through_pos: tuple[float, int] | None = None
     event_consumed_by_completion = False
 
-    runs.sort(key=lambda r: (r['start_ts'], r['start_seq']))
+    runs.sort(key=_run_start_pos)
     for run in runs:
-      if (cfg.after_match == 'skip_past_last' and
-          consumed_up_to_seq is not None and
-          run['start_seq'] <= consumed_up_to_seq):
+      run_start_pos = _run_start_pos(run)
+      if cfg.after_match == 'skip_past_last':
+        if (consumed_through_pos is not None and
+            run_start_pos <= consumed_through_pos):
+          continue
+        if event_consumed_by_completion:
+          if run_start_pos <= ev_pos:
+            continue
+          next_runs.append(run)
+          continue
+      if ev_pos < run_start_pos:
+        next_runs.append(run)
         continue
-      deadline = run['start_ts'] + cfg.within_sec
+      deadline = float(run['start_ts']) + cfg.within_sec
       nxt_i = run['next_idx']
       st_obj, st_pred = compiled_steps[nxt_i]
 
@@ -928,9 +1016,10 @@ def _advance_nfa_runs(
           emitted.append(
               (deadline, _project_match_row(cfg, ev_tuples, deadline)))
           if cfg.after_match == 'skip_past_last':
-            consumed_up_to_seq = (
-                run['last_seq'] if consumed_up_to_seq is None else max(
-                    consumed_up_to_seq, run['last_seq']))
+            l_pos = _run_last_pos(run)
+            consumed_through_pos = (
+                l_pos if consumed_through_pos is None else max(
+                    consumed_through_pos, l_pos))
           continue
         # Within `[start_ts, deadline]`: if `ev_dict` matches forbidden `S_m`, cancel run!
         if _step_matches_event(st_obj, st_pred, ev_dict, cfg.event_col):
@@ -945,28 +1034,28 @@ def _advance_nfa_runs(
         continue
 
       if _step_matches_event(st_obj, st_pred, ev_dict, cfg.event_col):
-        if cfg.mode == 'relaxed':
-          # Branch: under `skip_to_next`, keep waiting copy too? Standard NFA:
-          # greedily advance run on first matching step (`A -> B` matches earliest `B`).
-          pass
         new_events = list(run['events']) + [[
-            st_obj.base_name, st_obj.step_alias, ev_ts, ev_dict
+            st_obj.base_name, st_obj.step_alias, float(ev_ts), ev_dict
         ]]
         new_idx = nxt_i + 1
         if new_idx == num_steps:
           ev_tuples = [(b, al, float(ts_e), d) for b, al, ts_e, d in new_events]
           emitted.append((ev_ts, _project_match_row(cfg, ev_tuples, ev_ts)))
           if cfg.after_match == 'skip_past_last':
-            consumed_up_to_seq = (
-                ev_seq if consumed_up_to_seq is None else max(
-                    consumed_up_to_seq, ev_seq))
+            consumed_through_pos = (
+                ev_pos if consumed_through_pos is None else max(
+                    consumed_through_pos, ev_pos))
             event_consumed_by_completion = True
+            next_runs = [
+                r for r in next_runs if _run_start_pos(r) > consumed_through_pos
+            ]
         else:
           # Either advancing to next positive step OR entering trailing `!S_m` wait state!
           next_runs.append({
-              'start_ts': run['start_ts'],
-              'start_seq': run['start_seq'],
-              'last_seq': ev_seq,
+              'start_ts': float(run['start_ts']),
+              'start_seq': int(run['start_seq']),
+              'last_ts': float(ev_ts),
+              'last_seq': int(ev_seq),
               'next_idx': new_idx,
               'events': new_events,
           })
@@ -976,12 +1065,17 @@ def _advance_nfa_runs(
         else:
           next_runs.append(run)
 
-    if cfg.after_match == 'skip_past_last' and consumed_up_to_seq is not None:
-      next_runs = [r for r in next_runs if r['start_seq'] > consumed_up_to_seq]
+    if cfg.after_match == 'skip_past_last' and consumed_through_pos is not None:
+      next_runs = [
+          r for r in next_runs if _run_start_pos(r) > consumed_through_pos
+      ]
 
     # Check if `ev_dict` can also start a fresh `S_0` run!
     can_start = not (
-        cfg.after_match == 'skip_past_last' and event_consumed_by_completion)
+        cfg.after_match == 'skip_past_last' and (
+            event_consumed_by_completion or (
+                consumed_through_pos is not None and
+                ev_pos <= consumed_through_pos)))
     s0_step, s0_pred = compiled_steps[0]
     if can_start and _step_matches_event(
         s0_step, s0_pred, ev_dict, cfg.event_col):
@@ -990,11 +1084,14 @@ def _advance_nfa_runs(
         overflow_rows.append(ev_dict)
       else:
         next_runs.append({
-            'start_ts': ev_ts,
-            'start_seq': ev_seq,
-            'last_seq': ev_seq,
+            'start_ts': float(ev_ts),
+            'start_seq': int(ev_seq),
+            'last_ts': float(ev_ts),
+            'last_seq': int(ev_seq),
             'next_idx': 1,
-            'events': [[s0_step.base_name, s0_step.step_alias, ev_ts, ev_dict]],
+            'events': [[
+                s0_step.base_name, s0_step.step_alias, float(ev_ts), ev_dict
+            ]],
         })
 
     runs = next_runs
@@ -1036,8 +1133,10 @@ def match_bounded_patterns(
   total_ovf = 0
   for _, ev_list in by_key.items():
     ev_list.sort(key=lambda it: (it[0], it[1]))
+    ranked = [(float(t_e), rank_i, ev_d)
+              for rank_i, (t_e, _, ev_d) in enumerate(ev_list, start=1)]
     _, emitted, exp_c, ovf_c, _ = _advance_nfa_runs(
-        config, compiled, [], ev_list, horizon_sec=float('inf'))
+        config, compiled, [], ranked, horizon_sec=float('inf'))
     for _, m_row in emitted:
       all_matches.append(m_row)
     total_exp += exp_c
@@ -1267,12 +1366,16 @@ class _BoundedPatternMatchDoFn(beam.DoFn):
       self._compiled_steps = _compile_step_matchers(self.config)
     _, raw_events = element
     ev_list = list(raw_events)
-    ev_list.sort(key=lambda it: (it[0], it[1]))
+    ev_list.sort(
+        key=lambda it:
+        (float(it[0]), int(it[1]), interval_join._encode_state_payload(it[2])))
+    ranked_events = [(float(t_e), rank_i, ev_d)
+                     for rank_i, (t_e, _, ev_d) in enumerate(ev_list, start=1)]
     _, emitted, exp_c, ovf_c, ovf_rows = _advance_nfa_runs(
         self.config,
         self._compiled_steps,
         [],
-        ev_list,
+        ranked_events,
         horizon_sec=float('inf'))
     if emitted:
       self.matched_ctr.inc(len(emitted))

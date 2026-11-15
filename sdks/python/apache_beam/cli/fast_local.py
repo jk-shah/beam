@@ -42,7 +42,9 @@ Known differences from the runner path, all caused by Beam core:
 from __future__ import annotations
 
 import csv
+import decimal
 import json
+import math
 import os
 from typing import Any
 from typing import Iterable
@@ -58,7 +60,7 @@ RUNNER_NAME = 'local_fast'
 _SOURCE_FORMATS = frozenset(['csv', 'json', 'parquet', 'avro'])
 _SINK_FORMATS = frozenset(['csv', 'json', 'parquet'])
 _SINK_EXTENSIONS = {
-    'csv': ('.csv', ),
+    'csv': ('.csv', '.tsv'),
     'json': ('.json', '.jsonl', '.ndjson'),
     'parquet': ('.parquet', '.pq'),
 }
@@ -169,8 +171,10 @@ def _exact_sink_path(ep: uris.ParsedEndpoint | None) -> str | None:
   if not _is_local(target) or any(ch in target for ch in '*?['):
     return None
   extra = set(ep.config) - {'path'}
-  if extra and not (ep.format == 'json' and extra <= {'key', 'value'} and
-                    target.lower().endswith('.json')):
+  if extra and not (
+      (ep.format == 'json' and extra <= {'key', 'value'} and
+       target.lower().endswith('.json')) or
+      (ep.format == 'csv' and extra <= {'delimiter'})):
     return None
   if not target.lower().endswith(_SINK_EXTENSIONS[ep.format]):
     return None
@@ -224,6 +228,15 @@ def plan(
   return files
 
 
+def _spec_has_drop_bad(spec: dict[str, Any]) -> bool:
+  for t in spec.get('pipeline', {}).get('transforms', []):
+    t_type = t.get('type')
+    name = str(t.get('name', ''))
+    if t_type == 'CliDropRows' or (t_type == 'Filter' and name == 'DropBadRows'):
+      return True
+  return False
+
+
 def _transform_configs(spec: dict[str, Any]):
   """Extracts `(cdc_norm_cfg, cdc_mat_cfg, where_cfg, select_cfg)` or None.
 
@@ -246,6 +259,7 @@ def _transform_configs(spec: dict[str, Any]):
       'ReadFromAvro',
       'CliRowifyNested',
       'CliCountRows',
+      'CliDropRows',
       'WriteToCsv',
       'WriteToJson',
       'WriteToParquet',
@@ -261,6 +275,8 @@ def _transform_configs(spec: dict[str, Any]):
     elif t_type == 'CliMaterializeCdc':
       cdc_mat_cfg = t.get('config', {})
     elif t_type == 'Filter':
+      if name in ('DropBadRows', 'FilterBlankCdcLines'):
+        continue
       if where_cfg is not None or select_cfg is not None:
         return None
       where_cfg = t.get('config', {})
@@ -306,9 +322,23 @@ exec(  # pylint: disable=exec-used
 _safe_row_getattr = _ISOLATED_NS['_safe_row_getattr']
 
 
+_ALLOWED_FAST_IMPORTS = frozenset([
+    'datetime', 'math', 're', 'json', 'decimal', 'base64',
+    '_strptime', 'time', 'calendar', 'locale',
+])
+
+
+def _safe_fast_import(name, globals=None, locals=None, fromlist=(), level=0):  # pylint: disable=redefined-builtin
+  if level != 0 or name not in _ALLOWED_FAST_IMPORTS:
+    raise ImportError(f'import {name!r} is not allowed in local fast path')
+  return __import__(name, globals, locals, fromlist, level)
+
+
 _SAFE_FAST_BUILTINS: dict[str, Any] = {
+    '__import__': _safe_fast_import,
     'abs': abs,
     'bool': bool,
+    'dict': dict,
     'float': float,
     'getattr': _safe_row_getattr,
     'int': int,
@@ -317,7 +347,9 @@ _SAFE_FAST_BUILTINS: dict[str, Any] = {
     'list': list,
     'max': max,
     'min': min,
+    'range': range,
     'round': round,
+    'set': set,
     'str': str,
     'tuple': tuple,
     'bytes': bytes,
@@ -355,10 +387,12 @@ def _compile_expression(expr: str):
   except ValueError as e:
     raise FastPipeError(str(e)) from None
 
-  eval_builtins = {**expect_mod._SAFE_BUILTINS, **_SAFE_FAST_BUILTINS}
+  base_builtins = {**expect_mod._SAFE_BUILTINS, **_SAFE_FAST_BUILTINS}
 
   def fn(row):
-    return eval(code, {'__builtins__': eval_builtins}, row._asdict())  # pylint: disable=eval-used
+    row_dict = row._asdict()
+    eval_builtins = {**base_builtins, '_cli_exp_col': row_dict.get}
+    return eval(code, {'__builtins__': eval_builtins}, row_dict)  # pylint: disable=eval-used
 
   return fn
 
@@ -638,6 +672,21 @@ def _cell(value: Any) -> Any:
   return value
 
 
+def _sanitize_json_nan(value: Any) -> Any:
+  """Replaces non-finite floats/Decimals (`NaN`, `+-Inf`) with `None` (`null`)."""
+  if isinstance(value, float):
+    return None if (math.isnan(value) or math.isinf(value)) else value
+  if isinstance(value, decimal.Decimal):
+    return None if (value.is_nan() or value.is_infinite()) else str(value)
+  if isinstance(value, dict):
+    return {k: _sanitize_json_nan(v) for k, v in value.items()}
+  if isinstance(value, list):
+    return [_sanitize_json_nan(v) for v in value]
+  if isinstance(value, tuple):
+    return [_sanitize_json_nan(v) for v in value]
+  return value
+
+
 def _arrow_table(columns: list[str], rows: list[dict[str, Any]],
                  known_types: dict[str, Any]):
   import pyarrow as pa
@@ -646,6 +695,8 @@ def _arrow_table(columns: list[str], rows: list[dict[str, Any]],
   for col in columns:
     values = [r.get(col) for r in rows]
     typ = known_types.get(col)
+    if isinstance(typ, str):
+      typ = _kind_arrow_type(typ)
     arr = None
     if typ is not None:
       try:
@@ -694,15 +745,19 @@ def _stage_write(
       import pyarrow.parquet as pq
       pq.write_table(_arrow_table(columns, rows, known_types), tmp_path)
     elif ep.format == 'csv':
+      delim = str(ep.config.get('delimiter', ',') or ',')
       with open(tmp_path, 'w', encoding='utf-8', newline='') as f:
-        writer = csv.writer(f, lineterminator='\n')
-        writer.writerow(columns)
+        writer = csv.writer(f, delimiter=delim, lineterminator='\n')
+        if columns or rows:
+          writer.writerow(columns)
         for r in rows:
           writer.writerow([_cell(r.get(c)) for c in columns])
     else:
       with open(tmp_path, 'w', encoding='utf-8') as f:
         for r in rows:
-          f.write(json.dumps(r, default=str) + '\n')
+          f.write(
+              json.dumps(
+                  _sanitize_json_nan(r), default=str, allow_nan=False) + '\n')
   except BaseException:
     if os.path.exists(tmp_path):
       try:
@@ -717,7 +772,8 @@ def _stage_json_document(target: str, doc: Any) -> tuple[str, str]:
   tmp_path = _new_stage_path(target, 'doc')
   try:
     with open(tmp_path, 'w', encoding='utf-8') as f:
-      json.dump(doc, f, indent=2, default=str)
+      json.dump(
+          _sanitize_json_nan(doc), f, indent=2, default=str, allow_nan=False)
       f.write('\n')
   except BaseException:
     if os.path.exists(tmp_path):
@@ -750,6 +806,7 @@ def run(
     mixed_groups=None,
     *,
     assert_counts: bool = False,
+    drop_bad: bool = False,
 ) -> FastPipeResult:
   """Runs `pipe` in-process. Raises FastPipeError like a failed pipeline.
 
@@ -766,6 +823,9 @@ def run(
       limit_cfg,
   ) = _transform_configs(pipe.spec)
   route_errors = pipe.dlq_endpoint is not None
+  eff_drop_bad = bool(
+      (drop_bad or _spec_has_drop_bad(pipe.spec)) and not route_errors)
+  capture_errors = route_errors or eff_drop_bad
   dlq_records: list[dict[str, Any]] = []
   drift_state: dict[str, Any] = {'count': 0, 'fields': set()}
   cdc_superseded = 0
@@ -794,7 +854,7 @@ def run(
       src_cols, src_rows, rows_read, src_types = _read_source(
           pipe.source_endpoint,
           files,
-          route_errors,
+          capture_errors,
           dlq_records,
           drift_state=drift_state)
       raw_records = src_rows
@@ -826,7 +886,7 @@ def run(
                   cdc_norm_cfg.get('strict_inferred_fields')),
               on_unknown_fields=str(
                   cdc_norm_cfg.get('on_unknown_fields', 'error')),
-              route_errors=route_errors,
+              route_errors=capture_errors,
               row_factory=Row,
               dlq_list=dlq_records)
     except ValueError as exc:
@@ -840,14 +900,14 @@ def run(
     columns, rows, rows_read, types = _read_mixed(
         pipe.source_endpoint,
         mixed_groups,
-        route_errors,
+        capture_errors,
         dlq_records,
         drift_state=drift_state)
   else:
     columns, rows, rows_read, types = _read_source(
         pipe.source_endpoint,
         files,
-        route_errors,
+        capture_errors,
         dlq_records,
         drift_state=drift_state)
 
@@ -855,12 +915,20 @@ def run(
   text_number_cols: set[str] = set()
   if where_cfg is not None:
     keep = _compile_field(where_cfg.get('keep'))
+    if not rows and not columns:
+      try:
+        keep(Row())
+      except Exception as exc:  # pylint: disable=broad-except
+        if not capture_errors:
+          raise FastPipeError(
+              f"{type(exc).__name__}: {exc} [while running 'Filter']"
+          ) from None
     kept = []
     for row in rows:
       try:
         ok = keep(row)
       except Exception as exc:  # pylint: disable=broad-except
-        if not route_errors:
+        if not capture_errors:
           raise FastPipeError(
               f"{type(exc).__name__}: {exc} [while running 'Filter']"
           ) from None
@@ -876,20 +944,49 @@ def run(
   if select_cfg is not None:
     raw_fields = select_cfg.get('fields', {})
     fields = {name: _compile_field(spec) for name, spec in raw_fields.items()}
+    if not rows and not columns:
+      for fn in fields.values():
+        try:
+          fn(Row())
+        except Exception as exc:  # pylint: disable=broad-except
+          if not capture_errors:
+            raise FastPipeError(
+                f"{type(exc).__name__}: {exc} [while running 'MapToFields']"
+            ) from None
     is_append = bool(select_cfg.get('append'))
     drop_set = set(select_cfg.get('drop') or ())
     base_cols = (
         [c for c in columns if c not in drop_set and c not in fields]
         if is_append else [])
-    out_types: dict[str, str] = {}
+    out_types: dict[str, Any] = {}
     for c in base_cols:
       if c in types:
         out_types[c] = types[c]
+    _json_to_fast_type = {
+        'int': 'int',
+        'integer': 'int',
+        'int64': 'int',
+        'float': 'float',
+        'number': 'float',
+        'float64': 'float',
+        'double': 'float',
+        'str': 'str',
+        'string': 'str',
+        'bool': 'bool',
+        'boolean': 'bool',
+    }
     for name, spec in raw_fields.items():
       if isinstance(spec, dict):
-        ot = spec.get('output_type')
-        if isinstance(ot, str) and ot in ('int', 'float', 'str', 'bool'):
-          out_types[name] = ot
+        mapped_t = _json_to_fast_type.get(
+            str(spec.get('output_type') or '').lower())
+        if not mapped_t and isinstance(spec.get('callable'), str):
+          first_ln = spec['callable'].splitlines()[0]
+          if '->' in first_ln:
+            ann_tok = (
+                first_ln.split('->', 1)[1].rstrip(':').split('|', 1)[0].strip().lower())
+            mapped_t = _json_to_fast_type.get(ann_tok)
+        if mapped_t:
+          out_types[name] = _kind_arrow_type(mapped_t)
       elif str(spec) in types:
         out_types[name] = types[str(spec)]
     projected = []
@@ -903,7 +1000,7 @@ def run(
         else:
           projected.append(Row(**computed))
       except Exception as exc:  # pylint: disable=broad-except
-        if not route_errors:
+        if not capture_errors:
           raise FastPipeError(
               f"{type(exc).__name__}: {exc} [while running 'MapToFields']"
           ) from None
@@ -926,10 +1023,10 @@ def run(
     ]
     kept_exp = []
     for row in rows:
+      exp_metrics['expectations_evaluated'] = (
+          exp_metrics.get('expectations_evaluated', 0) + 1)
       failed_rule = None
       for rule, code in compiled_rules:
-        exp_metrics['expectations_evaluated'] = (
-            exp_metrics.get('expectations_evaluated', 0) + 1)
         if expect_mod.evaluate_record(code, row):
           exp_metrics[f'expectation_passed_{rule.name}'] = (
               exp_metrics.get(f'expectation_passed_{rule.name}', 0) + 1)
@@ -948,16 +1045,16 @@ def run(
             exp_metrics.get(f'expectation_failed_{failed_rule.name}', 0) + 1)
         raise FastPipeError(
             f"Expectation rule {failed_rule.name!r} ({failed_rule.expression}) "
-            f"violated by row: {row._asdict() if hasattr(row, '_asdict') else row}")
+            'violated')
       elif action == 'dlq':
         exp_metrics[f'expectation_quarantined_{failed_rule.name}'] = (
             exp_metrics.get(f'expectation_quarantined_{failed_rule.name}', 0) + 1)
         exp_metrics['expectation_quarantined_rows'] = (
             exp_metrics.get('expectation_quarantined_rows', 0) + 1)
-        if not route_errors:
+        if not capture_errors:
           raise FastPipeError(
-              f"Expectation rule {failed_rule.name!r} violated and no DLQ route configured; "
-              f"row: {row._asdict() if hasattr(row, '_asdict') else row}")
+              f'Expectation rule {failed_rule.name!r} violated and no DLQ '
+              'route configured')
         rec_dlq = _error_record(
             'CliExpect',
             expect_mod.ExpectationViolation(
@@ -981,12 +1078,15 @@ def run(
       filtered_out += len(rows) - lim_n
       rows = rows[:lim_n]
 
+  if eff_drop_bad and dlq_records:
+    filtered_out += len(dlq_records)
+
   out_rows = [_plain(r) for r in rows]
   metrics: dict[str, int] = {'rows_read': rows_read, 'rows_written': len(out_rows), **exp_metrics}
   if cdc_superseded:
     metrics['cdc_superseded_rows'] = cdc_superseded
   if (where_cfg is not None or cdc_superseded > 0 or cdc_preimage_skipped > 0 or
-      expect_cfg is not None or limit_cfg is not None):
+      expect_cfg is not None or limit_cfg is not None or eff_drop_bad):
     metrics['rows_filtered_out'] = (
         filtered_out + cdc_superseded + cdc_preimage_skipped)
   if route_errors:

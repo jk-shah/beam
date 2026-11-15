@@ -23,6 +23,7 @@ import io
 import json
 import os
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
@@ -1018,6 +1019,256 @@ class CliInferEndToEndPipeTest(unittest.TestCase):
       env_nw = json.loads(out_nw)
       self.assertTrue(
           any('no_wait_until_finish' in w for w in env_nw.get('warnings', ())))
+
+
+class InferProductionHardeningRegressionTest(unittest.TestCase):
+  def test_concurrent_lazy_vertexai_handler_deduplicates_init_and_list_models(
+      self):
+    init_count = 0
+    load_count = 0
+    count_lock = threading.Lock()
+    shared_endpoint_obj = object()
+
+    class _CountingVertexHandler(ModelHandler):
+      def __init__(self, **kwargs):
+        nonlocal init_count
+        _ = kwargs
+        import time as _t
+        _t.sleep(0.02)
+        with count_lock:
+          init_count += 1
+
+      def load_model(self):
+        nonlocal load_count
+        import time as _t
+        _t.sleep(0.02)
+        with count_lock:
+          load_count += 1
+        return shared_endpoint_obj
+
+      def run_inference(self, batch, model, inference_args=None):
+        _ = (model, inference_args)
+        return [PredictionResult(x, [{'score': 0.9}]) for x in batch]
+
+    cfg = infer.parse_infer_config({
+        'provider': 'vertexai',
+        'endpoint_id': '1234567890',
+        'project': 'my-gcp-proj',
+        'location': 'us-central1',
+        'fields': ['f1'],
+    })
+
+    n_threads = 10
+    barrier = threading.Barrier(n_threads)
+    loaded_models: list[object] = []
+    errors: list[BaseException] = []
+
+    with mock.patch(
+        'apache_beam.ml.inference.vertex_ai_inference.VertexAIModelHandlerJSON',
+        _CountingVertexHandler):
+
+      def _worker():
+        try:
+          h = infer._LazyCliModelHandler(cfg, catch_singleton_errors=True)
+          barrier.wait(timeout=5.0)
+          mdl = h.load_model()
+          with count_lock:
+            loaded_models.append(mdl)
+        except BaseException as exc:  # pylint: disable=broad-except
+          with count_lock:
+            errors.append(exc)
+
+      threads = [threading.Thread(target=_worker) for _ in range(n_threads)]
+      for th in threads:
+        th.start()
+      for th in threads:
+        th.join()
+
+    self.assertEqual(errors, [])
+    self.assertEqual(init_count, 1)
+    self.assertEqual(load_count, 1)
+    self.assertEqual(len(loaded_models), n_threads)
+    for mdl in loaded_models:
+      self.assertIs(mdl, shared_endpoint_obj)
+
+  def test_hf_large_model_false_serializes_pipeline_while_large_model_true_is_lock_free(
+      self):
+    def _run_concurrency_probe(large_model_flag: bool) -> int:
+      state_lock = threading.Lock()
+      active = 0
+      peak_active = 0
+      shared_hf_pipe = _FakeLoadedModel()
+
+      class _NonThreadSafeHfInner(ModelHandler):
+        def load_model(self):
+          return shared_hf_pipe
+
+        def run_inference(self, batch, model, inference_args=None):
+          nonlocal active, peak_active
+          _ = (model, inference_args)
+          import time as _t
+          with state_lock:
+            active += 1
+            peak_active = max(peak_active, active)
+            if not large_model_flag and active > 1:
+              raise RuntimeError('Already borrowed')
+          try:
+            _t.sleep(0.025)
+            return [
+                PredictionResult(x, {
+                    'label': 'POS', 'score': 0.99
+                }) for x in batch
+            ]
+          finally:
+            with state_lock:
+              active -= 1
+
+      cfg = infer.parse_infer_config({
+          'provider': 'hf',
+          'task': 'text-classification',
+          'model': 'distilbert-base-uncased',
+          'input_col': 'text',
+          'large_model': large_model_flag,
+      })
+      lazy = infer._LazyCliModelHandler(
+          cfg,
+          catch_singleton_errors=False,
+          handler_factory=lambda _c: _NonThreadSafeHfInner())
+      mdl = lazy.load_model()
+
+      errs: list[BaseException] = []
+      barrier = threading.Barrier(6)
+
+      def _call():
+        try:
+          barrier.wait(timeout=5.0)
+          res = list(lazy.run_inference(['hello'], mdl))
+          assert len(res) == 1
+        except BaseException as exc:  # pylint: disable=broad-except
+          with state_lock:
+            errs.append(exc)
+
+      threads = [threading.Thread(target=_call) for _ in range(6)]
+      for th in threads:
+        th.start()
+      for th in threads:
+        th.join()
+
+      self.assertEqual(errs, [])
+      return peak_active
+
+    self.assertEqual(_run_concurrency_probe(large_model_flag=False), 1)
+    self.assertGreater(_run_concurrency_probe(large_model_flag=True), 1)
+
+  def test_load_pipeline_args_and_model_kwargs_preserved_and_yaml_roundtripped(
+      self):
+    cfg = infer.parse_infer_config({
+        'provider': 'hf',
+        'task': 'text-classification',
+        'model': 'distilbert-base-uncased',
+        'revision': 'abc1234',
+        'input_col': 'text',
+        'load_pipeline_args': {
+            'batch_size': 16,
+            'truncation': True,
+        },
+        'model_kwargs': {
+            'torch_dtype': 'float16',
+            'low_cpu_mem_usage': True,
+        },
+    })
+    self.assertEqual(
+        dict(cfg.load_pipeline_args), {
+            'batch_size': 16, 'truncation': True
+        })
+    self.assertEqual(
+        dict(cfg.model_kwargs), {
+            'torch_dtype': 'float16', 'low_cpu_mem_usage': True
+        })
+
+    yaml_dict = infer.infer_config_to_yaml_dict(cfg)
+    self.assertEqual(
+        yaml_dict['load_pipeline_args'], {
+            'batch_size': 16, 'truncation': True
+        })
+    self.assertEqual(
+        yaml_dict['model_kwargs'], {
+            'torch_dtype': 'float16', 'low_cpu_mem_usage': True
+        })
+
+    # Verify Beam YAML `cli_infer(**yaml_dict)` round-trips cleanly.
+    transform = infer.cli_infer(**yaml_dict)
+    self.assertEqual(transform._cfg.load_pipeline_args, cfg.load_pipeline_args)
+    self.assertEqual(transform._cfg.model_kwargs, cfg.model_kwargs)
+
+    captured_hf_kwargs: dict[str, object] = {}
+
+    class _CaptureHfPipelineHandler(ModelHandler):
+      def __init__(self, **kwargs):
+        captured_hf_kwargs.update(kwargs)
+
+      def load_model(self):
+        return _FakeLoadedModel()
+
+      def run_inference(self, batch, model, inference_args=None):
+        _ = (batch, model, inference_args)
+        return []
+
+    import sys
+    import types
+    fake_hf_mod = types.ModuleType(
+        'apache_beam.ml.inference.huggingface_inference')
+    fake_hf_mod.HuggingFacePipelineModelHandler = _CaptureHfPipelineHandler  # type: ignore[attr-defined]
+    with mock.patch.dict(
+        sys.modules,
+        {'apache_beam.ml.inference.huggingface_inference': fake_hf_mod}):
+      lazy = infer._LazyCliModelHandler(cfg, catch_singleton_errors=True)
+      lazy._ensure_inner_handler()
+
+    lpa = captured_hf_kwargs['load_pipeline_args']
+    assert isinstance(lpa, dict)
+    self.assertEqual(lpa['batch_size'], 16)
+    self.assertTrue(lpa['truncation'])
+    self.assertFalse(lpa['trust_remote_code'])
+    self.assertEqual(lpa['revision'], 'abc1234')
+    mk = lpa['model_kwargs']
+    self.assertEqual(mk['torch_dtype'], 'float16')
+    self.assertTrue(mk['low_cpu_mem_usage'])
+    self.assertFalse(mk['trust_remote_code'])
+    self.assertTrue(mk['use_safetensors'])
+    self.assertEqual(mk['revision'], 'abc1234')
+
+  def test_shared_infer_rate_limiter_and_preprocess_finish_bundle_buffer_clear(
+      self):
+    cfg = infer.parse_infer_config({
+        'provider': 'mock',
+        'model_id': 'shared_rl_v1',
+        'fields': ['x'],
+        'rate_limit': 50.0,
+        'max_batch_size': 8,
+    })
+    h1 = infer._LazyCliModelHandler(cfg, catch_singleton_errors=True)
+    h2 = infer._LazyCliModelHandler(cfg, catch_singleton_errors=True)
+    self.assertIsNotNone(h1._rate_limiter)
+    self.assertIs(h1._rate_limiter, h2._rate_limiter)
+
+    dofn = infer._PreprocessAndBatchDoFn(cfg, has_dlq=False)
+    dofn.start_bundle()
+    win1 = window.GlobalWindow()
+    win2 = window.IntervalWindow(0, 60)
+    list(dofn.process(beam.Row(x=1.0), ts=10, win=win1))
+    list(dofn.process(beam.Row(x=2.0), ts=20, win=win2))
+    self.assertEqual(len(dofn._win_buffers), 2)
+
+    gen = dofn.finish_bundle()
+    first_batch = next(gen)
+    self.assertEqual(len(first_batch.value), 1)
+    # Simulate downstream exception aborting finish_bundle mid-iteration!
+    gen.close()
+    self.assertEqual(dofn._win_buffers, {})
+    self.assertEqual(dofn._buffer, {})
+    self.assertEqual(dofn._win_bytes, {})
+    self.assertEqual(dofn._win_started, {})
 
 
 if __name__ == '__main__':

@@ -35,6 +35,7 @@ Bridges ahead of Apache Beam `#41309` with leak-free 1:1 point-in-time joins:
 from __future__ import annotations
 
 import bisect
+import datetime
 import decimal
 import json
 import math
@@ -65,6 +66,7 @@ from . import output
 _ALLOWED_DIRECTIONS = frozenset(['backward', 'forward', 'nearest'])
 _ALLOWED_JOIN_TYPES = frozenset(['left', 'inner'])
 _ALLOWED_SKEW_ACTIONS = frozenset(['drop', 'warn', 'dlq', 'fail'])
+_UTC_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)
 
 
 class AsofJoinConfig(NamedTuple):
@@ -454,27 +456,62 @@ def _as_interval_projection_config(
   )
 
 
-def _encode_tie_key(row_dict: Mapping[str, Any], order_col: str | None) -> str:
-  """Encodes a lexicographically sortable tie-breaker string (never raises `TypeError`)."""
+def _datetime_to_utc_epoch_decimal(
+    dt_or_date: datetime.date) -> decimal.Decimal:
+  if isinstance(dt_or_date, datetime.datetime):
+    dt = (
+        dt_or_date.astimezone(datetime.timezone.utc) if dt_or_date.tzinfo
+        is not None else dt_or_date.replace(tzinfo=datetime.timezone.utc))
+  else:
+    dt = datetime.datetime(
+        dt_or_date.year,
+        dt_or_date.month,
+        dt_or_date.day,
+        tzinfo=datetime.timezone.utc)
+  delta = dt - _UTC_EPOCH
+  return (
+      decimal.Decimal(delta.days) * 86400 + decimal.Decimal(delta.seconds) +
+      (decimal.Decimal(delta.microseconds) / decimal.Decimal(1_000_000)))
+
+
+def _encode_tie_key(row_dict: Mapping[str, Any],
+                    order_col: str | None) -> tuple[int, Any]:
+  """Encodes a total-order-safe `(type_rank, val)` tie-breaker tuple."""
   if not order_col:
-    return ''
+    return (0, '')
   val = row_dict.get(order_col)
   if val is None:
-    return '0:'
+    return (0, '')
   if isinstance(val, bool):
-    return f'1:{int(val)}'
-  if isinstance(val, (int, float, decimal.Decimal)):
-    f = float(val)
-    if math.isnan(f):
-      return '0:'
-    # Offset-binary IEEE-like sortable fixed-width decimal for numbers
-    sign = '+' if f >= 0 else '-'
-    mag = abs(f)
-    if sign == '+':
-      return f'2:+{mag:028.9f}'
-    inv = max(0.0, 9_999_999_999_999_999.0 - mag)
-    return f'2:-{inv:028.9f}'
-  return f'3:{val}'
+    return (1, int(val))
+  if isinstance(val, int):
+    return (2, decimal.Decimal(val))
+  if isinstance(val, float):
+    if math.isnan(val):
+      return (3, 0)
+    if math.isinf(val):
+      return (2, decimal.Decimal('Infinity' if val > 0 else '-Infinity'))
+    return (2, decimal.Decimal(str(val)))
+  if isinstance(val, decimal.Decimal):
+    if val.is_nan():
+      return (3, 0)
+    if val.is_infinite():
+      return (
+          2, decimal.Decimal('-Infinity' if val.is_signed() else 'Infinity'))
+    return (2, decimal.Decimal(0) if val.is_zero() else val)
+  if isinstance(val, datetime.date):
+    return (4, _datetime_to_utc_epoch_decimal(val))
+  if hasattr(val, 'timestamp'):
+    try:
+      ts_f = float(val.timestamp())
+      if math.isnan(ts_f):
+        return (3, 0)
+      if math.isinf(ts_f):
+        return (4, decimal.Decimal('Infinity' if ts_f > 0 else '-Infinity'))
+      return (4, decimal.Decimal(str(ts_f)))
+    except Exception:  # pylint: disable=broad-except
+      pass
+  return (5, str(val))
 
 
 def _make_asof_dlq_row(
@@ -494,7 +531,7 @@ def _make_asof_dlq_row(
 
 def _find_best_right_entry(
     t_l: float,
-    sorted_right: list[tuple[float, str, str, dict[str, Any]]],
+    sorted_right: list[tuple[float, tuple[int, Any], str, dict[str, Any]]],
     t_list: list[float],
     cfg: AsofJoinConfig,
 ) -> dict[str, Any] | None:
@@ -522,7 +559,7 @@ def _find_best_right_entry(
     min_tr = sorted_right[pos][0]
     if cfg.tolerance is not None and (min_tr - t_l) > (cfg.tolerance + 1e-9):
       return None
-    # Among ties sharing `min_tr`, pick the highest `(tie_str, canon_json)`!
+    # Among ties sharing `min_tr`, pick the highest `(tie_key, canon_json)`!
     end_pos = bisect.bisect_right(t_list, min_tr)
     cand = sorted_right[end_pos - 1]
     return cand[0], cand[3]
@@ -568,19 +605,24 @@ def join_bounded_asof(
       if k not in right_cols:
         right_cols.append(k)
 
-  right_by_key: dict[bytes, list[tuple[float, str, str, dict[str, Any]]]] = {}
+  right_by_key: dict[bytes,
+                     list[tuple[float, tuple[int, Any], str, dict[str,
+                                                                  Any]]]] = {}
   for r in right_list:
     r_key_vals = tuple(r.get(c) for c in config.right_key)
     if any(kv is None for kv in r_key_vals):
       continue  # SQL semantics: NULL join keys never match NULL!
     k_bytes = interval_join.encode_canonical_key_values(r_key_vals)
     t_r = interval_join.extract_record_timestamp(r, config.right_timestamp)
-    tie_s = _encode_tie_key(r, config.right_order)
+    tie_k = _encode_tie_key(r, config.right_order)
     canon_s = interval_join._encode_state_payload(r)
-    right_by_key.setdefault(k_bytes, []).append((t_r, tie_s, canon_s, r))
+    right_by_key.setdefault(k_bytes, []).append((t_r, tie_k, canon_s, r))
 
   sorted_right_by_key: dict[bytes,
-                            tuple[list[tuple[float, str, str, dict[str, Any]]],
+                            tuple[list[tuple[float,
+                                             tuple[int, Any],
+                                             str,
+                                             dict[str, Any]]],
                                   list[float]]] = {}
   for k_bytes, r_items in right_by_key.items():
     r_items.sort(key=lambda item: (item[0], item[1], item[2]))
@@ -907,8 +949,7 @@ class AsofJoinStatefulDoFn(beam.DoFn):
           wm_state.write(json.dumps(cur_wm))
       if any(row_payload.get(c) is None for c in self.config.right_key):
         return  # SQL semantics: NULL join keys never match NULL!
-      tie_s = _encode_tie_key(row_payload, self.config.right_order)
-      right_buf.add((t, tie_s, encoded_json))
+      right_buf.add((t, '', encoded_json))
       clean_ms = self._compute_right_cleanup_ms(t)
       if clean_ms is not None:
         cur_next = next_eval.read()
@@ -939,17 +980,18 @@ class AsofJoinStatefulDoFn(beam.DoFn):
     waiting_left = [it for it in left_items if it[1] > fired_ms]
     ready_left.sort(key=lambda it: (it[0], it[2]))
 
-    sorted_right: list[tuple[float, str, str, dict[str, Any]]] = []
+    sorted_right: list[tuple[float, tuple[int, Any], str, dict[str, Any]]] = []
     right_cols: list[str] = list(self.config.right_fields)
     for rc in cur_wm.get('r_cols') or ():
       if rc not in right_cols:
         right_cols.append(rc)
-    for t_r, tie_s, r_json in right_raw:
+    for t_r, _unused_tie, r_json in right_raw:
       r_decoded = interval_join._decode_state_payload(r_json)
       for rk in r_decoded:
         if rk not in right_cols:
           right_cols.append(rk)
-      sorted_right.append((t_r, tie_s, r_json, r_decoded))
+      tie_k = _encode_tie_key(r_decoded, self.config.right_order)
+      sorted_right.append((t_r, tie_k, r_json, r_decoded))
     sorted_right.sort(key=lambda it: (it[0], it[1], it[2]))
     t_list = [it[0] for it in sorted_right]
 
@@ -999,14 +1041,14 @@ class AsofJoinStatefulDoFn(beam.DoFn):
             self.config.state_ttl is not None and
             (fired_sec - anchor[0]) > (self.config.state_ttl + 1e-9))
         if not expired_by_tol and not expired_by_ttl:
-          surviving_right.append((anchor[0], anchor[1], anchor[2]))
+          surviving_right.append((anchor[0], '', anchor[2]))
       for it in gt_h:
-        surviving_right.append((it[0], it[1], it[2]))
+        surviving_right.append((it[0], '', it[2]))
     else:
       tol = self.config.tolerance or 0.0
       for it in sorted_right:
         if it[0] >= (safe_horizon - tol - 1e-9):
-          surviving_right.append((it[0], it[1], it[2]))
+          surviving_right.append((it[0], '', it[2]))
 
     left_pending.clear()
     for it in waiting_left:
@@ -1085,6 +1127,10 @@ def cli_asof_join(
           t = interval_join.extract_record_timestamp(d, self.ts_col)
         else:
           t = float(elem_ts)
+        if not math.isfinite(t) or not (interval_join._MIN_BEAM_TS < t <
+                                        interval_join._MAX_BEAM_TS):
+          raise ValueError(
+              f'event timestamp {t!r} outside valid Beam watermark bounds')
         yield TimestampedValue((ckey, (self.side, t, d)),
                                beam_timestamp.Timestamp.of(t))
       except Exception as e:  # pylint: disable=broad-except
@@ -1152,32 +1198,27 @@ def cli_asof_join(
             | 'KeyLeft' >> beam.FlatMap(
                 lambda r: (() if (
                     any(
-                        v is None
-                        for v in interval_join.extract_record_key(
-                            r, join_cfg.left_key)) and
-                    join_cfg.join_type != 'left') else [(
+                        v is None for v in interval_join.extract_record_key(
+                            r, join_cfg.left_key)) and join_cfg.join_type !=
+                    'left') else [(
                         (
                             b'\xffNULLL\x00' + uuid.uuid4().bytes if any(
-                                v is None
-                                for v in interval_join.extract_record_key(
-                                    r, join_cfg.left_key)) else
+                                v is None for v in interval_join.
+                                extract_record_key(r, join_cfg.left_key)) else
                             interval_join.encode_canonical_key_values(
                                 interval_join.extract_record_key(
                                     r, join_cfg.left_key))),
-                        r,
-                    )])).with_output_types(tuple[bytes, Any]))
+                        r, )])).with_output_types(tuple[bytes, Any]))
         keyed_right = (
             win_right
             | 'KeyRight' >> beam.FlatMap(
                 lambda r: (() if any(
-                    v is None
-                    for v in interval_join.extract_record_key(
+                    v is None for v in interval_join.extract_record_key(
                         r, join_cfg.right_key)) else [(
                             interval_join.encode_canonical_key_values(
                                 interval_join.extract_record_key(
                                     r, join_cfg.right_key)),
-                            r,
-                        )])).with_output_types(tuple[bytes, Any]))
+                            r, )])).with_output_types(tuple[bytes, Any]))
         grouped = {
             'left': keyed_left, 'right': keyed_right
         } | 'CoGroupByKey' >> beam.CoGroupByKey()

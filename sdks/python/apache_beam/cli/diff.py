@@ -117,6 +117,106 @@ def _canonical_number_bytes(val: int | float | decimal.Decimal) -> bytes:
   return f'{sign_pfx}{stripped}e{exp}'.encode('ascii')
 
 
+def _canonical_temporal_str(val: Any) -> str | None:
+  """Returns canonical UTC ISO string for aware `datetime` / Beam `Timestamp`."""
+  import datetime
+  if hasattr(val, 'to_utc_datetime'):
+    try:
+      dt_utc = val.to_utc_datetime()
+      if dt_utc.tzinfo is None:
+        dt_utc = dt_utc.replace(tzinfo=datetime.timezone.utc)
+      return dt_utc.astimezone(datetime.timezone.utc).isoformat()
+    except Exception:  # pylint: disable=broad-except
+      pass
+  if hasattr(val, 'to_rfc3339'):
+    return str(val.to_rfc3339())
+  if isinstance(val, datetime.datetime):
+    if val.tzinfo is not None and val.utcoffset() is not None:
+      return val.astimezone(datetime.timezone.utc).isoformat()
+    return f'N:{val.isoformat()}'
+  if isinstance(val, (datetime.date, datetime.time)):
+    return val.isoformat()
+  if hasattr(val, 'isoformat'):
+    return str(val.isoformat())
+  return None
+
+
+def _canonical_number_str_for_digest(
+    val: int | float | decimal.Decimal,
+    float_sig_digits: int | None,
+) -> str:
+  if isinstance(val, float):
+    if math.isnan(val):
+      return 'NaN'
+    if math.isinf(val):
+      return '+Inf' if val > 0 else '-Inf'
+    if val == 0.0:
+      return '0'
+    if float_sig_digits is not None:
+      return f'{val:.{float_sig_digits}g}'
+    return _canonical_number_bytes(val).decode('ascii')
+
+  if isinstance(val, decimal.Decimal):
+    if val.is_nan():
+      return 'NaN'
+    if val.is_infinite():
+      return '+Inf' if val > 0 else '-Inf'
+    if val.is_zero():
+      return '0'
+    if float_sig_digits is not None:
+      try:
+        fv = float(val)
+        if not math.isinf(fv) and fv != 0.0:
+          return f'{fv:.{float_sig_digits}g}'
+      except (OverflowError, ValueError):
+        pass
+      ctx = decimal.Context(prec=max(1, float_sig_digits))
+      rounded = ctx.plus(val)
+      return _canonical_number_bytes(rounded).decode('ascii')
+    return _canonical_number_bytes(val).decode('ascii')
+
+  # int
+  if val == 0:
+    return '0'
+  if float_sig_digits is not None:
+    try:
+      fv = float(val)
+      if not math.isinf(fv):
+        return f'{fv:.{float_sig_digits}g}'
+    except OverflowError:
+      pass
+    ctx = decimal.Context(prec=max(1, float_sig_digits))
+    return _canonical_number_bytes(ctx.plus(decimal.Decimal(val))).decode(
+        'ascii')
+  return _canonical_number_bytes(val).decode('ascii')
+
+
+def _canonical_value_node(
+    v: Any, float_sig_digits: int | None = None) -> tuple[int, Any]:
+  """Canonicalizes any scalar, temporal, dict, Row, or list recursively."""
+  if v is None:
+    return (0, '')
+  if isinstance(v, bool):
+    return (1, '1' if v else '0')
+  if isinstance(v, (int, float, decimal.Decimal)):
+    return (2, _canonical_number_str_for_digest(v, float_sig_digits))
+  if isinstance(v, (bytes, bytearray, memoryview)):
+    return (4, bytes(v).hex())
+  ts_str = _canonical_temporal_str(v)
+  if ts_str is not None:
+    return (5, ts_str)
+  if hasattr(v, '_asdict'):
+    v = dict(v._asdict())
+  if isinstance(v, dict):
+    return (
+        7,
+        [(str(k), _canonical_value_node(sub, float_sig_digits))
+         for k, sub in sorted(v.items(), key=lambda kv: str(kv[0]))])
+  if isinstance(v, (list, tuple)):
+    return (8, [_canonical_value_node(item, float_sig_digits) for item in v])
+  return (3, str(v))
+
+
 def _encode_key_atom(val: Any) -> tuple[int, bytes]:
   """Encodes a key value into a deterministic `(tag, bytes)` primitive pair."""
   if val is None:
@@ -129,10 +229,13 @@ def _encode_key_atom(val: Any) -> tuple[int, bytes]:
     return (3, val.encode('utf-8', errors='surrogatepass'))
   if isinstance(val, (bytes, bytearray, memoryview)):
     return (4, bytes(val))
-  if hasattr(val, 'to_rfc3339'):
-    return (5, val.to_rfc3339().encode('utf-8'))
-  if hasattr(val, 'isoformat'):
-    return (5, val.isoformat().encode('utf-8'))
+  ts_str = _canonical_temporal_str(val)
+  if ts_str is not None:
+    return (5, ts_str.encode('utf-8'))
+  if hasattr(val, '_asdict') or isinstance(val, (dict, list, tuple)):
+    node = _canonical_value_node(val, None)
+    return (
+        node[0], json.dumps(node[1], separators=(',', ':')).encode('utf-8'))
   return (6, repr(val).encode('utf-8'))
 
 
@@ -146,29 +249,21 @@ def _row_to_plain_dict(row: Any) -> dict[str, Any]:
 
 def _canonical_row_digest(
     row_dict: dict[str, Any], float_sig_digits: int | None = None) -> bytes:
-  parts: list[tuple[str, int, str]] = []
+  parts: list[tuple[str, int, Any]] = []
   for k in sorted(row_dict.keys()):
-    v = row_dict[k]
-    if v is None:
-      parts.append((k, 0, ''))
-    elif isinstance(v, bool):
-      parts.append((k, 1, '1' if v else '0'))
-    elif isinstance(v, (int, float, decimal.Decimal)):
-      if float_sig_digits is not None and not (isinstance(
-          v, float) and (math.isnan(v) or math.isinf(v))):
-        parts.append((k, 2, f'{float(v):.{float_sig_digits}g}'))
-      else:
-        parts.append((k, 2, _canonical_number_bytes(v).decode('ascii')))
-    elif isinstance(v, (bytes, bytearray, memoryview)):
-      parts.append((k, 4, bytes(v).hex()))
-    elif hasattr(v, 'to_rfc3339'):
-      parts.append((k, 5, v.to_rfc3339()))
-    elif hasattr(v, 'isoformat'):
-      parts.append((k, 5, v.isoformat()))
-    else:
-      parts.append((k, 3, str(v)))
+    tag, payload = _canonical_value_node(row_dict[k], float_sig_digits)
+    parts.append((k, tag, payload))
   raw = json.dumps(parts, separators=(',', ':')).encode('utf-8')
   return hashlib.sha256(raw).digest()
+
+
+def _is_num_inf(v: Any) -> int:
+  """Returns +1 for +Inf, -1 for -Inf, or 0 for finite / NaN."""
+  if isinstance(v, float) and math.isinf(v):
+    return 1 if v > 0 else -1
+  if isinstance(v, decimal.Decimal) and v.is_infinite():
+    return 1 if v > 0 else -1
+  return 0
 
 
 def _values_equal(a: Any, b: Any, rtol: float, atol: float) -> bool:
@@ -186,13 +281,15 @@ def _values_equal(a: Any, b: Any, rtol: float, atol: float) -> bool:
               math.isnan(b)) or (isinstance(b, decimal.Decimal) and b.is_nan())
     if fa_nan or fb_nan:
       return fa_nan and fb_nan
+    inf_a = _is_num_inf(a)
+    inf_b = _is_num_inf(b)
+    if inf_a or inf_b:
+      return inf_a == inf_b
     if rtol == 0.0 and atol == 0.0:
       return _canonical_number_bytes(a) == _canonical_number_bytes(b)
     if not isinstance(a, float) and not isinstance(b, float):
       da = a if isinstance(a, decimal.Decimal) else decimal.Decimal(a)
       db = b if isinstance(b, decimal.Decimal) else decimal.Decimal(b)
-      if da.is_infinite() or db.is_infinite():
-        return da == db
       prec = max(
           80, len(da.as_tuple().digits) + 8, len(db.as_tuple().digits) + 8)
       ctx = decimal.Context(prec=prec)
@@ -202,9 +299,38 @@ def _values_equal(a: Any, b: Any, rtol: float, atol: float) -> bool:
           ctx.multiply(decimal.Decimal(str(rtol)), scale),
           decimal.Decimal(str(atol)))
       return diff_abs <= bound
-    return math.isclose(float(a), float(b), rel_tol=rtol, abs_tol=atol)
-  if hasattr(a, 'to_rfc3339') and hasattr(b, 'to_rfc3339'):
-    return a.to_rfc3339() == b.to_rfc3339()
+    try:
+      return math.isclose(float(a), float(b), rel_tol=rtol, abs_tol=atol)
+    except OverflowError:
+      da = decimal.Decimal(str(a)) if isinstance(a, float) else (
+          a if isinstance(a, decimal.Decimal) else decimal.Decimal(a))
+      db = decimal.Decimal(str(b)) if isinstance(b, float) else (
+          b if isinstance(b, decimal.Decimal) else decimal.Decimal(b))
+      prec = max(
+          80, len(da.as_tuple().digits) + 8, len(db.as_tuple().digits) + 8)
+      ctx = decimal.Context(prec=prec)
+      diff_abs = ctx.abs(ctx.subtract(da, db))
+      scale = max(ctx.abs(da), ctx.abs(db))
+      bound = max(
+          ctx.multiply(decimal.Decimal(str(rtol)), scale),
+          decimal.Decimal(str(atol)))
+      return diff_abs <= bound
+  ts_a = _canonical_temporal_str(a)
+  ts_b = _canonical_temporal_str(b)
+  if ts_a is not None and ts_b is not None:
+    return ts_a == ts_b
+  if hasattr(a, '_asdict'):
+    a = dict(a._asdict())
+  if hasattr(b, '_asdict'):
+    b = dict(b._asdict())
+  if isinstance(a, dict) and isinstance(b, dict):
+    if a.keys() != b.keys():
+      return False
+    return all(_values_equal(a[k], b[k], rtol, atol) for k in a)
+  if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+    if len(a) != len(b):
+      return False
+    return all(_values_equal(x, y, rtol, atol) for x, y in zip(a, b))
   return a == b
 
 
@@ -320,6 +446,7 @@ _TYPE_ALIASES = {
     'int64': 'int', 'long': 'int', 'integer': 'int',
     'float': 'float', 'float32': 'float', 'float64': 'float',
     'double': 'float', 'halffloat': 'float',
+    'decimal': 'decimal', 'numeric': 'decimal', 'bignumeric': 'decimal',
     'str': 'str', 'string': 'str', 'large_string': 'str', 'utf8': 'str',
     'bool': 'bool', 'boolean': 'bool',
     'bytes': 'bytes', 'binary': 'bytes', 'large_binary': 'bytes',
@@ -333,6 +460,8 @@ def _canonical_type(type_str: Any) -> str:
   for null_spelling in ("'null', ", ", 'null'", '"null", ', ', "null"'):
     low = low.replace(null_spelling, '')
   low = low.strip("[]'\" ")
+  if low.startswith('decimal'):
+    return 'decimal'
   return _TYPE_ALIASES.get(low, raw)
 
 
@@ -363,7 +492,9 @@ def run_diff(
   eff_key_limit = parse_key_limit(key_limit)
   p_args = list(pipeline_args or [])
 
-  key_cols = [k.strip() for k in (keys or ()) if k.strip()]
+  key_cols = [
+      p.strip() for k in (keys or ()) for p in str(k).split(',') if p.strip()
+  ]
   explicit_cols: list[str] | None = None
   if columns not in ('shared', 'all'):
     explicit_cols = [
@@ -751,7 +882,7 @@ def run_diff(
           if ep_c.kind == 'file':
             try:
               pipe_sql._match_source_files(ep_c.config['path'])
-            except pipe_sql.SqlPipeError:
+            except (pipe_sql.SqlPipeError, FileNotFoundError):
               raise uris.UriError(
                   f'no files matched {ep_c.raw!r} '
                   f'(checked {ep_c.config["path"]!r})') from None
@@ -774,18 +905,21 @@ def run_diff(
               limit_bytes=cap_limit)
         if l_b is not None and r_b is not None and comb_b <= 64 * 1024 * 1024:
           def _load_fast_rows(ep_obj: uris.ParsedEndpoint) -> list[dict[str, Any]]:
-            if ep_obj.kind == 'file' and ep_obj.format == 'json':
-              out_r: list[dict[str, Any]] = []
-              for fp in pipe_sql._match_source_files(ep_obj.config['path']):
-                with pipe_sql._open_binary(fp) as bf:
-                  for raw_ln in bf:
-                    txt_ln = raw_ln.decode('utf-8-sig', errors='replace').strip()
-                    if txt_ln:
-                      out_r.append(json.loads(txt_ln))
-              return out_r
-            _, loaded_r, _ = pipe_sql.load_endpoint_rows(
-                ep_obj, default_project=fast_proj)
-            return loaded_r
+            try:
+              if ep_obj.kind == 'file' and ep_obj.format == 'json':
+                out_r: list[dict[str, Any]] = []
+                for fp in pipe_sql._match_source_files(ep_obj.config['path']):
+                  with pipe_sql._open_binary(fp) as bf:
+                    for raw_ln in bf:
+                      txt_ln = raw_ln.decode('utf-8-sig', errors='replace').strip()
+                      if txt_ln:
+                        out_r.append(json.loads(txt_ln))
+                return out_r
+              _, loaded_r, _ = pipe_sql.load_endpoint_rows(
+                  ep_obj, default_project=fast_proj)
+              return loaded_r
+            except FileNotFoundError as exc:
+              raise uris.UriError(str(exc)) from None
 
           schema_diff_fast = _compute_schema_diff(
               _endpoint_schema(left_uri, left_format, left_opts, fast_proj),

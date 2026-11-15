@@ -186,8 +186,7 @@ def encode_canonical_key_values(values: Iterable[Any]) -> bytes:
 
 def _make_dlq_row(step: str, err_type: str, msg: str, elem: Any) -> beam.Row:
   from . import dlq
-  return dlq.make_transform_dlq_row(
-      step, err_type, msg, _to_plain_dict(elem))
+  return dlq.make_transform_dlq_row(step, err_type, msg, _to_plain_dict(elem))
 
 
 def parse_interval_duration(raw: str | int | float) -> float:
@@ -210,7 +209,7 @@ def parse_interval_duration(raw: str | int | float) -> float:
   if raw_unit in ('ms', 'millisecond', 'milliseconds'):
     mult = 0.001
   else:
-    unit = raw_unit.rstrip('s') if raw_unit not in ('s',) else 's'
+    unit = raw_unit.rstrip('s') if raw_unit not in ('s', ) else 's'
     mult = {
         's': 1.0,
         'sec': 1.0,
@@ -649,7 +648,6 @@ def _compile_join_select_expr(expr: str) -> Any:
 
 class _NullDefaultNamespace(types.SimpleNamespace):
   """Namespace returning `None` for missing public fields on outer-join rows."""
-
   def __getattr__(self, name: str) -> Any:
     if name.startswith('_'):
       raise AttributeError(name)
@@ -751,7 +749,7 @@ def project_joined_row(
     else:
       out[lk] = None
 
-  conflicts = (set(all_l_cols) & set(all_r_cols)) - set(config.left_key)
+  conflicts = set(all_l_cols) & (set(all_r_cols) - set(config.right_key))
   for k in all_l_cols:
     if k in config.left_key:
       continue
@@ -862,21 +860,13 @@ def join_bounded_records(
     for l_elem in null_left_unmatched:
       results.append(
           project_joined_row(
-              l_elem,
-              None,
-              config,
-              left_cols=left_cols,
-              right_cols=right_cols))
+              l_elem, None, config, left_cols=left_cols, right_cols=right_cols))
 
   if config.join_type in ('right', 'full'):
     for r_elem in null_right_unmatched:
       results.append(
           project_joined_row(
-              None,
-              r_elem,
-              config,
-              left_cols=left_cols,
-              right_cols=right_cols))
+              None, r_elem, config, left_cols=left_cols, right_cols=right_cols))
 
   return results
 
@@ -911,8 +901,7 @@ class _BoundedIntervalJoinDoFn(beam.DoFn):
             raise
           yield pvalue.TaggedOutput(
               self.err_tag,
-              _make_dlq_row(
-                  'CliIntervalJoin', type(e).__name__, str(e), r))
+              _make_dlq_row('CliIntervalJoin', type(e).__name__, str(e), r))
         elif self.config.skew_action == 'fail':
           raise
         else:
@@ -929,8 +918,7 @@ class _BoundedIntervalJoinDoFn(beam.DoFn):
             raise
           yield pvalue.TaggedOutput(
               self.err_tag,
-              _make_dlq_row(
-                  'CliIntervalJoin', type(e).__name__, str(e), r))
+              _make_dlq_row('CliIntervalJoin', type(e).__name__, str(e), r))
         elif self.config.skew_action == 'fail':
           raise
         else:
@@ -1159,11 +1147,17 @@ class IntervalJoinStatefulDoFn(beam.DoFn):
       existing_right = list(right_buf.read())
       updated_right = []
       left_matched = False
+      right_mutated = False
+      track_right_matched = self.config.join_type in ('right', 'full')
       for (t_r, r_json, r_matched) in existing_right:
-        if (t + self.config.lower_bound) <= t_r <= (t + self.config.upper_bound):
+        if (t + self.config.lower_bound) <= t_r <= (t +
+                                                    self.config.upper_bound):
           left_matched = True
           r_payload = _decode_state_payload(r_json)
-          updated_right.append((t_r, r_json, True))
+          new_r_matched = True if track_right_matched else r_matched
+          if new_r_matched != r_matched:
+            right_mutated = True
+          updated_right.append((t_r, r_json, new_r_matched))
           yield TimestampedValue(
               beam.Row(
                   **project_joined_row(row_payload, r_payload, self.config)),
@@ -1171,7 +1165,7 @@ class IntervalJoinStatefulDoFn(beam.DoFn):
         else:
           updated_right.append((t_r, r_json, r_matched))
 
-      if existing_right:
+      if right_mutated:
         right_buf.clear()
         for item in updated_right:
           right_buf.add(item)
@@ -1194,11 +1188,17 @@ class IntervalJoinStatefulDoFn(beam.DoFn):
       existing_left = list(left_buf.read())
       updated_left = []
       right_matched = False
+      left_mutated = False
+      track_left_matched = self.config.join_type in ('left', 'full')
       for (t_l, l_json, l_matched) in existing_left:
-        if (t_l + self.config.lower_bound) <= t <= (t_l + self.config.upper_bound):
+        if (t_l + self.config.lower_bound) <= t <= (t_l +
+                                                    self.config.upper_bound):
           right_matched = True
           l_payload = _decode_state_payload(l_json)
-          updated_left.append((t_l, l_json, True))
+          new_l_matched = True if track_left_matched else l_matched
+          if new_l_matched != l_matched:
+            left_mutated = True
+          updated_left.append((t_l, l_json, new_l_matched))
           yield TimestampedValue(
               beam.Row(
                   **project_joined_row(l_payload, row_payload, self.config)),
@@ -1206,7 +1206,7 @@ class IntervalJoinStatefulDoFn(beam.DoFn):
         else:
           updated_left.append((t_l, l_json, l_matched))
 
-      if existing_left:
+      if left_mutated:
         left_buf.clear()
         for item in updated_left:
           left_buf.add(item)
@@ -1243,34 +1243,46 @@ class IntervalJoinStatefulDoFn(beam.DoFn):
     min_surviving_deadline: float | None = None
 
     left_items = list(left_buf.read())
-    left_buf.clear()
+    surviving_left = []
+    left_evicted = False
     for (t_l, l_json, l_matched) in left_items:
       if (t_l + self.config.upper_bound) < watermark:
+        left_evicted = True
         if self.config.join_type in ('left', 'full') and not l_matched:
           l_payload = _decode_state_payload(l_json)
           yield TimestampedValue(
               beam.Row(**project_joined_row(l_payload, None, self.config)),
               beam_timestamp.Timestamp.of(t_l))
       else:
-        left_buf.add((t_l, l_json, l_matched))
+        surviving_left.append((t_l, l_json, l_matched))
         dl = t_l + self.config.upper_bound + 1.0
         if min_surviving_deadline is None or dl < min_surviving_deadline:
           min_surviving_deadline = dl
+    if left_evicted:
+      left_buf.clear()
+      for item in surviving_left:
+        left_buf.add(item)
 
     right_items = list(right_buf.read())
-    right_buf.clear()
+    surviving_right = []
+    right_evicted = False
     for (t_r, r_json, r_matched) in right_items:
       if (t_r - self.config.lower_bound) < watermark:
+        right_evicted = True
         if self.config.join_type in ('right', 'full') and not r_matched:
           r_payload = _decode_state_payload(r_json)
           yield TimestampedValue(
               beam.Row(**project_joined_row(None, r_payload, self.config)),
               beam_timestamp.Timestamp.of(t_r))
       else:
-        right_buf.add((t_r, r_json, r_matched))
+        surviving_right.append((t_r, r_json, r_matched))
         dl = t_r - self.config.lower_bound + 1.0
         if min_surviving_deadline is None or dl < min_surviving_deadline:
           min_surviving_deadline = dl
+    if right_evicted:
+      right_buf.clear()
+      for item in surviving_right:
+        right_buf.add(item)
 
     if min_surviving_deadline is not None:
       raw_wm = wm_state.read()
@@ -1436,7 +1448,7 @@ def _infer_joined_row_type(
     base_t = l_map.get(lk) or r_map.get(rk) or str
     fields.append((lk, _make_optional_type(base_t)))
 
-  conflicts = (set(all_l_cols) & set(all_r_cols)) - set(config.left_key)
+  conflicts = set(all_l_cols) & (set(all_r_cols) - set(config.right_key))
   for k in all_l_cols:
     if k in config.left_key:
       continue
@@ -1505,13 +1517,16 @@ def cli_interval_join(
         else:
           ckey = encode_canonical_key_values(k_vals)
         t = extract_record_timestamp(d, self.ts_col)
-        yield (ckey, (self.side, t, d))
+        if not math.isfinite(t) or not (_MIN_BEAM_TS < t < _MAX_BEAM_TS):
+          raise ValueError(
+              f'event timestamp {t!r} outside valid Beam watermark bounds')
+        yield TimestampedValue((ckey, (self.side, t, d)),
+                               beam_timestamp.Timestamp.of(t))
       except Exception as e:  # pylint: disable=broad-except
         if route_errors:
           yield pvalue.TaggedOutput(
               err_tag,
-              _make_dlq_row(
-                  'CliIntervalJoin', type(e).__name__, str(e), d))
+              _make_dlq_row('CliIntervalJoin', type(e).__name__, str(e), d))
         elif base_cfg.skew_action == 'fail':
           raise
         else:
@@ -1567,18 +1582,16 @@ def cli_interval_join(
             | 'KeyLeft' >> beam.FlatMap(
                 lambda r: (() if (
                     any(
-                        v is None
-                        for v in extract_record_key(r, join_cfg.left_key)) and
-                    join_cfg.join_type not in ('left', 'full')) else [(
+                        v is None for v in extract_record_key(
+                            r, join_cfg.left_key)) and join_cfg.join_type not in
+                    ('left', 'full')) else [(
                         (
                             b'\xffNULLL\x00' + uuid.uuid4().bytes if any(
-                                v is None
-                                for v in extract_record_key(
+                                v is None for v in extract_record_key(
                                     r, join_cfg.left_key)) else
                             encode_canonical_key_values(
                                 extract_record_key(r, join_cfg.left_key))),
-                        r,
-                    )])).with_output_types(tuple[bytes, Any]))
+                        r, )])).with_output_types(tuple[bytes, Any]))
         keyed_right = (
             win_right
             | 'KeyRight' >> beam.FlatMap(
@@ -1589,13 +1602,11 @@ def cli_interval_join(
                     join_cfg.join_type not in ('right', 'full')) else [(
                         (
                             b'\xffNULLR\x00' + uuid.uuid4().bytes if any(
-                                v is None
-                                for v in extract_record_key(
+                                v is None for v in extract_record_key(
                                     r, join_cfg.right_key)) else
                             encode_canonical_key_values(
                                 extract_record_key(r, join_cfg.right_key))),
-                        r,
-                    )])).with_output_types(tuple[bytes, Any]))
+                        r, )])).with_output_types(tuple[bytes, Any]))
         grouped = {
             'left': keyed_left, 'right': keyed_right
         } | 'CoGroupByKey' >> beam.CoGroupByKey()

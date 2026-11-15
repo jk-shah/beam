@@ -25,7 +25,6 @@ Executes in `<200 ms` locally without launching any Beam runner:
   64 MiB) returning matching rows strictly inside `untrusted_data`!
 """
 
-import csv
 import io
 import json
 import os
@@ -99,7 +98,10 @@ def run_inspect(
   }
 
 
-def _open_file_bytes(path: str):
+def _open_file_bytes(path: str, *, decompress: bool = False):
+  if decompress:
+    from . import dlq
+    return dlq._open_auto(path)
   if '://' not in path:
     return open(path, 'rb')
   from apache_beam.io.filesystems import FileSystems
@@ -142,12 +144,14 @@ def _inspect_files(
     search_term: str | None,
     scan_budget: int,
 ) -> dict[str, Any]:
+  from . import dlq
+  dlq.ensure_csv_field_size_limit()
+
   matched = _match_files(ep.raw)
   if not matched:
     raise FileNotFoundError(f'no files matched {ep.raw!r}')
 
   total_bytes = sum(sz for _, sz in matched)
-  first_path = matched[0][0]
   fmt = ep.format
   needle = search_term.lower() if search_term else None
 
@@ -223,62 +227,68 @@ def _inspect_files(
           pass
 
   elif fmt == 'csv':
-    from . import dlq
     scanned = 0
     header: list[str] | None = None
     col_samples: dict[str, list[str]] = {}
+    delim = str(ep.config.get('delimiter', ',') or ',')
     for fpath, fsize in matched:
       if scanned >= scan_budget:
         truncated_scan = True
         break
-      with _open_file_bytes(fpath) as raw_f:
-        bounded = io.BytesIO(raw_f.read(max(0, scan_budget - scanned)))
-        scanned += min(fsize, scan_budget - scanned)
+      with _open_file_bytes(fpath, decompress=True) as raw_f:
+        chunk_bytes = raw_f.read(max(0, scan_budget - scanned))
+        scanned += min(max(fsize, len(chunk_bytes)), scan_budget - scanned)
+        bounded = io.BytesIO(chunk_bytes)
         wrapper = io.TextIOWrapper(
             bounded, encoding='utf-8-sig', errors='replace', newline='')
-        reader = csv.reader(wrapper, delimiter=ep.config.get('delimiter', ','))
         try:
-          first = next(reader, None)
-        except csv.Error:
-          malformed_in_sample += 1
-          continue
-        if not first:
-          continue
-        norm_first = [c.strip() or f'col_{i}' for i, c in enumerate(first)]
-        if header is None:
-          header = norm_first
-          col_samples = {c: [] for c in header}
-        elif norm_first != header:
-          if len(first) != len(header):
-            malformed_in_sample += 1
-          else:
-            for c, cell in zip(header, first):
-              col_samples[c].append(cell)
-        idx = 0
-        while True:
+          rec_iter = dlq.iter_csv_rows_recovering(wrapper, delimiter=delim)
+          first = None
+          for cells, csv_err, _ in rec_iter:
+            if csv_err is not None:
+              malformed_in_sample += 1
+              continue
+            if cells:
+              first = cells
+              break
+          if not first:
+            continue
+          norm_first = [c.strip() or f'col_{i}' for i, c in enumerate(first)]
+          if header is None:
+            header = norm_first
+            col_samples = {c: [] for c in header}
+          elif norm_first != header:
+            if len(first) != len(header):
+              malformed_in_sample += 1
+            else:
+              for c, cell in zip(header, first):
+                col_samples[c].append(cell)
+          idx = 0
+          for cells, csv_err, _ in rec_iter:
+            if csv_err is not None:
+              malformed_in_sample += 1
+              continue
+            if not cells or (len(cells) == 1 and cells[0] == '' and
+                             len(header) > 1):
+              continue
+            if len(cells) != len(header):
+              malformed_in_sample += 1
+              continue
+            if idx < 100:
+              for c, cell in zip(header, cells):
+                col_samples[c].append(cell)
+            idx += 1
+            rec = dict(zip(header, cells))
+            if (needle is None or _row_matches_search(rec, needle)) and len(
+                rows) < sample_count:
+              rows.append(rec)
+            if idx >= 100 and len(rows) >= sample_count:
+              break
+        finally:
           try:
-            cells = next(reader, None)
-          except csv.Error:
-            malformed_in_sample += 1
-            break
-          if cells is None:
-            break
-          if not cells or (len(cells) == 1 and cells[0] == '' and
-                           len(header) > 1):
-            continue
-          if len(cells) != len(header):
-            malformed_in_sample += 1
-            continue
-          if idx < 100:
-            for c, cell in zip(header, cells):
-              col_samples[c].append(cell)
-          idx += 1
-          rec = dict(zip(header, cells))
-          if (needle is None or _row_matches_search(rec, needle)) and len(
-              rows) < sample_count:
-            rows.append(rec)
-          if idx >= 100 and len(rows) >= sample_count:
-            break
+            wrapper.detach()
+          except Exception:  # pylint: disable=broad-except
+            pass
     if header:
       dirty_cols: list[str] = []
       for c in header:
@@ -310,44 +320,90 @@ def _inspect_files(
 
   else:  # json / jsonl / text
     scanned = 0
+    seen_keys: list[str] = []
+    seen_key_set: set[str] = set()
     inferred_types: dict[str, str] = {}
+    min_schema_records = max(100, sample_count)
+    records_scanned = 0
+
+    def _observe_record(rec_obj: dict[str, Any]) -> None:
+      nonlocal records_scanned
+      records_scanned += 1
+      for k, v in rec_obj.items():
+        if k not in seen_key_set:
+          seen_key_set.add(k)
+          seen_keys.append(k)
+        if v is not None:
+          val_t = type(v).__name__
+          prev_t = inferred_types.get(k)
+          if prev_t is None:
+            inferred_types[k] = val_t
+          elif {prev_t, val_t} == {'int', 'float'}:
+            inferred_types[k] = 'float'
+      if (needle is None or _row_matches_search(rec_obj, needle)) and len(
+          rows) < sample_count:
+        rows.append(rec_obj)
+
     for fpath, fsize in matched:
       if scanned >= scan_budget:
         truncated_scan = True
         break
-      with _open_file_bytes(fpath) as raw_f:
+      with _open_file_bytes(fpath, decompress=True) as raw_f:
         chunk = raw_f.read(max(0, scan_budget - scanned))
-        scanned += min(fsize, len(chunk))
-        for raw_line in chunk.decode('utf-8', errors='replace').splitlines():
+        scanned += min(max(fsize, len(chunk)), scan_budget - scanned)
+        text_chunk = chunk.decode('utf-8-sig', errors='replace')
+        stripped_whole = text_chunk.lstrip()
+        if fmt != 'text' and stripped_whole.startswith('['):
+          try:
+            top_parsed = json.loads(stripped_whole)
+            if isinstance(top_parsed, list):
+              for item in top_parsed:
+                rec = item if isinstance(item, dict) else {'value': item}
+                _observe_record(rec)
+                if (records_scanned >= min_schema_records and
+                    len(rows) >= sample_count):
+                  break
+              if (records_scanned >= min_schema_records and
+                  len(rows) >= sample_count):
+                break
+              continue
+          except ValueError:
+            pass
+
+        for raw_line in text_chunk.splitlines():
           s = raw_line.strip()
           if not s:
             continue
           if fmt == 'text':
-            rec = {'line': s}
+            _observe_record({'line': s})
           else:
             try:
               parsed = json.loads(s)
-              rec = parsed if isinstance(parsed, dict) else {'value': parsed}
             except ValueError:
               malformed_in_sample += 1
               continue
-          for k, v in rec.items():
-            if k not in inferred_types and v is not None:
-              inferred_types[k] = type(v).__name__
-          if (needle is None or _row_matches_search(rec, needle)) and len(
-              rows) < sample_count:
-            rows.append(rec)
-          if len(inferred_types) > 0 and len(rows) >= sample_count:
+            if isinstance(parsed, list) and all(
+                isinstance(el, dict) for el in parsed):
+              for el in parsed:
+                _observe_record(el)
+            else:
+              rec = parsed if isinstance(parsed, dict) else {'value': parsed}
+              _observe_record(rec)
+          if (records_scanned >= min_schema_records and
+              len(rows) >= sample_count):
             break
+      if records_scanned >= min_schema_records and len(rows) >= sample_count:
+        break
+
     if malformed_in_sample > 0:
       inspect_warnings.append(
           f'Detected {malformed_in_sample} malformed JSON line(s) in sample; '
           'pass --dlq <path> to `beam pipe` to quarantine corrupt records.')
     schema_fields = [{
         'name': output.sanitize_untrusted_text(str(k), max_chars=256),
-        'type': t,
+        'type': inferred_types.get(k, 'str'),
         'nullable': True,
-    } for k, t in inferred_types.items()]
+    } for k in seen_keys]
 
   stats: dict[str, Any] | None = None
   if include_stats and rows:

@@ -53,19 +53,35 @@ _SAFE_FUNCS = frozenset([
     'abs',
     'bool',
     'coalesce',
+    'date_part',
+    'day',
+    'epoch_ms',
     'float',
+    'hour',
     'ifnull',
     'int',
+    'json_extract_scalar',
+    'json_get',
+    'json_value',
     'len',
     'length',
     'lower',
     'max',
     'min',
+    'minute',
+    'month',
+    'parse_timestamp',
     'round',
+    'second',
+    'sql_ilike',
+    'sql_like',
     'str',
     'strip',
+    'to_epoch_ms',
+    'to_utc',
     'trim',
     'upper',
+    'year',
 ])
 
 _SQL_CAST_TYPES: dict[str, str] = {
@@ -410,69 +426,182 @@ def _lex_and_normalize_with_colmap(
 
   tokens = _rewrite_sql_cast_tokens(tokens)
 
-  rewritten: list[str] = []
-  i = 0
-  while i < len(tokens):
-    ttype, tval = tokens[i]
-    if ttype == tokenize.NAME:
-      upper = tval.upper()
-      # Rewrite `IS NOT NULL` -> `is not None` and `IS NULL` -> `is None`.
-      if (upper == 'IS' and i + 2 < len(tokens) and
-          tokens[i + 1][0] == tokenize.NAME and
-          tokens[i + 1][1].upper() == 'NOT' and
-          tokens[i + 2][0] == tokenize.NAME and
-          tokens[i + 2][1].upper() == 'NULL'):
-        rewritten.extend(['is', 'not', 'None'])
-        i += 3
-        continue
-      if (upper == 'IS' and i + 1 < len(tokens) and
-          tokens[i + 1][0] == tokenize.NAME and
-          tokens[i + 1][1].upper() == 'NULL'):
-        rewritten.extend(['is', 'None'])
-        i += 2
-        continue
-      if upper in ('AND', 'OR', 'NOT', 'IN'):
-        rewritten.append(upper.lower())
-        i += 1
-        continue
-      if upper == 'NULL':
-        rewritten.append('None')
-        i += 1
-        continue
-      if upper == 'TRUE':
-        rewritten.append('True')
-        i += 1
-        continue
-      if upper == 'FALSE':
-        rewritten.append('False')
-        i += 1
-        continue
-      if upper in ('LIKE', 'ILIKE',
-                   'BETWEEN') and not (rewritten and rewritten[-1] == '.'):
-        raise ExpressionError(
-            f'SQL {upper} is not supported in row expressions; use --sql '
-            '"SELECT ... WHERE ..." or Python string/comparison operators '
-            '(.startswith/.endswith/in/and)')
-      if keyword.iskeyword(tval) and tval not in _EXPR_KEYWORDS:
-        placeholder = f'beam_colref__{len(colref_map)}'
-        colref_map[placeholder] = tval
-        rewritten.append(placeholder)
-        i += 1
-        continue
-    rewritten.append(tval)
-    i += 1
+  lhs_stops = frozenset([
+      'and',
+      'or',
+      'not',
+      ',',
+      '(',
+      '[',
+      '==',
+      '!=',
+      '<',
+      '<=',
+      '>',
+      '>=',
+      'in',
+      'is',
+      'if',
+      'else',
+  ])
 
-  # Join tokens with spaces where needed so adjacent identifiers/keywords never
-  # fuse while operators and parentheses stay valid Python syntax.
-  out: list[str] = []
-  for idx, piece in enumerate(rewritten):
-    if idx > 0:
-      prev = rewritten[idx - 1]
-      if prev != '.' and piece not in ('.', ',', ')', ']') and prev not in (
-          '(', '['):
-        out.append(' ')
-    out.append(piece)
-  return ''.join(out), colref_map
+  def _join_pieces(pieces: list[str]) -> str:
+    joined: list[str] = []
+    for idx, piece in enumerate(pieces):
+      if idx > 0:
+        prev = pieces[idx - 1]
+        if prev != '.' and piece not in ('.', ',', ')', ']') and prev not in (
+            '(', '['):
+          joined.append(' ')
+      joined.append(piece)
+    return ''.join(joined)
+
+  def _pop_lhs(buf: list[str]) -> str:
+    picked: list[str] = []
+    depth = 0
+    while buf:
+      tok = buf[-1]
+      if depth == 0 and tok in lhs_stops:
+        break
+      buf.pop()
+      picked.append(tok)
+      if tok in (')', ']'):
+        depth += 1
+      elif tok in ('(', '['):
+        depth -= 1
+        if depth < 0:
+          buf.append(picked.pop())
+          break
+    picked.reverse()
+    return _join_pieces(picked)
+
+  def _scan_operand(
+      tok_slice: list[tuple[int, str]], start: int
+  ) -> tuple[list[tuple[int, str]], int]:
+    depth = 0
+    j = start
+    n_tok = len(tok_slice)
+    while j < n_tok:
+      jt, jv = tok_slice[j]
+      if jt == tokenize.OP and jv in ('(', '[', '{'):
+        depth += 1
+      elif jt == tokenize.OP and jv in (')', ']', '}'):
+        if depth == 0:
+          break
+        depth -= 1
+      elif depth == 0:
+        if jt == tokenize.OP and jv == ',':
+          break
+        if jt == tokenize.NAME and jv.upper() in ('AND', 'OR', 'IF', 'ELSE'):
+          break
+      j += 1
+    return tok_slice[start:j], j
+
+  def _norm_stream(tok_list: list[tuple[int, str]]) -> list[str]:
+    rewritten: list[str] = []
+    i = 0
+    n_tok = len(tok_list)
+    while i < n_tok:
+      ttype, tval = tok_list[i]
+      if ttype == tokenize.NAME:
+        upper = tval.upper()
+        # Rewrite `IS NOT NULL` -> `is not None` and `IS NULL` -> `is None`.
+        if (upper == 'IS' and i + 2 < n_tok and
+            tok_list[i + 1][0] == tokenize.NAME and
+            tok_list[i + 1][1].upper() == 'NOT' and
+            tok_list[i + 2][0] == tokenize.NAME and
+            tok_list[i + 2][1].upper() == 'NULL'):
+          rewritten.extend(['is', 'not', 'None'])
+          i += 3
+          continue
+        if (upper == 'IS' and i + 1 < n_tok and
+            tok_list[i + 1][0] == tokenize.NAME and
+            tok_list[i + 1][1].upper() == 'NULL'):
+          rewritten.extend(['is', 'None'])
+          i += 2
+          continue
+        # Rewrite `[NOT] BETWEEN <low> AND <high>`.
+        is_not_between = (
+            upper == 'NOT' and i + 1 < n_tok and
+            tok_list[i + 1][0] == tokenize.NAME and
+            tok_list[i + 1][1].upper() == 'BETWEEN' and bool(rewritten))
+        is_between = (
+            upper == 'BETWEEN' and bool(rewritten) and rewritten[-1] != '.')
+        if is_not_between or is_between:
+          lhs = _pop_lhs(rewritten)
+          if not lhs:
+            raise ExpressionError('missing expression before BETWEEN')
+          low_start = i + 2 if is_not_between else i + 1
+          low_toks, and_idx = _scan_operand(tok_list, low_start)
+          if (not low_toks or and_idx >= n_tok or
+              tok_list[and_idx][0] != tokenize.NAME or
+              tok_list[and_idx][1].upper() != 'AND'):
+            raise ExpressionError(
+                'BETWEEN requires `<low> AND <high>`, e.g. v BETWEEN 5 AND 15')
+          high_toks, next_i = _scan_operand(tok_list, and_idx + 1)
+          if not high_toks:
+            raise ExpressionError('missing upper bound in BETWEEN expression')
+          low_s = _join_pieces(_norm_stream(low_toks))
+          high_s = _join_pieces(_norm_stream(high_toks))
+          between_s = f'(({lhs}) >= ({low_s}) and ({lhs}) <= ({high_s}))'
+          rewritten.append(
+              f'(not {between_s})' if is_not_between else between_s)
+          i = next_i
+          continue
+        # Rewrite `[NOT] LIKE / ILIKE <pattern>`.
+        is_not_like = (
+            upper == 'NOT' and i + 1 < n_tok and
+            tok_list[i + 1][0] == tokenize.NAME and
+            tok_list[i + 1][1].upper() in ('LIKE', 'ILIKE') and
+            bool(rewritten))
+        is_like = (
+            upper in ('LIKE', 'ILIKE') and bool(rewritten) and
+            rewritten[-1] != '.')
+        if is_not_like or is_like:
+          like_kw = tok_list[i + 1][1].upper() if is_not_like else upper
+          fn_name = 'sql_ilike' if like_kw == 'ILIKE' else 'sql_like'
+          lhs = _pop_lhs(rewritten)
+          pat_start = i + 2 if is_not_like else i + 1
+          pat_toks, next_i = _scan_operand(tok_list, pat_start)
+          if not lhs or not pat_toks:
+            raise ExpressionError(f'invalid {like_kw} syntax in expression')
+          pat_s = _join_pieces(_norm_stream(pat_toks))
+          call_s = f'{fn_name}(({lhs}), ({pat_s}))'
+          rewritten.append(f'(not {call_s})' if is_not_like else call_s)
+          i = next_i
+          continue
+        if (upper in ('RLIKE', 'REGEXP', 'SIMILAR') and bool(rewritten) and
+            rewritten[-1] != '.'):
+          raise ExpressionError(
+              f'SQL {upper} is not supported in row expressions; use --sql '
+              '"SELECT ... WHERE ..." or LIKE / ILIKE')
+        if upper in ('AND', 'OR', 'NOT', 'IN'):
+          rewritten.append(upper.lower())
+          i += 1
+          continue
+        if upper == 'NULL':
+          rewritten.append('None')
+          i += 1
+          continue
+        if upper == 'TRUE':
+          rewritten.append('True')
+          i += 1
+          continue
+        if upper == 'FALSE':
+          rewritten.append('False')
+          i += 1
+          continue
+        if keyword.iskeyword(tval) and tval not in _EXPR_KEYWORDS:
+          placeholder = f'beam_colref__{len(colref_map)}'
+          colref_map[placeholder] = tval
+          rewritten.append(placeholder)
+          i += 1
+          continue
+      rewritten.append(tval)
+      i += 1
+    return rewritten
+
+  return _join_pieces(_norm_stream(tokens)), colref_map
 
 
 def _ast_stats(node: ast.AST, depth: int = 1) -> tuple[int, int]:
@@ -533,6 +662,10 @@ class _RowExprCompiler(ast.NodeTransformer):
     self.columns: set[str] = set()
     self.uses_safe_mul = False
     self.uses_coalesce = False
+    self.uses_datetime = False
+    self.uses_json = False
+    self.uses_like = False
+    self.uses_temporal_cmp = False
     self._colref_map = colref_map or {}
     self._jinja_tokens = jinja_tokens or frozenset()
     self._temp_count = 0
@@ -696,6 +829,17 @@ class _RowExprCompiler(ast.NodeTransformer):
     return self._null_safe([operand],
                            lambda v: ast.UnaryOp(op=op, operand=v))
 
+  _CMP_OP_NAMES = {
+      ast.Eq: 'eq',
+      ast.NotEq: 'ne',
+      ast.Lt: 'lt',
+      ast.LtE: 'le',
+      ast.Gt: 'gt',
+      ast.GtE: 'ge',
+      ast.In: 'in',
+      ast.NotIn: 'not_in',
+  }
+
   def visit_Compare(self, node: ast.Compare) -> ast.AST:
     for op in node.ops:
       if not isinstance(op, _ALLOWED_CMPOPS):
@@ -711,10 +855,15 @@ class _RowExprCompiler(ast.NodeTransformer):
         # `IS [NOT] NULL` is the one comparison that is never NULL itself.
         parts.append(ast.Compare(left=a, ops=[op], comparators=[b]))
       else:
+        op_name = self._CMP_OP_NAMES[type(op)]
+        self.uses_temporal_cmp = True
         parts.append(
-            self._null_safe([a, b],
-                            lambda x, y, op=op: ast.Compare(
-                                left=x, ops=[op], comparators=[y])))
+            self._null_safe(
+                [a, b],
+                lambda x, y, op_s=op_name: ast.Call(
+                    func=ast.Name(id='_cli_cmp', ctx=ast.Load()),
+                    args=[ast.Constant(value=op_s), x, y],
+                    keywords=[])))
     return parts[0] if len(parts) == 1 else self._bool3(ast.And(), parts)
 
   def visit_Name(self, node: ast.Name) -> ast.AST:
@@ -766,6 +915,15 @@ class _RowExprCompiler(ast.NodeTransformer):
             f'function {fn_name!r} is not allowed; allowed functions: '
             f'{", ".join(sorted(_SAFE_FUNCS))}')
       compiled_args = [self.visit(a) for a in node.args]
+      if lowered in ('sql_like', 'sql_ilike'):
+        if len(compiled_args) != 2:
+          raise ExpressionError(f'{fn_name}() expects 2 arguments')
+        self.uses_like = True
+        ci_flag = lowered == 'sql_ilike'
+        return ast.Call(
+            func=ast.Name(id='_cli_like', ctx=ast.Load()),
+            args=[compiled_args[0], compiled_args[1], ast.Constant(value=ci_flag)],
+            keywords=[])
       if lowered in ('lower', 'upper', 'strip', 'trim'):
         if len(compiled_args) != 1:
           raise ExpressionError(f'{fn_name}() expects 1 argument')
@@ -802,6 +960,46 @@ class _RowExprCompiler(ast.NodeTransformer):
         self.uses_coalesce = True
         return ast.Call(
             func=ast.Name(id='_cli_coalesce', ctx=ast.Load()),
+            args=compiled_args,
+            keywords=[])
+      if lowered in ('parse_timestamp', 'to_utc'):
+        if len(compiled_args) != 1:
+          raise ExpressionError(f'{fn_name}() expects 1 argument')
+        self.uses_datetime = True
+        return ast.Call(
+            func=ast.Name(id='_cli_dt_utc', ctx=ast.Load()),
+            args=compiled_args,
+            keywords=[])
+      if lowered in ('epoch_ms', 'to_epoch_ms'):
+        if len(compiled_args) != 1:
+          raise ExpressionError(f'{fn_name}() expects 1 argument')
+        self.uses_datetime = True
+        return ast.Call(
+            func=ast.Name(id='_cli_epoch_ms', ctx=ast.Load()),
+            args=compiled_args,
+            keywords=[])
+      if lowered in ('year', 'month', 'day', 'hour', 'minute', 'second'):
+        if len(compiled_args) != 1:
+          raise ExpressionError(f'{fn_name}() expects 1 argument')
+        self.uses_datetime = True
+        return ast.Call(
+            func=ast.Name(id='_cli_date_part', ctx=ast.Load()),
+            args=[ast.Constant(value=lowered), compiled_args[0]],
+            keywords=[])
+      if lowered == 'date_part':
+        if len(compiled_args) != 2:
+          raise ExpressionError(f'{fn_name}() expects 2 arguments (part, ts)')
+        self.uses_datetime = True
+        return ast.Call(
+            func=ast.Name(id='_cli_date_part', ctx=ast.Load()),
+            args=compiled_args,
+            keywords=[])
+      if lowered in ('json_get', 'json_extract_scalar', 'json_value'):
+        if len(compiled_args) != 2:
+          raise ExpressionError(f'{fn_name}() expects 2 arguments (val, path)')
+        self.uses_json = True
+        return ast.Call(
+            func=ast.Name(id='_cli_json_get', ctx=ast.Load()),
             args=compiled_args,
             keywords=[])
       if lowered in ('int', 'float', 'abs', 'round', 'str') and compiled_args:
@@ -852,13 +1050,15 @@ def _infer_json_schema_type(tree_body: ast.AST) -> str | None:
   if isinstance(tree_body, ast.Call):
     if isinstance(tree_body.func, ast.Name):
       fn = tree_body.func.id.lower()
-      if fn == 'bool':
+      if fn in ('bool', 'sql_like', 'sql_ilike'):
         return 'boolean'
-      if fn in ('int', 'len', 'length'):
+      if fn in ('int', 'len', 'length', 'epoch_ms', 'to_epoch_ms', 'year',
+                'month', 'day', 'hour', 'minute', 'second', 'date_part'):
         return 'integer'
       if fn in ('float', 'round'):
         return 'number'
-      if fn in ('str', 'lower', 'upper', 'strip', 'trim'):
+      if fn in ('str', 'lower', 'upper', 'strip', 'trim', 'parse_timestamp',
+                'to_utc', 'json_get', 'json_extract_scalar', 'json_value'):
         return 'string'
     if isinstance(tree_body.func, ast.Attribute):
       if tree_body.func.attr in ('startswith', 'endswith'):
@@ -886,8 +1086,16 @@ def _build_callable_source(
     as_bool: bool,
     uses_safe_mul: bool,
     uses_coalesce: bool,
+    uses_datetime: bool = False,
+    uses_json: bool = False,
+    uses_like: bool = False,
+    uses_temporal_cmp: bool = False,
+    return_annotation: str | None = None,
 ) -> str:
-  lines = ['def _cli_fn(__row__):']
+  hdr = (
+      f'def _cli_fn(__row__) -> {return_annotation}:'
+      if return_annotation else 'def _cli_fn(__row__):')
+  lines = [hdr]
   if uses_safe_mul:
     lines.extend([
         '  def _cli_mul(a, b):',
@@ -904,15 +1112,221 @@ def _build_callable_source(
         '        return v',
         '    return None',
     ])
+  if uses_datetime or uses_temporal_cmp:
+    lines.append('  import datetime as _dt')
+  if uses_temporal_cmp:
+    lines.extend([
+        '  def _cli_ts(v, allow_s):',
+        "    ms = getattr(v, 'micros', None)",
+        '    if isinstance(ms, int) and not isinstance(ms, bool):',
+        '      return ms',
+        '    if isinstance(v, _dt.datetime):',
+        '      dt = v.replace(tzinfo=_dt.timezone.utc) if v.tzinfo is None else v.astimezone(_dt.timezone.utc)',
+        '      return (dt - _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)) // _dt.timedelta(microseconds=1)',
+        '    if isinstance(v, _dt.date):',
+        '      return (_dt.datetime(v.year, v.month, v.day, tzinfo=_dt.timezone.utc) - _dt.datetime(1970, 1, 1, tzinfo=_dt.timezone.utc)) // _dt.timedelta(microseconds=1)',
+        '    if allow_s and isinstance(v, str) and 0 < len(v) <= 128:',
+        '      s = v.strip()',
+        "      s = (s[:-1] + '+00:00') if s.endswith(('Z', 'z')) else s",
+        '      try:',
+        '        return _cli_ts(_dt.datetime.fromisoformat(s), False)',
+        '      except ValueError:',
+        '        try:',
+        '          return _cli_ts(_dt.date.fromisoformat(s), False)',
+        '        except ValueError:',
+        '          return None',
+        '    return None',
+        '  def _cli_cmp(op, a, b):',
+        "    if isinstance(a, (_dt.datetime, _dt.date)) or isinstance(b, (_dt.datetime, _dt.date)) or isinstance(getattr(a, 'micros', None), int) or isinstance(getattr(b, 'micros', None), int):",
+        '      ta = _cli_ts(a, True)',
+        '      tb = _cli_ts(b, True)',
+        '      if ta is not None and tb is not None:',
+        '        a = ta',
+        '        b = tb',
+        "    if op == 'in' or op == 'not_in':",
+        '      if isinstance(b, str):',
+        '        r = str(a) in b',
+        '      else:',
+        '        has_n = False',
+        '        hit = False',
+        '        for it in b:',
+        '          if it is None:',
+        '            has_n = True',
+        "          elif _cli_cmp('eq', a, it):",
+        '            hit = True',
+        '            break',
+        '        r = True if hit else (None if has_n else False)',
+        "      return (None if r is None else (not r)) if op == 'not_in' else r",
+        "    if op == 'eq':",
+        '      return a == b',
+        "    if op == 'ne':",
+        '      return a != b',
+        "    if op == 'lt':",
+        '      return a < b',
+        "    if op == 'le':",
+        '      return a <= b',
+        "    if op == 'gt':",
+        '      return a > b',
+        '    return a >= b',
+    ])
+  if uses_like:
+    lines.extend([
+        '  def _cli_like(val, pat, ci):',
+        '    if val is None or pat is None:',
+        '      return None',
+        '    s = str(val)',
+        '    raw_p = str(pat)',
+        '    if len(s) > 65536 or len(raw_p) > 4096:',
+        '      return False',
+        '    if ci:',
+        '      s = s.lower()',
+        '      raw_p = raw_p.lower()',
+        '    toks = []',
+        '    esc = False',
+        '    for ch in raw_p:',
+        '      if esc:',
+        "        toks.append(('L', ch))",
+        '        esc = False',
+        "      elif ch == '\\\\':",
+        '        esc = True',
+        "      elif ch == '%':",
+        "        if not toks or toks[-1][0] != '*':",
+        "          toks.append(('*', ''))",
+        "      elif ch == '_':",
+        "        toks.append(('?', ''))",
+        '      else:',
+        "        toks.append(('L', ch))",
+        '    if esc:',
+        "      toks.append(('L', '\\\\'))",
+        '    m = len(toks)',
+        '    dp = [False] * (m + 1)',
+        '    dp[0] = True',
+        '    for j in range(m):',
+        "      if toks[j][0] == '*':",
+        '        dp[j + 1] = dp[j]',
+        '      else:',
+        '        break',
+        '    for sc in s:',
+        '      nxt = [False] * (m + 1)',
+        '      for j in range(m):',
+        '        tk = toks[j][0]',
+        "        if tk == '*':",
+        '          if dp[j + 1] or nxt[j]:',
+        '            nxt[j + 1] = True',
+        "        elif dp[j] and (tk == '?' or toks[j][1] == sc):",
+        '          nxt[j + 1] = True',
+        '      dp = nxt',
+        '    return dp[m]',
+    ])
+  if uses_datetime:
+    lines.extend([
+        '  def _cli_parse_dt(v):',
+        '    if v is None:',
+        '      return None',
+        '    if isinstance(v, _dt.datetime):',
+        '      return v.replace(tzinfo=_dt.timezone.utc) if v.tzinfo is None else v.astimezone(_dt.timezone.utc)',
+        '    if isinstance(v, (int, float)) and not isinstance(v, bool):',
+        '      sec = float(v) / 1000.0 if abs(float(v)) >= 1e11 else float(v)',
+        '      return _dt.datetime.fromtimestamp(sec, tz=_dt.timezone.utc)',
+        '    s = str(v).strip()',
+        '    if not s:',
+        '      return None',
+        '    try:',
+        '      num = float(s)',
+        '      sec = num / 1000.0 if abs(num) >= 1e11 else num',
+        '      return _dt.datetime.fromtimestamp(sec, tz=_dt.timezone.utc)',
+        '    except ValueError:',
+        '      pass',
+        "    if s.endswith('Z') or s.endswith('z'):",
+        "      s = s[:-1] + '+00:00'",
+        "    elif ' ' in s and 'T' not in s:",
+        "      s = s.replace(' ', 'T', 1)",
+        '    try:',
+        '      dt = _dt.datetime.fromisoformat(s)',
+        '    except ValueError:',
+        '      dt = None',
+        "      for fmt in ('%Y/%m/%d %H:%M:%S', '%Y/%m/%d', '%m/%d/%Y %H:%M:%S', '%m/%d/%Y', '%d-%b-%Y %H:%M:%S', '%b %d %Y %H:%M:%S'):",
+        '        try:',
+        '          dt = _dt.datetime.strptime(s, fmt)',
+        '          break',
+        '        except ValueError:',
+        '          pass',
+        '      if dt is None:',
+        "        raise ValueError('unrecognized timestamp: ' + s)",
+        '    return dt.replace(tzinfo=_dt.timezone.utc) if dt.tzinfo is None else dt.astimezone(_dt.timezone.utc)',
+        '  def _cli_dt_utc(v):',
+        '    dt = _cli_parse_dt(v)',
+        '    if dt is None:',
+        '      return None',
+        "    return dt.isoformat().replace('+00:00', 'Z')",
+        '  def _cli_epoch_ms(v):',
+        '    dt = _cli_parse_dt(v)',
+        '    return None if dt is None else int(round(dt.timestamp() * 1000.0))',
+        '  def _cli_date_part(part, v):',
+        '    dt = _cli_parse_dt(v)',
+        '    if dt is None or part is None:',
+        '      return None',
+        '    p = str(part).strip().lower()',
+        "    if p == 'epoch':",
+        '      return int(dt.timestamp())',
+        "    parts = {'year': dt.year, 'month': dt.month, 'day': dt.day, 'hour': dt.hour, 'minute': dt.minute, 'second': dt.second}",
+        '    if p in parts:',
+        '      return int(parts[p])',
+        "    if p in ('dow', 'dayofweek'):",
+        '      return (dt.weekday() + 1) % 7',
+        "    raise ValueError('unsupported date_part: ' + p)",
+    ])
+  if uses_json:
+    lines.extend([
+        '  import json as _json',
+        '  def _cli_json_get(v, path):',
+        '    if v is None or path is None:',
+        '      return None',
+        '    cur = _json.loads(v) if isinstance(v, (str, bytes)) else v',
+        '    p = str(path).strip()',
+        "    if p.startswith('$'):",
+        '      p = p[1:]',
+        "    if p.startswith('.'):",
+        '      p = p[1:]',
+        '    if not p:',
+        '      return None if cur is None else (cur if isinstance(cur, str) else _json.dumps(cur))',
+        "    for seg in p.replace('[', '.').replace(']', '').split('.'):",
+        '      if not seg:',
+        '        continue',
+        '      if cur is None:',
+        '        return None',
+        '      if isinstance(cur, dict):',
+        '        cur = cur.get(seg)',
+        '      elif isinstance(cur, (list, tuple)):',
+        '        try:',
+        '          idx = int(seg)',
+        '        except ValueError:',
+        '          return None',
+        '        cur = cur[idx] if -len(cur) <= idx < len(cur) else None',
+        '      else:',
+        '        return None',
+        '    if cur is None:',
+        '      return None',
+        '    return cur if isinstance(cur, str) else (str(cur) if isinstance(cur, (int, float, bool)) else _json.dumps(cur))',
+    ])
   ret = f'bool({compiled_expr})' if as_bool else compiled_expr
   lines.append(f'  return {ret}')
   return '\n'.join(lines) + '\n'
 
 
+def _safe_expr_import(name, globals=None, locals=None, fromlist=(), level=0):  # pylint: disable=redefined-builtin
+  if level != 0 or name not in (
+      'datetime', 'json', '_strptime', 'time', 'calendar', 'locale'):
+    raise ImportError(f'import {name!r} is not allowed in expressions')
+  return __import__(name, globals, locals, fromlist, level)
+
+
 _SAFE_EXEC_BUILTINS: dict[str, Any] = {
+    '__import__': _safe_expr_import,
     'abs': abs,
     'bool': bool,
     'bytes': bytes,
+    'dict': dict,
     'float': float,
     'getattr': getattr,
     'int': int,
@@ -921,10 +1335,13 @@ _SAFE_EXEC_BUILTINS: dict[str, Any] = {
     'list': list,
     'max': max,
     'min': min,
+    'range': range,
     'round': round,
+    'set': set,
     'str': str,
     'tuple': tuple,
     'TypeError': TypeError,
+    'ValueError': ValueError,
 }
 
 
@@ -955,7 +1372,11 @@ def compile_scalar_callable(
       expr_code,
       as_bool=as_bool,
       uses_safe_mul=compiler.uses_safe_mul,
-      uses_coalesce=compiler.uses_coalesce)
+      uses_coalesce=compiler.uses_coalesce,
+      uses_datetime=compiler.uses_datetime,
+      uses_json=compiler.uses_json,
+      uses_like=compiler.uses_like,
+      uses_temporal_cmp=compiler.uses_temporal_cmp)
   ns: dict[str, Any] = {'__builtins__': _SAFE_EXEC_BUILTINS}
   exec(compile(callable_src, '<beam_cli_expr>', 'exec'), ns)  # pylint: disable=exec-used
   return ns['_cli_fn'], frozenset(compiler.columns)
@@ -1008,7 +1429,11 @@ def compile_where(
       expr_code,
       as_bool=True,
       uses_safe_mul=compiler.uses_safe_mul,
-      uses_coalesce=compiler.uses_coalesce)
+      uses_coalesce=compiler.uses_coalesce,
+      uses_datetime=compiler.uses_datetime,
+      uses_json=compiler.uses_json,
+      uses_like=compiler.uses_like,
+      uses_temporal_cmp=compiler.uses_temporal_cmp)
   return (
       {
           'language': 'python',
@@ -1021,6 +1446,7 @@ def compile_where(
 
 
 _NATIVE_BINOPS = (ast.Add, ast.Sub, ast.Div)
+_ISO_DATE_LIT_RE = re.compile(r'^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}|$)')
 
 
 def _native_expression(
@@ -1058,9 +1484,13 @@ def _native_expression(
     if isinstance(node, ast.UnaryOp) and not isinstance(node.operand,
                                                         ast.Constant):
       return None
-    if isinstance(node, ast.Constant) and not (
-        node.value is None or isinstance(node.value, (bool, int, float, str))):
-      return None
+    if isinstance(node, ast.Constant):
+      if not (node.value is None or
+              isinstance(node.value, (bool, int, float, str))):
+        return None
+      if isinstance(node.value, str) and _ISO_DATE_LIT_RE.match(
+          node.value.strip()):
+        return None
     if isinstance(node, ast.Name) and (
         node.id.startswith('_') or keyword.iskeyword(node.id) or
         not _IDENT_RE.match(node.id)):
@@ -1221,9 +1651,30 @@ def compile_select(
   fields_cfg: dict[str, Any] = {}
   all_cols: set[str] = set()
   has_star = False
+  except_cols: list[str] = []
+  star_except_re = re.compile(
+      r'^\*\s+[Ee][Xx][Cc][Ee][Pp][Tt]\s*\((?P<cols>[^)]*)\)\s*$')
 
   for part in parts:
     if part.strip() == '*':
+      has_star = True
+      continue
+    m_star_exc = star_except_re.match(part.strip())
+    if m_star_exc:
+      raw_exc = _split_top_level_commas(m_star_exc.group('cols'))
+      if not raw_exc or any(not c.strip() for c in raw_exc):
+        raise ExpressionError(
+            f'{flag_name} "* EXCEPT(...)" requires at least one column name')
+      for rc in raw_exc:
+        ec = _unwrap_plain_col(rc)
+        if ec is None or ec in jinja_map:
+          raise ExpressionError(
+              f'invalid column {rc.strip()!r} in {flag_name} "* EXCEPT(...)"')
+        if known_columns is not None:
+          _check_known_columns({ec}, known_columns, flag_name)
+        all_cols.add(ec)
+        if ec not in except_cols:
+          except_cols.append(ec)
       has_star = True
       continue
 
@@ -1312,15 +1763,19 @@ def compile_select(
         expr_code,
         as_bool=False,
         uses_safe_mul=compiler.uses_safe_mul,
-        uses_coalesce=compiler.uses_coalesce)
+        uses_coalesce=compiler.uses_coalesce,
+        uses_datetime=compiler.uses_datetime,
+        uses_json=compiler.uses_json,
+        uses_like=compiler.uses_like,
+        uses_temporal_cmp=compiler.uses_temporal_cmp)
     field_entry: dict[str, Any] = {'callable': callable_src}
     if inferred_type is not None:
       field_entry['output_type'] = inferred_type
     fields_cfg[alias] = field_entry
 
-  if has_star and not fields_cfg:
+  if has_star and not fields_cfg and not except_cols:
     raise ExpressionError(
-        f'{flag_name} "*" must include at least one computed or renamed column')
+        f'{flag_name} "*" must include at least one computed, renamed, or EXCEPT column')
   out_cfg: dict[str, Any] = {
       'language': 'python',
       'fields': fields_cfg,
@@ -1328,9 +1783,12 @@ def compile_select(
   if has_star:
     out_cfg['append'] = True
     known_or_ref = set(known_columns or ()) | set(all_cols)
-    overwritten = [a for a in fields_cfg if a in known_or_ref]
-    if overwritten:
-      out_cfg['drop'] = overwritten
+    drop_cols = list(except_cols)
+    for a in fields_cfg:
+      if a in known_or_ref and a not in drop_cols:
+        drop_cols.append(a)
+    if drop_cols:
+      out_cfg['drop'] = drop_cols
   return (out_cfg, frozenset(all_cols))
 
 

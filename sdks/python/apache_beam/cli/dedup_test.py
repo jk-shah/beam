@@ -25,6 +25,10 @@ import json
 import os
 import tempfile
 import unittest
+from datetime import date
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
 from unittest import mock
 
 import apache_beam as beam
@@ -317,20 +321,21 @@ class DedupeStageOrderAndValidationGuardsTest(unittest.TestCase):
       types = [t['type'] for t in spec_obj.spec['pipeline']['transforms']]
       self.assertLess(types.index('CliDeduplicate'), types.index('WindowInto'))
 
-      rc = cli_main.main([
-          'pipe',
-          '--from',
-          src_p,
-          '--to',
-          out_p,
-          '--dedupe-by',
-          'event_id',
-          '--timestamp-col',
-          'ts',
-          '--window',
-          'fixed:60s,group_by=acct,total=sum(amount)',
-          '--json',
-      ])
+      with mock.patch('sys.stdout', io.StringIO()):
+        rc = cli_main.main([
+            'pipe',
+            '--from',
+            src_p,
+            '--to',
+            out_p,
+            '--dedupe-by',
+            'event_id',
+            '--timestamp-col',
+            'ts',
+            '--window',
+            'fixed:60s,group_by=acct,total=sum(amount)',
+            '--json',
+        ])
       self.assertEqual(rc, 0)
       with open(out_p, encoding='utf-8') as f:
         got = [json.loads(line) for line in f if line.strip()]
@@ -476,6 +481,83 @@ class DedupeStageOrderAndValidationGuardsTest(unittest.TestCase):
         check_cmd.run_check(yaml_path)
     finally:
       os.unlink(yaml_path)
+
+
+class DedupProductionHardeningRegressionTest(unittest.TestCase):
+  def test_sortable_order_key_64bit_int_38digit_decimal_snan_and_naive_datetime_utc(
+      self):
+    # 1. Exact 64-bit integers beyond IEEE-754 53-bit float mantissa!
+    i_low = 9007199254740992
+    i_high = 9007199254740993
+    self.assertEqual(float(i_low), float(i_high))
+    self.assertLess(
+        dedup._sortable_order_key({'v': i_low}, 'v'),
+        dedup._sortable_order_key({'v': i_high}, 'v'))
+
+    # 2. Exact 38-digit Decimal precision & safe NaN / sNaN handling.
+    d_low = decimal.Decimal('123456789012345678901234567890.12345678')
+    d_high = decimal.Decimal('123456789012345678901234567890.12345679')
+    self.assertLess(
+        dedup._sortable_order_key({'v': d_low}, 'v'),
+        dedup._sortable_order_key({'v': d_high}, 'v'))
+    self.assertEqual(
+        dedup._sortable_order_key({'v': decimal.Decimal('NaN')}, 'v'), (0, ''))
+    self.assertEqual(
+        dedup._sortable_order_key({'v': decimal.Decimal('sNaN')}, 'v'), (0, ''))
+
+    # 3. Naive datetime normalized as UTC alongside aware datetimes & dates.
+    dt_naive = datetime(2026, 6, 1, 12, 0, 0)
+    dt_utc = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+    dt_plus2 = datetime(
+        2026, 6, 1, 14, 0, 0, tzinfo=timezone(timedelta(hours=2)))
+    self.assertEqual(
+        dedup._sortable_order_key({'v': dt_naive}, 'v'),
+        dedup._sortable_order_key({'v': dt_utc}, 'v'))
+    self.assertEqual(
+        dedup._sortable_order_key({'v': dt_utc}, 'v'),
+        dedup._sortable_order_key({'v': dt_plus2}, 'v'))
+    self.assertLess(
+        dedup._sortable_order_key({'v': date(2026, 6, 1)}, 'v'),
+        dedup._sortable_order_key({'v': dt_utc}, 'v'))
+
+    # 4. End-to-end `keep='last'` with `order_by` on 64-bit integer versions!
+    with beam.Pipeline() as p:
+      out = (
+          p
+          | beam.Create([
+              beam.Row(id='k1', ver=i_high, payload='winner'),
+              beam.Row(id='k1', ver=i_low, payload='stale'),
+          ])
+          | dedup.CliDeduplicate(keys='id', keep='last', order_by='ver')
+          | beam.Map(lambda r: (r.id, r.ver, r.payload)))
+      assert_that(out, equal_to([('k1', i_high, 'winner')]))
+
+  def test_bounded_dedupe_window_without_timestamp_col_fallback_and_event_time_guard(
+      self):
+    # 1. Bounded `beam.Create` (elements at `MIN_TIMESTAMP`, no `timestamp_col`)
+    # with `--dedupe-window 10m` (`time_domain='auto'`) falls back to wall-clock
+    # time instead of crashing with out-of-range deduplication timestamp!
+    with beam.Pipeline() as p:
+      out = (
+          p
+          | beam.Create([
+              beam.Row(id='k1', seq=1),
+              beam.Row(id='k1', seq=2),
+              beam.Row(id='k2', seq=3),
+          ])
+          | dedup.CliDeduplicate(keys='id', window='10m', keep='first')
+          | beam.Map(lambda r: (r.id, r.seq)))
+      assert_that(out, equal_to([('k1', 1), ('k2', 3)]))
+
+    # 2. Explicit `time_domain='event_time'` on `MIN_TIMESTAMP` without
+    # `timestamp_col` raises an actionable error pointing to `--timestamp-col`!
+    with self.assertRaisesRegex(Exception, '--timestamp-col'):
+      with beam.Pipeline() as p_bad:
+        _ = (
+            p_bad
+            | beam.Create([beam.Row(id='k1', seq=1)])
+            | dedup.CliDeduplicate(
+                keys='id', window='10m', time_domain='event_time'))
 
 
 if __name__ == '__main__':

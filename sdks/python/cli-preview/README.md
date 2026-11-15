@@ -241,8 +241,8 @@ beam pipe \
 | **Pub/Sub & Kafka** | `pubsub://projects/PROJ/topics/T`, `pubsub://projects/PROJ/subscriptions/S`, `kafka://HOST:9092/TOPIC` | Non-destructive peek, live `tail -f` follow, and streaming `beam pipe` |
 
 ### Safe `--where` & `--select` Expressions
-* **Operators**: `AND`, `OR`, `NOT`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `IN (...)`, `IS NULL`, `IS NOT NULL`, `+`, `-`, `*`, `/` (blocks `**`, `<<`, sequence repetition `*`, and `_`-prefixed attributes).
-* **Scalar Helpers**: `lower`, `upper`, `strip`, `len`, `coalesce`, `abs`, `round`, `int`, `float`, `str`, `bool`.
+* **Operators**: `AND`, `OR`, `NOT`, `==`, `=`, `!=`, `<>`, `<`, `<=`, `>`, `>=`, `[NOT] IN (...)`, `[NOT] BETWEEN a AND b`, `[NOT] LIKE` / `ILIKE`, `IS NULL`, `IS NOT NULL`, `+`, `-`, `*`, `/` (blocks `**`, `<<`, sequence repetition `*`, and `_`-prefixed attributes; `--drop-bad` / `--skip-errors` drops corrupt rows when a DLQ sink is not needed).
+* **Scalar Helpers**: `lower`, `upper`, `strip`/`trim`, `len`/`length`, `coalesce`/`ifnull`, `abs`, `round`, `int`, `float`, `str`, `bool`, `parse_timestamp`/`to_utc`, `epoch_ms`/`to_epoch_ms`, `year`, `month`, `day`, `hour`, `minute`, `second`, `date_part`, `json_get`/`json_extract_scalar`/`json_value`.
 
 ### Deterministic Exit Codes
 

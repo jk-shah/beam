@@ -300,8 +300,10 @@ def _estimate_postgres_bytes(endpoint: uris.ParsedEndpoint) -> dict[str, Any]:
     conn_kwargs['user'] = endpoint.config['username']
   if endpoint.config.get('password'):
     conn_kwargs['password'] = endpoint.config['password']
+  conn = None
   try:
-    with driver.connect(pg_dsn, **conn_kwargs) as conn:
+    conn = driver.connect(pg_dsn, **conn_kwargs)
+    with conn:
       with conn.cursor() as cur:
         cur.execute(
             'SELECT COALESCE(SUM(pg_relation_size(relid)), 0) '
@@ -314,3 +316,9 @@ def _estimate_postgres_bytes(endpoint: uris.ParsedEndpoint) -> dict[str, Any]:
         }
   except Exception:  # pylint: disable=broad-except
     return {'estimated_bytes': None, 'method': 'postgres_probe_skipped'}
+  finally:
+    if conn is not None:
+      try:
+        conn.close()
+      except Exception:  # pylint: disable=broad-except
+        pass

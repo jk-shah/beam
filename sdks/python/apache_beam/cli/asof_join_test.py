@@ -19,11 +19,16 @@
 
 from __future__ import annotations
 
+import decimal
 import io
 import json
 import os
 import tempfile
 import unittest
+from datetime import date
+from datetime import datetime
+from datetime import timedelta
+from datetime import timezone
 from unittest import mock
 
 import pyarrow.parquet as pq
@@ -484,6 +489,87 @@ class CliAsofJoinCliAndSqlEndToEndTest(unittest.TestCase):
           '--dry-run',
       ])
       self.assertEqual(rc_bad, 2)
+
+
+class AsofJoinProductionHardeningRegressionTest(unittest.TestCase):
+  def test_encode_tie_key_numeric_signs_inf_nan_and_datetime_utc_normalization(
+      self):
+    ordered_vals = [
+        None,
+        False,
+        True,
+        float('-inf'),
+        decimal.Decimal('-Infinity'),
+        -1000,
+        -5,
+        -0.5,
+        0,
+        1.0,
+        10,
+        9007199254740992,
+        9007199254740993,
+        decimal.Decimal('9999999999999999999999999999.123456789'),
+        decimal.Decimal('9999999999999999999999999999.123456790'),
+        float('inf'),
+        float('nan'),
+    ]
+    # Check strict monotonic increases except equal pairs (-inf == -Infinity).
+    keys = [asof_join._encode_tie_key({'v': x}, 'v') for x in ordered_vals]
+    self.assertLess(keys[0], keys[1])  # None < False
+    self.assertLess(keys[1], keys[2])  # False < True
+    self.assertEqual(keys[3], keys[4])  # -inf == -Infinity
+    for idx in range(4, len(keys) - 1):
+      self.assertLess(
+          keys[idx],
+          keys[idx + 1],
+          msg=f'expected {ordered_vals[idx]!r} < {ordered_vals[idx + 1]!r}')
+
+    # Signaling NaN (`sNaN`) must not raise `decimal.InvalidOperation`.
+    snan_key = asof_join._encode_tie_key({'v': decimal.Decimal('sNaN')}, 'v')
+    self.assertEqual(snan_key, keys[-1])
+
+    # Naive datetime is normalized as UTC alongside aware datetimes & dates.
+    dt_naive = datetime(2026, 6, 1, 12, 0, 0)
+    dt_utc = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+    dt_plus2 = datetime(
+        2026, 6, 1, 14, 0, 0, tzinfo=timezone(timedelta(hours=2)))
+    d_day = date(2026, 6, 1)
+    k_naive = asof_join._encode_tie_key({'v': dt_naive}, 'v')
+    k_utc = asof_join._encode_tie_key({'v': dt_utc}, 'v')
+    k_plus2 = asof_join._encode_tie_key({'v': dt_plus2}, 'v')
+    k_day = asof_join._encode_tie_key({'v': d_day}, 'v')
+    self.assertEqual(k_naive, k_utc)
+    self.assertEqual(k_utc, k_plus2)
+    self.assertLess(k_day, k_utc)
+
+  def test_tie_break_negative_vs_positive_right_order_across_bounded_and_stateful(
+      self):
+    trades = [beam.Row(sym='AAPL', t_ts=100, qty=5)]
+    quotes = [
+        beam.Row(sym='AAPL', q_ts=100, price=11.0, seq=-5),
+        beam.Row(sym='AAPL', q_ts=100, price=99.0, seq=10),
+    ]
+    for force_st in (False, True):
+      with self.subTest(force_stateful=force_st):
+        p = beam.Pipeline(runner=fn_runner.FnApiRunner())
+        l_pc = p | 'L' >> beam.Create(trades)
+        r_pc = p | 'R' >> beam.Create(quotes)
+        joined = {
+            'left': l_pc, 'right': r_pc
+        } | asof_join.CliAsofJoin(
+            key='sym',
+            left_time='t_ts',
+            right_time='q_ts',
+            direction='backward',
+            type='left',
+            right_order='seq',
+            force_stateful=force_st,
+        )
+        assert_that(
+            joined | beam.Map(lambda r: (r.sym, r.price)),
+            equal_to([('AAPL', 99.0)]),
+        )
+        p.run().wait_until_finish()
 
 
 if __name__ == '__main__':

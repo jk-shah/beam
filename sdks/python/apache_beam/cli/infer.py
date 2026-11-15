@@ -49,6 +49,7 @@ import os
 import re
 import threading
 import time
+import weakref
 from collections.abc import Iterable
 from collections.abc import Mapping
 from collections.abc import Sequence
@@ -67,6 +68,7 @@ from apache_beam.pvalue import TaggedOutput
 from apache_beam.transforms.window import WindowedValue
 from apache_beam.typehints import schemas
 from apache_beam.typehints.row_type import RowTypeConstraint
+from apache_beam.utils import shared
 
 from . import enrich as enrich_mod
 from . import interval_join
@@ -253,6 +255,8 @@ class InferConfig(NamedTuple):
   model_copies: int = 1
   hf_token_env: str = 'HF_TOKEN'
   hf_token: str | None = None
+  load_pipeline_args: dict[str, Any] | None = None
+  model_kwargs: dict[str, Any] | None = None
   # Mock options
   mock_score: float = 0.9
   mock_label: str = 'POSITIVE'
@@ -684,9 +688,23 @@ def parse_infer_config(
       raise ValueError(
           'use_safetensors=False is blocked in CliInfer to prevent unsafe '
           'pickle (.bin) weight deserialization')
-    _validate_hf_security_dict(
-        norm.get('load_pipeline_args'), 'load_pipeline_args')
-    _validate_hf_security_dict(norm.get('model_kwargs'), 'model_kwargs')
+    raw_lpa = norm.get('load_pipeline_args')
+    if isinstance(raw_lpa, str):
+      loaded_lpa = output.safe_yaml_load(raw_lpa)
+      if not isinstance(loaded_lpa, Mapping):
+        raise ValueError('load_pipeline_args must be a mapping')
+      raw_lpa = loaded_lpa
+    raw_mk = norm.get('model_kwargs')
+    if isinstance(raw_mk, str):
+      loaded_mk = output.safe_yaml_load(raw_mk)
+      if not isinstance(loaded_mk, Mapping):
+        raise ValueError('model_kwargs must be a mapping')
+      raw_mk = loaded_mk
+
+    _validate_hf_security_dict(raw_lpa, 'load_pipeline_args')
+    _validate_hf_security_dict(raw_mk, 'model_kwargs')
+    clean_lpa = {str(k): v for k, v in raw_lpa.items()} if raw_lpa else None
+    clean_mk = {str(k): v for k, v in raw_mk.items()} if raw_mk else None
 
     task = (
         str(norm['task']).strip().lower()
@@ -794,6 +812,8 @@ def parse_infer_config(
         model_copies=model_copies,
         hf_token_env=hf_token_env,
         hf_token=hf_token,
+        load_pipeline_args=clean_lpa,
+        model_kwargs=clean_mk,
     )
 
   # provider == 'mock'
@@ -919,6 +939,10 @@ def infer_config_to_yaml_dict(cfg: InferConfig) -> dict[str, Any]:
       out['hf_token_env'] = cfg.hf_token_env
     if cfg.hf_token is not None:
       out['hf_token'] = cfg.hf_token
+    if cfg.load_pipeline_args:
+      out['load_pipeline_args'] = dict(cfg.load_pipeline_args)
+    if cfg.model_kwargs:
+      out['model_kwargs'] = dict(cfg.model_kwargs)
   else:  # mock
     if cfg.mock_mode != 'static':
       out['mode'] = cfg.mock_mode
@@ -1211,10 +1235,10 @@ class _TokenBucketRateLimiter(beam_rate_limiter.RateLimiter):
     self._next_allowed = 0.0
 
   def __getstate__(self):
-    return {'rate': self._rate}
+    return {'rate': self._rate, 'namespace': self.namespace}
 
   def __setstate__(self, state):
-    super().__init__(namespace='CliInfer')
+    super().__init__(namespace=state.get('namespace', 'CliInfer'))
     self._rate = state['rate']
     self._lock = threading.Lock()
     self._next_allowed = 0.0
@@ -1236,6 +1260,61 @@ class _TokenBucketRateLimiter(beam_rate_limiter.RateLimiter):
       time.sleep(min(wait_s, 5.0))
     self.requests_allowed.inc(hits)
     return True
+
+
+_INFER_HANDLER_LOCK = threading.RLock()
+_INFER_RATE_LIMITER_LOCK = threading.Lock()
+_SHARED_INFER_RATE_LIMITERS: dict[tuple[str, str, float],
+                                  _TokenBucketRateLimiter] = {}
+_SHARED_VERTEX_HANDLERS: dict[tuple[Any, ...], Any] = {}
+_SHARED_VERTEX_CLIENTS: dict[tuple[Any, ...], shared.Shared] = {}
+_HF_LOCKS_GUARD = threading.Lock()
+_HF_MODEL_LOCKS: weakref.WeakKeyDictionary[
+    Any, threading.Lock] = weakref.WeakKeyDictionary()
+_HF_MODEL_LOCKS_BY_ID: dict[int, threading.Lock] = {}
+
+
+class _SharedVertexClientBox:
+  """Weak-referenceable container for `shared.Shared` Vertex AI endpoints."""
+  def __init__(self, value: Any):
+    self.value = value
+
+
+def _infer_stage_rate_key(cfg: InferConfig) -> str:
+  key_dict = infer_config_to_yaml_dict(cfg)
+  key_dict.pop('hf_token', None)
+  return json.dumps(key_dict, sort_keys=True, default=str)
+
+
+def _get_shared_infer_rate_limiter(
+    cfg: InferConfig,
+    namespace: str = 'CliInfer',
+) -> _TokenBucketRateLimiter:
+  assert cfg.rate_limit is not None
+  r_key = (_infer_stage_rate_key(cfg), namespace, float(cfg.rate_limit))
+  with _INFER_RATE_LIMITER_LOCK:
+    limiter = _SHARED_INFER_RATE_LIMITERS.get(r_key)
+    if limiter is None:
+      limiter = _TokenBucketRateLimiter(cfg.rate_limit, namespace=namespace)
+      _SHARED_INFER_RATE_LIMITERS[r_key] = limiter
+    return limiter
+
+
+def _get_hf_pipeline_lock(model: Any) -> threading.Lock:
+  with _HF_LOCKS_GUARD:
+    try:
+      lk = _HF_MODEL_LOCKS.get(model)
+      if lk is None:
+        lk = threading.Lock()
+        _HF_MODEL_LOCKS[model] = lk
+      return lk
+    except TypeError:
+      mid = id(model)
+      lk = _HF_MODEL_LOCKS_BY_ID.get(mid)
+      if lk is None:
+        lk = threading.Lock()
+        _HF_MODEL_LOCKS_BY_ID[mid] = lk
+      return lk
 
 
 class _LoadedMockModel:
@@ -1332,8 +1411,9 @@ class _LazyCliModelHandler(ModelHandler[Any, Any, Any]):
     self._catch_singleton_errors = catch_singleton_errors
     self._handler_factory = handler_factory
     self._inner: ModelHandler[Any, Any, Any] | None = None
+    self._shared_vertex_box: _SharedVertexClientBox | None = None
     self._rate_limiter = (
-        _TokenBucketRateLimiter(cfg.rate_limit)
+        _get_shared_infer_rate_limiter(cfg)
         if cfg.rate_limit is not None and cfg.provider != 'vertexai' else None)
     self._batches_counter = Metrics.counter('beam_cli', 'inference_batches')
     self._latency_dist = Metrics.distribution(
@@ -1352,93 +1432,171 @@ class _LazyCliModelHandler(ModelHandler[Any, Any, Any]):
     self._catch_singleton_errors = state['catch_singleton_errors']
     self._handler_factory = state['handler_factory']
     self._inner = None
+    self._shared_vertex_box = None
     self._rate_limiter = (
-        _TokenBucketRateLimiter(self._cfg.rate_limit)
+        _get_shared_infer_rate_limiter(self._cfg)
         if self._cfg.rate_limit is not None and self._cfg.provider != 'vertexai'
         else None)
     self._batches_counter = Metrics.counter('beam_cli', 'inference_batches')
     self._latency_dist = Metrics.distribution(
         'beam_cli', 'inference_latency_ms')
 
+  def _vertex_cache_key(self, cls_obj: Any) -> tuple[Any, ...]:
+    return (
+        id(cls_obj),
+        self._cfg.endpoint_id,
+        self._cfg.project,
+        self._cfg.location,
+        self._cfg.experiment,
+        self._cfg.network,
+        self._cfg.private,
+        self._cfg.invoke_route,
+        self._cfg.min_batch_size,
+        self._cfg.max_batch_size,
+        self._cfg.num_retries,
+        self._cfg.rate_limit,
+    )
+
   def _ensure_inner_handler(self) -> ModelHandler[Any, Any, Any]:
     if self._inner is not None:
       return self._inner
 
-    if self._handler_factory is not None:
-      self._inner = self._handler_factory(self._cfg)
-      return self._inner
+    with _INFER_HANDLER_LOCK:
+      if self._inner is not None:
+        return self._inner
 
-    if self._cfg.provider == 'mock':
-      self._inner = _MockModelHandler(self._cfg)
-      return self._inner
+      if self._handler_factory is not None:
+        self._inner = self._handler_factory(self._cfg)
+        return self._inner
 
-    if self._cfg.provider == 'vertexai':
-      try:
-        from apache_beam.ml.inference.vertex_ai_inference import VertexAIModelHandlerJSON
-      except ImportError as e:
-        raise RuntimeError(
-            'Vertex AI --infer requires google-cloud-aiplatform; install with: '
-            'pip install "apache-beam[gcp]" google-cloud-aiplatform') from e
+      if self._cfg.provider == 'mock':
+        self._inner = _MockModelHandler(self._cfg)
+        return self._inner
 
-      v_kwargs: dict[str, Any] = {
-          'num_retries': self._cfg.num_retries,
-      }
-      if self._cfg.rate_limit is not None:
-        v_kwargs['rate_limiter'] = _TokenBucketRateLimiter(
-            self._cfg.rate_limit, namespace='VertexAIModelHandlerJSON')
-      self._inner = VertexAIModelHandlerJSON(
-          endpoint_id=str(self._cfg.endpoint_id),
-          project=str(self._cfg.project),
-          location=str(self._cfg.location),
-          experiment=self._cfg.experiment,
-          network=self._cfg.network,
-          private=self._cfg.private,
-          invoke_route=self._cfg.invoke_route,
-          min_batch_size=self._cfg.min_batch_size,
-          max_batch_size=self._cfg.max_batch_size,
-          **v_kwargs,
-      )
-      return self._inner
+      if self._cfg.provider == 'vertexai':
+        try:
+          from apache_beam.ml.inference.vertex_ai_inference import VertexAIModelHandlerJSON
+        except ImportError as e:
+          raise RuntimeError(
+              'Vertex AI --infer requires google-cloud-aiplatform; install with: '
+              'pip install "apache-beam[gcp]" google-cloud-aiplatform') from e
 
-    if self._cfg.provider == 'hf':
-      try:
-        from apache_beam.ml.inference.huggingface_inference import HuggingFacePipelineModelHandler
-      except ImportError as e:
-        raise RuntimeError(
-            'HuggingFace --infer requires transformers and torch; install with: '
-            'pip install transformers torch safetensors') from e
+        v_key = self._vertex_cache_key(VertexAIModelHandlerJSON)
+        cached_handler = _SHARED_VERTEX_HANDLERS.get(v_key)
+        if cached_handler is not None:
+          self._inner = cached_handler
+          return self._inner
 
-      model_kwargs: dict[str, Any] = {
-          'trust_remote_code': False,
-          'use_safetensors': True,
-      }
-      load_pipeline_args: dict[str, Any] = {
-          'trust_remote_code': False,
-          'model_kwargs': model_kwargs,
-      }
-      if self._cfg.revision:
-        load_pipeline_args['revision'] = self._cfg.revision
-        model_kwargs['revision'] = self._cfg.revision
-      tok = os.environ.get(self._cfg.hf_token_env) or self._cfg.hf_token
-      if tok:
-        load_pipeline_args['token'] = tok
+        v_kwargs: dict[str, Any] = {
+            'num_retries': self._cfg.num_retries,
+        }
+        if self._cfg.rate_limit is not None:
+          v_kwargs['rate_limiter'] = _get_shared_infer_rate_limiter(
+              self._cfg, namespace='VertexAIModelHandlerJSON')
+        constructed = VertexAIModelHandlerJSON(
+            endpoint_id=str(self._cfg.endpoint_id),
+            project=str(self._cfg.project),
+            location=str(self._cfg.location),
+            experiment=self._cfg.experiment,
+            network=self._cfg.network,
+            private=self._cfg.private,
+            invoke_route=self._cfg.invoke_route,
+            min_batch_size=self._cfg.min_batch_size,
+            max_batch_size=self._cfg.max_batch_size,
+            **v_kwargs,
+        )
+        _SHARED_VERTEX_HANDLERS[v_key] = constructed
+        self._inner = constructed
+        return self._inner
 
-      self._inner = HuggingFacePipelineModelHandler(
-          task=self._cfg.task or '',
-          model=self._cfg.model or '',
-          device=self._cfg.device,
-          load_pipeline_args=load_pipeline_args,
-          min_batch_size=self._cfg.min_batch_size,
-          max_batch_size=self._cfg.max_batch_size,
-          large_model=self._cfg.large_model,
-          model_copies=self._cfg.model_copies,
-      )
-      return self._inner
+      if self._cfg.provider == 'hf':
+        try:
+          from apache_beam.ml.inference.huggingface_inference import HuggingFacePipelineModelHandler
+        except ImportError as e:
+          raise RuntimeError(
+              'HuggingFace --infer requires transformers and torch; install with: '
+              'pip install transformers torch safetensors') from e
 
-    raise ValueError(f'unsupported provider {self._cfg.provider!r}')
+        user_lpa = dict(self._cfg.load_pipeline_args or {})
+        nested_lpa_mk = user_lpa.pop('model_kwargs', None)
+        base_nested_mk = (
+            dict(nested_lpa_mk) if isinstance(nested_lpa_mk, Mapping) else {})
+        user_mk = dict(self._cfg.model_kwargs or {})
+        model_kwargs: dict[str, Any] = {
+            **base_nested_mk,
+            **user_mk,
+            'trust_remote_code': False,
+            'use_safetensors': True,
+        }
+        load_pipeline_args: dict[str, Any] = {
+            **user_lpa,
+            'trust_remote_code': False,
+            'model_kwargs': model_kwargs,
+        }
+        if self._cfg.revision:
+          load_pipeline_args['revision'] = self._cfg.revision
+          model_kwargs['revision'] = self._cfg.revision
+        tok = os.environ.get(self._cfg.hf_token_env) or self._cfg.hf_token
+        if tok:
+          load_pipeline_args['token'] = tok
+
+        eff_device = (
+            None if 'device' in load_pipeline_args else self._cfg.device)
+        self._inner = HuggingFacePipelineModelHandler(
+            task=self._cfg.task or '',
+            model=self._cfg.model or '',
+            device=eff_device,
+            load_pipeline_args=load_pipeline_args,
+            min_batch_size=self._cfg.min_batch_size,
+            max_batch_size=self._cfg.max_batch_size,
+            large_model=self._cfg.large_model,
+            model_copies=self._cfg.model_copies,
+        )
+        return self._inner
+
+      raise ValueError(f'unsupported provider {self._cfg.provider!r}')
 
   def load_model(self) -> Any:
-    return self._ensure_inner_handler().load_model()
+    inner = self._ensure_inner_handler()
+    if self._cfg.provider == 'vertexai' and self._handler_factory is None:
+      import sys
+      with _INFER_HANDLER_LOCK:
+        from apache_beam.ml.inference.vertex_ai_inference import VertexAIModelHandlerJSON
+        v_key = self._vertex_cache_key(VertexAIModelHandlerJSON)
+        sh = _SHARED_VERTEX_CLIENTS.get(v_key)
+        if sh is None:
+          sh = shared.Shared()
+          _SHARED_VERTEX_CLIENTS[v_key] = sh
+
+        def _create_box() -> _SharedVertexClientBox:
+          aip_mod = sys.modules.get('google.cloud.aiplatform')
+          if aip_mod is not None and callable(getattr(aip_mod, 'init', None)):
+            aip_mod.init(
+                project=str(self._cfg.project),
+                location=str(self._cfg.location),
+                experiment=self._cfg.experiment,
+                network=self._cfg.network)
+          return _SharedVertexClientBox(inner.load_model())
+
+        box = sh.acquire(_create_box)
+        self._shared_vertex_box = box
+        return box.value
+    return inner.load_model()
+
+  def _invoke_inner_inference(
+      self,
+      inner: ModelHandler[Any, Any, Any],
+      sub_batch: Sequence[Any],
+      model: Any,
+      inference_args: Optional[dict[str, Any]],
+  ) -> list[Any]:
+    actual_model = (
+        model.value if isinstance(model, _SharedVertexClientBox) else model)
+    if self._cfg.provider == 'hf' and not self._cfg.large_model:
+      with _get_hf_pipeline_lock(actual_model):
+        return list(
+            inner.run_inference(sub_batch, actual_model, inference_args))
+    return list(inner.run_inference(sub_batch, actual_model, inference_args))
 
   def run_inference(
       self,
@@ -1452,7 +1610,7 @@ class _LazyCliModelHandler(ModelHandler[Any, Any, Any]):
     self._batches_counter.inc()
     t0 = time.monotonic()
     try:
-      preds = list(inner.run_inference(batch, model, inference_args))
+      preds = self._invoke_inner_inference(inner, batch, model, inference_args)
       if len(preds) != len(batch):
         raise RuntimeError(
             f'model returned {len(preds)} predictions for batch of {len(batch)}'
@@ -1473,8 +1631,8 @@ class _LazyCliModelHandler(ModelHandler[Any, Any, Any]):
       isolated: list[Any] = []
       for single_item in batch:
         try:
-          single_preds = list(
-              inner.run_inference([single_item], model, inference_args))
+          single_preds = self._invoke_inner_inference(
+              inner, [single_item], model, inference_args)
           if len(single_preds) != 1:
             raise RuntimeError(
                 f'singleton retry returned {len(single_preds)} predictions')
@@ -1520,13 +1678,18 @@ class _PreprocessAndBatchDoFn(beam.DoFn):
     self._cfg = cfg
     self._has_dlq = has_dlq
     self._err_counter = Metrics.counter('beam_cli', 'inference_errors')
-
-  def start_bundle(self):
     self._win_buffers: dict[Any,
                             list[tuple[tuple[dict[str, Any], Any, Any],
                                        Any]]] = {}
+    self._buffer = self._win_buffers
     self._win_bytes: dict[Any, int] = {}
     self._win_started: dict[Any, float] = {}
+
+  def start_bundle(self):
+    self._win_buffers = {}
+    self._buffer = self._win_buffers
+    self._win_bytes = {}
+    self._win_started = {}
 
   def _flush_window(self, win: Any):
     buf = self._win_buffers.get(win)
@@ -1642,8 +1805,13 @@ class _PreprocessAndBatchDoFn(beam.DoFn):
       yield from self._flush_window(win)
 
   def finish_bundle(self):
-    for win in list(self._win_buffers.keys()):
-      yield from self._flush_window(win)
+    try:
+      for win in list(self._win_buffers.keys()):
+        yield from self._flush_window(win)
+    finally:
+      self._win_buffers.clear()
+      self._win_bytes.clear()
+      self._win_started.clear()
 
 
 class _UnpackInferResultsDoFn(beam.DoFn):
@@ -1940,6 +2108,10 @@ def cli_infer(
     model_copies: Optional[int] = None,
     hf_token: Optional[str] = None,
     hf_token_env: Optional[str] = None,
+    load_pipeline_args: Optional[Mapping[str, Any]] = None,
+    model_kwargs: Optional[Mapping[str, Any]] = None,
+    trust_remote_code: Optional[bool] = None,
+    use_safetensors: Optional[bool] = None,
     # Mock
     score: Optional[float] = None,
     label: Optional[str] = None,
@@ -1996,6 +2168,10 @@ def cli_infer(
       ('model_copies', model_copies),
       ('hf_token', hf_token),
       ('hf_token_env', hf_token_env),
+      ('load_pipeline_args', load_pipeline_args),
+      ('model_kwargs', model_kwargs),
+      ('trust_remote_code', trust_remote_code),
+      ('use_safetensors', use_safetensors),
       ('score', score),
       ('label', label),
       ('model_id', model_id),

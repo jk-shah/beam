@@ -22,7 +22,10 @@ from __future__ import annotations
 import io
 import json
 import os
+import sqlite3
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import redirect_stderr
 from contextlib import redirect_stdout
@@ -909,6 +912,519 @@ class EnrichCliPipeIntegrationTest(unittest.TestCase):
             os.path.join(tmp, 'o.jsonl'),
             from_format='json',
             enrich='file:path=dims.jsonl,key=id,on_miss=dlq')
+
+
+class EnrichProductionHardeningRegressionTest(unittest.TestCase):
+  def test_comma_grouped_enrich_opt_parsing_and_fields_ttl_disambiguation(self):
+    yaml_cfg = enrich.parse_enrich_spec_str(
+        'file:dims.csv',
+        extra_opts={
+            'on': 'user_id,on_miss=drop,fields=[tier,region:str],'
+            'prefix=u_,redis=redis://127.0.0.1:6379,ttl=600'
+        })
+    self.assertEqual(yaml_cfg['handler'], 'file')
+    self.assertEqual(yaml_cfg['row_key'], 'user_id')
+    self.assertEqual(yaml_cfg['on_miss'], 'drop')
+    self.assertEqual(yaml_cfg['columns'], ['tier', 'region:str'])
+    self.assertEqual(yaml_cfg['prefix'], 'u_')
+    self.assertEqual(yaml_cfg['redis_ttl'], 600)
+
+    # Unbracketed composite `on=` + unbracketed `fields=` in one grouped string.
+    cfg_multi = enrich.parse_enrich_config({
+        'handler': 'file',
+        'path': 'dims.csv',
+        'on': 'tenant_id,user_id,fields=tier,region,on_miss=drop,prefix=d_',
+    })
+    self.assertEqual(cfg_multi.fields, ('tenant_id', 'user_id'))
+    self.assertEqual(cfg_multi.columns, ('tier', 'region'))
+    self.assertEqual(cfg_multi.on_miss, 'drop')
+    self.assertEqual(cfg_multi.prefix, 'd_')
+
+    # Inline secrets inside comma-grouped `--enrich-opt` must still be rejected.
+    with self.assertRaisesRegex(ValueError, 'secret'):
+      enrich.parse_enrich_spec_str(
+          'file:dims.csv', extra_opts={'on': 'user_id,api_key=super_secret'})
+
+  def test_feast_sqlite_thread_affinity_across_dofn_worker_threads(self):
+    with tempfile.TemporaryDirectory() as tmp:
+      fs_yaml = os.path.join(tmp, 'feature_store.yaml')
+      with open(fs_yaml, 'w', encoding='utf-8') as f:
+        f.write(
+            'project: demo\n'
+            'provider: local\n'
+            'online_store:\n'
+            '  type: sqlite\n')
+
+      created_tmp_paths: list[str] = []
+      closed_flags: list[bool] = []
+
+      class _OnlineResp:
+        def __init__(self, payload):
+          self._payload = payload
+
+        def to_dict(self):
+          return self._payload
+
+      class _SqliteBoundFeastStore:
+        def __init__(self, yaml_path: str):
+          created_tmp_paths.append(yaml_path)
+          # Enforce strict SQLite same-thread check (`check_same_thread=True`).
+          self._conn = sqlite3.connect(':memory:', check_same_thread=True)
+          self._conn.execute(
+              'CREATE TABLE feats (user_id TEXT PRIMARY KEY, tier TEXT, score REAL)'
+          )
+          self._conn.execute("INSERT INTO feats VALUES ('u1', 'PLATINUM', 9.5)")
+          self._conn.commit()
+
+        def get_online_features(
+            self, features, entity_rows, full_feature_names):
+          _ = (features, full_feature_names)
+          uids, tiers, scores = [], [], []
+          for er in entity_rows:
+            uid = er['user_id']
+            uids.append(uid)
+            row = self._conn.execute(
+                'SELECT tier, score FROM feats WHERE user_id = ?',
+                (uid, )).fetchone()
+            if row is not None:
+              tiers.append(row[0])
+              scores.append(row[1])
+            else:
+              tiers.append(None)
+              scores.append(None)
+          return _OnlineResp({'user_id': uids, 'tier': tiers, 'score': scores})
+
+        def close(self):
+          self._conn.close()
+          closed_flags.append(True)
+
+      cfg = enrich.parse_enrich_config({
+          'handler': 'feast',
+          'path': fs_yaml,
+          'entity_id': 'user_id',
+          'feature_names': ['stats:tier', 'stats:score:float'],
+          'on_miss': 'null',
+      })
+      dofn = enrich._CliEnrichDoFn(
+          cfg,
+          static_columns=cfg.columns,
+          static_column_types=cfg.column_types,
+          caller_factory=lambda c: enrich._FeastCaller(
+              c, store_factory=_SqliteBoundFeastStore))
+
+      from apache_beam.transforms.window import GlobalWindow
+      dofn.setup()
+      try:
+        dofn.start_bundle()
+        emitted = []
+        for uid in ('u1', 'u2'):
+          emitted.extend(
+              dofn.process(beam.Row(user_id=uid), ts=100, win=GlobalWindow()))
+        emitted.extend(dofn.finish_bundle())
+      finally:
+        dofn.teardown()
+
+      rows = [wv.value._asdict() for wv in emitted]
+      self.assertEqual(
+          rows,
+          [
+              {
+                  'user_id': 'u1', 'tier': 'PLATINUM', 'score': 9.5
+              },
+              {
+                  'user_id': 'u2', 'tier': None, 'score': None
+              },
+          ])
+      self.assertEqual(closed_flags, [True])
+      self.assertEqual(len(created_tmp_paths), 1)
+      self.assertFalse(os.path.exists(created_tmp_paths[0]))
+
+  def test_batch_timeout_skips_singleton_storm_and_serializes_hung_caller(self):
+    call_sizes: list[int] = []
+    active_lock = threading.Lock()
+    active_calls = 0
+    max_concurrent = 0
+
+    class _SlowCaller:
+      discovered_columns = ('tier', )
+
+      def __enter__(self):
+        return self
+
+      def __exit__(self, *args):
+        return None
+
+      def lookup_batch(self, reqs):
+        nonlocal active_calls, max_concurrent
+        with active_lock:
+          call_sizes.append(len(reqs))
+          active_calls += 1
+          max_concurrent = max(max_concurrent, active_calls)
+        try:
+          time.sleep(0.22)
+          return {ck: {'tier': 'LATE'} for ck, _, _ in reqs}
+        finally:
+          with active_lock:
+            active_calls -= 1
+
+    cfg = enrich.parse_enrich_config({
+        'handler': 'bigquery',
+        'project': 'my-proj',
+        'table': 'my-proj.d.users',
+        'row_key': 'user_id',
+        'columns': ['tier'],
+        'timeout': '0.05s',
+        'max_batch_size': 10,
+    })
+    dofn = enrich._CliEnrichDoFn(
+        cfg,
+        has_error_handling=True,
+        error_output_tag='custom_dlq',
+        static_columns=cfg.columns,
+        static_column_types=cfg.column_types,
+        caller_factory=lambda _c: _SlowCaller())
+
+    from apache_beam.transforms.window import GlobalWindow
+    dofn.setup()
+    try:
+      t0 = time.monotonic()
+      dofn.start_bundle()
+      for i in range(5):
+        list(dofn.process(beam.Row(user_id=f'u{i}'), ts=10, win=GlobalWindow()))
+      dlq_out = list(dofn.finish_bundle())
+      elapsed = time.monotonic() - t0
+
+      # Batch timeout must fail once without 2 retries or 5 singleton retries!
+      self.assertEqual(call_sizes, [5])
+      self.assertLess(elapsed, 0.4)
+      self.assertEqual(len(dlq_out), 5)
+      for tagged in dlq_out:
+        self.assertEqual(tagged.tag, 'custom_dlq')
+        self.assertEqual(tagged.value.value.error_type, 'TimeoutError')
+
+      # Immediate second bundle while worker 1 is still sleeping must NOT invoke
+      # lookup_batch concurrently (`max_concurrent == 1`)!
+      dofn.start_bundle()
+      list(dofn.process(beam.Row(user_id='u_next'), ts=11, win=GlobalWindow()))
+      dlq_out2 = list(dofn.finish_bundle())
+      self.assertEqual(len(dlq_out2), 1)
+      self.assertEqual(max_concurrent, 1)
+    finally:
+      dofn.teardown()
+
+  def test_setup_rollback_teardown_order_and_finish_bundle_buffer_cleanup(self):
+    # 1. `setup()` rollback when Redis cache initialization fails after Feast
+    # caller already opened its temp YAML and worker thread.
+    with tempfile.TemporaryDirectory() as tmp:
+      fs_yaml = os.path.join(tmp, 'feature_store.yaml')
+      with open(fs_yaml, 'w', encoding='utf-8') as f:
+        f.write('project: demo\nprovider: local\n')
+
+      created_tmp: list[str] = []
+      store_closed: list[bool] = []
+
+      class _Store:
+        def __init__(self, p):
+          created_tmp.append(p)
+
+        def close(self):
+          store_closed.append(True)
+
+      class _ExplodingRedis:
+        def __enter__(self):
+          raise RuntimeError('redis connection setup failed')
+
+      cfg_redis = enrich.parse_enrich_config({
+          'handler': 'feast',
+          'path': fs_yaml,
+          'entity_id': 'user_id',
+          'feature_names': ['v:tier'],
+          'redis': 'redis://127.0.0.1:6379',
+      })
+      dofn_fail = enrich._CliEnrichDoFn(
+          cfg_redis,
+          caller_factory=lambda c: enrich._FeastCaller(c, store_factory=_Store))
+      orig_cache_cls = enrich._SafeRedisCache
+      enrich._SafeRedisCache = lambda *a, **kw: _ExplodingRedis()
+      try:
+        with self.assertRaisesRegex(RuntimeError, 'redis connection setup'):
+          dofn_fail.setup()
+      finally:
+        enrich._SafeRedisCache = orig_cache_cls
+
+      self.assertIsNone(dofn_fail._executor)
+      self.assertIsNone(dofn_fail._caller)
+      self.assertIsNone(dofn_fail._cache)
+      self.assertEqual(store_closed, [True])
+      self.assertEqual(len(created_tmp), 1)
+      self.assertFalse(os.path.exists(created_tmp[0]))
+
+    # 2. `teardown()` shuts down `_executor` BEFORE `_caller.__exit__` & `_cache.__exit__`.
+    order: list[str] = []
+
+    class _FakeExec:
+      def shutdown(self, wait=True, cancel_futures=False):
+        _ = (wait, cancel_futures)
+        order.append('executor.shutdown')
+
+    class _OrderCaller:
+      def __exit__(self, *args):
+        order.append('caller.__exit__')
+
+    class _OrderCache:
+      def __exit__(self, *args):
+        order.append('cache.__exit__')
+
+    cfg_basic = enrich.parse_enrich_config({
+        'handler': 'file',
+        'path': 'dummy.csv',
+        'key': 'user_id',
+        'columns': ['tier'],
+    })
+    dofn_order = enrich._CliEnrichDoFn(cfg_basic)
+    dofn_order._executor = _FakeExec()  # type: ignore[assignment]
+    dofn_order._caller = _OrderCaller()
+    dofn_order._cache = _OrderCache()  # type: ignore[assignment]
+    dofn_order.teardown()
+    self.assertEqual(
+        order, ['executor.shutdown', 'caller.__exit__', 'cache.__exit__'])
+
+    # 3. `finish_bundle()` clears `_buffer` even when an unhandled error raises.
+    class _FailingCaller:
+      discovered_columns = ('tier', )
+
+      def __enter__(self):
+        return self
+
+      def __exit__(self, *args):
+        return None
+
+      def lookup_batch(self, _reqs):
+        raise ValueError('boom')
+
+    dofn_err = enrich._CliEnrichDoFn(
+        cfg_basic,
+        has_error_handling=False,
+        caller_factory=lambda _c: _FailingCaller())
+    from apache_beam.transforms.window import GlobalWindow
+    dofn_err.setup()
+    try:
+      dofn_err.start_bundle()
+      list(dofn_err.process(beam.Row(user_id='u1'), ts=1, win=GlobalWindow()))
+      self.assertEqual(len(dofn_err._buffer), 1)
+      with self.assertRaises(RuntimeError):
+        list(dofn_err.finish_bundle())
+      self.assertEqual(dofn_err._buffer, [])
+    finally:
+      dofn_err.teardown()
+
+  def test_shared_file_index_multiline_csv_leading_zeros_and_shared_rate_limiter(
+      self):
+    with tempfile.TemporaryDirectory() as tmp:
+      # CSV 1: mixed leading-zero ("00501") + numeric-looking ("94043") string
+      # keys AND quoted multiline note cell!
+      mixed_csv = os.path.join(tmp, 'zips_mixed.csv')
+      with open(mixed_csv, 'w', encoding='utf-8', newline='') as f:
+        f.write('zip_code,city,notes\n')
+        f.write('00501,Holtsville,"IRS\nService Center"\n')
+        f.write('94043,Mountain View,"Google\nPlex"\n')
+
+      cfg_mixed = enrich.parse_enrich_config({
+          'handler': 'file',
+          'path': mixed_csv,
+          'key': 'zip_code',
+      })
+      c1 = enrich._FileEnrichmentCaller(cfg_mixed)
+      c2 = enrich._FileEnrichmentCaller(cfg_mixed)
+      with c1, c2:
+        # `shared.Shared` must deduplicate the loaded index across callers!
+        self.assertIs(c1._shared_table, c2._shared_table)
+        self.assertIs(c1._index, c2._index)
+        ck_lead = enrich.encode_canonical_key_values(['00501'])
+        ck_num_str = enrich.encode_canonical_key_values(['94043'])
+        res = c1.lookup_batch([
+            (ck_lead, ('00501', ), beam.Row(zip_code='00501')),
+            (ck_num_str, ('94043', ), beam.Row(zip_code='94043')),
+        ])
+        self.assertEqual(
+            res[ck_lead], {
+                'city': 'Holtsville', 'notes': 'IRS\nService Center'
+            })
+        self.assertEqual(
+            res[ck_num_str], {
+                'city': 'Mountain View', 'notes': 'Google\nPlex'
+            })
+
+      # CSV 2: all-digits key column ("94043", "10001") queried with `str` keys!
+      digits_csv = os.path.join(tmp, 'zips_digits.csv')
+      with open(digits_csv, 'w', encoding='utf-8', newline='') as f:
+        f.write('zip_code,state\n94043,CA\n10001,NY\n')
+
+      with beam.Pipeline() as p:
+        out = (
+            p
+            | beam.Create([
+                beam.Row(zip_code='94043'),
+                beam.Row(zip_code='10001'),
+            ])
+            | enrich.CliEnrich({
+                'handler': 'file',
+                'path': digits_csv,
+                'on': 'zip_code',
+                'fields': ['state'],
+            })
+            | beam.Map(lambda r: (r.zip_code, r.state)))
+        assert_that(out, equal_to([('94043', 'CA'), ('10001', 'NY')]))
+
+      # Process-wide shared rate limiter per stage across DoFn instances.
+      cfg_rl = enrich.parse_enrich_config({
+          'handler': 'file',
+          'path': digits_csv,
+          'key': 'zip_code',
+          'columns': ['state'],
+          'rate_limit': '40',
+      })
+      d1 = enrich._CliEnrichDoFn(cfg_rl)
+      d2 = enrich._CliEnrichDoFn(cfg_rl)
+      d1.setup()
+      d2.setup()
+      try:
+        self.assertIsNotNone(d1._rate_limiter)
+        self.assertIs(d1._rate_limiter, d2._rate_limiter)
+        t_start = time.monotonic()
+        threads = [
+            threading.Thread(target=d1._rate_limiter.acquire) for _ in range(5)
+        ]
+        for th in threads:
+          th.start()
+        for th in threads:
+          th.join()
+        # 5 permits at 40 QPS (25ms spacing): 4 intervals >= ~0.085s.
+        self.assertGreaterEqual(time.monotonic() - t_start, 0.08)
+      finally:
+        d1.teardown()
+        d2.teardown()
+
+  def test_chained_enrich_fallback_dynamic_miss_columns_and_custom_error_tag(
+      self):
+    with tempfile.TemporaryDirectory() as tmp:
+      primary_csv = os.path.join(tmp, 'primary.csv')
+      fallback_csv = os.path.join(tmp, 'fallback.csv')
+      with open(primary_csv, 'w', encoding='utf-8') as f:
+        f.write('user_id,tier,region\nu1,VIP,US\n')
+      with open(fallback_csv, 'w', encoding='utf-8') as f:
+        f.write('user_id,tier,region\nu1,FALLBACK_IGNORED,EU\nu2,STD,APAC\n')
+
+      # 1. Stage 1 pads `u2` with `None`, Stage 2 hydrates `u2` without
+      # overwriting `u1`'s non-null values!
+      with beam.Pipeline() as p:
+        res = (
+            p
+            | beam.Create([
+                beam.Row(user_id='u1'),
+                beam.Row(user_id='u2'),
+                beam.Row(user_id='u3'),
+            ])
+            | 'Primary' >> enrich.CliEnrich({
+                'handler': 'file',
+                'path': primary_csv,
+                'on': 'user_id',
+                'columns': ['tier', 'region'],
+                'on_miss': 'null',
+            })
+            | 'Fallback' >> enrich.CliEnrich({
+                'handler': 'file',
+                'path': fallback_csv,
+                'on': 'user_id',
+                'columns': ['tier', 'region'],
+                'on_miss': 'null',
+            })
+            | beam.Map(lambda r: (r.user_id, r.tier, r.region)))
+        assert_that(
+            res,
+            equal_to([
+                ('u1', 'VIP', 'US'),
+                ('u2', 'STD', 'APAC'),
+                ('u3', None, None),
+            ]))
+
+      # 2. Dynamic miss columns when miss precedes hit in the same batch!
+      def _dyn_caller_factory(_cfg):
+        class _DynCaller:
+          discovered_columns = ()
+
+          def __enter__(self):
+            return self
+
+          def __exit__(self, *args):
+            return None
+
+          def lookup_batch(self, reqs):
+            u1_ck = enrich.encode_canonical_key_values(['u1'])
+            out = {}
+            for ck, _, _ in reqs:
+              if ck == u1_ck:
+                self.discovered_columns = ('dyn_tier', )
+                out[ck] = {'dyn_tier': 'GOLD'}
+              else:
+                out[ck] = None
+            return out
+
+        return _DynCaller()
+
+      with beam.Pipeline() as p_dyn:
+        res_dyn = (
+            p_dyn
+            | beam.Create([
+                beam.Row(user_id='u_miss_first'),
+                beam.Row(user_id='u1'),
+            ])
+            | enrich.CliEnrich({
+                'handler': 'bigquery',
+                'project': 'my-proj',
+                'table': 'my-proj.d.users',
+                'row_key': 'user_id',
+                'on_miss': 'null',
+                'max_batch_size': 10,
+            },
+                               caller_factory=_dyn_caller_factory)
+            | beam.Map(lambda r: (r.user_id, r.dyn_tier)))
+        assert_that(res_dyn, equal_to([('u_miss_first', None), ('u1', 'GOLD')]))
+
+      # 3. `on_miss='dlq'` without `error_handling` raises ValueError, and
+      # `cli_enrich(..., error_handling={'output': 'bad_records'})` honors tag!
+      with self.assertRaisesRegex(ValueError, "on_miss='dlq' requires"):
+        enrich.CliEnrich({
+            'handler': 'file',
+            'path': primary_csv,
+            'key': 'user_id',
+            'columns': ['tier'],
+            'on_miss': 'dlq',
+        })
+
+      with beam.Pipeline() as p_tag:
+        tagged_out = (
+            p_tag
+            | beam.Create([
+                beam.Row(user_id='u1'),
+                beam.Row(user_id='u_missing'),
+            ])
+            | enrich.cli_enrich(
+                handler='file',
+                path=primary_csv,
+                key='user_id',
+                columns=['tier'],
+                on_miss='dlq',
+                error_handling={'output': 'bad_records'}))
+        self.assertIn('bad_records', tagged_out)
+        assert_that(
+            tagged_out['good'] | beam.Map(lambda r: (r.user_id, r.tier)),
+            equal_to([('u1', 'VIP')]),
+            label='CheckCustomGood')
+        assert_that(
+            tagged_out['bad_records'] | beam.Map(lambda r: r.error_type),
+            equal_to(['EnrichmentMissError']),
+            label='CheckCustomBadTag')
 
 
 if __name__ == '__main__':
