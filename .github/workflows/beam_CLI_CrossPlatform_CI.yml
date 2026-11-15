@@ -94,10 +94,24 @@ jobs:
             txt = open(tf, encoding='utf-8').read()
             if 'import unittest' in txt and 'unittest.main' not in txt:
               errs.append(f'{tf}: missing unittest.main()')
+            import ast
+            tree = ast.parse(txt, filename=tf)
+            has_tc = False
+            for node in tree.body:
+              if isinstance(node, ast.FunctionDef) and node.name.startswith('test_'):
+                errs.append(f'{tf}:{node.name}: top-level test_* ignored by Beam pytest.ini; wrap in unittest.TestCase')
+              elif isinstance(node, ast.ClassDef):
+                bases = [ast.unparse(b) for b in node.bases]
+                if any('TestCase' in b for b in bases):
+                  has_tc = True
+                elif node.name.startswith('Test'):
+                  errs.append(f'{tf}:{node.name}: Test* class must inherit unittest.TestCase for Beam pytest.ini')
+            if not has_tc:
+              errs.append(f'{tf}: missing unittest.TestCase subclass')
           if errs:
             print('\n'.join(errs), file=sys.stderr)
             sys.exit(1)
-          print(f'Verified ASF headers, whitespace, and unittest.main() across {len(files)} files.')
+          print(f'Verified ASF headers, whitespace, and Beam pytest.ini TestCase rules across {len(files)} files.')
           PY
 
   pytest-cross-platform:
@@ -117,6 +131,7 @@ jobs:
             sdks/python/cli-preview
             sdks/python/_apache_beam_cli.py
             sdks/python/pyproject.toml
+            sdks/python/pytest.ini
             sdks/python/setup.cfg
           sparse-checkout-cone-mode: false
       - uses: actions/setup-python@v5
@@ -125,7 +140,7 @@ jobs:
       - name: Install Apache Beam & Test Dependencies
         run: |
           python -m pip install --upgrade pip build wheel
-          python -m pip install "apache-beam[yaml,dataframe,gcp]>=2.68.0" pytest pytest-xdist duckdb deltalake jinja2 pyyaml pyarrow fastavro
+          python -m pip install "apache-beam[yaml,dataframe,gcp]>=2.68.0" pytest pytest-xdist pytest-cov duckdb deltalake jinja2 pyyaml pyarrow fastavro
       - name: Verify Isolated sdist -> wheel Build & Install Smoke Check
         run: |
           python - << 'PY'
@@ -175,5 +190,45 @@ jobs:
           beam --version --json
           beam doctor --json
       - name: Run Full Apache Beam CLI Pytest Suite (`pytest -n auto`)
+        if: matrix.os != 'ubuntu-latest'
         run: |
-          python -c "import glob, pytest; raise SystemExit(pytest.main(['-n', 'auto', '-v', '-rs', '--import-mode=importlib', *sorted(glob.glob('sdks/python/apache_beam/cli/*_test.py'))]))"
+          python -c "import glob, pytest; raise SystemExit(pytest.main(['-c', 'sdks/python/pytest.ini', '-n', 'auto', '-v', '-rs', '--import-mode=importlib', *sorted(glob.glob('sdks/python/apache_beam/cli/*_test.py'))]))"
+      - name: Run Full CLI Pytest Suite & Enforce Per-Component Coverage Gate (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          BEAM_CLI_DIR: ${{ github.workspace }}/sdks/python/apache_beam/cli
+        run: |
+          python - << 'PY'
+          import glob, json, os, pytest, sys
+          from apache_beam.options import pipeline_options
+
+          pipeline_options.enable_all_additional_type_checks()
+          rc = pytest.main([
+              '-c', 'sdks/python/pytest.ini',
+              '-n', 'auto', '-v', '-rs', '--import-mode=importlib',
+              '--cov=sdks/python/apache_beam/cli',
+              '--cov-report=term',
+              '--cov-report=json:cli_coverage.json',
+              *sorted(glob.glob('sdks/python/apache_beam/cli/*_test.py')),
+          ])
+          if rc != 0:
+            sys.exit(rc)
+
+          cov = json.load(open('cli_coverage.json', encoding='utf-8'))
+          overall = float(cov['totals']['percent_covered'])
+          print(f'Overall CLI statement coverage: {overall:.2f}%')
+          failures = []
+          if overall < 75.0:
+            failures.append(f'Overall coverage {overall:.2f}% < 75.0% floor')
+          for fpath, info in sorted(cov.get('files', {}).items()):
+            bname = os.path.basename(fpath)
+            if bname.endswith('_test.py') or bname == '__init__.py':
+              continue
+            pct = float(info['summary']['percent_covered'])
+            if pct < 68.0:
+              failures.append(f'{bname}: {pct:.1f}% < 68.0% component floor')
+          if failures:
+            print('Coverage gate failed:\n  ' + '\n  '.join(failures), file=sys.stderr)
+            sys.exit(1)
+          print('All CLI component and aggregate coverage gates passed!')
+          PY

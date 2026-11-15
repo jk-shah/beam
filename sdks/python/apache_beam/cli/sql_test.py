@@ -319,6 +319,146 @@ class SqlShellTest(unittest.TestCase):
         pom_xml.index('beam-sdks-java-extensions-sql-delta'),
         pom_xml.index('beam-sdks-java-extensions-sql-jdbc'))
 
+    with mock.patch.dict(os.environ, {'ICEBERG_VERSION': '../bad'}, clear=False):
+      with self.assertRaisesRegex(SqlError, 'invalid ICEBERG_VERSION') as ctx:
+        sql._render_pom('2.79.0', 'direct', ['iceberg'])
+      self.assertEqual(ctx.exception.exit_code, 2)
+
+  def test_list_versions_and_list_runners_online_and_offline(self):
+    out_v = io.StringIO()
+    with (
+        mock.patch.object(
+            sql, '_fetch_maven_versions', return_value=['2.79.0', '2.78.0']
+        ),
+        contextlib.redirect_stdout(out_v),
+    ):
+      self.assertEqual(sql.run(list_versions=True), 0)
+    self.assertIn('2.79.0', out_v.getvalue())
+
+    with mock.patch.object(sql, '_fetch_maven_versions', return_value=[]):
+      with self.assertRaisesRegex(SqlError, 'could not retrieve Beam versions') as c_v:
+        sql.run(list_versions=True)
+      self.assertEqual(c_v.exception.exit_code, 1)
+
+    solr_runners = json.dumps({
+        'response': {
+            'docs': [
+                {'a': 'beam-runners-direct-java'},
+                {'a': 'beam-runners-google-cloud-dataflow-java'},
+                {'a': 'beam-runners-flink-1.18'},
+                {'a': 'beam-runners-core-java'},
+            ]
+        }
+    })
+    out_r = io.StringIO()
+    with (
+        mock.patch.object(sql, '_fetch_text', return_value=solr_runners),
+        contextlib.redirect_stdout(out_r),
+    ):
+      self.assertEqual(sql.run(version='2.79.0', list_runners=True), 0)
+    self.assertIn('DirectRunner', out_r.getvalue())
+    self.assertIn('DataflowRunner', out_r.getvalue())
+    self.assertIn('flink-1.18', out_r.getvalue())
+
+    out_ro, err_ro = io.StringIO(), io.StringIO()
+    with (
+        mock.patch.object(sql, '_fetch_text', return_value=None),
+        contextlib.redirect_stdout(out_ro),
+        contextlib.redirect_stderr(err_ro),
+    ):
+      self.assertEqual(sql.run(version='2.79.0', list_runners=True), 1)
+    self.assertIn('DirectRunner', out_ro.getvalue())
+
+  def test_download_https_symlink_and_maven_failure_guards(self):
+    # Non-https rejected
+    with self.assertRaises(ValueError):
+      sql._download_https('http://example.com/a.jar', os.path.join(self.tmp, 'a.jar'))
+    with self.assertRaises(ValueError):
+      sql._fetch_text('http://example.com/meta.xml')
+
+    # Redirect downgrade to http:// rejected
+    handler = sql._HttpsOnlyRedirectHandler()
+    with self.assertRaises(sql.urllib.error.URLError):
+      handler.redirect_request(None, None, 302, 'Found', {}, 'http://evil.test/x')
+
+    # Atomic download success & max_bytes overflow
+    dest = os.path.join(self.tmp, 'dl', 'ok.jar')
+    with mock.patch.object(
+        sql,
+        '_https_urlopen',
+        side_effect=lambda u, timeout: contextlib.nullcontext(io.BytesIO(b'hello')),
+    ):
+      sql._download_https('https://repo.maven.apache.org/ok.jar', dest, max_bytes=16)
+    with open(dest, 'rb') as f:
+      self.assertEqual(f.read(), b'hello')
+
+    with mock.patch.object(
+        sql,
+        '_https_urlopen',
+        side_effect=lambda u, timeout: contextlib.nullcontext(io.BytesIO(b'x' * 32)),
+    ):
+      with self.assertRaisesRegex(SqlError, 'exceeded maximum size'):
+        sql._download_https('https://repo.maven.apache.org/big.jar', dest, max_bytes=8)
+
+    # _fetch_text bounded read + XXE guard in _fetch_maven_versions
+    with mock.patch.object(
+        sql,
+        '_https_urlopen',
+        side_effect=lambda u, timeout: contextlib.nullcontext(io.BytesIO(b'<!DOCTYPE foo>')),
+    ):
+      self.assertEqual(sql._fetch_maven_versions(), [])
+
+    # Missing JAVA_HOME/bin/java & OSError on execution
+    empty_jdk = os.path.join(self.tmp, 'empty_jdk')
+    os.makedirs(empty_jdk)
+    with mock.patch.dict(os.environ, {'JAVA_HOME': empty_jdk}, clear=True):
+      with self.assertRaisesRegex(SqlError, 'does not contain') as c_jh:
+        sql._find_java()
+      self.assertEqual(c_jh.exception.exit_code, 4)
+
+    with (
+        mock.patch.dict(os.environ, {}, clear=True),
+        mock.patch('shutil.which', return_value='/usr/bin/java'),
+        mock.patch('subprocess.run', side_effect=OSError('exec format error')),
+    ):
+      with self.assertRaisesRegex(SqlError, 'could not execute') as c_os:
+        sql._find_java()
+      self.assertEqual(c_os.exception.exit_code, 4)
+
+    # Symlinked wrapper dir rejected on POSIX
+    if hasattr(os, 'symlink'):
+      real_d = os.path.join(self.tmp, 'real_w')
+      os.makedirs(real_d)
+      os.makedirs(self.beam_home, exist_ok=True)
+      os.symlink(real_d, os.path.join(self.beam_home, 'maven-wrapper'))
+      with self.assertRaisesRegex(SqlError, 'refusing symlinked'):
+        sql._ensure_maven_wrapper(self.beam_home)
+      os.unlink(os.path.join(self.beam_home, 'maven-wrapper'))
+
+    # Maven missing-artifact (exit 2) and generic build failure (exit 1)
+    wrapper_jar = os.path.join(
+        self.beam_home, 'maven-wrapper', '.mvn', 'wrapper', 'maven-wrapper.jar'
+    )
+    _write_dummy_jar(wrapper_jar)
+    with mock.patch(
+        'subprocess.run',
+        return_value=_proc(
+            1, stderr='[ERROR] Could not find artifact org.apache.beam:beam-sdks-java-io-nope:jar:2.75.0'
+        ),
+    ), contextlib.redirect_stderr(io.StringIO()):
+      with self.assertRaisesRegex(SqlError, 'Maven could not resolve') as c_mv:
+        sql._build_shaded_jar(
+            wrapper_jar,
+            java_home='/opt/jdk',
+            version='2.75.0',
+            runner_key='direct',
+            ios=['nope'],
+            jar_path=os.path.join(self.tmp, 'out.jar'),
+            debug=False,
+            java_bin='/opt/jdk/bin/java',
+        )
+      self.assertEqual(c_mv.exception.exit_code, 2)
+
 
 if __name__ == '__main__':
   unittest.main()

@@ -262,7 +262,7 @@ def run_tail(
           default_project=default_project,
           allow_sniff=True)
     except uris.UriError as e:
-      scheme, _ = uris.split_scheme(location)
+      scheme = location.split('://', 1)[0].lower() if '://' in location else ''
       if (follow and not explicit_format and scheme in ('', 'gs') and
           'cannot tell the format' in str(e)):
         # Allow `beam tail -f` on empty, not-yet-created, or directory targets

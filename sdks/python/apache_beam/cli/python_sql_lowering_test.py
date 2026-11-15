@@ -521,6 +521,96 @@ class PythonSqlLoweringEndToEndTest(unittest.TestCase):
     self.assertEqual(rc_ins, cli.EXIT_OK)
     self.assertEqual(env_ins['outputs']['row_count'], 3)
 
+  def test_local_sql_pre_where_post_select_dlq_redaction_and_stats_funcs(self):
+    csv_in = os.path.join(self.tmp, 'dirty_pii.csv')
+    with open(csv_in, 'w', encoding='utf-8') as f:
+      f.write(
+          'id,x,y,ssn,email\n'
+          '1,10.0,20.0,111-11-1111,a@example.com\n'
+          '2,20.0,40.0,222-22-2222,b@example.com\n'
+          '3,30.0,60.0,333-33-3333,c@example.com\n'
+          '4,bad_num,80.0,999-99-9999,secret@example.com\n'
+      )
+    dlq_out = os.path.join(self.tmp, 'sql_pii_dlq.jsonl')
+    res_out = os.path.join(self.tmp, 'stats_out.json')
+    rc, env, stderr = _run_cli([
+        'pipe',
+        csv_in,
+        res_out,
+        '--from-opt',
+        'fields=id:int,x:float,y:float,ssn:str,email:str',
+        '--where',
+        'x >= 10.0',
+        '--sql',
+        'SELECT COUNT(*) AS n, median(x) AS med_x, quantile(y, 0.5) AS q50_y, '
+        'stddev(x) AS sd_x, var_pop(x) AS vp_x, corr(x, y) AS r_xy, '
+        'regr_slope(y, x) AS slope, regr_intercept(y, x) AS intercept, '
+        'regr_r2(y, x) AS r2 FROM source',
+        '--select',
+        '*, round(slope, 2) AS clean_slope',
+        '--dlq',
+        dlq_out,
+        '--dlq-redact-fields',
+        'ssn,email',
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, f'env={env} stderr={stderr}')
+    dlq_text = open(dlq_out, encoding='utf-8').read()
+    self.assertNotIn('999-99-9999', dlq_text)
+    self.assertNotIn('secret@example.com', dlq_text)
+    self.assertIn('<REDACTED>', dlq_text)
+    rows = _read_jsonl_dir_or_prefix(res_out)
+    self.assertEqual(len(rows), 1)
+    self.assertAlmostEqual(rows[0]['clean_slope'], 2.0)
+    self.assertAlmostEqual(rows[0]['r2'], 1.0)
+
+  def test_asof_and_interval_sql_yaml_lowering_with_dlq_and_redaction(self):
+    left_p = os.path.join(self.tmp, 'trades.jsonl')
+    right_p = os.path.join(self.tmp, 'quotes.jsonl')
+    with open(left_p, 'w', encoding='utf-8') as f:
+      f.write('{"sym":"AAPL","t_ts":"2026-05-01T12:00:05Z","qty":10,"ssn":"123"}\n')
+    with open(right_p, 'w', encoding='utf-8') as f:
+      f.write('{"sym":"AAPL","q_ts":"2026-05-01T12:00:01Z","bid":190.5}\n')
+
+    # 1. ASOF JOIN YAML lowering with --dlq and --dlq-redact-fields
+    rc_a, env_a, err_a = _run_cli([
+        'pipe',
+        '--from',
+        f't={left_p}',
+        '--join',
+        f'q={right_p}',
+        '--to',
+        os.path.join(self.tmp, 'asof_out.jsonl'),
+        '--dlq',
+        os.path.join(self.tmp, 'asof_dlq.jsonl'),
+        '--dlq-redact-fields',
+        'ssn',
+        '--sql',
+        'SELECT t.sym, t.qty, q.bid FROM t ASOF LEFT JOIN q '
+        'ON t.sym = q.sym AND t.t_ts >= q.q_ts',
+        '--dry-run',
+    ])
+    self.assertEqual(rc_a, cli.EXIT_OK, err_a)
+    self.assertIn('CliAsofJoin', env_a['outputs']['yaml'])
+
+    # 2. Temporal INTERVAL JOIN YAML lowering with --dlq
+    rc_i, env_i, err_i = _run_cli([
+        'pipe',
+        '--from',
+        f't={left_p}',
+        '--join',
+        f'q={right_p}',
+        '--to',
+        os.path.join(self.tmp, 'iv_out.jsonl'),
+        '--dlq',
+        os.path.join(self.tmp, 'iv_dlq.jsonl'),
+        '--sql',
+        "SELECT t.sym, t.qty, q.bid FROM t JOIN q ON t.sym = q.sym "
+        "AND t.t_ts BETWEEN q.q_ts AND q.q_ts + INTERVAL '10' SECOND",
+        '--dry-run',
+    ])
+    self.assertEqual(rc_i, cli.EXIT_OK, err_i)
+    self.assertIn('CliIntervalJoin', env_i['outputs']['yaml'])
+
 
 if __name__ == '__main__':
   unittest.main()

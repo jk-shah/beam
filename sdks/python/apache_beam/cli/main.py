@@ -4043,12 +4043,11 @@ def _pipe_impl(
         getattr(args, 'post_where', None) or args.cdc or args.zero_copy or
         args.window or has_b23_flags or getattr(args, 'dedupe_by', None) or
         getattr(args, 'enrich_specs', None) or
-        getattr(args, 'infer_specs', None) or getattr(args, 'expect', None) or
-        getattr(args, 'dlq_redact_fields', None)):
+        getattr(args, 'infer_specs', None) or getattr(args, 'expect', None)):
       raise _CliError(
           '--sql cannot be combined with --pre-select, --enrich, --infer, '
           '--post-where, --window, --allowed-lateness, --trigger, --expect, '
-          '--dlq-redact-fields, --cdc, --dedupe-by, or --zero-copy; '
+          '--cdc, --dedupe-by, or --zero-copy; '
           'express those stages inside --sql (or omit --sql)',
           EXIT_USAGE)
     if getattr(args, 'limit', None) is not None:
@@ -4127,6 +4126,7 @@ def _pipe_impl(
           max_watermark_skew=getattr(args, 'max_watermark_skew', None),
           skew_action=getattr(args, 'skew_action', None),
           dlq_ep=dlq_ep,
+          dlq_redact_fields=getattr(args, 'dlq_redact_fields', None),
           for_local_only=will_run_local_sql,
           prefer_python_lowering=prefer_py_sql,
           strict_python_lowering=strict_py_sql,
@@ -4357,6 +4357,7 @@ def _pipe_impl(
           args.sql,
           default_project=default_proj,
           enable_dlq=bool(dlq_ep is not None or getattr(args, 'drop_bad', False)),
+          dlq_redact_fields=getattr(args, 'dlq_redact_fields', None),
           engine=args.sql_engine,
           warnings=sql_warnings,
           pre_where=args.where,
