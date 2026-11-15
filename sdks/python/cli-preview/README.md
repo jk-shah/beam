@@ -59,6 +59,9 @@ Give your agent either:
 1. **Zero-Config Self-Discovery**: Tell the agent:
    > *"Use `/path/to/.venv-beam-cli/bin/beam` (run `beam --llms-txt` first to learn its contract, exit codes, and URI schemes) to inspect, clean, and reconcile `<dataset>`."*
 2. **Agent Skill (`SKILL.md`)**: Copy [`.agents/skills/apache-beam-cli/SKILL.md`](../../../.agents/skills/apache-beam-cli/SKILL.md) into your workspace's `.agents/skills/apache-beam-cli/SKILL.md`.
+3. **Website Documentation & Task-Oriented User Guide**:
+   - **By Data Task**: [`website/www/site/content/en/documentation/sdks/cli-user-guide.md`](../../../website/www/site/content/en/documentation/sdks/cli-user-guide.md)
+   - **Reference Manual**: [`website/www/site/content/en/documentation/sdks/cli.md`](../../../website/www/site/content/en/documentation/sdks/cli.md)
 
 ---
 
@@ -70,11 +73,14 @@ Give your agent either:
 | `beam doctor` | Checks Python extras, SQLite/DuckDB `--sql` engines, Java runtime, JAR cache, and GCP ADC credentials | `<90 ms` |
 | `beam io list` / `describe` | Lists & describes Universal URI connectors (`csv`, `json`, `parquet`, `avro`, `delta`, `iceberg`, `bigquery`, `postgres`, `mysql`, `spanner`, `pubsub`, `kafka`) | `<60 ms` |
 | `beam inspect <URI>` | Schema, size, row count, column `--stats`, `--search`, `delta://`/`iceberg://` snapshots, and sanitized samples | `<90 ms` (local) |
-| `beam check <FILE\|->` | Fast static YAML, sandboxed `--jinja-variables`, and provider trust check (`--plan` for full Beam graph expansion) | `<80 ms` (static) |
-| `beam pipe --from <A> --to <B>` | Zero-code ETL, `--where`, `--select`, `--sql`, `--join`, `--dlq`, `--max-bytes`, `--assert-counts`, `--verify`, `--zero-copy`, and `--cdc --primary-key` | `<80 ms` (local) or Cloud |
-| `beam diff <LEFT> <RIGHT>` | Distributed $O(1)$-memory key/hash reconciliation (`--columns shared\|all\|c1,c2`, `--to FILE`, `--exit-zero`, `EXIT_DIFF_MISMATCH = 6`) | Local or Cloud |
-| `beam tail [-f] <URI>` | Bounded stream peek OR live `tail -f` follow (`pubsub://`, `kafka://`, `delta://`, `iceberg://`, `gs://`/local shards) | `<65 ms` |
+| `beam check <FILE\|->` | Fast static YAML, sandboxed `--jinja-variables`, and provider trust check (`--plan` for full Beam graph expansion; `--portable` for SQL portability) | `<90 ms` (static) |
+| `beam pipe <SRC> [<DST>]` | Zero-code ETL, `--where`, `--select`, `--sql` (`sqlite` / `duckdb` / zero-JVM `python`), `--expect`, `--dlq`, `--max-bytes`, `--check-schema`, `--assert-counts`, `--verify`, `--zero-copy`, `--cdc`, `--enrich`, `--infer` | `<80 ms` (local) or Cloud |
+| `beam diff <LEFT> <RIGHT>` | Distributed $O(1)$-memory key/hash reconciliation (`--columns shared\|all\|c1,c2`, 38-digit `Decimal` fidelity, `--to FILE`, `EXIT_DIFF_MISMATCH = 6`) | Local or Cloud |
+| `beam schema [diff\|check] <A> <B>` | Zero-compute `<90 ms` schema compatibility check (`BACKWARD`, `FORWARD`, `FULL`) with `CAST(...)` remediation hints | `<90 ms` |
+| `beam catalog sync <SRC> <DST>` | Zero-copy (`0` bytes copied) Lakehouse registration into Iceberg REST, BigLake REST, or BigQuery Managed Iceberg | `<200 ms` |
+| `beam tail [-f] [-i] <URI>` | Bounded stream peek OR live `tail -f` follow + interactive throughput TUI (`-i`) across `pubsub://`, `kafka://`, `delta://`, `iceberg://`, `gs://`/local shards | `<65 ms` |
 | `beam package <FILE\|->` | Zero-Docker YAML Flex Templates (`<2 s`) & zero-boilerplate Python AST Flex bundles | `<65 ms` |
+| `beam export-schedule <FILE.yaml>` | Exports Cloud Composer (Apache Airflow) DAGs or serverless Cloud Scheduler triggers | `<80 ms` |
 | `beam run <FILE\|->` | Runs Beam YAML pipelines (`--no-jinja` default on stdin; sandboxed Jinja2 rendering) | Local or Cloud |
 | `beam wait <JOB_ID>` | Polls detached remote jobs and runs deferred `--assert-counts` / `--verify` checks | `<90 ms` |
 | `beam cancel <JOB_ID>` | Cancels or `--drain`s running remote pipelines | `<90 ms` |

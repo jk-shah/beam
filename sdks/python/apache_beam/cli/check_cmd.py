@@ -570,6 +570,9 @@ _SAFE_BUILTINS_COMBINE_FNS = frozenset([
     'apache_beam.cli.windowing.count_distinct_combine_fn',
     'apache_beam.cli.windowing.var_pop_combine_fn',
     'apache_beam.cli.windowing.stddev_pop_combine_fn',
+    'apache_beam.cli.windowing.countdistinctcombinefn',
+    'apache_beam.cli.windowing.varpopcombinefn',
+    'apache_beam.cli.windowing.stddevpopcombinefn',
 ])
 
 

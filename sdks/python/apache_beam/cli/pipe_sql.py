@@ -2041,7 +2041,8 @@ def _try_lower_single_source_sql(
         combines[dest_col] = {
             'value': p_arg,
             'fn': {
-                'type': 'apache_beam.cli.windowing.COUNT_DISTINCT_COMBINE_FN'
+                'type': 'apache_beam.cli.windowing.CountDistinctCombineFn',
+                'config': {},
             },
             '_needs_python': True,
         }
@@ -2070,12 +2071,12 @@ def _try_lower_single_source_sql(
           syn_agg_counter += 1
           pre_proj_exprs.append(f'{arg_s} AS {p_arg}')
         comb_fqn = (
-            'apache_beam.cli.windowing.VAR_POP_COMBINE_FN'
+            'apache_beam.cli.windowing.VarPopCombineFn'
             if fn_low == 'var_pop' else
-            'apache_beam.cli.windowing.STDDEV_POP_COMBINE_FN')
+            'apache_beam.cli.windowing.StddevPopCombineFn')
         combines[dest_col] = {
             'value': p_arg,
-            'fn': {'type': comb_fqn},
+            'fn': {'type': comb_fqn, 'config': {}},
             '_needs_python': True,
         }
       else:

@@ -1053,6 +1053,14 @@ def cli_extract_pane_info() -> CliExtractPaneInfo:
 @beam.typehints.with_output_types(int)
 class CountDistinctCombineFn(beam.CombineFn):
   """Pure-Python non-null distinct count CombineFn for zero-JVM SQL lowering."""
+  def __init__(self):
+    super().__init__()
+    self._type_hints = (
+        beam.typehints.decorators.IOTypeHints.empty().with_output_types(int))
+
+  def default_type_hints(self):
+    return beam.typehints.decorators.IOTypeHints.empty().with_output_types(int)
+
   def create_accumulator(self):
     return set()
 
@@ -1074,6 +1082,16 @@ class CountDistinctCombineFn(beam.CombineFn):
 @beam.typehints.with_output_types(Optional[float])
 class VarPopCombineFn(beam.CombineFn):
   """Parallel Welford population variance (`VAR_POP`) CombineFn."""
+  def __init__(self):
+    super().__init__()
+    self._type_hints = (
+        beam.typehints.decorators.IOTypeHints.empty().with_output_types(
+            Optional[float]))
+
+  def default_type_hints(self):
+    return beam.typehints.decorators.IOTypeHints.empty().with_output_types(
+        Optional[float])
+
   def create_accumulator(self):
     return (0, 0.0, 0.0)
 

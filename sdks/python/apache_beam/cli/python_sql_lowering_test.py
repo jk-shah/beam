@@ -495,6 +495,32 @@ class PythonSqlLoweringEndToEndTest(unittest.TestCase):
         {'available': True, 'zero_jvm': True},
     )
 
+  def test_tumble_count_distinct_and_stddev_write_to_parquet(self):
+    out_pq = os.path.join(self.tmp, 'tumble_stats.parquet')
+    sql = (
+        "SELECT region, window_start, window_end, "
+        "COUNT(*) AS n, COUNT(DISTINCT user_id) AS uniq_users, "
+        "STDDEV_POP(amount) AS sd, ROUND(AVG(amount), 2) AS avg_amt "
+        "FROM TABLE(TUMBLE(TABLE source, DESCRIPTOR(event_ts), "
+        "INTERVAL '5' MINUTE)) "
+        "WHERE status = 'OK' "
+        "GROUP BY region, window_start, window_end "
+        "HAVING COUNT(*) >= 1"
+    )
+    rc, env, stderr = _run_cli([
+        'pipe',
+        self.events_path,
+        out_pq,
+        '--sql-engine',
+        'python',
+        '--sql',
+        sql,
+    ])
+    self.assertEqual(rc, cli.EXIT_OK, f'env={env} stderr={stderr}')
+    rc_ins, env_ins, _ = _run_cli(['inspect', out_pq, '-n', '10'])
+    self.assertEqual(rc_ins, cli.EXIT_OK)
+    self.assertEqual(env_ins['outputs']['row_count'], 3)
+
 
 if __name__ == '__main__':
   unittest.main()
