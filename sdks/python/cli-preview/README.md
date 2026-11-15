@@ -94,9 +94,10 @@ Give your agent either:
 1. **Pure JSON Envelope (`--json` / `--output=json`)**:
    - Permanently redirects OS file descriptor `stdout` (`fd 1`) to `stderr` (`fd 2`) before importing `apache_beam`, keeping C++/gRPC/JVM logs out of machine-parsed JSON stdout.
    - Every response includes `schema_version: "1.0"`, `ok`, `exit_code`, `duration_ms`, `metrics`, `outputs`, `warnings`, `error`, and `next_actions` (and `beam tail -f --json` emits flushed NDJSON `{"event":"record", ...}` lines followed by the final summary envelope).
-2. **Atomic `--if-exists replace` (Never Loses Previous Output on Failure)**:
-   - Default `--if-exists=fail` refuses to overwrite existing files or non-empty BigQuery tables.
-   - When `--if-exists=replace` is passed across local fast-path, `--sql`, or Beam runner paths, outputs are staged and committed atomically **only after** execution, `--dlq` writes, `--assert-counts`, and `--verify` all succeed—a failed run always leaves the previous output intact on disk.
+2. **Atomic `--if-exists` & Cross-Job Concurrency Isolation**:
+   - Default `--if-exists=fail` uses atomic hardlink creation (`os.link`) and exclusive Iceberg snapshot commits to eliminate TOCTOU races—concurrent contenders targeting the same path fail cleanly (`EXIT_USAGE = 2`) without overwriting the winner's output or DLQ.
+   - Overlapping sibling prefixes in shared directories (`orders`, `orders_daily`, `orders.parquet`, `orders_v2.parquet`), concurrent Iceberg v2 appends/CDC/schema-evolution (`vN.metadata.json`), and shared `~/.beam/` state (`config.yaml`, `jobs/`) are strictly isolated across threads and OS processes.
+   - When `--if-exists=replace` is passed across local fast-path, `--sql`, or Beam runner paths, outputs are staged in private directories and swapped atomically **only after** execution, `--dlq` writes, `--assert-counts`, and `--verify` all succeed.
 3. **Zero Silent Schema or Leading-Zero Loss**:
    - **JSONL Schema-Drift Protection**: Local JSONL inputs `<= 64 MB` are automatically scanned end-to-end so sparse fields appearing after row 100 are included automatically. On larger or remote JSONL inputs, any unseen field appearing after schema sampling triggers `SchemaDriftError` (or quarantines the full record to `--dlq` with an explicit warning in `warnings`—never silently dropping fields). Override anytime with `--from-opt sample_rows=all|<N>`, `--from-opt fields="col:type,..."`, or `--from-opt on_unknown_fields=ignore`.
    - **Leading-Zero & Explicit Column Typing**: Local CSVs automatically scan all rows so late leading-zero strings (`00123` at row 120) stay `str` instead of silently truncating to `int`; declare explicit types anytime via `--from-opt fields="zip:str,amount:float"` and custom null sentinels via `--null-values "NA,N/A,-"`.
@@ -307,7 +308,7 @@ beam pipe --from pubsub://projects/<PROJ>/subscriptions/orders --to bigquery://<
 ## 11. Architecture & Documentation Links
 
 * **Official Beam Website CLI Reference**: [`website/www/site/content/en/documentation/sdks/cli.md`](../../../website/www/site/content/en/documentation/sdks/cli.md)
-* **CLI Module Map & Test Runner (`431` tests across 27 modules)**: [`sdks/python/apache_beam/cli/README.md`](../apache_beam/cli/README.md)
+* **CLI Module Map & Test Runner (`553` tests across 38 modules)**: [`sdks/python/apache_beam/cli/README.md`](../apache_beam/cli/README.md)
 * **AI Coding Agent Skill**: [`.agents/skills/apache-beam-cli/SKILL.md`](../../../.agents/skills/apache-beam-cli/SKILL.md)
 
 All CLI source modules live directly in their upstream target path [`sdks/python/apache_beam/cli/`](../apache_beam/cli/README.md) (**Feature Complete** at `v0.2.0`) so individual PR slices cherry-pick cleanly onto `apache/beam:master` ([apache/beam#40891](https://github.com/apache/beam/issues/40891)). This `sdks/python/cli-preview/` package is a lightweight pure-Python overlay that lets anyone install and test the complete CLI experience against released PyPI `apache-beam` wheels in seconds.

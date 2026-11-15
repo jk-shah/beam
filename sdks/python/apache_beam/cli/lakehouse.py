@@ -23,6 +23,7 @@ upserts/deletes), and zero-copy Parquet/Delta -> Iceberg v2 manifest
 registration using only `FileSystems`, `pyarrow`, and `fastavro`.
 """
 
+import contextlib
 import datetime
 import decimal
 import io
@@ -157,9 +158,16 @@ def _fs_open_read(path: str):
   return FileSystems.open(path)
 
 
-def _fs_write_bytes(path: str, data: bytes, mime_type: str = 'application/octet-stream') -> None:
+def _fs_write_bytes(
+    path: str,
+    data: bytes,
+    mime_type: str = 'application/octet-stream',
+    *,
+    exclusive_create: bool = False,
+) -> None:
   if '://' not in path:
     import tempfile
+    from . import jobs as _jobs_mod
     abs_p = os.path.abspath(path)
     parent = os.path.dirname(abs_p) or '.'
     os.makedirs(parent, exist_ok=True)
@@ -172,7 +180,8 @@ def _fs_write_bytes(path: str, data: bytes, mime_type: str = 'application/octet-
         os.chmod(tmp_path, 0o644)
       except OSError:
         pass
-      os.replace(tmp_path, path)
+      _jobs_mod.atomic_commit_local_file(
+          tmp_path, path, allow_overwrite=not exclusive_create)
     except BaseException:
       if os.path.exists(tmp_path):
         try:
@@ -181,6 +190,8 @@ def _fs_write_bytes(path: str, data: bytes, mime_type: str = 'application/octet-
           pass
       raise
     return
+  if exclusive_create and _fs_exists(path):
+    raise FileExistsError(path)
   from apache_beam.io.filesystems import FileSystems
   with FileSystems.create(path, mime_type=mime_type) as f:
     f.write(data)
@@ -1947,6 +1958,19 @@ def _resolve_iceberg_write_fields(
   return resolved
 
 
+@contextlib.contextmanager
+def _iceberg_local_commit_lock(table_dir: str):
+  norm_dir = _normalize_fs_root(table_dir)
+  if '://' in norm_dir:
+    yield
+    return
+  from . import jobs as _jobs_mod
+  meta_dir = _join_fs(norm_dir, 'metadata')
+  os.makedirs(meta_dir, exist_ok=True)
+  with _jobs_mod._file_lock(pathlib.Path(meta_dir) / '.beam_iceberg_commit.lock'):
+    yield
+
+
 def commit_iceberg_snapshot(
     table_dir: str,
     *,
@@ -1956,9 +1980,50 @@ def commit_iceberg_snapshot(
     new_eq_delete_files: Optional[list[dict[str, Any]]] = None,
     partition_spec: Optional[dict[str, Any]] = None,
     replace_table: bool = False,
+    fail_if_exists: bool = False,
     cdc_seq_state: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
   """Atomically writes Iceberg v2 manifests, manifest-list, and `vN.metadata.json`."""
+  table_dir = _normalize_fs_root(table_dir)
+
+  with _iceberg_local_commit_lock(table_dir):
+    for attempt in range(16):
+      try:
+        return _commit_iceberg_snapshot_once(
+            table_dir,
+            iceberg_fields=iceberg_fields,
+            identifier_columns=identifier_columns,
+            new_data_files=new_data_files,
+            new_eq_delete_files=new_eq_delete_files,
+            partition_spec=partition_spec,
+            replace_table=replace_table,
+            fail_if_exists=fail_if_exists,
+            cdc_seq_state=cdc_seq_state)
+      except FileExistsError:
+        if fail_if_exists:
+          raise LakehouseError(
+              f'Iceberg table already exists at {table_dir!r}; pass '
+              '--if-exists=append or --if-exists=replace') from None
+        if attempt >= 15:
+          raise LakehouseError(
+              f'concurrent Iceberg metadata commit conflict on {table_dir!r} '
+              'after 16 retries') from None
+        time.sleep(0.01 * (attempt + 1))
+    raise AssertionError('unreachable')
+
+
+def _commit_iceberg_snapshot_once(
+    table_dir: str,
+    *,
+    iceberg_fields: list[dict[str, Any]],
+    identifier_columns: Optional[Iterable[str]] = None,
+    new_data_files: list[dict[str, Any]],
+    new_eq_delete_files: Optional[list[dict[str, Any]]] = None,
+    partition_spec: Optional[dict[str, Any]] = None,
+    replace_table: bool = False,
+    fail_if_exists: bool = False,
+    cdc_seq_state: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
   table_dir = _normalize_fs_root(table_dir)
   meta_dir = _join_fs(table_dir, 'metadata')
   now_ms = int(time.time() * 1000)
@@ -1969,6 +2034,11 @@ def commit_iceberg_snapshot(
       existing = load_iceberg_state(table_dir)
     except FileNotFoundError:
       existing = None
+
+  if fail_if_exists and existing is not None:
+    raise LakehouseError(
+        f'Iceberg table already exists at {table_dir!r}; pass '
+        '--if-exists=append or --if-exists=replace')
 
   if existing is not None:
     meta_ver = max(
@@ -2323,7 +2393,8 @@ def commit_iceberg_snapshot(
   _fs_write_bytes(
       new_meta_path,
       json.dumps(meta_json_obj, indent=2).encode('utf-8'),
-      mime_type='application/json')
+      mime_type='application/json',
+      exclusive_create=True)
   _fs_write_bytes(
       _join_fs(meta_dir, 'version-hint.text'),
       f'{meta_ver}\n'.encode('utf-8'),
@@ -2530,7 +2601,6 @@ def register_zero_copy_to_iceberg(
 
   table_dir = resolve_iceberg_table_dir(
       sink_ep.config, default_project=default_project)
-  existing_st: Optional[dict[str, Any]] = None
   if if_exists == 'fail':
     try:
       find_latest_iceberg_metadata_path(table_dir)
@@ -2539,11 +2609,6 @@ def register_zero_copy_to_iceberg(
           '--if-exists=append or --if-exists=replace')
     except FileNotFoundError:
       pass
-  elif if_exists != 'replace':
-    try:
-      existing_st = load_iceberg_state(table_dir)
-    except FileNotFoundError:
-      existing_st = None
 
   seen_fields: dict[str, dict[str, Any]] = {}
   file_field_presence: dict[str, int] = {}
@@ -2626,27 +2691,37 @@ def register_zero_copy_to_iceberg(
         'type': fdict['type'],
         'nullable': is_nullable,
     })
-  iceberg_fields = _resolve_iceberg_write_fields(existing_st, raw_iceberg_fields)
 
-  partition_spec = None
-  if partition_cols:
-    name_to_fid = {f['name']: f['id'] for f in iceberg_fields}
-    part_fields = []
-    for p_idx, pcol in enumerate(partition_cols, start=1000):
-      part_fields.append({
-          'source-id': name_to_fid.get(pcol, p_idx - 999),
-          'field-id': p_idx,
-          'name': pcol,
-          'transform': 'identity',
-      })
-    partition_spec = {'spec-id': 0, 'fields': part_fields}
+  with _iceberg_local_commit_lock(table_dir):
+    existing_st: Optional[dict[str, Any]] = None
+    if if_exists not in ('fail', 'replace'):
+      try:
+        existing_st = load_iceberg_state(table_dir)
+      except FileNotFoundError:
+        existing_st = None
+    iceberg_fields = _resolve_iceberg_write_fields(
+        existing_st, raw_iceberg_fields)
 
-  commit_res = commit_iceberg_snapshot(
-      table_dir,
-      iceberg_fields=iceberg_fields,
-      new_data_files=data_entries,
-      partition_spec=partition_spec,
-      replace_table=(if_exists == 'replace'))
+    partition_spec = None
+    if partition_cols:
+      name_to_fid = {f['name']: f['id'] for f in iceberg_fields}
+      part_fields = []
+      for p_idx, pcol in enumerate(partition_cols, start=1000):
+        part_fields.append({
+            'source-id': name_to_fid.get(pcol, p_idx - 999),
+            'field-id': p_idx,
+            'name': pcol,
+            'transform': 'identity',
+        })
+      partition_spec = {'spec-id': 0, 'fields': part_fields}
+
+    commit_res = commit_iceberg_snapshot(
+        table_dir,
+        iceberg_fields=iceberg_fields,
+        new_data_files=data_entries,
+        partition_spec=partition_spec,
+        replace_table=(if_exists == 'replace'),
+        fail_if_exists=(if_exists == 'fail'))
 
   cat_reg = register_iceberg_catalog_table(
       sink_ep.config.get('table', ''),
@@ -3278,114 +3353,120 @@ def cli_write_to_iceberg(
       if not raw_list:
         return
 
-      cur_max_ver = _max_existing_iceberg_metadata_version(table_dir)
-      should_replace = (
-          self._replace_max_ver >= 0 and cur_max_ver <= self._replace_max_ver)
+      with _iceberg_local_commit_lock(table_dir):
+        cur_max_ver = _max_existing_iceberg_metadata_version(table_dir)
+        should_replace = (
+            self._replace_max_ver >= 0 and cur_max_ver <= self._replace_max_ver)
 
-      st: Optional[dict[str, Any]] = None
-      table_exists = False
-      if not should_replace:
-        try:
-          st = load_iceberg_state(table_dir)
-          table_exists = True
-        except FileNotFoundError:
-          st = None
-          table_exists = False
-      eff_fields = _resolve_iceberg_write_fields(st, list(self._fields))
+        st: Optional[dict[str, Any]] = None
+        table_exists = False
+        if not should_replace:
+          try:
+            st = load_iceberg_state(table_dir)
+            table_exists = True
+          except FileNotFoundError:
+            st = None
+            table_exists = False
+        if if_exists == 'fail' and table_exists:
+          raise LakehouseError(
+              f'Iceberg table already exists at {table_dir!r}; pass '
+              '--if-exists=append or --if-exists=replace')
+        eff_fields = _resolve_iceberg_write_fields(st, list(self._fields))
 
-      batch_id = uuid.uuid4().hex
-      data_dir = _join_fs(table_dir, 'data')
-      new_data: list[dict[str, Any]] = []
-      new_eq_del: list[dict[str, Any]] = []
-      cdc_seq_state_out: Optional[dict[str, Any]] = None
+        batch_id = uuid.uuid4().hex
+        data_dir = _join_fs(table_dir, 'data')
+        new_data: list[dict[str, Any]] = []
+        new_eq_del: list[dict[str, Any]] = []
+        cdc_seq_state_out: Optional[dict[str, Any]] = None
 
-      if not is_mor:
-        clean_rows = [{
-            f['name']: r.get(f['name']) for f in eff_fields
-        } for r in raw_list]
-        d_path = _join_fs(data_dir, f'00000-0-{batch_id}.parquet')
-        new_data.append(
-            write_parquet_with_field_ids(d_path, clean_rows, eff_fields))
-      else:
-        if not eq_cols:
-          raise ValueError(
-              'Iceberg merge-on-read CDC requires --primary-key / equality_columns')
-        prior_seqs = (
-            _load_prior_cdc_seq_map(
-                table_dir, st, eq_cols, sequence_number_column)
-            if (table_exists and st is not None) else {})
-        eff_seq_col = sequence_number_column or 'beam_cdc_seq'
-        # Deduplicate per primary key within this commit window by max sequence.
-        latest_by_key: dict[
-            tuple[tuple[int, str], ...],
-            tuple[tuple[int, str], int, dict[str, Any], dict[str, Any]]] = {}
-        for arrival_idx, r in enumerate(raw_list):
-          op_raw = str(
-              r.get(change_type_column or 'beam_cdc_op', 'UPSERT')).upper()
-          if op_raw in ('UPDATE_BEFORE', 'UPDATE_PREIMAGE'):
-            continue
-          for pk_c in eq_cols:
-            if r.get(pk_c) is None:
-              raise ValueError(
-                  'Iceberg merge-on-read CDC event has null/missing primary '
-                  f'key column {pk_c!r}')
-          if eff_seq_col == 'beam_cdc_seq' and r.get('beam_cdc_hex_seq'):
-            cand_seq = (
-                int(r.get('beam_cdc_seq') or 0),
-                str(r['beam_cdc_hex_seq']))
-          else:
-            cand_seq = _comparable_iceberg_cdc_seq(r.get(eff_seq_col))
-          ck = _canonical_iceberg_key_tuple(r, eq_cols)
-          key_rec = {c: r.get(c) for c in eq_cols}
-          prev = latest_by_key.get(ck)
-          if prev is None or (cand_seq, arrival_idx) >= (prev[0], prev[1]):
-            latest_by_key[ck] = (cand_seq, arrival_idx, key_rec, r)
-
-        upserts: list[dict[str, Any]] = []
-        eq_delete_keys: list[dict[str, Any]] = []
-        for ck, (cand_seq, _, key_rec, winner) in latest_by_key.items():
-          if ck in prior_seqs and cand_seq < prior_seqs[ck]:
-            # Stale out-of-order event from an earlier sequence than already
-            # committed in a previous snapshot/window: ignore safely.
-            continue
-          prior_seqs[ck] = cand_seq
-          op_w = str(
-              winner.get(change_type_column or 'beam_cdc_op', 'UPSERT')).upper()
-          if op_w in ('DELETE', 'D'):
-            eq_delete_keys.append(key_rec)
-          else:
-            upserts.append({
-                f['name']: winner.get(f['name']) for f in eff_fields
-            })
-            if table_exists:
-              # Equality delete removes any older snapshot's version of this key
-              # (`data_seq < current_snap_seq`) while keeping this snapshot's row!
-              eq_delete_keys.append(key_rec)
-
-        cdc_seq_state_out = {
-            json.dumps(ck, separators=(',', ':')): [s[0], s[1]]
-            for ck, s in prior_seqs.items()
-        }
-        if upserts:
+        if not is_mor:
+          clean_rows = [{
+              f['name']: r.get(f['name']) for f in eff_fields
+          } for r in raw_list]
           d_path = _join_fs(data_dir, f'00000-0-{batch_id}.parquet')
           new_data.append(
-              write_parquet_with_field_ids(d_path, upserts, eff_fields))
-        if eq_delete_keys:
-          eq_field_specs = [f for f in eff_fields if f['name'] in eq_col_set]
-          del_path = _join_fs(data_dir, f'00000-0-{batch_id}-eq-del.parquet')
-          new_eq_del.append(
-              write_parquet_with_field_ids(
-                  del_path, eq_delete_keys, eq_field_specs))
+              write_parquet_with_field_ids(d_path, clean_rows, eff_fields))
+        else:
+          if not eq_cols:
+            raise ValueError(
+                'Iceberg merge-on-read CDC requires --primary-key / equality_columns')
+          prior_seqs = (
+              _load_prior_cdc_seq_map(
+                  table_dir, st, eq_cols, sequence_number_column)
+              if (table_exists and st is not None) else {})
+          eff_seq_col = sequence_number_column or 'beam_cdc_seq'
+          # Deduplicate per primary key within this commit window by max sequence.
+          latest_by_key: dict[
+              tuple[tuple[int, str], ...],
+              tuple[tuple[int, str], int, dict[str, Any], dict[str, Any]]] = {}
+          for arrival_idx, r in enumerate(raw_list):
+            op_raw = str(
+                r.get(change_type_column or 'beam_cdc_op', 'UPSERT')).upper()
+            if op_raw in ('UPDATE_BEFORE', 'UPDATE_PREIMAGE'):
+              continue
+            for pk_c in eq_cols:
+              if r.get(pk_c) is None:
+                raise ValueError(
+                    'Iceberg merge-on-read CDC event has null/missing primary '
+                    f'key column {pk_c!r}')
+            if eff_seq_col == 'beam_cdc_seq' and r.get('beam_cdc_hex_seq'):
+              cand_seq = (
+                  int(r.get('beam_cdc_seq') or 0),
+                  str(r['beam_cdc_hex_seq']))
+            else:
+              cand_seq = _comparable_iceberg_cdc_seq(r.get(eff_seq_col))
+            ck = _canonical_iceberg_key_tuple(r, eq_cols)
+            key_rec = {c: r.get(c) for c in eq_cols}
+            prev = latest_by_key.get(ck)
+            if prev is None or (cand_seq, arrival_idx) >= (prev[0], prev[1]):
+              latest_by_key[ck] = (cand_seq, arrival_idx, key_rec, r)
 
-      if new_data or new_eq_del:
-        commit_iceberg_snapshot(
-            table_dir,
-            iceberg_fields=eff_fields,
-            identifier_columns=eq_cols if is_mor else None,
-            new_data_files=new_data,
-            new_eq_delete_files=new_eq_del,
-            replace_table=should_replace,
-            cdc_seq_state=cdc_seq_state_out)
+          upserts: list[dict[str, Any]] = []
+          eq_delete_keys: list[dict[str, Any]] = []
+          for ck, (cand_seq, _, key_rec, winner) in latest_by_key.items():
+            if ck in prior_seqs and cand_seq < prior_seqs[ck]:
+              # Stale out-of-order event from an earlier sequence than already
+              # committed in a previous snapshot/window: ignore safely.
+              continue
+            prior_seqs[ck] = cand_seq
+            op_w = str(
+                winner.get(change_type_column or 'beam_cdc_op', 'UPSERT')).upper()
+            if op_w in ('DELETE', 'D'):
+              eq_delete_keys.append(key_rec)
+            else:
+              upserts.append({
+                  f['name']: winner.get(f['name']) for f in eff_fields
+              })
+              if table_exists:
+                # Equality delete removes any older snapshot's version of this key
+                # (`data_seq < current_snap_seq`) while keeping this snapshot's row!
+                eq_delete_keys.append(key_rec)
+
+          cdc_seq_state_out = {
+              json.dumps(ck, separators=(',', ':')): [s[0], s[1]]
+              for ck, s in prior_seqs.items()
+          }
+          if upserts:
+            d_path = _join_fs(data_dir, f'00000-0-{batch_id}.parquet')
+            new_data.append(
+                write_parquet_with_field_ids(d_path, upserts, eff_fields))
+          if eq_delete_keys:
+            eq_field_specs = [f for f in eff_fields if f['name'] in eq_col_set]
+            del_path = _join_fs(data_dir, f'00000-0-{batch_id}-eq-del.parquet')
+            new_eq_del.append(
+                write_parquet_with_field_ids(
+                    del_path, eq_delete_keys, eq_field_specs))
+
+        if new_data or new_eq_del:
+          commit_iceberg_snapshot(
+              table_dir,
+              iceberg_fields=eff_fields,
+              identifier_columns=eq_cols if is_mor else None,
+              new_data_files=new_data,
+              new_eq_delete_files=new_eq_del,
+              replace_table=should_replace,
+              fail_if_exists=(if_exists == 'fail'),
+              cdc_seq_state=cdc_seq_state_out)
 
   class _CliWriteIcebergTransform(beam.PTransform):
     def expand(self, pcoll):

@@ -807,6 +807,7 @@ def run(
     *,
     assert_counts: bool = False,
     drop_bad: bool = False,
+    if_exists: str = 'fail',
 ) -> FastPipeResult:
   """Runs `pipe` in-process. Raises FastPipeError like a failed pipeline.
 
@@ -1127,8 +1128,12 @@ def run(
           tag='dlq')
       staged_pairs.append(dlq_pair)
 
-    for tmp_p, final_p in staged_pairs:
-      os.replace(tmp_p, final_p)
+    from . import jobs as _jobs_mod
+    _jobs_mod.atomic_commit_local_file(
+        sink_pair[0], sink_pair[1], allow_overwrite=(if_exists != 'fail'))
+    if dlq_pair is not None:
+      _jobs_mod.atomic_commit_local_file(
+          dlq_pair[0], dlq_pair[1], allow_overwrite=True)
   finally:
     for tmp_p, _ in staged_pairs:
       if os.path.exists(tmp_p):

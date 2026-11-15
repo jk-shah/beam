@@ -33,6 +33,7 @@ envelopes for autonomous AI agents across:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import glob
 import hashlib
@@ -46,6 +47,7 @@ import sys
 import tempfile
 import time
 import traceback
+from pathlib import Path
 from typing import Any
 from typing import Iterable
 
@@ -3656,7 +3658,13 @@ def _materialize_single_local_file(
   if total_bytes > 256 * 1024 * 1024:
     return written
 
-  tmp_path = f'{prefix}.tmp.{os.getpid()}'
+  parent_dir = os.path.dirname(os.path.abspath(prefix)) or '.'
+  os.makedirs(parent_dir, exist_ok=True)
+  fd_mat, tmp_path = tempfile.mkstemp(
+      prefix=f'.{os.path.basename(prefix)}.mat.',
+      suffix='.tmp',
+      dir=parent_dir)
+  os.close(fd_mat)
   try:
     if ext in ('.parquet', '.pq'):
       import pyarrow as pa
@@ -3706,6 +3714,10 @@ def _materialize_single_local_file(
             out_f.write(data)
             if not data.endswith(b'\n'):
               out_f.write(b'\n')
+    try:
+      os.chmod(tmp_path, 0o644)
+    except OSError:
+      pass
     os.replace(tmp_path, prefix)
     for p in written:
       if p != prefix and os.path.exists(p):
@@ -3724,7 +3736,7 @@ def _materialize_single_local_file(
 
 
 def _cleanup_empty_beam_temp_dirs(prefix: str | None) -> None:
-  """Prunes empty `.temp*` sibling directories left by local FileBasedSink."""
+  """Prunes stale empty `.temp*` sibling directories left by FileBasedSink."""
   if not prefix or '://' in prefix:
     return
   clean_prefix = prefix.split('*', 1)[0].split('?', 1)[0]
@@ -4287,7 +4299,7 @@ def _pipe_impl(
               dlq_prefix=orig_sql_dlq,
               stage_sink=bool(
                   is_local_runner and not args.dry_run and
-                  args.if_exists == 'replace'),
+                  args.if_exists in ('fail', 'replace')),
               stage_dlq=bool(
                   is_local_runner and not args.dry_run and
                   args.if_exists != 'append')))
@@ -4365,33 +4377,49 @@ def _pipe_impl(
       written_sql: list[str] = []
       dlq_written: list[str] = []
       staged_sql_pairs: list[tuple[str, str]] = []
+      append_cm = (
+          jobs._file_lock(
+              Path(f'{os.path.abspath(sink_prefix)}.append.lock'))
+          if (args.if_exists == 'append' and sink_prefix and
+              '://' not in sink_prefix) else contextlib.nullcontext())
       try:
         sink_sql_pair: tuple[str, str] | None = None
-        if sink_ep is not None:
-          if '://' in (sink_prefix or ''):
-            raise _CliError(
-                f'remote sink {args.sink!r} with --sql requires '
-                '--runner=DataflowRunner or a local destination path',
-                EXIT_USAGE)
-          sink_sql_pair = pipe_sql.stage_rows_to_local_file(
-              out_cols,
-              out_rows,
-              sink_ep,
-              if_exists=args.if_exists,
-              warnings=sql_warnings,
-              tag='sink')
-          staged_sql_pairs.append(sink_sql_pair)
         dlq_sql_pair: tuple[str, str] | None = None
-        if dlq_ep is not None:
-          dlq_sql_pair = pipe_sql.stage_rows_to_local_file(
-              ['step', 'error_type', 'error', 'raw_payload'],
-              dlq_recs,
-              dlq_ep,
-              if_exists='append' if args.if_exists == 'append' else 'replace',
-              tag='dlq')
-          staged_sql_pairs.append(dlq_sql_pair)
-        for tmp_p, final_p in staged_sql_pairs:
-          os.replace(tmp_p, final_p)
+        with append_cm:
+          if sink_ep is not None:
+            if '://' in (sink_prefix or ''):
+              raise _CliError(
+                  f'remote sink {args.sink!r} with --sql requires '
+                  '--runner=DataflowRunner or a local destination path',
+                  EXIT_USAGE)
+            sink_sql_pair = pipe_sql.stage_rows_to_local_file(
+                out_cols,
+                out_rows,
+                sink_ep,
+                if_exists=args.if_exists,
+                warnings=sql_warnings,
+                tag='sink')
+            staged_sql_pairs.append(sink_sql_pair)
+          if dlq_ep is not None:
+            dlq_sql_pair = pipe_sql.stage_rows_to_local_file(
+                ['step', 'error_type', 'error', 'raw_payload'],
+                dlq_recs,
+                dlq_ep,
+                if_exists='append' if args.if_exists == 'append' else 'replace',
+                tag='dlq')
+            staged_sql_pairs.append(dlq_sql_pair)
+          if sink_sql_pair is not None:
+            try:
+              jobs.atomic_commit_local_file(
+                  sink_sql_pair[0],
+                  sink_sql_pair[1],
+                  allow_overwrite=(args.if_exists != 'fail'))
+            except FileExistsError:
+              raise _format_existing_output_error(
+                  sink_prefix or args.sink, [sink_sql_pair[1]]) from None
+          if dlq_sql_pair is not None:
+            jobs.atomic_commit_local_file(
+                dlq_sql_pair[0], dlq_sql_pair[1], allow_overwrite=True)
       finally:
         for tmp_p, _ in staged_sql_pairs:
           if os.path.exists(tmp_p):
@@ -4405,6 +4433,8 @@ def _pipe_impl(
           _remove_existing_output_for_replace(sink_prefix, keep=written_sql)
       if dlq_sql_pair is not None:
         dlq_written = [dlq_sql_pair[1]]
+    except _CliError:
+      raise
     except pipe_sql.SqlEngineMissingError as e:
       raise _CliError(str(e), EXIT_MISSING_PACKAGE) from None
     except (pipe_sql.SqlPipeError, FileNotFoundError) as e:
@@ -4890,6 +4920,9 @@ def _pipe_impl(
       pipe.late_dlq_endpoint.output_prefix if
       (pipe.dlq_endpoint is not None and
        pipe.late_dlq_endpoint is not None) else None)
+  explicit_sharding = any(
+      str(opt).split('=', 1)[0].strip() in ('num_shards', 'shard_name_template')
+      for opt in (args.to_opts or ()))
   staged_spec, sink_stage_dir, sink_stage_prefix, dlq_stage_dir, dlq_stage_prefix = (
       _stage_spec_sinks(
           pipe.spec,
@@ -4897,7 +4930,7 @@ def _pipe_impl(
           dlq_prefix=orig_dlq_prefix,
           stage_sink=bool(
               is_local_runner and not args.dry_run and
-              args.if_exists == 'replace'),
+              args.if_exists in ('fail', 'replace') and not explicit_sharding),
           stage_dlq=bool(
               is_local_runner and not args.dry_run and
               args.if_exists != 'append')))
@@ -4930,9 +4963,6 @@ def _pipe_impl(
           'right_opts': list(args.to_opts),
       } if args.verify else None,
   }
-  explicit_sharding = any(
-      str(opt).split('=', 1)[0].strip() in ('num_shards', 'shard_name_template')
-      for opt in (args.to_opts or ()))
 
   extra_warnings: list[str] = []
   if args.dry_run and _bigquery_write_disposition(pipe.spec) == 'WRITE_EMPTY':
@@ -5173,16 +5203,20 @@ def _commit_staged_local_files(
     target_prefix: str,
     *,
     remove_stale_replace: bool,
+    allow_overwrite: bool = True,
 ) -> list[str]:
   """Atomically swaps staged local output files onto `target_prefix`."""
+  from . import jobs as _jobs_mod
   final_files: list[str] = []
   for f in staged_files:
     abs_f = os.path.abspath(f)
     suffix = abs_f[len(stage_prefix):] if abs_f.startswith(stage_prefix) else ''
     dest = target_prefix + suffix
-    parent = os.path.dirname(os.path.abspath(dest)) or '.'
-    os.makedirs(parent, exist_ok=True)
-    os.replace(abs_f, dest)
+    try:
+      _jobs_mod.atomic_commit_local_file(
+          abs_f, dest, allow_overwrite=allow_overwrite)
+    except FileExistsError:
+      raise _format_existing_output_error(target_prefix, [dest]) from None
     final_files.append(dest)
   if remove_stale_replace:
     _remove_existing_output_for_replace(target_prefix, keep=final_files)
@@ -5263,13 +5297,17 @@ def _run_fast_local_pipe(
         files,
         mixed_groups=mixed_groups,
         assert_counts=bool(args.assert_counts),
-        drop_bad=bool(getattr(args, 'drop_bad', False)))
+        drop_bad=bool(getattr(args, 'drop_bad', False)),
+        if_exists=args.if_exists)
   except ImportError as e:
     if mixed_groups:
       raise _CliError(
           f'a required package is missing: {e}', EXIT_MISSING_PACKAGE) from None
     # pyarrow/fastavro missing: the Beam runner reports it properly.
     return None
+  except FileExistsError:
+    raise _format_existing_output_error(
+        pipe.output_prefix, [pipe.output_prefix]) from None
   except fast_local.FastPipeError as e:
     raise _CliError(f'pipeline failed: {e}', EXIT_PIPELINE_FAILED) from None
   except (ValueError, FileNotFoundError) as e:
@@ -5500,8 +5538,10 @@ def _run_yaml(
           stack.enter_context(
               subprocess_server.SubprocessServer.cache_subprocesses())
           pipeline = beam.Pipeline(options=options, display_data=display_data)
-          if output_prefix is not None and if_exists == 'fail' and dry_run_yaml is None:
-            _refuse_existing_output(output_prefix, verbose)
+          check_out_target = replace_commit_target or output_prefix
+          if (check_out_target is not None and if_exists == 'fail' and
+              dry_run_yaml is None):
+            _refuse_existing_output(check_out_target, verbose)
           constructor(pipeline)
         except _CliError:
           raise
@@ -5900,24 +5940,30 @@ def _run_yaml(
                 'outputs': outputs_dict, 'metrics': row_metrics
             })
 
-    if dlq_commit_target is not None and dlq_prefix is not None:
-      dlq_files = _commit_staged_local_files(
-          dlq_files,
-          dlq_prefix,
-          dlq_commit_target,
-          remove_stale_replace=bool(if_exists == 'replace' or dlq_files))
-      outputs_dict['dlq_files'] = dlq_files
     if replace_commit_target is not None and output_prefix is not None:
       written = _commit_staged_local_files(
           written,
           output_prefix,
           replace_commit_target,
-          remove_stale_replace=True)
+          remove_stale_replace=(if_exists == 'replace'),
+          allow_overwrite=(if_exists != 'fail'))
       outputs_dict['files'] = written
       outputs_dict['file_count'] = len(written)
-    if is_local and local_paths and not ephemeral_preview:
-      for lp in local_paths:
-        _cleanup_empty_beam_temp_dirs(lp)
+    if dlq_commit_target is not None and dlq_prefix is not None:
+      dlq_files = _commit_staged_local_files(
+          dlq_files,
+          dlq_prefix,
+          dlq_commit_target,
+          remove_stale_replace=bool(if_exists == 'replace' or dlq_files),
+          allow_overwrite=True)
+      outputs_dict['dlq_files'] = dlq_files
+    if is_local and not ephemeral_preview:
+      for clean_t in (replace_commit_target, dlq_commit_target):
+        if clean_t:
+          _cleanup_empty_beam_temp_dirs(clean_t)
+      if command_name == 'run' and local_paths:
+        for lp in local_paths:
+          _cleanup_empty_beam_temp_dirs(lp)
 
     want_preview = bool(is_local and (ephemeral_preview or preview_rows))
     yaml_preview_rows, yaml_preview_trunc = (
@@ -6186,9 +6232,25 @@ def _format_existing_output_error(prefix, existing):
       }])
 
 
+def _is_owned_by_prefix(path: str, prefix: str) -> bool:
+  """True if `path` is `prefix` itself or a Beam shard of `prefix` (`-NNNNN-of-NNNNN`)."""
+  if not prefix or prefix.endswith(('/', os.sep)) or any(
+      ch in prefix for ch in '*?['):
+    return True
+  norm_path = path.replace('\\', '/')
+  norm_pref = prefix.replace('\\', '/')
+  if norm_path == norm_pref:
+    return True
+  if not norm_path.startswith(norm_pref):
+    return False
+  rest = norm_path[len(norm_pref):]
+  return bool(rest.startswith('-') and re.search(r'-\d+-of-\d+', rest))
+
+
 def _refuse_existing_local_output(prefix):
   existing = sorted(
-      p for p in glob.glob(glob.escape(prefix) + '*') if os.path.isfile(p))
+      p for p in glob.glob(glob.escape(prefix) + '*')
+      if os.path.isfile(p) and _is_owned_by_prefix(p, prefix))
   if existing:
     raise _format_existing_output_error(prefix, existing)
 
@@ -6222,9 +6284,11 @@ def _matching_files(prefix, verbose, error_exit_code):
           EXIT_MISSING_PACKAGE) from None
     raise _CliError(
         f'could not access {prefix!r}: {cause}', error_exit_code) from None
-  return sorted(
+  candidates = [
       m.path[len(dot):] if dot and m.path.startswith(dot) else m.path
-      for m in match.metadata_list)
+      for m in match.metadata_list
+  ]
+  return sorted(p for p in candidates if _is_owned_by_prefix(p, prefix))
 
 
 def _runner_name(runner):

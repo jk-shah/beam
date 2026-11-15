@@ -124,42 +124,104 @@ def _jobs_dir() -> Path:
   return d
 
 
+_INPROC_LOCKS_GUARD = None
+_INPROC_LOCKS: dict[str, Any] = {}
+_INPROC_LOCK_DEPTH: dict[str, int] = {}
+
+
+def _get_inproc_lock(key: str):
+  import threading
+  global _INPROC_LOCKS_GUARD
+  if _INPROC_LOCKS_GUARD is None:
+    _INPROC_LOCKS_GUARD = threading.Lock()
+  with _INPROC_LOCKS_GUARD:
+    lk = _INPROC_LOCKS.get(key)
+    if lk is None:
+      lk = threading.RLock()
+      _INPROC_LOCKS[key] = lk
+    return lk
+
+
 @contextlib.contextmanager
 def _file_lock(lock_path: Path):
-  lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-  fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-  try:
-    if os.name == 'nt':
-      import msvcrt
-      os.lseek(fd, 0, os.SEEK_SET)
+  abs_key = os.path.abspath(str(lock_path))
+  inproc_lk = _get_inproc_lock(abs_key)
+  with inproc_lk:
+    depth = _INPROC_LOCK_DEPTH.get(abs_key, 0)
+    if depth > 0:
+      _INPROC_LOCK_DEPTH[abs_key] = depth + 1
       try:
-        if os.fstat(fd).st_size == 0:
-          os.write(fd, b'\0')
-          os.lseek(fd, 0, os.SEEK_SET)
-      except OSError:
-        pass
-      while True:
-        try:
-          msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
-          break
-        except OSError:
-          time.sleep(0.05)
-    else:
-      import fcntl
-      fcntl.flock(fd, fcntl.LOCK_EX)
-    yield
-  finally:
+        yield
+      finally:
+        _INPROC_LOCK_DEPTH[abs_key] = depth
+      return
+
+    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
     try:
       if os.name == 'nt':
         import msvcrt
         os.lseek(fd, 0, os.SEEK_SET)
-        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        try:
+          if os.fstat(fd).st_size == 0:
+            os.write(fd, b'\0')
+            os.lseek(fd, 0, os.SEEK_SET)
+        except OSError:
+          pass
+        while True:
+          try:
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            break
+          except OSError:
+            time.sleep(0.05)
       else:
         import fcntl
-        fcntl.flock(fd, fcntl.LOCK_UN)
-    except OSError:
-      pass
-    os.close(fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+      _INPROC_LOCK_DEPTH[abs_key] = 1
+      yield
+    finally:
+      _INPROC_LOCK_DEPTH.pop(abs_key, None)
+      try:
+        if os.name == 'nt':
+          import msvcrt
+          os.lseek(fd, 0, os.SEEK_SET)
+          msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+          import fcntl
+          fcntl.flock(fd, fcntl.LOCK_UN)
+      except OSError:
+        pass
+      os.close(fd)
+
+
+def atomic_commit_local_file(
+    tmp_path: str,
+    final_path: str,
+    *,
+    allow_overwrite: bool = True,
+) -> None:
+  """Commits `tmp_path` onto `final_path`; refuses TOCTOU overwrite when `allow_overwrite=False`."""
+  parent = os.path.dirname(os.path.abspath(final_path)) or '.'
+  os.makedirs(parent, exist_ok=True)
+  if allow_overwrite:
+    os.replace(tmp_path, final_path)
+    return
+  try:
+    os.link(tmp_path, final_path)
+  except FileExistsError:
+    raise
+  except OSError:
+    # Fallback for filesystems that do not support hardlinks (e.g. FAT/exFAT).
+    lock_p = Path(f'{os.path.abspath(final_path)}.commit.lock')
+    with _file_lock(lock_p):
+      if os.path.exists(final_path):
+        raise FileExistsError(final_path) from None
+      os.replace(tmp_path, final_path)
+      return
+  try:
+    os.unlink(tmp_path)
+  except OSError:
+    pass
 
 
 def validate_job_id(job_id: str) -> str:
@@ -285,7 +347,8 @@ def record_job_submission(
   }
   jobs_d = _jobs_dir()
   job_path = jobs_d / f'{safe_id}.json'
-  _atomic_write_json(job_path, record)
+  with _file_lock(jobs_d / f'.{safe_id}.job.lock'):
+    _atomic_write_json(job_path, record)
 
   if idem_key:
     ledger_path = jobs_d / '_idempotency_ledger.json'
@@ -325,27 +388,29 @@ def mark_job_validation(
   """Updates persisted job record with post-job validation outcome."""
   try:
     safe_id = validate_job_id(job_id)
-    rec = load_job_record(safe_id)
+    jobs_d = _jobs_dir()
+    with _file_lock(jobs_d / f'.{safe_id}.job.lock'):
+      rec = load_job_record(safe_id)
+      if state is not None:
+        rec['state'] = state
+      rec['updated_at'] = time.time()
+      has_post = bool(rec.get('post_checks'))
+      rec['validation_state'] = (('PASSED' if has_post else 'NONE')
+                                 if passed else 'FAILED')
+      rec['validation_exit_code'] = int(exit_code)
+      if error:
+        rec['post_check_error'] = error
+      else:
+        rec.pop('post_check_error', None)
+      if metrics is not None:
+        rec['metrics'] = dict(metrics)
+      if outputs is not None:
+        rec['outputs'] = {**dict(rec.get('outputs') or {}), **dict(outputs)}
+      if verify_diff is not None:
+        rec['verify_diff'] = verify_diff
+      _atomic_write_json(jobs_d / f'{safe_id}.json', rec)
   except JobError:
     return
-  if state is not None:
-    rec['state'] = state
-  rec['updated_at'] = time.time()
-  has_post = bool(rec.get('post_checks'))
-  rec['validation_state'] = (('PASSED' if has_post else 'NONE')
-                             if passed else 'FAILED')
-  rec['validation_exit_code'] = int(exit_code)
-  if error:
-    rec['post_check_error'] = error
-  else:
-    rec.pop('post_check_error', None)
-  if metrics is not None:
-    rec['metrics'] = dict(metrics)
-  if outputs is not None:
-    rec['outputs'] = {**dict(rec.get('outputs') or {}), **dict(outputs)}
-  if verify_diff is not None:
-    rec['verify_diff'] = verify_diff
-  _atomic_write_json(_jobs_dir() / f'{safe_id}.json', rec)
 
 
 def load_job_record(job_id: str) -> dict[str, Any]:
