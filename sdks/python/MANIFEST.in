@@ -15,6 +15,7 @@
 # limitations under the License.
 #
 
+include _apache_beam_cli.py
 include gen_protos.py
 include gen_xlang_wrappers.py
 include README.md

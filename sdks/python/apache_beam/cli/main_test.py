@@ -30,10 +30,12 @@ import yaml
 
 import apache_beam as beam
 from apache_beam.cli import main as cli
+from apache_beam.cli import sql
 from apache_beam.io.filesystem import BeamIOError
 from apache_beam.io.filesystems import FileSystems
 from apache_beam.options.pipeline_options import GoogleCloudOptions
 from apache_beam.options.pipeline_options import PipelineOptions
+from apache_beam.runners.runner import PipelineState
 from apache_beam.utils import subprocess_server
 
 try:
@@ -191,7 +193,7 @@ class RunTest(unittest.TestCase):
 
     # Also check when `wait_until_finish` returns a non-DONE state directly.
     result = mock.Mock()
-    result.wait_until_finish.return_value = cli.PipelineState.FAILED
+    result.wait_until_finish.return_value = PipelineState.FAILED
     with mock.patch.object(beam.Pipeline, 'run', return_value=result):
       code, _, err = _run_cli(['run', path])
     self.assertEqual(code, cli.EXIT_PIPELINE_FAILED)
@@ -276,7 +278,7 @@ class RunTest(unittest.TestCase):
       return options, wrapped_constructor, display_data
 
     result = mock.Mock()
-    result.wait_until_finish.return_value = cli.PipelineState.DONE
+    result.wait_until_finish.return_value = PipelineState.DONE
 
     def fake_run(_self):
       capture('run')
@@ -337,7 +339,7 @@ class RunTest(unittest.TestCase):
   def test_no_wait_until_finish(self):
     path = self._pipeline_file(PIPELINE)
     result = mock.Mock()
-    result.state = cli.PipelineState.RUNNING
+    result.state = PipelineState.RUNNING
     with mock.patch.object(beam.Pipeline, 'run',
                            return_value=result) as run_mock:
       code, out, _ = _run_cli(['run', path, '--no_wait_until_finish'])
@@ -541,7 +543,7 @@ class PipeTest(unittest.TestCase):
       return real_match(patterns, *args, **kwargs)
 
     result = mock.Mock()
-    result.wait_until_finish.return_value = cli.PipelineState.DONE
+    result.wait_until_finish.return_value = PipelineState.DONE
     with (
         mock.patch.object(beam.Pipeline, 'run', return_value=result),
         mock.patch.object(FileSystems, 'match',
@@ -554,7 +556,7 @@ class PipeTest(unittest.TestCase):
 
   def test_no_wait_and_failure_and_ctrl_c_exit_codes(self):
     result = mock.Mock()
-    result.state = cli.PipelineState.RUNNING
+    result.state = PipelineState.RUNNING
     with mock.patch.object(beam.Pipeline, 'run', return_value=result):
       code, out, _ = _run_cli([
           'pipe',
@@ -697,7 +699,7 @@ class SqlCliTest(unittest.TestCase):
 
   def test_maps_sql_error_to_cli_exit_code_without_traceback(self):
     with mock.patch('apache_beam.cli.sql.run',
-                    side_effect=cli.sql.SqlError('Java 11+ required', 4)):
+                    side_effect=sql.SqlError('Java 11+ required', 4)):
       code, _, err = _run_cli(['sql'])
     self.assertEqual(code, cli.EXIT_MISSING_PACKAGE)
     self.assertEqual(err.strip(), 'error: Java 11+ required')

@@ -42,21 +42,11 @@ Ctrl-C cancelling the pipeline, and a last line naming the runner that ran it.
 """
 
 import argparse
+import glob
 import logging
 import os
 import sys
 import traceback
-
-import yaml
-
-import apache_beam as beam
-from apache_beam.cli import config
-from apache_beam.cli import pipe_spec
-from apache_beam.cli import sql
-from apache_beam.io.filesystem import BeamIOError
-from apache_beam.io.filesystems import FileSystems
-from apache_beam.options.pipeline_options import StandardOptions
-from apache_beam.runners.runner import PipelineState
 
 # Exit codes, also listed in `--help`. Usage errors use 2, the code argparse
 # itself exits with.
@@ -341,6 +331,7 @@ class _CliError(Exception):
 
 
 def _config(args, extra_args):
+  from . import config
   if extra_args:
     raise _CliError(
         f'unrecognized arguments: {" ".join(extra_args)}', EXIT_USAGE)
@@ -351,6 +342,7 @@ def _config(args, extra_args):
 
 
 def _resolve_config_args(args, pipeline_args):
+  from . import config
   try:
     return config.resolve_pipeline_args(
         pipeline_args, profile=args.profile, no_config=args.no_config)
@@ -359,6 +351,8 @@ def _resolve_config_args(args, pipeline_args):
 
 
 def _sql(args, sqlline_args):
+  from . import config
+  from . import sql
   if sqlline_args and sqlline_args[0] == '--':
     sqlline_args = sqlline_args[1:]
   try:
@@ -399,6 +393,7 @@ def _run(args, pipeline_args):
 
 def _pipe(args, pipeline_args, pipe_argv):
   """Runs `beam pipe`; `pipe_argv` is its command line, for --dry-run."""
+  from . import pipe_spec
   try:
     pipe = pipe_spec.build_pipe_spec(
         args.source,
@@ -408,18 +403,27 @@ def _pipe(args, pipeline_args, pipe_argv):
   except pipe_spec.PipeSpecError as e:
     raise _CliError(str(e), EXIT_USAGE) from None
 
+  if '://' not in pipe.output_prefix:
+    existing = sorted(
+        p for p in glob.glob(glob.escape(pipe.output_prefix) + '*')
+        if os.path.isfile(p))
+    if existing:
+      _raise_existing_output(pipe.output_prefix, existing)
+
   # A dry run makes every check a real run makes, including checking for
   # existing output and building the pipeline, so that it predicts whether
   # `beam run` on its output will work.
   resolved_args = _resolve_config_args(args, pipeline_args)
-  return _run_yaml(
-      ['--yaml_pipeline=' + yaml.safe_dump(pipe.spec, sort_keys=False)] +
-      resolved_args,
-      args.verbose,
-      local_paths=[args.source, args.sink],
-      dry_run_yaml=pipe_spec.to_yaml(pipe.spec, pipe_argv)
-      if args.dry_run else None,
-      output_prefix=pipe.output_prefix)
+  import yaml
+  dumper = getattr(yaml, 'CSafeDumper', yaml.SafeDumper)
+  return _run_yaml([
+      '--yaml_pipeline=' + yaml.dump(pipe.spec, Dumper=dumper, sort_keys=False)
+  ] + resolved_args,
+                   args.verbose,
+                   local_paths=[args.source, args.sink],
+                   dry_run_yaml=pipe_spec.to_yaml(pipe.spec, pipe_argv)
+                   if args.dry_run else None,
+                   output_prefix=pipe.output_prefix)
 
 
 def _run_yaml(
@@ -428,10 +432,13 @@ def _run_yaml(
     local_paths=(),
     dry_run_yaml=None,
     output_prefix=None):
-  # Beam YAML is imported here, not at the top of the module, because it needs
-  # the [yaml] extra; a missing extra is then reported with exit code 4 and a
-  # hint instead of a traceback.
+  # Beam and Beam YAML are imported here, not at the top of the module, so
+  # fast CLI paths remain instant and a missing [yaml] extra is reported with
+  # exit code 4 and a hint instead of a traceback.
   try:
+    import apache_beam as beam
+    from apache_beam.options.pipeline_options import StandardOptions
+    from apache_beam.runners.runner import PipelineState
     from apache_beam.yaml import main as yaml_main
   except ImportError as e:
     _maybe_print_traceback(verbose)
@@ -529,20 +536,27 @@ def _run_yaml(
   return EXIT_OK
 
 
+def _raise_existing_output(prefix, existing):
+  shown = '\n'.join('  ' + path for path in existing[:5])
+  more = f'\n  ... and {len(existing) - 5} more' if len(existing) > 5 else ''
+  raise _CliError(
+      f'output already exists for {prefix!r}; beam pipe never overwrites '
+      f'data:\n{shown}{more}\n'
+      '  remove these files or choose another --to path',
+      EXIT_USAGE)
+
+
 def _refuse_existing_output(prefix, verbose):
   """Fails if any file starts with the output prefix: pipe never overwrites."""
   existing = _matching_files(prefix, verbose, error_exit_code=EXIT_USAGE)
   if existing:
-    shown = '\n'.join('  ' + path for path in existing[:5])
-    more = f'\n  ... and {len(existing) - 5} more' if len(existing) > 5 else ''
-    raise _CliError(
-        f'output already exists for {prefix!r}; beam pipe never overwrites '
-        f'data:\n{shown}{more}\n'
-        '  remove these files or choose another --to path',
-        EXIT_USAGE)
+    _raise_existing_output(prefix, existing)
 
 
 def _matching_files(prefix, verbose, error_exit_code):
+  from apache_beam.io.filesystem import BeamIOError
+  from apache_beam.io.filesystems import FileSystems
+
   # LocalFileSystem.match calls os.path.dirname(prefix), which is '' for a
   # bare filename in the current directory and causes _list('') to return no
   # files. Prepending './' (or '.\' on Windows) gives dirname '.' so files in
@@ -592,6 +606,7 @@ def _warn_if_local_paths(paths, options):
   path refers to each worker's own disk or container. The job can then
   succeed while reading nothing, or write where the user never looks.
   """
+  from apache_beam.options.pipeline_options import StandardOptions
   runner = options.view_as(StandardOptions).runner
   local = [
       path for path in paths
@@ -671,6 +686,7 @@ def _describe_runner(options, result):
   pipeline on Prism and falls back to the Python direct runner when Prism
   can't run it. The type of the result tells the two apart.
   """
+  from apache_beam.options.pipeline_options import StandardOptions
   runner = options.view_as(StandardOptions).runner
   if _runner_name(runner) != 'direct':
     return f'on {runner}'
