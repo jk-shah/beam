@@ -60,7 +60,7 @@ This package implements the `beam` (and `apache-beam`) command-line interface tr
 | `interval_join.py` / `asof_join.py` | Stateful event-time `CliIntervalJoin` (`--max-watermark-skew`) and leak-free point-in-time `CliAsofJoin` (`--asof-join`, SQL `ASOF JOIN`) |
 | `dedup.py` | Bounded-state event/processing-time `CliDeduplicate` (`--dedupe-by`, `--dedupe-keep`, `--dedupe-dlq`) |
 | `enrich.py` | Batched worker-side `CliEnrich` (parameterized BQ, Bigtable, VertexFS, Feast, `file:`, TLS `rediss://` cache, `AdaptiveThrottler`) |
-| `infer.py` | Lazy `RunInference`-backed `CliInfer` (Vertex AI `<1.4 MB` split, pinned HF `safetensors`, singleton poison-pill bisect) |
+| `infer.py` | Lazy `RunInference`-backed `CliInfer` (Vertex AI `<1.4 MB` split, pinned HF `safetensors`, $O(\log N)$ poison-pill batch bisect) |
 | `windowing.py` / `cep.py` | Speculative/late triggers, sharded `_LateDataAuditDoFn` (`--late-data-dlq`), `CliExtractPaneInfo`, and bounded NFA `CliPatternMatch` (`--pattern`) |
 | `io_cmd.py` / `doctor.py` | Connector reference cards (`beam io`) and environment/SQL-engine/ADC pre-flight diagnostics (`beam doctor`) |
 | `sql.py` / `config.py` | Beam Calcite SQL runner (`beam sql`) and persistent `PipelineOptions` profiles (`beam config`) |
@@ -84,9 +84,9 @@ This package implements the `beam` (and `apache-beam`) command-line interface tr
 
 ---
 
-## 5. Production-Hardened Feature-Complete Status & Test Suite (`553` Tests Across 38 Modules)
+## 5. Production-Hardened Feature-Complete Status & Test Suite (`565` Tests Across 39 Modules)
 
-The `beam-cli-preview` (`v0.2.0`) feature set is **Feature Complete & Production-Hardened** across Core ETL, Lakehouse/CDC, Governance, Tier 1 (Joins, Deduplication, Online Enrichment, ML Inference), Tier 2 (Point-in-Time `ASOF JOIN`, Bounded CEP, Window Triggers & Late-Data Quarantine), Zero-JVM Pure-Python SQL Lowering (`--sql-engine python`), Multi-Job Concurrency & Cross-Job Isolation, and cross-subcommand Human UX / Agent DX ergonomics (`78.2%` overall line coverage; `33 / 33` modules `>= 72.7%` component coverage, `17 / 33` modules `>= 80.1%`), with active engineering focused on incremental ~400-line upstream PRs into `apache/beam:master`.
+The `beam-cli-preview` (`v0.2.0`) feature set is **Feature Complete & Production-Hardened** across Core ETL, Lakehouse/CDC, Governance, Tier 1 (Joins, Deduplication, Online Enrichment, ML Inference), Tier 2 (Point-in-Time `ASOF JOIN`, Bounded CEP, Window Triggers & Late-Data Quarantine), Zero-JVM Pure-Python SQL Lowering (`--sql-engine python`), Multi-Job Concurrency & Cross-Job Isolation, Scale & Memory-Ceiling Stress Testing, and cross-subcommand Human UX / Agent DX ergonomics (`78.4%` overall line coverage; `33 / 33` modules `>= 72.8%` component coverage, `17 / 33` modules `>= 80.1%`), with active engineering focused on incremental ~400-line upstream PRs into `apache/beam:master`.
 
 * **Preview Quickstart & Recipes**: [`sdks/python/cli-preview/README.md`](../../cli-preview/README.md)
 * **Website CLI Reference**: [`website/www/site/content/en/documentation/sdks/cli.md`](../../../../website/www/site/content/en/documentation/sdks/cli.md)
@@ -94,7 +94,7 @@ The `beam-cli-preview` (`v0.2.0`) feature set is **Feature Complete & Production
 * **AI Agent Skill**: [`.agents/skills/apache-beam-cli/SKILL.md`](../../../../.agents/skills/apache-beam-cli/SKILL.md)
 * **Acknowledgements**: Thanks to **[Darsh Patel (`@darshpatel1052`)](https://github.com/darshpatel1052)** for preview dogfooding that caught and resolved 38-digit Parquet `Decimal` rounding in `beam diff` (`diff.py`, `interval_join.py`), failed post-validation `DONE` job reuse in the 30-minute idempotency ledger (`jobs.py`, `main.py`), and premature >15-minute ephemeral subscription GC across concurrent Pub/Sub `beam tail` sessions (`tail.py`).
 
-After installing the preview overlay (`sdks/python/cli-preview`) into a virtual environment, run the full `553`-test unit, `<90 ms` startup-isolation, stateful streaming, enrichment/ML, Lakehouse/CDC, pure-Python SQL lowering, cross-runner/Parquet parity, multi-job concurrency/isolation, ergonomics, and adversarial security/chaos suite from the repository root:
+After installing the preview overlay (`sdks/python/cli-preview`) into a virtual environment, run the full `565`-test unit, `<90 ms` startup-isolation, stateful streaming, enrichment/ML, Lakehouse/CDC, pure-Python SQL lowering, cross-runner/Parquet parity, multi-job concurrency/isolation, scale/stress, ergonomics, and adversarial security/chaos suite from the repository root:
 
 ```bash
 python -m unittest discover -s sdks/python/apache_beam/cli -p '*_test.py'

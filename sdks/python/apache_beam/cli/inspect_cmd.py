@@ -109,22 +109,30 @@ def _open_file_bytes(path: str, *, decompress: bool = False):
 
 
 def _match_files(path: str) -> list[tuple[str, int]]:
+  has_wild = any(c in path for c in '*?[')
   if '://' not in path:
     import glob as _glob
-    if any(c in path for c in '*?['):
+    if has_wild:
       files = sorted(p for p in _glob.glob(path) if os.path.isfile(p))
     elif os.path.isfile(path):
       files = [path]
+    elif os.path.isdir(path):
+      files = sorted(
+          os.path.join(path, fn) for fn in os.listdir(path)
+          if not fn.startswith('.') and os.path.isfile(os.path.join(path, fn)))
     else:
       files = sorted(
-          p for p in _glob.glob(_glob.escape(path) + '*') if os.path.isfile(p))
+          p for p in _glob.glob(_glob.escape(path) + '*')
+          if os.path.isfile(p) and cost_guard.is_owned_by_prefix(p, path))
     return [(p, os.path.getsize(p)) for p in files]
 
   from apache_beam.io.filesystems import FileSystems
-  pattern = path if any(c in path for c in '*?[') else path
-  metas = FileSystems.match([pattern])[0].metadata_list
-  if not metas and not any(c in path for c in '*?['):
-    metas = FileSystems.match([path + '*'])[0].metadata_list
+  metas = FileSystems.match([path])[0].metadata_list
+  if not metas and not has_wild:
+    metas = [
+        m for m in FileSystems.match([path + '*'])[0].metadata_list
+        if cost_guard.is_owned_by_prefix(m.path, path)
+    ]
   return [(m.path, int(m.size_in_bytes or 0)) for m in sorted(
       metas, key=lambda x: x.path)]
 
@@ -166,7 +174,13 @@ def _inspect_files(
   if fmt == 'parquet':
     import pyarrow.parquet as pq
     total_rows = 0
-    for fpath, _ in matched:
+    scanned = 0
+    scanned_all_footers = True
+    for fpath, fsize in matched:
+      if scanned >= scan_budget and schema_fields:
+        truncated_scan = True
+        scanned_all_footers = False
+        break
       with _open_file_bytes(fpath) as fobj:
         pf = pq.ParquetFile(fobj)
         if not schema_fields:
@@ -187,7 +201,8 @@ def _inspect_files(
                   break
             if len(rows) >= sample_count:
               break
-    exact_row_count = total_rows
+      scanned += min(max(fsize, 1), 16384)
+    exact_row_count = total_rows if scanned_all_footers else None
 
   elif fmt == 'avro':
     import fastavro

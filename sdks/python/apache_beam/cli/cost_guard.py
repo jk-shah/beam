@@ -163,18 +163,43 @@ def check_max_bytes(
   return est
 
 
+def is_owned_by_prefix(candidate: str, prefix: str) -> bool:
+  """True if `candidate` is `prefix`, inside directory `prefix/`, or a Beam shard of `prefix`."""
+  if not prefix or prefix.endswith(('/', '\\', '-')) or any(
+      ch in prefix for ch in '*?['):
+    return True
+  norm_cand = candidate.replace('\\', '/')
+  norm_pref = prefix.replace('\\', '/')
+  if norm_cand == norm_pref:
+    return True
+  if not norm_cand.startswith(norm_pref):
+    return False
+  rest = norm_cand[len(norm_pref):]
+  if rest.startswith('/'):
+    return True
+  return bool(rest.startswith('-') and re.search(r'-\d+-of-\d+', rest))
+
+
 def _estimate_file_bytes(
     path: str, stop_after_bytes: int | None = None) -> dict[str, Any]:
   total = 0
   count = 0
+  has_wild = any(c in path for c in '*?[')
   if '://' not in path:
     import glob as _glob
     import os
-    matched = (
-        _glob.iglob(path)
-        if any(c in path for c in '*?[') else ([path] if os.path.isfile(path) else
-                                               _glob.iglob(_glob.escape(path) +
-                                                           '*')))
+    if has_wild:
+      matched = _glob.iglob(path)
+    elif os.path.isfile(path):
+      matched = iter([path])
+    elif os.path.isdir(path):
+      matched = (
+          os.path.join(path, fn) for fn in os.listdir(path)
+          if not fn.startswith('.'))
+    else:
+      matched = (
+          p for p in _glob.iglob(_glob.escape(path) + '*')
+          if is_owned_by_prefix(p, path))
     for p in matched:
       if os.path.isfile(p):
         total += os.path.getsize(p)
@@ -194,8 +219,13 @@ def _estimate_file_bytes(
     }
 
   from apache_beam.io.filesystems import FileSystems
-  matches = FileSystems.match([path])[0].metadata_list
-  for meta in matches:
+  metas = FileSystems.match([path])[0].metadata_list
+  if not metas and not has_wild:
+    metas = [
+        m for m in FileSystems.match([path + '*'])[0].metadata_list
+        if is_owned_by_prefix(m.path, path)
+    ]
+  for meta in metas:
     total += int(meta.size_in_bytes or 0)
     count += 1
     if stop_after_bytes is not None and total > stop_after_bytes:

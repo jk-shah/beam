@@ -308,7 +308,7 @@ beam pipe --from pubsub://projects/<PROJ>/subscriptions/orders --to bigquery://<
 ## 11. Architecture & Documentation Links
 
 * **Official Beam Website CLI Reference**: [`website/www/site/content/en/documentation/sdks/cli.md`](../../../website/www/site/content/en/documentation/sdks/cli.md)
-* **CLI Module Map & Test Runner (`553` tests across 38 modules)**: [`sdks/python/apache_beam/cli/README.md`](../apache_beam/cli/README.md)
+* **CLI Module Map & Test Runner (`565` tests across 39 modules)**: [`sdks/python/apache_beam/cli/README.md`](../apache_beam/cli/README.md)
 * **AI Coding Agent Skill**: [`.agents/skills/apache-beam-cli/SKILL.md`](../../../.agents/skills/apache-beam-cli/SKILL.md)
 
 All CLI source modules live directly in their upstream target path [`sdks/python/apache_beam/cli/`](../apache_beam/cli/README.md) (**Feature Complete** at `v0.2.0`) so individual PR slices cherry-pick cleanly onto `apache/beam:master` ([apache/beam#40891](https://github.com/apache/beam/issues/40891)). This `sdks/python/cli-preview/` package is a lightweight pure-Python overlay that lets anyone install and test the complete CLI experience against released PyPI `apache-beam` wheels in seconds.

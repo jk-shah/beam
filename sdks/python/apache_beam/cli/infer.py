@@ -1626,23 +1626,32 @@ class _LazyCliModelHandler(ModelHandler[Any, Any, Any]):
                 err_type=type(batch_exc).__name__,
                 msg=_sanitize_infer_error(batch_exc, self._cfg.provider))
         ]
-      # Singleton bisect against the already-loaded model so N - 1 healthy rows
-      # succeed without triggering a model reload!
-      isolated: list[Any] = []
-      for single_item in batch:
-        try:
-          single_preds = self._invoke_inner_inference(
-              inner, [single_item], model, inference_args)
-          if len(single_preds) != 1:
-            raise RuntimeError(
-                f'singleton retry returned {len(single_preds)} predictions')
-          isolated.append(single_preds[0])
-        except Exception as item_exc:  # pylint: disable=broad-except
-          isolated.append(
+
+      # Recursive O(log N) binary bisection against the already-loaded model so
+      # healthy halves succeed in bulk RPCs without triggering a model reload!
+      def _bisect(sub_batch: Sequence[Any], last_exc: Exception) -> list[Any]:
+        if len(sub_batch) == 1:
+          return [
               _InferErrorSentinel(
-                  err_type=type(item_exc).__name__,
-                  msg=_sanitize_infer_error(item_exc, self._cfg.provider)))
-      return isolated
+                  err_type=type(last_exc).__name__,
+                  msg=_sanitize_infer_error(last_exc, self._cfg.provider))
+          ]
+        mid = len(sub_batch) // 2
+        out: list[Any] = []
+        for half in (sub_batch[:mid], sub_batch[mid:]):
+          try:
+            half_preds = self._invoke_inner_inference(
+                inner, half, model, inference_args)
+            if len(half_preds) != len(half):
+              raise RuntimeError(
+                  f'model returned {len(half_preds)} predictions for '
+                  f'sub-batch of {len(half)}')
+            out.extend(half_preds)
+          except Exception as sub_exc:  # pylint: disable=broad-except
+            out.extend(_bisect(half, sub_exc))
+        return out
+
+      return _bisect(batch, batch_exc)
     finally:
       elapsed_ms = int(round(max(0.0, (time.monotonic() - t0) * 1000.0)))
       self._latency_dist.update(elapsed_ms)
