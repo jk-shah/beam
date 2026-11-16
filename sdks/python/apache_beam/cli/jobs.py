@@ -748,6 +748,7 @@ class _DataflowPoller:
     state_str = str(getattr(raw_state, 'name', None) or raw_state)
     raw_counters = {}
     try:
+      # Direct RPC avoids DataflowMetrics KeyError (apache/beam#41076).
       metrics_proto = self._apiclient.get_job_metrics(job_id)
       raw_counters = _extract_raw_counters_from_metrics_list(
           getattr(metrics_proto, 'metrics', None))

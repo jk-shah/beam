@@ -1813,7 +1813,7 @@ class _VertexFSCaller:
     else:
       from apache_beam.transforms.enrichment_handlers.utils import ExceptionLevel
       from apache_beam.transforms.enrichment_handlers.vertex_ai_feature_store import VertexAIFeatureStoreEnrichmentHandler
-      # Never pass ExceptionLevel.QUIET (upstream UnboundLocalError at L181).
+      # Never pass ExceptionLevel.QUIET (apache/beam#41345 UnboundLocalError).
       self._handler = VertexAIFeatureStoreEnrichmentHandler(
           project=hp['project'],
           location=hp['location'],

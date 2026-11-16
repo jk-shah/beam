@@ -833,6 +833,7 @@ def install_keyword_safe_row_hooks() -> None:
       try:
         return orig_nt(self_st, schema)
       except (ValueError, TypeError, SyntaxError):
+        # Workaround for apache/beam#40698 (keyword / non-identifier Row cols).
         from apache_beam import coders
         from apache_beam.typehints import row_type
         type_name = 'BeamSchema_{}'.format(schema.id.replace('-', '_'))
@@ -860,6 +861,7 @@ def install_keyword_safe_row_hooks() -> None:
     st_cls.named_tuple_from_schema = _safe_nt
     st_cls._cli_preview_patched = True
 
+  # Workaround for apache/beam#41077 (keyword column names in yaml_mapping).
   orig_exp = getattr(yaml_map_mod, '_expand_python_mapping_func', None)
   py_call = getattr(yaml_map_mod, 'python_callable', None)
   if (orig_exp is not None and py_call is not None and
@@ -891,6 +893,7 @@ def install_keyword_safe_row_hooks() -> None:
     _safe_exp._cli_preview_patched = True
     yaml_map_mod._expand_python_mapping_func = _safe_exp
 
+  # Workaround for apache/beam#41373 (_validator rejects None on output_type).
   orig_val = getattr(yaml_map_mod, '_validator', None)
   if orig_val is not None and not getattr(orig_val, '_cli_preview_patched', False):
 

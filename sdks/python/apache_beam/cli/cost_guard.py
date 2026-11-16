@@ -186,6 +186,7 @@ def _estimate_file_bytes(
   count = 0
   has_wild = any(c in path for c in '*?[')
   if '://' not in path:
+    # Local globbing avoids LocalFileSystem.match CWD bug (apache/beam#41375).
     import glob as _glob
     import os
     if has_wild:

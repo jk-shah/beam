@@ -1055,6 +1055,7 @@ class CountDistinctCombineFn(beam.CombineFn):
   """Pure-Python non-null distinct count CombineFn for zero-JVM SQL lowering."""
   def __init__(self):
     super().__init__()
+    # Workaround for apache/beam#41374 (WithTypeHints.__init__ resets hints).
     self._type_hints = (
         beam.typehints.decorators.IOTypeHints.empty().with_output_types(int))
 

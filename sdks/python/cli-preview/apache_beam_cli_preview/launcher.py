@@ -91,6 +91,7 @@ def _core_beam_cli_dir() -> Path | None:
 
 
 def _patch_arrow_module(module) -> None:
+  """Shims apache/beam#41042 (merged in #41045) on Beam <= 2.78 wheels."""
   conv = getattr(module, 'PyarrowBatchConverter', None)
   if conv is not None and not getattr(conv, '_cli_preview_patched', False):
     orig_produce = conv.produce_batch
@@ -153,6 +154,7 @@ def _make_arbitrary_field_row_tuple(type_name: str, subfields) -> type:
 
 
 def _patch_schemas_module(module) -> None:
+  """Shims apache/beam#40698 (keyword / non-identifier Python Row columns)."""
   st_cls = getattr(module, 'SchemaTranslation', None)
   if st_cls is None or getattr(st_cls, '_cli_preview_patched', False):
     return
@@ -191,6 +193,7 @@ def _patch_schemas_module(module) -> None:
 
 
 def _patch_yaml_mapping_module(module) -> None:
+  """Shims apache/beam#41043 (merged in #41044) and apache/beam#41077."""
   import keyword
   orig_validate = getattr(module, 'validate_generic_expression', None)
   is_literal = getattr(module, 'is_literal', None)
@@ -249,7 +252,7 @@ def _patch_yaml_mapping_module(module) -> None:
 
 
 def _patch_opcodes_module(module) -> None:
-  """Resolves nested NamedTuple and Optional[Row] attributes in typehints."""
+  """Resolves nested NamedTuple and Optional[Row] attrs (apache/beam#41099)."""
   orig = getattr(module, '_getattr', None)
   if orig is None or getattr(orig, '_cli_preview_patched', False):
     return

@@ -1106,6 +1106,7 @@ def run_package(
     warnings_out.extend(img_warnings)
 
     yaml_def = source_text
+    # Workaround for GoogleCloudPlatform/DataflowTemplates#4565 (private-IP).
     if (
         no_use_public_ips
         and 's3://' not in source_text
