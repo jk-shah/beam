@@ -159,6 +159,34 @@ def transform_dlq_row_type():
   return RowTypeConstraint.from_fields(list(TRANSFORM_DLQ_FIELDS))
 
 
+_RAW_EMAIL_PII_RE = (
+    r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}')
+_RAW_PAN_PII_RE = r'(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)'
+_RAW_SSN_PII_RE = r'\b\d{3}-\d{2}-\d{4}\b'
+
+
+def scrub_unparseable_dlq_text(
+    raw_text: str,
+    redact_fields: Iterable[str] = (),
+) -> str:
+  """Scrubs PII from unparseable/corrupt CSV or JSON strings when `redact_fields` is set."""
+  import re
+  rk = tuple(str(f) for f in (redact_fields or ()) if str(f).strip())
+  if not rk or not raw_text:
+    return raw_text
+  out_s = str(raw_text)
+  for col in rk:
+    out_s = re.sub(
+        r'([\'"]?' + re.escape(col) +
+        r'[\'"]?\s*[:=]\s*)(?:"(?:\\.|[^"])*"|\'(?:\\.|[^\'])*\'|[^,\s)\]}]+)',
+        r'\1"<REDACTED>"',
+        out_s)
+  out_s = re.sub(_RAW_EMAIL_PII_RE, '<REDACTED>', out_s)
+  out_s = re.sub(_RAW_SSN_PII_RE, '<REDACTED>', out_s)
+  out_s = re.sub(_RAW_PAN_PII_RE, '<REDACTED>', out_s)
+  return out_s
+
+
 def redact_nested_fields(
     value: Any,
     redact_fields: Iterable[str] = (),
@@ -183,6 +211,8 @@ def redact_nested_fields(
         redact_nested_fields(item, rk, max_depth=max_depth - 1)
         for item in value
     ]
+  if isinstance(value, str):
+    return scrub_unparseable_dlq_text(value, rk)
   return value
 
 
@@ -204,6 +234,8 @@ def make_transform_dlq_row(
   clean_err = out_mod.sanitize_untrusted_text(str(error_msg), max_chars=4096)
   clean_err = out_mod.redact_inline_secrets(
       clean_err, placeholder='<REDACTED_SECRET>')
+  if rk:
+    clean_err = scrub_unparseable_dlq_text(clean_err, rk)
   for col in rk:
     clean_err = re.sub(
         r'([\'"]?' + re.escape(col) +
@@ -254,9 +286,23 @@ def build_dlq_normalizer_transform(
         '        r\'([\\\'"]?\' + re.escape(_col) + r\'[\\\'"]?\\s*[:=]\\s*)(?:([\\\'"]).*?\\2|[^,\\s)\\]}]+)\',\n'
         "        r'\\1<REDACTED>',\n"
         '        msg)\n'
+        f'  msg = re.sub({_RAW_EMAIL_PII_RE!r}, "<REDACTED>", msg)\n'
+        f'  msg = re.sub({_RAW_SSN_PII_RE!r}, "<REDACTED>", msg)\n'
+        f'  msg = re.sub({_RAW_PAN_PII_RE!r}, "<REDACTED>", msg)\n'
         '  return msg[:4096]\n')
     redact_tail = (
+        '  import re\n'
         f'  _rk = {redact_lit}\n'
+        '  def _scrub_str(s):\n'
+        '    for _col in _rk:\n'
+        '      s = re.sub(\n'
+        '          r\'([\\\'"]?\' + re.escape(_col) + r\'[\\\'"]?\\s*[:=]\\s*)(?:"(?:\\\\.|[^"])*"|\\\'(?:\\\\.|[^\\\'])*\\\'|[^,\\s)\\]}]+)\',\n'
+        '          r\'\\1"<REDACTED>"\',\n'
+        '          s)\n'
+        f'    s = re.sub({_RAW_EMAIL_PII_RE!r}, "<REDACTED>", s)\n'
+        f'    s = re.sub({_RAW_SSN_PII_RE!r}, "<REDACTED>", s)\n'
+        f'    s = re.sub({_RAW_PAN_PII_RE!r}, "<REDACTED>", s)\n'
+        '    return s\n'
         '  def _scrub(v, d=8):\n'
         '    if d <= 0:\n'
         '      return v\n'
@@ -264,14 +310,18 @@ def build_dlq_normalizer_transform(
         "      return {k: ('<REDACTED>' if k in _rk else _scrub(val, d - 1)) for k, val in v.items()}\n"
         '    if isinstance(v, list):\n'
         '      return [_scrub(x, d - 1) for x in v]\n'
+        '    if isinstance(v, str):\n'
+        '      return _scrub_str(v)\n'
         '    return v\n'
         '  try:\n'
         '    _obj = json.loads(_out)\n'
         '    if isinstance(_obj, (dict, list)):\n'
         '      return json.dumps(_scrub(_obj), allow_nan=False, sort_keys=True)\n'
+        '    if isinstance(_obj, str):\n'
+        '      return json.dumps(_scrub_str(_obj), allow_nan=False)\n'
         '  except Exception:\n'
         '    pass\n'
-        '  return _out\n')
+        '  return _scrub_str(str(_out))\n')
     payload_src = (
         'def normalize_dlq(err_row):\n' + _SAFE_JSON_HELPERS_SRC +
         "  raw = getattr(err_row, 'raw_payload', None)\n"

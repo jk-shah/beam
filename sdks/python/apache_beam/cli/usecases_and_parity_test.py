@@ -765,6 +765,76 @@ class EightUseCasesAndParityTest(unittest.TestCase):
     self.assertEqual(len(res_rows), 1)
     self.assertAlmostEqual(res_rows[0]['prediction_score'], 0.92)
 
+  def test_hc3_dlq_redact_fields_fast_local_and_corrupt_raw_lines(self):
+    dirty_csv = os.path.join(self.tmp, 'dirty_pii.csv')
+    Path(dirty_csv).write_text(
+        'order_id,customer_email,card_number,amount\n'
+        'ord-1,ada@acme.com,4111222233334444,49.5\n'
+        'ord-2,"shifted,col,bob@acme.com,4532-1111-2222-3333,123-45-6789,oops\n'
+        ',carol@acme.com,5500111122223333,10.0\n',
+        encoding='utf-8')
+
+    for label, env_ov in (
+        ('fast', None),
+        ('beam', {'BEAM_CLI_NO_FAST_PATH': '1'}),
+    ):
+      out_pq = os.path.join(self.tmp, f'clean_{label}.parquet')
+      dlq_jl = os.path.join(self.tmp, f'dlq_{label}.jsonl')
+      rc, out, err = _run_cli(
+          [
+              'pipe',
+              dirty_csv,
+              out_pq,
+              '--where',
+              'amount > 0',
+              '--expect',
+              'pk_ok: order_id IS NOT NULL -> dlq',
+              '--dlq',
+              dlq_jl,
+              '--dlq-redact-fields',
+              'customer_email,card_number',
+              '--assert-counts',
+              '--json',
+          ],
+          env_overrides=env_ov)
+      self.assertEqual(rc, 0, msg=f'{label}: {err or out}')
+      env = json.loads(out)
+      if label == 'fast':
+        self.assertEqual(env['runner'], 'local_fast')
+      dlq_txt = Path(dlq_jl).read_text(encoding='utf-8')
+      self.assertNotIn('bob@acme.com', dlq_txt)
+      self.assertNotIn('carol@acme.com', dlq_txt)
+      self.assertNotIn('4532-1111-2222-3333', dlq_txt)
+      self.assertNotIn('5500111122223333', dlq_txt)
+      self.assertNotIn('123-45-6789', dlq_txt)
+      self.assertIn('<REDACTED>', dlq_txt)
+
+    # Also verify truncated/corrupt JSONL raw-line redaction
+    dirty_jl = os.path.join(self.tmp, 'dirty_pii.jsonl')
+    Path(dirty_jl).write_text(
+        '{"id": "1", "email": "ada@acme.com", "amount": 20.0}\n'
+        '{"id": "2", "email": "eve@acme.com", "card": "4111-2222-3333-9999", BROKEN\n',
+        encoding='utf-8')
+    out_jl = os.path.join(self.tmp, 'clean_jl.parquet')
+    dlq_broken_jl = os.path.join(self.tmp, 'dlq_broken_jl.jsonl')
+    rc_j, out_j, err_j = _run_cli([
+        'pipe',
+        dirty_jl,
+        out_jl,
+        '--dlq',
+        dlq_broken_jl,
+        '--dlq-redact-fields',
+        'email,card',
+        '--assert-counts',
+        '--json',
+    ])
+    self.assertEqual(rc_j, 0, msg=err_j or out_j)
+    self.assertEqual(json.loads(out_j)['runner'], 'local_fast')
+    broken_dlq_txt = Path(dlq_broken_jl).read_text(encoding='utf-8')
+    self.assertNotIn('eve@acme.com', broken_dlq_txt)
+    self.assertNotIn('4111-2222-3333-9999', broken_dlq_txt)
+    self.assertIn('<REDACTED>', broken_dlq_txt)
+
   def test_skill_and_llms_txt_agreement_guardrails(self):
     manual = llms_txt.render_llms_txt()
     self.assertIn('beam catalog sync', manual)
@@ -787,7 +857,7 @@ class EightUseCasesAndParityTest(unittest.TestCase):
               encoding='utf-8')
       total_bytes = sum(
           len(c.encode('utf-8')) for c in (skill_md, sql_cdc_md, cloud_md))
-      self.assertLess(total_bytes, 42000)
+      self.assertLess(total_bytes, 44000)
       frontmatter = skill_md.split('---', 2)[1]
       self.assertIn('apache-beam-cli-preview v0.2.0', frontmatter)
       self.assertIn('Use when', frontmatter)
@@ -809,6 +879,13 @@ class EightUseCasesAndParityTest(unittest.TestCase):
       self.assertIn('--zero-copy', skill_md)
       self.assertIn('Skills & Tools to Pair With', skill_md)
       self.assertIn('Operating Streaming, CDC, & Scheduled Jobs', skill_md)
+      self.assertIn('--checkpointing_interval=30000', skill_md)
+      self.assertIn('--to-opt-file', skill_md)
+      self.assertIn('--extra_package', skill_md)
+      self.assertIn('2GB', skill_md)
+      self.assertIn('300 MiB', skill_md)
+      self.assertIn('pg_drop_replication_slot', sql_cdc_md)
+      self.assertIn('rewrite_data_files', cloud_md)
 
 
 if __name__ == '__main__':

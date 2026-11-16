@@ -41,6 +41,7 @@ Known differences from the runner path, all caused by Beam core:
 
 from __future__ import annotations
 
+import ast
 import csv
 import decimal
 import json
@@ -249,6 +250,7 @@ def _transform_configs(spec: dict[str, Any]):
   select_cfg = None
   expect_cfg = None
   limit_cfg = None
+  dlq_redact_cols: list[str] = []
   known = {
       'ReadFromCsv',
       'ReadCsvWithDlq',
@@ -282,9 +284,19 @@ def _transform_configs(spec: dict[str, Any]):
       where_cfg = t.get('config', {})
     elif t_type == 'MapToFields' and name.startswith('Normalize'):
       raw_p = ((t.get('config') or {}).get('fields') or {}).get('raw_payload')
-      if isinstance(raw_p, dict) and '_rk =' in str(raw_p.get('callable') or
-                                                    ''):
-        return None
+      src_c = str(raw_p.get('callable') or '') if isinstance(raw_p, dict) else ''
+      if '_rk =' in src_c:
+        for ln in src_c.splitlines():
+          s_ln = ln.strip()
+          if s_ln.startswith('_rk ='):
+            try:
+              parsed_rk = ast.literal_eval(s_ln.split('=', 1)[1].strip())
+              if isinstance(parsed_rk, (tuple, list)):
+                for rk_item in parsed_rk:
+                  if str(rk_item) not in dlq_redact_cols:
+                    dlq_redact_cols.append(str(rk_item))
+            except Exception:  # pylint: disable=broad-except
+              return None
       continue
     elif t_type == 'MapToFields':
       if select_cfg is not None:
@@ -301,7 +313,15 @@ def _transform_configs(spec: dict[str, Any]):
   for cfg in (where_cfg, select_cfg):
     if cfg is not None and cfg.get('language', 'python') != 'python':
       return None
-  return cdc_norm_cfg, cdc_mat_cfg, where_cfg, select_cfg, expect_cfg, limit_cfg
+  return (
+      cdc_norm_cfg,
+      cdc_mat_cfg,
+      where_cfg,
+      select_cfg,
+      expect_cfg,
+      limit_cfg,
+      tuple(dlq_redact_cols),
+  )
 
 
 _ISOLATED_NS: dict[str, Any] = {
@@ -822,6 +842,7 @@ def run(
       select_cfg,
       expect_cfg,
       limit_cfg,
+      dlq_redact_cols,
   ) = _transform_configs(pipe.spec)
   route_errors = pipe.dlq_endpoint is not None
   eff_drop_bad = bool(
@@ -911,6 +932,7 @@ def run(
         capture_errors,
         dlq_records,
         drift_state=drift_state)
+  orig_src_columns = list(columns)
 
   filtered_out = 0
   text_number_cols: set[str] = set()
@@ -1120,6 +1142,16 @@ def run(
 
     dlq_pair: tuple[str, str] | None = None
     if route_errors:
+      if dlq_redact_cols and dlq_records:
+        csv_delim = str(pipe.source_endpoint.config.get('delimiter', ','))
+        dlq_records = [
+            pipe_sql._redact_dlq_entry(
+                rec,
+                dlq_redact_cols,
+                header=orig_src_columns,
+                delim=csv_delim)
+            for rec in dlq_records
+        ]
       dlq_pair = _stage_write(
           pipe.dlq_endpoint,
           ['step', 'error_type', 'error', 'raw_payload'],

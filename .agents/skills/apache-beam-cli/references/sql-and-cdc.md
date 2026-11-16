@@ -1,22 +1,23 @@
 # SQL, Multi-Table Quality Pipelines, Masking, & CDC Reference (`beam`)
 
-Reference for expressions, PII masking, multi-table SQL joins with `--expect`, multi-sink Bronze -> Silver -> Gold Beam YAML pipelines, Change Data Capture (`--cdc`), and zero-copy Lakehouse sync in `apache-beam-cli-preview` `v0.2.0`.
+Reference for expressions, PII masking & raw-line DLQ redaction, multi-table SQL joins with `--expect`, multi-sink Bronze -> Silver -> Gold Beam YAML pipelines, Change Data Capture (`--cdc`), and zero-copy Lakehouse sync in `apache-beam-cli-preview` `v0.2.0`.
 
 ---
 
-## 1. `--where` & `--select` Expressions + PII Masking
+## 1. `--where` & `--select` Expressions + PII Masking & Raw-Line DLQ Scrubbing
 
 `beam pipe` compiles `--where`, `--pre-select`, `--post-where`, and `--select` through an AST-allowlisted compiler with SQL three-valued NULL logic (`NULL` comparisons evaluate to `NULL`, never raising `TypeError`):
 
 - **Operators & Casts**: `=` / `==`, `!=` / `<>`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, `IS NULL`, `IS NOT NULL`, `[NOT] IN (...)`, `[NOT] BETWEEN a AND b`, `[NOT] LIKE` / `ILIKE`, `CAST(col AS INT|FLOAT|STRING|BOOL)`, and backticked reserved column names (`` `class` ``, `` `from` ``, `` `in` ``).
 - **Scalar & String Helpers**: `lower(s)`, `upper(s)`, `strip(s)` / `trim(s)`, `len(s)` / `length(s)`, `substr(s, start[, len])` / `substring(s, start[, len])` (1-based positive index, negative tail index), `concat(a, b, ...)`, `coalesce(a, b, ...)` / `ifnull(a, b)`, `abs(x)`, `round(x[, n])`, `int(x)`, `float(x)`, `str(x)`, `bool(x)`.
-- **PII Masking & Hashing Helpers** (available identically in `--select`, `--pre-select`, `--where`, and local `--sql`):
+- **PII Masking & Hashing Helpers**:
   - `sha256(val)`: Deterministic lowercase hex SHA-256 digest (`None` -> `None`) for joinable pseudonymous keys.
-  - `mask(val[, keep_last=4, mask_char='*'])`: Masks leading characters while keeping the trailing `keep_last` characters (e.g., `mask('4111222233334444')` -> `'************4444'`).
-  - `mask_last4(val)`: Shorthand for `mask(val, 4, '*')`.
+  - `mask(val[, keep_last=4, mask_char='*'])` / `mask_last4(val)`: Masks leading characters while preserving trailing `keep_last` characters (`mask_last4('4111222233334444')` -> `'************4444'`).
   - `mask_email(val)`: Preserves first local character and domain (`mask_email('alice@example.com')` -> `'a***@example.com'`).
   - `redact(val)`: Replaces any non-null value with `'<REDACTED>'` (`None` -> `None`).
-- **Timestamp & JSON Helpers**: `parse_timestamp(ts)` / `to_utc(ts)`, `epoch_ms(ts)` / `to_epoch_ms(ts)`, `year(ts)`, `month(ts)`, `day(ts)`, `hour(ts)`, `minute(ts)`, `second(ts)`, `date_part(part, ts)`, `json_get(col, '$.a.b')` / `json_value(col, '$.a.b')`.
+  - *Dialect portability*: Available in `--select` / `--where` across **all** runners (including `local_fast`, `FlinkRunner`, `DataflowRunner`) and in local SQLite `--sql`. On distributed Calcite `--sql`, keep standard SQL inside `--sql` and apply `mask_email(...)` / `sha256(...)` in `--select`.
+- **DLQ Redaction on Corrupt Raw Lines (`--dlq-redact-fields`)**:
+  - Replaces named keys/columns with `'<REDACTED>'` on parsed records (keeping `local_fast` enabled for files `<= 256 MiB`) **and** falls back to key-value + regex scrubbing of email addresses, 13–19 digit payment card PANs, and `XXX-XX-XXXX` SSNs when raw CSV quoting or truncated JSON fails parsing before column binding.
 
 ---
 
@@ -26,21 +27,21 @@ Pass `--sql "SELECT ..."` or `--sql-file query.sql` across repeatable `--from al
 
 | Engine | Flag / Trigger | Limits & Portability | Supported Dialect Extensions |
 | :--- | :--- | :--- | :--- |
-| **SQLite** *(default locally)* | Default when no `--runner` is passed | In-memory (`30s` / `1,000,000` result rows via `BEAM_CLI_SQL_MAX_SECONDS` / `BEAM_CLI_SQL_MAX_RESULT_ROWS`); reads/writes local & `gs://`/`s3://` files directly | `to_utc`, `split_part`, `sha256`, `mask`, `mask_last4`, `mask_email`, `redact`, `median(x)`, `percentile(x, 95)`, `quantile(x, 0.95)`, `stddev`, `corr`, `regr_slope`, `OVER (...)` |
-| **DuckDB** | `--sql-engine duckdb` (`pip install duckdb`) | In-memory (`512MB` default via `BEAM_CLI_DUCKDB_MAX_MEMORY`, external file access disabled inside SQL) | `PERCENTILE_CONT(0.95) WITHIN GROUP (...)`, `QUALIFY`, `GROUPING SETS`, nested structs |
+| **SQLite** *(default locally)* | Default when no `--runner` is passed | In-memory (`30s` / `1,000,000` result rows via `BEAM_CLI_SQL_MAX_SECONDS` / `BEAM_CLI_SQL_MAX_RESULT_ROWS`); reads/writes local & `gs://`/`s3://` `--to` and `--dlq` files | `to_utc`, `split_part`, `sha256`, `mask`, `mask_last4`, `mask_email`, `redact`, `median(x)`, `percentile(x, 95)`, `quantile(x, 0.95)`, `stddev`, `corr`, `OVER (...)` |
+| **DuckDB** | `--sql-engine duckdb` (`pip install duckdb`) | Vectorized C++ in-memory (**`2GB`** default via `BEAM_CLI_DUCKDB_MAX_MEMORY`, external SQL file access disabled for sandbox safety) | `QUANTILE_CONT(x, 0.95)`, `PERCENTILE_CONT(0.95) WITHIN GROUP (...)`, `QUALIFY`, `GROUPING SETS`, nested structs |
 | **Python Lowering** | `--sql-engine python` (or TVFs without JVM) | Pure-Python Beam YAML lowering (no Java required locally or on cloud runners) | Single-source `GROUP BY` / `HAVING`, `TUMBLE`/`HOP`/`SESSION` TVFs, 2-source `ASOF JOIN` & `BETWEEN ... INTERVAL` |
 | **Beam Calcite** | `--runner=DataflowRunner\|FlinkRunner\|SparkRunner` or `--portable` | Distributed execution (requires Java 11–25 expansion service) | Standard Apache Calcite SQL; pass `--portable` locally to reject SQLite-only functions pre-flight (exit `2`) |
 
 - **`percentile` vs. `quantile` Scale Agreement**:
   - **`percentile(col, p)`** takes **`p` in `0..100`** (percentage scale, e.g., `percentile(latency_ms, 95)`).
-  - **`quantile(col, q)`** takes **`q` in `0.0..1.0`** (fraction scale, e.g., `quantile(latency_ms, 0.95)`).
+  - **`quantile(col, q)`** (and DuckDB `QUANTILE_CONT(col, q)`) takes **`q` in `0.0..1.0`** (fraction scale, e.g., `quantile(latency_ms, 0.95)`).
 
 ---
 
 ## 3. Multi-Table Pipelines with Quality Rules (`--expect` & Multi-Sink YAML)
 
 ### Pattern A: Multi-Table SQL Join + Per-Rule `--expect` Routing
-`--sql` composes directly with repeatable `--expect "<name>: <boolean_expr> -> dlq|drop|fail"`:
+`--sql` composes directly with repeatable `--expect "<name>: <sql_or_python_expr> -> dlq|drop|fail"`:
 - `fail`: Aborts immediately with exit code `1` (`ExpectationViolationError`) on broken primary-key or critical invariants.
 - `dlq`: Routes violating rows to `--dlq` (`step: "CliExpect"`, `error_type: "ExpectationViolation"`) while writing clean rows to `--to`.
 - `drop`: Drops violating rows cleanly and records `expectation_dropped_<rule>` and `expectation_dropped_rows` in `metrics`.
@@ -58,7 +59,7 @@ beam pipe \
 ```
 
 ### Pattern B: Multi-Sink Bronze -> Silver -> Gold DAG in One Beam YAML File
-When one job must materialize **multiple output tables** (e.g., Silver orders + Gold tier rollups + shared DLQ) with quality rules between layers, define a multi-transform YAML file, validate offline with `beam check medallion.yaml --json`, and run locally or on `FlinkRunner` / `DataflowRunner` with `beam run medallion.yaml --json`:
+When one job must materialize **multiple output tables** (Silver + Gold + shared DLQ), define a multi-transform YAML file, validate offline with `beam check medallion.yaml --json`, and run with `beam run medallion.yaml --json`. *(Note: CLI `--expect` auto-normalizes SQL `IS NOT NULL` / `AND` into Python expressions; when writing raw YAML `CliExpect` `rules:` directly, use Python boolean syntax such as `order_id is not None` and `and`.)*
 
 ```yaml
 pipeline:
@@ -87,8 +88,8 @@ pipeline:
       input: SilverQuality.good
       config:
         table: lake.silver_orders
-        catalog_name: hadoop
-        catalog_properties: {type: hadoop, warehouse: "s3://my-bkt/wh"}
+        catalog_name: rest
+        catalog_properties: {type: rest, uri: "https://cat.internal", warehouse: "s3://my-bkt/wh"}
     - name: RollupGold
       type: Sql
       input: SilverQuality.good
@@ -99,8 +100,8 @@ pipeline:
       input: RollupGold
       config:
         table: lake.gold_revenue_by_tier
-        catalog_name: hadoop
-        catalog_properties: {type: hadoop, warehouse: "s3://my-bkt/wh"}
+        catalog_name: rest
+        catalog_properties: {type: rest, uri: "https://cat.internal", warehouse: "s3://my-bkt/wh"}
     - name: NormalizeQualityDlq
       type: NormalizeDlq
       input: SilverQuality.errors
@@ -121,7 +122,7 @@ providers:
 
 ## 4. Two-Stream Kafka Joins (`INTERVAL` & `ASOF`)
 
-Join two `kafka://` topics using per-URI query options (`?format=json|avro`, `?schema_registry=https://...`, `?timestamp_policy=CreateTime|LogAppendTime`, `?consumer_group=...`, `?commit_offset_in_finalize=true`) and `--max-watermark-skew` state protection on `FlinkRunner` or `DataflowRunner`:
+Join two `kafka://` topics using per-URI query options (`?format=json|avro`, `?schema_registry=https://...`, `?timestamp_policy=CreateTime|LogAppendTime`, `?consumer_group=...`, `?commit_offset_in_finalize=true`), `--max-watermark-skew`, and `--checkpointing_interval=30000` on `FlinkRunner` (or `DataflowRunner`):
 
 ```bash
 # Stream-stream temporal interval join (clicks -> orders within 15m)
@@ -134,19 +135,21 @@ beam pipe \
          FROM c JOIN o ON c.user_id = o.user_id
                       AND o.order_ts BETWEEN c.click_ts AND c.click_ts + INTERVAL '15' MINUTE" \
   --max-watermark-skew 30m --skew-action dlq --dlq s3://my-bkt/dlq/skew/ \
-  --from-opt-file kafka.opts --runner=FlinkRunner --flink_master=http://flink-jm:8081 --json
+  --from-opt-file kafka.opts --join-opt-file kafka.opts \
+  --runner=FlinkRunner --flink_master=http://flink-jm:8081 --checkpointing_interval=30000 --job_name=attr-join --wait-timeout 30s --json
 
 # Point-in-time ASOF LEFT JOIN (latest quote <= 5s prior to each trade)
 beam pipe \
-  --from "t=kafka://broker:9092/trades?format=json&auto_offset_reset=latest" \
-  --join "q=kafka://broker:9092/quotes?format=json&auto_offset_reset=latest" \
+  --from "t=kafka://broker:9092/trades?format=json&consumer_group=priced-trades&commit_offset_in_finalize=true" \
+  --join "q=kafka://broker:9092/quotes?format=json&consumer_group=priced-quotes&commit_offset_in_finalize=true" \
   --to "iceberg://lake.priced_trades?warehouse=s3://my-bkt/wh" \
   --to-opt triggering_frequency_seconds=15 \
   --sql "SELECT t.trade_id, t.symbol, t.qty, q.bid, q.ask, t.trade_ts
          FROM t ASOF LEFT JOIN q
            MATCH_CONDITION (t.trade_ts >= q.quote_ts AND t.trade_ts <= q.quote_ts + INTERVAL '5' SECOND)
            ON t.symbol = q.symbol" \
-  --from-opt-file kafka.opts --runner=FlinkRunner --flink_master=http://flink-jm:8081 --json
+  --from-opt-file kafka.opts --join-opt-file kafka.opts \
+  --runner=FlinkRunner --flink_master=http://flink-jm:8081 --checkpointing_interval=30000 --job_name=priced-trades --wait-timeout 30s --json
 ```
 
 ---
@@ -154,24 +157,27 @@ beam pipe \
 ## 5. PostgreSQL / MySQL CDC & Partitioned Delta Lake -> Iceberg
 
 ### Pattern A: PostgreSQL to Iceberg Replication (`ReadFromDebezium` -> Merge-on-Read)
-Requires logical WAL (`wal_level = logical`) and `REPLICATION` privileges on PostgreSQL. Store credentials and Debezium slot settings in a `chmod 0600` `pg.opts` file (`username=replicator`, `password=...`, `connection_properties=slot.name=beam_orders_slot;publication.autocreate.mode=filtered`):
+Requires logical WAL (`wal_level = logical`), `REPLICATION` privileges, and **explicit user/DBA confirmation before creating replication slots or publications**. Store credentials and slot settings in a `chmod 0600` `pg.opts` file (never read `.opts` into LLM context):
 
 ```bash
 beam pipe \
   --from "postgres://pg.internal:5432/prod?table=public.orders" \
-  --to "iceberg://lake.orders?warehouse=s3://my-bkt/wh" \
+  --to "iceberg://lake.orders?catalog=rest&uri=https://cat.internal&warehouse=s3://my-bkt/wh" \
   --cdc --primary-key order_id \
   --to-opt triggering_frequency_seconds=30 \
-  --from-opt-file pg.opts \
-  --runner=FlinkRunner --flink_master=http://flink-jm:8081 --wait-timeout 30s --json
+  --from-opt-file pg.opts --to-opt-file catalog.opts \
+  --runner=FlinkRunner --flink_master=http://flink-jm:8081 --checkpointing_interval=30000 --job_name=pg-orders-cdc --wait-timeout 30s --json
 ```
-- **Delivery & Restart Semantics**: `ReadFromDebezium` takes a consistent `initial` snapshot then tails WAL changes from `slot.name`. Iceberg commits `mode=merge-on-read` snapshots (`equality-deletes` on `order_id`), deduplicating replays within and across commit windows by `ts_ms`/LSN. Draining (`beam cancel <JOB_ID> --drain`) and restarting with the same `slot.name` resumes from the last acknowledged LSN without re-snapshotting.
+- **Delivery, Restart & Day-2 WAL / Compaction Safeguards**:
+  - `ReadFromDebezium` takes an `initial` snapshot then streams WAL from `slot.name` into Iceberg `mode=merge-on-read` (`equality-deletes` on `order_id`). Draining (`beam cancel <JOB_ID> --drain`) and restarting with the same `slot.name` resumes from the last acknowledged LSN.
+  - **PostgreSQL WAL bloat protection**: Configure `max_slot_wal_keep_size` on PostgreSQL, alert on `pg_replication_slots` lag (`pg_wal_lsn_diff`), and run `SELECT pg_drop_replication_slot('beam_orders_slot');` if the CDC job is permanently retired.
+  - **Iceberg delete-file compaction**: Schedule periodic `rewrite_data_files` + `expire_snapshots` maintenance so frequent `equality-deletes` do not degrade downstream DuckDB/Trino/Spark reads.
 
 ### Pattern B: Partitioned or Unpartitioned Delta Lake to Iceberg (`--zero-copy` + Incremental `--cdc`)
-`beam catalog sync` and `beam pipe --zero-copy` support **both partitioned and unpartitioned** `delta://`, `iceberg://`, and Hive-partitioned Parquet (`col=val/*.parquet`) sources (`0` data bytes copied, preserving partition specs). If the source Delta table uses v3+ Deletion Vectors or Column Mapping, omit `--zero-copy` (`pip install deltalake`) so live rows are rewritten into clean Parquet.
+`beam catalog sync` and `beam pipe --zero-copy` support **both partitioned and unpartitioned** `delta://`, `iceberg://`, and Hive-partitioned Parquet (`col=val/*.parquet`) sources (`0` data bytes copied, preserving partition specs). Tables with active Delta v3+ Deletion Vectors or Column Mapping are rejected by `--zero-copy` (omit `--zero-copy` and `pip install deltalake` to materialize live rows).
 
 ```bash
-# 1. Read-only dry-run preview first, then ask user confirmation before catalog write
+# 1. Read-only dry-run preview first, then obtain human confirmation before catalog write
 beam catalog sync --dry-run "delta://s3://my-bkt/delta/orders" "iceberg://lake.orders?warehouse=s3://my-bkt/wh" --json
 V0=$(beam inspect "delta://s3://my-bkt/delta/orders" --sample 0 --json | jq -r '.outputs.snapshot_version')
 

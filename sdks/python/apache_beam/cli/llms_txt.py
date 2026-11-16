@@ -93,7 +93,7 @@ def render_llms_txt() -> str:
     hydrate external features or lookup tables (`--pre-select EXPR --enrich "bigquery|bigtable|vertexai|feast|file:..." [--enrich-opt [STAGE:]K=V]`),
     run low-delay streaming or batch ML inference (`--infer "vertexai|hf|mock:...,min_batch_size=1,max_batch_duration_ms=10" [--infer-fields "col AS feat, nested.col AS feat2"] [--infer-tag prediction] [--infer-flatten] [--infer-opt [STAGE:]K=V] [--post-where|--post-filter EXPR]`; stage order is `--where -> --pre-select -> --enrich -> --infer -> --post-where -> --window -> --select -> --expect`),
     enforce data quality rules (`--expect "rule: expr -> dlq|drop|fail"`, supported both standalone and combined with multi-table `--sql`), run pre-flight
-    schema contract comparison (`--check-schema`), quarantine dirty rows (`--dlq` or `--dead-letter-target`, scrubbing PII via `--dlq-redact-fields|--redact-fields COLS`),
+    schema contract comparison (`--check-schema`), quarantine dirty rows (`--dlq` or `--dead-letter-target`, scrubbing structured keys and raw-line email/PAN/SSN PII via `--dlq-redact-fields|--redact-fields COLS`),
     drop invalid rows (`--drop-bad` / `--skip-errors`), enforce scan budget (`--max-bytes`), verify
     conservation (`--assert-counts`), reconcile output (`--verify [--key COL]`), apply
     cross-engine CDC (`--cdc --primary-key COL`), or register existing **partitioned or

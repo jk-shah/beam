@@ -3089,26 +3089,15 @@ def _redact_dlq_entry(
       scrubbed = None
     if scrubbed is None:
       tmp_s = raw_p
-      replaced_any = False
-      for col in redact_fields:
-        nxt_s, cnt = re.subn(
-            r'([\'"]' + re.escape(col) +
-            r'[\'"]\s*:\s*)(?:"(?:\\.|[^"])*"|\'(?:\\.|[^\'])*\'|[^,\s}\]]+)',
-            r'\1"<REDACTED>"',
-            tmp_s)
-        if cnt:
-          replaced_any = True
-          tmp_s = nxt_s
-      if replaced_any:
-        scrubbed = tmp_s
-      elif header and any(h in rk_set for h in header):
+      if header and any(h in rk_set for h in header):
         parts = raw_p.split(delim)
-        for idx, col_n in enumerate(header):
-          if col_n in rk_set and idx < len(parts):
-            parts[idx] = '<REDACTED>'
-        scrubbed = delim.join(parts)
-      else:
-        scrubbed = tmp_s
+        if len(parts) == len(header):
+          for idx, col_n in enumerate(header):
+            if col_n in rk_set:
+              parts[idx] = '<REDACTED>'
+          tmp_s = delim.join(parts)
+      scrubbed = dlq.scrub_unparseable_dlq_text(tmp_s, redact_fields)
+    out['error'] = dlq.scrub_unparseable_dlq_text(out['error'], redact_fields)
     out['raw_payload'] = scrubbed
   return out
 
@@ -4637,9 +4626,9 @@ def _run_duckdb(
         END
       )
     ''')
-    raw_mem = os.environ.get('BEAM_CLI_DUCKDB_MAX_MEMORY', '').strip() or '512MB'
+    raw_mem = os.environ.get('BEAM_CLI_DUCKDB_MAX_MEMORY', '').strip() or '2GB'
     if not re.fullmatch(r'\d+\s*(?:KB|MB|GB|KiB|MiB|GiB)', raw_mem, re.I):
-      raw_mem = '512MB'
+      raw_mem = '2GB'
     raw_max_sec = os.environ.get('BEAM_CLI_SQL_MAX_SECONDS', '').strip()
     try:
       max_sql_sec = float(raw_max_sec) if raw_max_sec else 30.0

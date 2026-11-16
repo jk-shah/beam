@@ -4471,13 +4471,46 @@ def _pipe_impl(
                   tag='sink')
               staged_sql_pairs.append(sink_sql_pair)
           if dlq_ep is not None:
-            dlq_sql_pair = pipe_sql.stage_rows_to_local_file(
-                ['step', 'error_type', 'error', 'raw_payload'],
-                dlq_recs,
-                dlq_ep,
-                if_exists='append' if args.if_exists == 'append' else 'replace',
-                tag='dlq')
-            staged_sql_pairs.append(dlq_sql_pair)
+            dlq_prefix_str = str(
+                dlq_ep.output_prefix or dlq_ep.config.get('path') or '')
+            if '://' in dlq_prefix_str and not dlq_prefix_str.lower().startswith(
+                'file://'):
+              if dlq_recs:
+                from apache_beam.io.filesystems import FileSystems
+                from apache_beam.options.pipeline_options import PipelineOptions
+                FileSystems.set_options(PipelineOptions(resolved_args))
+                ext_dlq = (
+                    os.path.splitext(dlq_prefix_str)[1] or f'.{dlq_ep.format}')
+                fd_dlq, tmp_dlq_target = tempfile.mkstemp(
+                    prefix='.beam_sql_dlq.', suffix=ext_dlq)
+                os.close(fd_dlq)
+                try:
+                  os.unlink(tmp_dlq_target)
+                except OSError:
+                  pass
+                local_dlq_proxy = uris.parse_endpoint(
+                    tmp_dlq_target,
+                    is_read=False,
+                    explicit_format=dlq_ep.format,
+                    options=dict(dlq_ep.config))
+                rem_dlq_pair = pipe_sql.stage_rows_to_local_file(
+                    ['step', 'error_type', 'error', 'raw_payload'],
+                    dlq_recs,
+                    local_dlq_proxy,
+                    if_exists='replace',
+                    tag='dlq')
+                staged_sql_pairs.append(rem_dlq_pair)
+                with open(rem_dlq_pair[0], 'rb') as rf_d:
+                  with FileSystems.create(dlq_prefix_str) as wf_d:
+                    shutil.copyfileobj(rf_d, wf_d, length=1024 * 1024)
+            else:
+              dlq_sql_pair = pipe_sql.stage_rows_to_local_file(
+                  ['step', 'error_type', 'error', 'raw_payload'],
+                  dlq_recs,
+                  dlq_ep,
+                  if_exists='append' if args.if_exists == 'append' else 'replace',
+                  tag='dlq')
+              staged_sql_pairs.append(dlq_sql_pair)
           if sink_sql_pair is not None:
             try:
               jobs.atomic_commit_local_file(
