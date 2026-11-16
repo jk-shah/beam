@@ -25,11 +25,11 @@ title: "Apache Beam CLI User Guide"
 
 This guide is organized around **what you want to accomplish**—from inspecting an
 unknown dataset in `<90 ms` on your laptop to running failure-isolated streaming
-joins, online enrichment, ML inference, Lakehouse registration, and cross-store
-migrations on production clusters.
+joins, online enrichment, ML inference, Lakehouse registration, and verified
+cross-store migrations on production clusters.
 
 For a compact syntax lookup of all subcommands, URI schemes, and exit codes, see
-the [Apache Beam CLI Reference](../cli/).
+the [Apache Beam CLI Reference](../cli/) or run `beam --llms-txt`.
 
 ---
 
@@ -40,12 +40,13 @@ Jump directly to the workflow that matches your task:
 | Your Goal | Command Pattern | Typical Latency / Scale | Section |
 | :--- | :--- | :--- | :--- |
 | **Inspect an unknown file, Lakehouse table, or warehouse view** | `beam inspect <URI> --stats -n 5` | `<90 ms` local / `$0` metadata | [Task 1](#task-1-explore-unknown-files-tables-and-live-streams-safely) |
-| **Peek or live-follow Kafka, Pub/Sub, or Lakehouse commits** | `beam tail -f -i <URI>` | `<65 ms` non-destructive | [Task 1.3](#13-peek-and-live-follow-streams-without-perturbing-production) |
+| **Peek or live-follow Kafka, Pub/Sub, or Lakehouse commits** | `beam tail -f -i <URI>` | `<65 ms` non-destructive | [Task 1.4](#14-peek-and-live-follow-streams-without-perturbing-production) |
 | **Convert & filter CSV, JSONL, Parquet, or Avro** | `beam pipe raw.csv clean.parquet --where "..." --select "..."` | `<150 ms` local or Cloud | [Task 2.1](#21-convert-formats-filter-rows-and-project-columns) |
 | **Quarantine dirty rows & scrub PII into a Dead-Letter Queue** | `beam pipe ... --expect "..." --dlq bad.jsonl --dlq-redact-fields ssn` | Local & Distributed | [Task 2.2](#22-enforce-data-quality-rules-and-quarantine-dirty-records) |
-| **Block accidental multi-TB scans or breaking schema drift** | `beam pipe ... --max-bytes 10GB --check-schema --assert-counts` | `<100 ms` pre-flight | [Task 2.3](#23-prevent-runaway-scans-schema-breakage-and-silent-row-loss) |
+| **Block accidental multi-TB scans or breaking schema drift** | `beam pipe ... --max-bytes 10GB --check-schema --assert-counts` | `<100 ms` pre-flight | [Task 2.3](#23-prevent-runaway-scans-schema-breakage-and-race-overwrites) |
 | **Join Parquet + CSV + Iceberg with SQL & quantiles** | `beam pipe --from o=... --join c=... --sql "SELECT ..."` | `<80 ms` local or Runner | [Task 3.1](#31-join-multiple-formats-and-compute-quantiles-in-sql) |
 | **Run `TUMBLE` / `HOP` / `SESSION` SQL windows without Java** | `beam pipe ... --sql "SELECT ... FROM TABLE(TUMBLE(...))" --sql-engine python` | Zero-JVM Beam YAML | [Task 3.2](#32-run-windowed-sql-without-a-jvm) |
+| **Launch an interactive or batch Apache Calcite SQL shell** | `beam sql --io kafka -e "SELECT ..."` | Cached JVM `BeamSqlLine` | [Task 3.3](#33-run-interactive-or-batch-apache-calcite-sql-beam-sql) |
 | **Migrate a database table & prove zero row or decimal drift** | `beam pipe postgres://... iceberg://... --verify --key id` + `beam diff` | Distributed $O(1)$ RAM | [Task 4](#task-4-migrate-databases-and-mathematically-prove-zero-drift) |
 | **Replicate CDC (`UPSERT` + `DELETE`) across files & tables** | `beam pipe <CDC_SRC> <DEST> --cdc --primary-key id` | Local / BQ Write API / Iceberg MoR | [Task 5](#task-5-replicate-change-data-capture-cdc-across-engines) |
 | **Expose Parquet or Delta files as Iceberg with `0` bytes copied** | `beam pipe --zero-copy` / `beam catalog sync <SRC> <DEST>` | `<200 ms` metadata-only | [Task 6](#task-6-register-lakehouse-tables-with-zero-bytes-copied) |
@@ -64,12 +65,12 @@ automatically routing execution to the lightest tier capable of running your job
 
 1. **Tier 1 — Zero-SDK Metadata & Control (`<60–90 ms`)**: `beam inspect`,
    `beam tail`, `beam schema diff`, `beam catalog sync`, `beam check`,
-   `beam package`, `beam io`, and `beam doctor` run without importing the heavy
-   SDK runtime or spinning up workers.
+   `beam package`, `beam config`, `beam io`, and `beam doctor` run without
+   importing the heavy SDK runtime or spinning up workers.
 2. **Tier 2 — In-Process Local Fast Path (`<80–250 ms`, `<= 64 MB`)**: Bounded
    local file pipelines (`CSV`, `JSONL`, `Parquet`, `Avro`, `Text`) and local
    `--sql` queries (`sqlite` or `duckdb`) execute directly in-process with zero
-   cluster startup overhead.
+   cluster startup overhead (`BEAM_CLI_NO_FAST_PATH=1` forces a Beam runner).
 3. **Tier 3 — Zero-JVM Local Portable Runner (`PrismRunner` / `FnApiRunner`)**:
    Multi-branch DAGs, stateful streaming simulations, and `--sql-engine python`
    windowed aggregations execute locally across Python workers without requiring
@@ -79,7 +80,7 @@ automatically routing execution to the lightest tier capable of running your job
    scales the exact same pipeline across multi-terabyte batch datasets and
    24/7 unbounded event streams.
 
-### One-Time Setup
+### One-Time Setup & 3-Minute End-to-End Lab
 
 ```sh
 python3 -m venv .venv-beam && source .venv-beam/bin/activate
@@ -89,6 +90,55 @@ pip install 'apache-beam[yaml]' pyarrow fastavro
 # pip install 'apache-beam[yaml,gcp,aws]' duckdb
 
 beam doctor
+```
+
+*(Both `beam` and `apache-beam` entrypoints are installed; use `apache-beam` if
+another binary on `PATH` shadows `beam`.)*
+
+Try the complete local workflow—inspection, PII-redacted DLQ quarantine,
+row-conservation proof, multi-format SQL join, zero-copy Iceberg v2
+registration, and `beam diff` verification—in an empty directory:
+
+```sh
+mkdir beam-lab && cd beam-lab
+
+cat << 'EOF' > orders.csv
+order_id,zip,customer_id,email,status,amount,created_at,metadata_json
+1001,00501,c1,ada@example.com,PAID,149.50,2026-11-15T10:00:00Z,"{""channel"":""web""}"
+1002,94043,c2,linus@example.org,CANCELLED,25.00,2026-11-15T10:05:00Z,"{""channel"":""mobile""}"
+1003,02139,c1,ADA@example.com,SHIPPED,299.00,2026-11-15T10:12:00-05:00,"{""channel"":""partner""}"
+1004,10001,c3,bad@example.com,PAID,-15.00,2026-11-15T10:20:00Z,"{""channel"":""web""}"
+corrupt_line_missing_columns
+EOF
+
+cat << 'EOF' > customers.csv
+customer_id,tier,country
+c1,ENTERPRISE,US
+c2,STARTER,FI
+EOF
+
+# 1. Inspect schema & sanitized sample (<90 ms; 'zip' stays 'str' because of '00501')
+beam inspect orders.csv -n 3
+
+# 2. Clean, normalize UTC timestamps, redact PII in DLQ, and prove row conservation
+beam pipe orders.csv curated/orders.parquet \
+  --where "status IN ('PAID', 'SHIPPED')" \
+  --select "CAST(order_id AS INT) AS order_id, zip, customer_id, lower(email) AS email, parse_timestamp(created_at) AS created_utc, json_get(metadata_json, '$.channel') AS channel, round(amount, 2) AS amount" \
+  --expect "positive_amount: amount > 0 -> dlq" \
+  --dlq quarantine/orders_dlq.jsonl \
+  --dlq-redact-fields email \
+  --assert-counts --json
+
+# 3. Join curated Parquet + customer CSV in SQL -> single-document keyed JSON
+beam pipe \
+  --from o=curated/orders.parquet \
+  --join c=customers.csv \
+  --sql "SELECT COALESCE(c.tier, 'UNMAPPED') AS tier, COUNT(*) AS orders, ROUND(SUM(o.amount), 2) AS revenue, ROUND(quantile(o.amount, 0.95), 2) AS p95_amount FROM o LEFT JOIN c ON o.customer_id = c.customer_id GROUP BY 1" \
+  --to reports/tier_summary.json --to-opt key=tier
+
+# 4. Register curated Parquet as an Apache Iceberg v2 table (0 bytes copied) & verify zero drift
+beam pipe curated/orders.parquet "iceberg://$PWD/iceberg_wh/lake.orders" --zero-copy
+beam diff curated/orders.parquet "iceberg://$PWD/iceberg_wh/lake.orders" --key order_id
 ```
 
 ---
@@ -111,18 +161,30 @@ beam inspect "s3://analytics-lake/events/2026-11-*.parquet" --stats -n 5
 # Search a wide 400-column table for timestamp or revenue columns
 beam inspect bigquery://my-proj.sales.fact_orders --search "amount|created"
 
+# Bound Parquet footer scanning across 500+ shards (sets truncated_scan: true when capped)
+beam inspect "s3://analytics-lake/archive/*.parquet" --max-scanned-bytes 4MB --json
+
 # Inspect a specific Delta Lake version or Apache Iceberg v2 snapshot
 beam inspect "delta://gs://my-lake/orders?version=12" --stats
 beam inspect "iceberg://sales.orders?warehouse=s3://my-lake/warehouse" -n 3
 ```
 
-### 1.2 Preview Transformations Without Writing Output Files
+### 1.2 Discover Connectors and Transforms Offline (`beam io`)
+
+```sh
+beam io list
+beam io describe bigquery
+beam io describe WindowInto
+```
+
+### 1.3 Preview Transformations Without Writing Output Files
 
 Omit the destination URI (and cap rows with `-n`) to preview filtered or
 computed rows directly in your terminal before materializing any files:
 
 ```sh
 beam pipe orders.csv \
+  --drop-bad \
   --where "amount >= 100 AND status = 'PAID'" \
   --select "order_id, lower(email) AS email, round(amount * 1.08, 2) AS total_with_tax" \
   -n 5
@@ -131,16 +193,19 @@ beam pipe orders.csv \
 When writing an output file, pass `--preview` alongside `--to` to materialize
 the destination *and* return a sanitized sample in one pass.
 
-### 1.3 Peek and Live-Follow Streams Without Perturbing Production
+### 1.4 Peek and Live-Follow Streams Without Perturbing Production
 
 `beam tail` inspects live streams **non-destructively**:
 - On **Kafka** (`kafka://`), it uses an ephemeral consumer group
   (`beam-tail-<uuid>`) with `enable.auto.commit=false`, never advancing
   committed production offsets.
-- On **Pub/Sub** (`pubsub://`), peeking a **topic** creates a temporary
-  auto-expiring subscription (cleaned up on exit), while peeking an existing
-  **subscription** pulls messages without `ACK`ing them so downstream consumers
-  never lose events.
+- On **Pub/Sub** (`pubsub://`), peeking a **topic** creates an ephemeral
+  subscription protected by 5-minute `beam_lease_until` label heartbeats and
+  local PID leases (so concurrent `>15m` tail sessions never delete each other,
+  while crashed sessions expire cleanly). Peeking an existing **subscription**
+  pulls messages without `ACK`ing them so downstream consumers lose zero events.
+- On **large log files and shards**, `--max-scanned-bytes` (default `64MB`)
+  bounds memory below `16 MiB` even on multi-gigabyte logs.
 
 ```sh
 # Bounded 5-second peek of 10 events
@@ -167,20 +232,22 @@ PII fields that must never leak into error logs.
 `--to` flags) and infers formats from file extensions:
 
 ```sh
-beam pipe raw/orders_*.csv curated/orders.parquet \
+beam pipe "raw/orders_*.csv" curated/orders.parquet \
   --null-values "NA,N/A,-" \
   --where "status IN ('PAID', 'SHIPPED') AND email ILIKE '%@example.com' AND amount BETWEEN 10 AND 50000" \
   --select "CAST(order_id AS INT) AS order_id, strip(customer_name) AS customer_name, parse_timestamp(created_at) AS created_utc, json_get(metadata_json, '$.channel') AS channel, round(amount, 2) AS amount"
 ```
 
 What `beam pipe` handles automatically here:
-- **Leading-zero safety**: Columns containing values like `00501` stay `string`
-  rather than silently truncating to integer `501` (override explicitly anytime
-  with `--from-opt fields="zip:str,amount:float"`).
+- **Leading-zero & header safety**: Columns containing values like `00501` stay
+  `string` rather than silently truncating to integer `501` (override explicitly
+  anytime with `--from-opt fields="zip:str,amount:float"`), and CSV shards in a
+  glob align by column name even when column orders differ across files.
 - **Sparse JSONL schema safety**: Local JSONL inputs (`<= 64 MB`) scan every
   record so sparse keys appearing after row 100 are preserved automatically; on
   larger remote streams, unseen keys raise `SchemaDriftError` (or route cleanly
-  to `--dlq` rather than silently dropping fields).
+  to `--dlq` rather than silently dropping fields; customize via
+  `--from-opt sample_rows=all` or `on_unknown_fields=ignore`).
 - **SQL-natural expressions**: `--where` and `--select` compile AST-sandboxed
   expressions supporting `=` / `<>`, `[NOT] LIKE` / `ILIKE`, `[NOT] BETWEEN`,
   `IN (...)`, `IS [NOT] NULL`, `CAST(x AS INT|FLOAT|STRING|BOOL)`, backticked
@@ -188,7 +255,9 @@ What `beam pipe` handles automatically here:
   structs (`user.address.country`), UTC timestamp helpers (`parse_timestamp` /
   `to_utc`, `epoch_ms`, `year`, `month`, `day`, `hour`, `date_part`), and JSON
   extraction (`json_get` / `json_extract_scalar` / `json_value`)—with strict SQL
-  three-valued `NULL` semantics across both local and distributed runners.
+  three-valued `NULL` semantics across both local and distributed runners
+  *(note: as in SQL, `state != 'CA'` drops `NULL` rows; write
+  `state IS NULL OR state != 'CA'` to retain `NULL`s)*.
 
 ### 2.2 Enforce Data Quality Rules and Quarantine Dirty Records
 
@@ -198,6 +267,7 @@ ad-hoc `try/except` wrappers—combine `--expect` rules with `--dlq` and
 
 ```sh
 beam pipe raw/events.jsonl clean/events.parquet \
+  --select "event_id, user_id, email, ssn, amount, env" \
   --expect "valid_amount: amount > 0 -> dlq" \
   --expect "has_user: user_id IS NOT NULL -> dlq" \
   --expect "non_test_env: env != 'sandbox' -> drop" \
@@ -209,7 +279,8 @@ beam pipe raw/events.jsonl clean/events.parquet \
 - **Malformed syntax + rule violations in one quarantine**: Corrupt CSV/JSON
   parse errors, schema drift, sink rejections, and `--expect ... -> dlq`
   violations all route to `quarantine/events_dlq.jsonl` with structured
-  (`step`, `error_type`, `error`, `raw_payload`) metadata.
+  (`step`, `error_type`, `error`, `raw_payload`) metadata. Referencing a column
+  in `--expect` that was dropped by `--select` fails fast pre-flight (`exit 2`).
 - **Recursive PII scrubbing (`--dlq-redact-fields`)**: Redacts sensitive keys
   inside both structured rows and nested JSON strings in `raw_payload` before
   dead-letter records touch disk or object storage.
@@ -217,9 +288,9 @@ beam pipe raw/events.jsonl clean/events.parquet \
   discarded without materializing a DLQ dataset, pass `--drop-bad` (alias
   `--skip-errors`).
 
-### 2.3 Prevent Runaway Scans, Schema Breakage, and Silent Row Loss
+### 2.3 Prevent Runaway Scans, Schema Breakage, and Race Overwrites
 
-Add three pre- and post-flight guardrails when promoting batch jobs to shared
+Add pre- and post-flight guardrails when promoting batch jobs to shared
 warehouses:
 
 ```sh
@@ -236,12 +307,16 @@ beam pipe "gs://raw-landing/orders/*.parquet" bigquery://prod.analytics.orders \
    exiting `2` with copy-pasteable `--select "CAST(...)"` remediation hints if a
    required column was dropped or narrowed (`FLOAT64 -> INT32`).
 2. **`--max-bytes 25GB`**: Evaluates scan size pre-flight (`$0` metadata /
-   `dryRun` on BigQuery, `pg_partition_tree` on PostgreSQL, paged object
+   `dryRun` on BigQuery, `pg_partition_tree` on PostgreSQL, sibling-safe object
    listings on S3/GCS) and aborts with exit code `8` (`EXIT_COST_LIMIT`) before
    spending compute.
-3. **Atomic `--if-exists replace` + `--assert-counts`**: Stages new local outputs
-   atomically so a failed run never clobbers the previous good dataset, and
-   verifies mathematically that
+3. **Atomic `--if-exists` & multi-job concurrency**: Default `--if-exists fail`
+   uses kernel-atomic hardlinks (`os.link`) and exclusive Iceberg locks so
+   concurrent jobs racing on the same path never overwrite the winner's output
+   or DLQ; `--if-exists replace` stages new local outputs in private directories
+   and swaps primary sinks ahead of DLQ only after execution,
+   `--assert-counts`, and `--verify` all pass.
+4. **`--assert-counts`**: Verifies mathematically that
    `rows_read == rows_written + rows_filtered_out + dlq_rows + stage_dropped_rows`
    (exiting `1` if a single record goes missing).
 
@@ -258,7 +333,8 @@ window functions across heterogeneous files and Lakehouse tables, use `--sql`
 Alias each input with `alias=URI` via `--from` / `--join`. Locally (`<= 64 MB`),
 `beam pipe --sql` runs in `<80 ms` inside a read-only `:memory:` SQLite sandbox
 augmented with `median(x)`, `quantile(x, p)`, `percentile(x, 95)`, `stddev(x)`,
-and `to_utc(ts)`—or in an in-memory DuckDB sandbox via `--sql-engine duckdb`:
+`corr(x, y)`, `regr_slope(y, x)`, and `to_utc(ts)`—or in an in-memory DuckDB
+sandbox via `--sql-engine duckdb`:
 
 ```sh
 beam pipe \
@@ -288,7 +364,7 @@ beam pipe \
   generating configuration artifacts or API payloads.
 - **Composable pipeline stages**: Combine `--where` (pre-filter before SQL),
   `--sql`, `--select` (post-SQL projection), and `--dlq` / `--drop-bad` in a
-  single command.
+  single command across `.parquet`, `.avro`, `.jsonl`, and `.csv` sinks.
 - **ANSI OLAP extensions (`--sql-engine duckdb`)**: Pass `--sql-engine duckdb`
   whenever your query uses `PERCENTILE_CONT(...) WITHIN GROUP`, `QUALIFY`, or
   `GROUPING SETS`.
@@ -324,6 +400,18 @@ beam pipe events.jsonl windowed_counts.parquet \
 > local SQL prototype to a remote cluster—`beam` flags any SQLite-only scalar
 > functions pre-flight with exit code `2` so remote jobs never fail mid-launch.
 
+### 3.3 Run Interactive or Batch Apache Calcite SQL (`beam sql`)
+
+For interactive `CREATE EXTERNAL TABLE` DDL exploration or batch Calcite SQL
+scripts (`BeamSqlLine`), use `beam sql` (requires Java 11+ and shares shaded
+JAR caches in `~/.beam/cache/` with `scripts/beam-sql.sh`):
+
+```sh
+beam sql --list-ios
+beam sql -e "SELECT 1 + 1 AS two;"
+beam sql --io kafka --io bigquery-storage --runner dataflow
+```
+
 ---
 
 ## Task 4: Migrate Databases and Mathematically Prove Zero Drift
@@ -334,10 +422,10 @@ misses silent float/decimal rounding, timezone shifts, and NULL-coercion bugs.
 
 ### 4.1 Extract from Relational Databases Without Inline Secrets
 
-`beam` rejects inline `user:password@` credentials in URIs with exit code `2` so
-secrets never leak into shell history, process tables, or agent transcripts.
-Provide credentials via environment variables or a `0600`-permissioned options
-file:
+`beam` rejects inline `user:password@` credentials in URIs and flags with exit
+code `2` so secrets never leak into shell history, process tables, or agent
+transcripts. Provide credentials via environment variables, ADC, or a `0600`
+options file (symbolic links are refused):
 
 ```sh
 export BEAM_POSTGRES_USER="readonly_migrator"
@@ -447,7 +535,7 @@ beam pipe "delta://s3://my-lake/orders?start_version=43&end_version=45" \
 
 Copying terabytes of Parquet files just to switch catalog engines wastes hours
 and storage egress. `beam` synthesizes Apache Iceberg v2 metadata manifests
-directly over your existing Parquet or partitioned Delta Lake files in
+directly over your existing Parquet, partitioned Delta Lake, or Iceberg files in
 `<200 ms` with **`bytes_copied = 0`**.
 
 ### 6.1 Convert Partitioned Parquet or Delta Tables In-Place (`--zero-copy`)
@@ -461,7 +549,8 @@ beam pipe \
 
 Hive-style directory partitions (`date=2026-11-15/region=US/*.parquet`) and
 schema evolution across historical Delta commits are mapped automatically to
-Iceberg `PartitionSpec` records and monotonic column IDs.
+Iceberg `PartitionSpec` records and monotonic column IDs, with atomic snapshot
+locks and 16-attempt CAS retries protecting concurrent writers.
 
 ### 6.2 Synchronize Partitions into Enterprise REST Catalogs (`beam catalog sync`)
 
@@ -509,6 +598,10 @@ beam pipe kafka://broker:9092/payments clean/payments.parquet \
   --dedupe-dlq audit/duplicate_payments.jsonl
 ```
 
+*(Note: When your pipeline also specifies `--dlq <URI>`, pass `--dedupe-dlq` as
+a boolean flag without a path so suppressed duplicates route into the shared
+DLQ.)*
+
 ### 7.2 Hydrate Records from Online Stores with Read-Through Caching (`--enrich`)
 
 Batch worker-side lookups against `file:`, parameterized BigQuery
@@ -538,14 +631,14 @@ beam pipe reviews.jsonl flagged_reviews.parquet \
   --assert-counts
 ```
 
-- **In-worker singleton bisection**: If 1 corrupt record inside a 64-row batch
-  raises a tokenization or tensor error, `CliInfer` bisects the batch in-memory
-  on the existing loaded model instance—emitting all `63` healthy predictions
-  with **zero model weight reloads** and routing only the single bad row to
-  `--dlq`.
+- **$O(\log N)$ recursive binary batch bisection**: If 1 corrupt record inside a
+  64-row batch raises a tokenization or tensor error, `CliInfer` recursively
+  bisects the batch in-memory (`<= 13` calls instead of `65` linear retries) on
+  the existing loaded model instance—emitting all `63` healthy predictions with
+  **zero model weight reloads** and routing only the single bad row to `--dlq`.
 - **Stage-scoped options**: When chaining multiple `--enrich` or `--infer`
   stages, target stage `N` cleanly with `<1-based-stage>:key=value` (for
-  example, `--infer-opt 2:batch_size=16`).
+  example, `--infer-opt 2:max_batch_size=16`).
 
 ---
 
@@ -597,7 +690,8 @@ the horizon into `--late-data-dlq` instead of silently discarding them:
 beam pipe pubsub://projects/my-proj/subscriptions/ad-clicks \
   bigquery://my-proj.realtime.click_rollups \
   --timestamp-col click_ts \
-  --window "fixed:1m,group_by=campaign_id,count(*)" \
+  --window "fixed:1m" \
+  --select "campaign_id, COUNT(*) AS clicks, SUM(cost) AS spend" \
   --allowed-lateness 10m \
   --trigger "watermark,early=every:10s,late=count:1" \
   --accumulation accumulating \
@@ -606,6 +700,10 @@ beam pipe pubsub://projects/my-proj/subscriptions/ad-clicks \
   --runner=DataflowRunner \
   --project=my-proj --region=us-central1 --temp_location=gs://my-bucket/tmp
 ```
+
+*(Tip: When testing triggers locally against bounded JSONL/CSV files without
+`--runner=PrismRunner`, use a count-based early trigger such as
+`early=count:1`.)*
 
 ### 8.4 Detect Ordered Event Sequences and Missing Follow-Ups (`--pattern`)
 
@@ -636,7 +734,8 @@ boilerplate to go to production.
 ### 9.1 Save Named Runner Profiles (`beam config`)
 
 Store reusable runner options in `~/.beam/config.yaml` (`0600` permissions
-enforced; dangerous code-loading options are blocked from config files):
+enforced; override path via `BEAM_CONFIG`, or bypass in CI via `--no-config` /
+`BEAM_NO_CONFIG=1`; dangerous code-loading options are blocked):
 
 ```sh
 beam config set --profile flink-prod runner FlinkRunner
@@ -707,8 +806,9 @@ beam package pipelines/daily_orders.yaml \
 # 2. Generate a production Apache Airflow / Cloud Composer DAG
 beam export-schedule pipelines/daily_orders.yaml \
   --orchestrator composer \
+  --project=my-gcp-project \
   --schedule "0 2 * * *" \
-  -p bucket=prod-landing > dags/daily_orders_dag.py
+  --to dags/daily_orders_dag.py
 ```
 
 ---
@@ -761,6 +861,25 @@ case $rc in
   *) echo "Pipeline or conservation failure (exit $rc)" ;;
 esac
 ```
+
+---
+
+## Troubleshooting & Common Error Playbook
+
+| Symptom / Exit Code | Root Cause | Fix |
+| :--- | :--- | :--- |
+| `exit 2`: `cannot pass both --dlq and --dedupe-dlq '<path>'` | Pipeline already sets `--dlq <URI>` | Pass boolean `--dedupe-dlq` (no path) alongside `--dlq <URI>` |
+| `--where "state != 'CA'"` dropped empty `state` rows | SQL 3-valued logic treats `NULL != 'CA'` as `UNKNOWN` | Write `--where "state IS NULL OR state != 'CA'"` |
+| `exit 2` pre-flight error on `--expect` after `--select` | `--expect` referenced a column dropped by `--select` | Keep the column in `--select` or filter earlier via `--where` |
+| `exit 2`: inline credentials rejected in `postgres://user:pass@...` | Secrets blocked in URIs and flags | Set `BEAM_POSTGRES_USER` / `BEAM_POSTGRES_PASSWORD` or `0600` `--from-opt-file` |
+| `exit 2`: output path already exists | Default `--if-exists fail` prevents overwrites | Pass `--if-exists replace` (atomic swap) or `--if-exists append` |
+| `exit 2`: `--to -` rejected | Raw rows on `stdout` collide with logs/JSON | Omit `--to` for sinkless local preview, or write a file and `beam inspect` |
+| `AttributeError: 'NoneType' ... 'time'` on local bounded `--trigger` | `early=every:10s` needs a streaming processing-time clock | Use `early=count:1` on local bounded files, or `--runner=PrismRunner` / `DataflowRunner` |
+| `SchemaDriftError` on large/remote JSONL past row 100 | Unseen JSON key appeared after initial sample | Pass `--dlq`, `--from-opt sample_rows=all`, or `--from-opt on_unknown_fields=ignore` |
+| `exit 4` on `--sql-engine duckdb` or `beam sql` | Missing optional `duckdb` or Java 11+ | Run `pip install duckdb`, or use `--sql-engine sqlite` / `--sql-engine python` |
+| `exit 6` on `beam diff` | Schema, key, or 1-ULP value drift detected | Inspect `outputs.differing_keys`; add `--atol 1e-6` only if float noise is expected |
+| `exit 8`: `CostLimitExceededError` | Source estimate exceeded `--max-bytes` | Narrow partition/glob filter or raise `--max-bytes` |
+| Private-IP Dataflow Flex job hangs on PyPI | Workers lack internet (`--no-use-public-ips`) | Package with `beam package ... --no-use-public-ips` |
 
 ---
 
