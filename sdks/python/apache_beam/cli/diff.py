@@ -903,7 +903,7 @@ def run_diff(
               f'({cap_limit:,} bytes)',
               estimated_bytes=comb_b,
               limit_bytes=cap_limit)
-        if l_b is not None and r_b is not None and comb_b <= 64 * 1024 * 1024:
+        if l_b is not None and r_b is not None and comb_b <= 256 * 1024 * 1024:
           def _load_fast_rows(ep_obj: uris.ParsedEndpoint) -> list[dict[str, Any]]:
             try:
               if ep_obj.kind == 'file' and ep_obj.format == 'json':

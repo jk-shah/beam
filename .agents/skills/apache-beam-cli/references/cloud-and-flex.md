@@ -1,385 +1,127 @@
-# Apache Beam CLI — Cloud, Flex Templates, Streams, and Production Boundaries
+# Streaming Operations, Kafka Tailing, Scheduling, Zero-Copy & Scoring (`beam`)
 
-This guide covers Zero-Docker Dataflow Flex Template packaging, offline validation, cloud execution, bounded stream tailing, and production scheduling boundaries with `beam`.
-
----
-
-## 1. Zero-Docker Dataflow Flex Template Packaging (`beam package`)
-
-`beam package` bundles Beam YAML or Python pipelines into Dataflow Flex Template specifications without requiring manual Dockerfile authoring or local container builds.
-
-### Canonical Flag Usage: `--to`
-Always specify the destination template spec with `--to`:
-```bash
-# Package Beam YAML pipeline into a Flex Template spec
-beam package pipeline.yaml \
-             --to gs://my-bucket/templates/orders.json \
-             --project=my-project \
-             --region=us-central1 \
-             --json
-```
-*(Note: `-o` and `--output` are accepted as aliases for `--to`, and `--sdk` is case-insensitive, e.g. `--sdk yaml` or `--sdk YAML`.)*
-
-### Jinja Parameter Extraction
-If your Beam YAML pipeline contains Jinja2 expressions (e.g. `{{ input_topic }}` or `{{ threshold | default(100) }}`), `beam package` automatically extracts them into the template's `metadata.parameters` schema with inferred types and defaults:
-```bash
-beam package streaming.yaml \
-             --to gs://my-bucket/templates/streaming.json \
-             --project=my-project \
-             --region=us-central1 \
-             --json
-```
-
-### Packaging Python Pipelines
-For Python pipelines, `beam package` introspects your pipeline's `PipelineOptions` via AST parsing, eliminating the need to maintain a separate `metadata.json`:
-```bash
-beam package main.py \
-             --to gs://my-bucket/templates/python_pipe.json \
-             --image gcr.io/my-project/beam-runner:latest \
-             --json
-```
+Operational runbook for Kafka-to-Iceberg streaming, live Kafka inspection (`beam tail`), environment-agnostic nightly scheduling (`cron` / K8s / Airflow / Composer), low-delay ML transaction scoring, and confirm-before-write guardrails in `apache-beam-cli-preview` `v0.2.0`.
 
 ---
 
-## 2. Offline Pipeline Validation (`beam check`)
+## 1. Kafka to Iceberg: Format, Commit Interval, SASL, & Day-2 Operations
 
-Validate Beam YAML pipeline structure, transform types, schemas, and provider dependencies offline before submission:
+### Configuring JSON vs. Avro Schema Registry, SASL, & Sub-Minute Commits
+- **Schema Registry format override**: Passing `?schema_registry=https://...` defaults `ReadFromKafka` to `AVRO`. For **JSON Schema** or plain JSON topics, add **`&format=json`** (or `--from-format json`).
+- **Commit interval (`triggering_frequency_seconds`)**: Streaming Iceberg sinks default to `60s` snapshot commits. Set `--to-opt triggering_frequency_seconds=30` (or `15`) to meet `<60s` freshness targets without excessive small files.
+- **Confluent / Broker SASL & TLS (`chmod 0600 kafka.opts`)**: Accepts YAML (`key: value`) or Java/Kafka `.properties` (`key=value`) syntax:
+  ```ini
+  security_protocol=SASL_SSL
+  sasl_mechanism=PLAIN
+  sasl_username=CLUSTER_API_KEY
+  sasl_password=CLUSTER_API_SECRET
+  ```
+- **Runner Choice (No Extra Cloud Platform Required)**: Run directly on an existing **`FlinkRunner`** (`--runner=FlinkRunner --flink_master=http://flink-jm:8081`), **`SparkRunner`**, single-node **`PrismRunner`**, or **`DataflowRunner`** on GCP:
+
 ```bash
-# Validate YAML syntax and transform schema offline
-beam check pipeline.yaml --portable --json
+beam pipe \
+  --from "kafka://pkc-xyz.confluent.cloud:9092/payments?schema_registry=https://psrc-xyz.confluent.cloud&format=json&consumer_group=payments-iceberg-v1&commit_offset_in_finalize=true&auto_offset_reset=earliest" \
+  --to "iceberg://lake.payments?catalog=rest&uri=https://catalog.internal&warehouse=s3://my-bkt/wh" \
+  --where "status = 'CAPTURED' AND amount > 0" \
+  --select "payment_id, sha256(user_id) AS user_hash, mask_email(email) AS email, mask_last4(card_number) AS card_masked, amount, event_ts" \
+  --to-opt partition_fields="day(event_ts)" \
+  --to-opt triggering_frequency_seconds=30 \
+  --dlq s3://my-bkt/dlq/payments/ --dlq-redact-fields email,card_number \
+  --from-opt-file kafka.opts \
+  --runner=FlinkRunner --flink_master=http://flink-jm:8081 --wait-timeout 30s --json
 ```
 
-### Static Warning for Untyped Python Expressions
-When using `language: python` inside `MapToFields` followed downstream by `WriteToParquet`, untyped string expressions risk runtime PyArrow schema conversion failures (`LogicalType` errors). `beam check` detects this pattern statically and outputs a warning:
-```
-warning: MapToFields has untyped Python expressions preceding WriteToParquet; consider adding output_type (or using language: sql / typed callables) to prevent Arrow schema conversion errors.
-```
-
-### Plan Graph Generation (`--plan`)
-Generate an execution plan graph and deterministic SHA-256 plan hash:
-```bash
-beam check pipeline.yaml --plan --json
-```
+### Delivery Guarantees, Monitoring, Restart, & Upgrade Runbook
+1. **Delivery Guarantees**: `commit_offset_in_finalize=true` commits Kafka offsets only after runner checkpoints complete, and `WriteToIceberg` commits atomic Iceberg v2 manifests every `triggering_frequency_seconds` (at-least-once across worker restarts; add `--dedupe-by payment_id --dedupe-window 15m` or `--cdc --primary-key payment_id` for idempotent deduplication).
+2. **Monitoring**: `--wait-timeout 30s --json` writes `~/.beam/jobs/<job_id>.json` and returns `exit_code: 7` (`detached: true`). Poll status and counters (`rows_read`, `rows_written`, `dlq_rows`) via `beam wait <JOB_ID> --timeout 10s --json`, and monitor Kafka `payments-iceberg-v1` consumer lag + DLQ prefix object count.
+3. **Graceful Drain & Restart**: Confirm with the user, then run `beam cancel <JOB_ID> --drain --json` to stop Kafka fetches, commit the final in-flight Iceberg snapshot, and finalize offsets. Relaunching the same command with `consumer_group=payments-iceberg-v1` resumes from the last committed offset.
+4. **Pipeline Upgrade**: Validate schema and YAML changes pre-flight with `beam check` and `beam schema`. On **Dataflow**, pass `--update --job_name=payments-iceberg` (`--transform_name_mapping` if step names changed); on **Flink**, trigger `flink stop --savepointPath s3://my-bkt/savepoints <FLINK_JOB_ID>` and relaunch with `--runner=FlinkRunner --savepoint_path=...`.
 
 ---
 
-## 3. Cloud Execution and Job Lifecycle (`beam run`, `beam wait`, `beam cancel`)
+## 2. Nightly JSON to Partitioned Iceberg (Cron, K8s, Airflow, or GCP Flex)
 
-### Submitting Pipelines to Dataflow
-Execute pipelines directly on Dataflow by specifying `--runner=DataflowRunner`:
+`--to-opt partition_fields=dt` (or `day(event_ts)`, `month(ts)`, `year(ts)`, `hour(ts)`, `truncate(col, N)`) writes Hive-partitioned Parquet files and Iceberg v2 `partition-specs`. Subsequent `--if-exists append` runs automatically inherit the existing table's partition spec.
+
+### Option A: Environment-Agnostic Cron / Kubernetes `CronJob` / Airflow `BashOperator`
+Because `beam pipe ... --json` exits `0` on verified completion, `2` on pre-flight schema mismatch, `8` on scan-cap overrun, and `1` on runtime/conservation failure, any scheduler can invoke it directly without Cloud Composer or Cloud Scheduler:
+
 ```bash
-beam run pipeline.yaml \
-         --runner=DataflowRunner \
-         --project=my-project \
-         --region=us-central1 \
-         --temp_location=gs://my-bucket/tmp \
-         --wait-timeout=30s \
-         --json
+#!/usr/bin/env bash
+set -euo pipefail
+DT="${1:-$(date -u -d 'yesterday' +%F)}"
+beam pipe \
+  --from "s3://my-bkt/raw/events/${DT}/*.jsonl" \
+  --to "iceberg://lake.events?warehouse=s3://my-bkt/wh" \
+  --check-schema --max-bytes 50GB \
+  --select "*, '${DT}' AS dt" --to-opt partition_fields=dt \
+  --if-exists append \
+  --dlq "s3://my-bkt/dlq/events/${DT}/bad.jsonl" \
+  --assert-counts --json
 ```
-If `--wait-timeout` expires while the job is still running, the CLI outputs `detached: true` with exit code `7`, tracking the job ID in `~/.beam/jobs/<job_id>.json`.
 
-### Monitoring Detached Jobs (`beam wait`)
-Poll the status of a detached Dataflow job:
+### Option B: Google Cloud Dataflow Flex Template + Composer / Cloud Scheduler
+When running on Google Cloud:
 ```bash
-beam wait <JOB_ID> --timeout=5m --json
-```
-
-### Canceling or Draining Jobs (`beam cancel`)
-Safely stop running streaming or batch jobs:
-```bash
-# Gracefully drain a streaming Dataflow job
-beam cancel <JOB_ID> --drain --json
-
-# Immediately cancel a job
-beam cancel <JOB_ID> --json
+beam pipe --from "gs://my-bkt/raw/events/{{ ds }}/*.jsonl" \
+          --to "iceberg://lake.events?warehouse=gs://my-bkt/wh" \
+          --select "*, '{{ ds }}' AS dt" --to-opt partition_fields=dt \
+          --if-exists append --dlq "gs://my-bkt/dlq/events/{{ ds }}/" \
+          --emit-yaml > nightly_events.yaml
+beam package nightly_events.yaml --to gs://my-bkt/templates/nightly_events.json --json
+beam export-schedule nightly_events.yaml --template-gcs-path gs://my-bkt/templates/nightly_events.json \
+     --orchestrator composer --schedule "0 2 * * *" --to dags/nightly_events_dag.py --json
 ```
 
 ---
 
-## 4. Stream Peeking and Live Tailing (`beam tail`)
+## 3. Live Kafka Inspection & Schema Validation (`beam tail`)
 
-AI agents executing commands synchronously should **always** use bounded inspection rather than unbounded streaming tailing.
+`beam tail` inspects live `kafka://`, `pubsub://`, `delta://`, `iceberg://`, and local/`gs://` files in Python (`pip install confluent-kafka`) with zero JVM startup:
 
-### Bounded Stream Peeking (Recommended for Agents)
-Peek at the next $N$ messages or wait up to a timeout before returning cleanly:
-```bash
-# Peek up to 10 messages or wait at most 5 seconds
-beam tail pubsub://projects/my-project/subscriptions/events-sub \
-          -n 10 --duration 5s --json
-```
-
-### Kafka Stream Tailing (`beam tail kafka://...`)
-`beam tail` connects to Apache Kafka topics with built-in guardrails designed specifically for operational debugging and agents:
-- **Ephemeral Non-Committing Consumer Groups**: `beam tail` connects with an ephemeral consumer group (`beam-tail-<uuid>`) and explicitly sets `enable.auto.commit=false`. It reads messages without committing offsets, preventing any disruption to production consumer groups or consumer lag metrics.
-- **Payload Decoding**: Automatically decodes UTF-8 text and JSON lines. When working with Kafka Schema Registry (Avro or Protobuf payloads), pass the registry URL via `--from-opt schema_registry_url=http://registry:8081` or ingest pre-decoded topics.
-- **Authentication**: Supports standard Kafka client security properties:
-  - `--from-opt security_protocol=SASL_SSL`
-  - `--from-opt sasl_mechanism=PLAIN` (or `SCRAM-SHA-512`)
-  - Standard environment variables: `BEAM_KAFKA_BOOTSTRAP_SERVERS`, `BEAM_KAFKA_SASL_USERNAME`, `BEAM_KAFKA_SASL_PASSWORD`
-  - *Never pass credentials in the URI string (rejected with exit code 2).*
+- **Zero-Group Partition Assign (`?no_group=true`) vs. Ephemeral Non-Committing Group**:
+  - Pass **`?no_group=true`** (or `--from-opt no_group=true`) to read partitions directly via `consumer.assign([TopicPartition(...)])` without sending `JoinGroup` or registering any consumer group on the broker (works even when broker `Group` ACLs are restricted).
+  - By default, uses `'beam-tail-<uuid>'` with `'enable.auto.commit': False` (never commits offsets).
+- **Confluent Wire Header (`schema_id`), Avro & Live JSON Schema Validation**:
+  - Whenever a message carries Confluent's 5-byte wire header (`0x00` + big-endian uint32 ID), `beam tail` surfaces **`"schema_id": <int>`** on the returned record.
+  - With `?schema_registry=https://...` (and optional Basic Auth via `BEAM_SCHEMA_REGISTRY_USER_INFO="KEY:SECRET"` or `schema_registry_user_info` in `0600` `kafka.opts`), `beam tail` fetches `/schemas/ids/<id>`:
+    - **`AVRO` subjects**: decodes binary Avro via `fastavro` and sets `"schema_valid": true`.
+    - **`JSON` subjects**: parses UTF-8 JSON and validates each live message against the subject's JSON Schema via `jsonschema`, setting **`"schema_valid": true|false`** and `"schema_error"` on contract violations.
+- **Raw Wire Hex Inspection (`?raw_bytes=true` or `--format raw`)**: Adds `"size_bytes"` and `"raw_hex"` (first 256 raw wire bytes, including magic byte and schema ID) alongside decoded `"payload"`.
+- **Interactive TUI (`-i`) + `--json`**: Renders rolling 5s `msg/s` throughput and colored fields to `stderr` while keeping `stdout` a pure RFC-8259 JSON envelope.
 
 ```bash
-# Bounded tail of a secure Kafka topic
-beam tail "kafka://broker.example.com:9092/user-activity" \
-          -n 5 --duration 5s \
-          --from-opt security_protocol=SASL_SSL \
-          --from-opt sasl_mechanism=SCRAM-SHA-512 \
-          --json
-```
-
-### Interactive Stream TUI (`beam tail -i` / `--interactive`)
-For human developers and live terminal operators, `beam tail` offers an interactive terminal TUI experience:
-- **Rolling Throughput**: Displays live rolling message rates (`msg/s`) calculated over a 5-second moving window.
-- **Color-Coded Fields & Timestamps**: Highlights timestamps in green, identifiers in cyan, and numerical metrics in yellow for instant readability.
-- **Exit Summary Card**: Upon exiting (or pressing Ctrl-C), renders a summary card with total events consumed, run duration, and average throughput.
-- **Structured JSON Preservation**: When `--json` is supplied alongside `-i`, the command preserves standard JSON envelope output on `stdout` while displaying interactive formatting on `stderr`, preserving automation contracts.
-
-```bash
-# Launch interactive terminal TUI on a live stream
-beam tail kafka://broker:9092/events -f -i
+# Zero-group peek showing schema_id, live Schema Registry validation, and raw wire hex
+beam tail "kafka://broker:9092/payments?schema_registry=https://sr.internal:8081&no_group=true&raw_bytes=true&auto_offset_reset=latest" \
+  -n 10 --duration 5s --from-opt-file kafka.opts --json
 ```
 
 ---
 
-## 5. Production Scheduling & Operational Boundaries (`beam export-schedule`)
+## 4. Low-Delay Streaming Transaction Scoring (`--enrich` + `--infer`)
 
-`beam` is a single-pipeline execution CLI and driver; it is **not** an orchestrator daemon. Instead of running a local cron process, `beam export-schedule` compiles pipelines directly into enterprise orchestration deployment definitions:
-
-### Export to Google Cloud Composer (Apache Airflow)
-Generates an idiomatic, PEP 8 Airflow DAG utilizing `DataflowStartFlexTemplateOperator`:
-```bash
-beam export-schedule pipeline.yaml \
-             --schedule "0 2 * * *" \
-             --orchestrator composer \
-             --project=my-project \
-             --region=us-central1 \
-             --template-gcs-path=gs://my-bucket/templates/pipeline.json \
-             --to dags/daily_orders_dag.py \
-             --json
-```
-
-### Export to Serverless Cloud Scheduler
-Generates a bash setup script creating a Cloud Scheduler HTTP trigger targeting Dataflow's `flexTemplates:launch` REST endpoint with OAuth authentication:
-```bash
-beam export-schedule pipeline.yaml \
-             --schedule "0 2 * * *" \
-             --orchestrator cloud-scheduler \
-             --project=my-project \
-             --region=us-central1 \
-             --template-gcs-path=gs://my-bucket/templates/pipeline.json \
-             --service-account-email=scheduler-sa@my-project.iam.gserviceaccount.com \
-             --to deploy_scheduler.sh \
-             --json
-```
-
-### Progress Markers & Streaming Checkpointing
-`beam` maintains no local state or checkpoint databases on the CLI client. 
-- In streaming pipelines, progress markers, committed offsets, and watermarks are managed entirely within the target runner (e.g. Google Cloud Dataflow managed state backend or Kafka broker consumer groups when run on Dataflow).
-- In batch incremental loads and CDC backfills, state tracking is achieved deterministically through version-pinned watermarks (`?version=V0`, `?start_version=...`) as detailed in [references/sql-and-cdc.md](sql-and-cdc.md).
-
----
-
-## 6. Guardrails & Confirmation for Autonomous Agents
-
-Autonomous agents interacting with `beam` must uphold strict operational guardrails:
-1. **Confirm Paid Cloud Compute**: Always prompt the user for confirmation before submitting jobs with `--runner=DataflowRunner`, as this provisions paid Google Cloud Compute Engine worker VMs.
-2. **Confirm Destructive Overwrites**: Always obtain user confirmation before specifying `--if-exists replace` or running operations that overwrite existing tables or storage paths.
-3. **Confirm Job Termination**: Always confirm before canceling or draining active production jobs via `beam cancel <JOB_ID>`.
-4. **Pre-Flight Cost Guard**: When running large ad-hoc scans on cloud storage or BigQuery, always include `--max-bytes <BUDGET>` (e.g., `--max-bytes 10GB`) to halt execution before incurring unexpected scan costs (exits with code 8 `EXIT_COST_LIMIT`).
-
----
-
-## 7. Data Quality Expectations & Tagged DLQ Routing (`--expect`)
-
-Declare schema-aware data quality assertions directly on pipeline flows:
-```bash
-beam pipe --from gs://my-bucket/raw/transactions.csv \
-          --to bigquery://my-project.analytics.transactions \
-          --expect "positive_amount: amount > 0.0" \
-          --expect "valid_currency: currency in ['USD', 'EUR', 'GBP']" \
-          --expect "customer_id is not None -> fail" \
-          --on-violation dlq \
-          --dlq gs://my-bucket/dlq/transactions.jsonl \
-          --assert-counts \
-          --runner=DataflowRunner \
-          --project=my-project \
-          --json
-```
-
-### Violation Actions
-- `dlq` (default): Routes invalid records to `--dlq` sink with full error metadata (`error_type`, `error`, `raw_payload`).
-- `drop`: Silently filters out invalid records while incrementing audit counters.
-- `fail`: Halts pipeline execution immediately upon detecting a violation (raising `ExpectationViolationError`).
-
-### Live Google Cloud Dataflow Telemetry
-When executed on `DataflowRunner`, each expectation rule automatically publishes custom Beam metrics (`Metrics.counter` in `beam_cli` namespace):
-- `expectation_passed_{rule}`
-- `expectation_quarantined_{rule}`
-- `expectation_dropped_{rule}`
-- `expectation_failed_{rule}`
-These surface as live real-time time-series charts in the Google Cloud Dataflow Monitoring Console UI.
-
----
-
-## 8. Apache Iceberg Catalog Integration Hierarchy
-
-When writing to or reading from Apache Iceberg lakehouses (`iceberg://`), the CLI resolves table locations and registers snapshots using a strict three-tier catalog hierarchy:
-
-### Tier 1: BigQuery Managed Iceberg API (Primary)
-Direct integration with BigQuery managed tables storing data in Apache Iceberg format:
-- **API Endpoint**: `https://bigquery.googleapis.com/bigquery/v2/projects/{project}/datasets/{dataset}/tables/{table}`
-- **Storage Mapping**: Tables are resolved and registered via `bigLakeConfiguration.storageUri` with `tableFormat: "ICEBERG"` and `fileFormat: "PARQUET"`.
-- **Authentication**: Seamlessly authenticated via Google Application Default Credentials (ADC) or active environment tokens.
-- **Auto-Resolution**: 3-part identifiers (`project.dataset.table`) automatically query the BigQuery API first. If the table already exists, updates are pushed via `PATCH /tables/{tableId}`; otherwise, it is created via `POST /tables`.
+Combine in-VPC `--enrich` (`bigtable:` / `vertexai:` / `feast:` with TLS `rediss://` read-through cache) and `--infer` micro-batching (`min_batch_size=1,max_batch_duration_ms=10`) on `FlinkRunner` or `DataflowRunner`:
+- `max_batch_duration_ms=10` caps micro-batch buffering at `10ms` (`0.01s`) under low QPS while batching up to `max_batch_size` under spikes.
+- If a batch fails inference, $O(\log N)$ in-worker binary bisection isolates poison-pill transactions to `--dlq` (`--dlq-redact-fields`) without dropping healthy peers or reloading local `@<40-hex-sha>` `safetensors` weights.
 
 ```bash
-# Register or write directly to BigQuery managed Iceberg table
-beam pipe --from gs://my-bucket/clean_orders.parquet \
-          --to "iceberg://my-proj.analytics.orders?catalog=bigquery" \
-          --json
-```
-
-### Tier 2: Google Cloud Lakehouse / BigLake REST Catalog (Secondary)
-When an enterprise Iceberg catalog is configured in BigLake:
-- **API Endpoint**: `https://biglake.googleapis.com/iceberg/v1/restcatalog`
-- **Catalog Prefix**: Resolves tables under `/projects/{project}/catalogs/{catalog}/namespaces/{namespace}/tables/{table}`.
-- **Registration**: Publishes table metadata locations to `/namespaces/{namespace}/register` with GCP OAuth 2.0 bearer tokens.
-
-```bash
-# Register to BigLake REST Catalog
-beam pipe --from delta://gs://my-lakehouse/delta/events \
-          --to "iceberg://analytics.events?warehouse=gs://my-lakehouse/wh" \
-          --to-opt catalog_type=biglake \
-          --to-opt uri=https://biglake.googleapis.com/iceberg/v1/restcatalog \
-          --zero-copy --json
-```
-
-### Tier 3: Generic Iceberg REST Catalog (Tertiary)
-Portable standard Iceberg REST Catalog for open lakehouse deployments:
-- **API Endpoint**: Standard Iceberg REST OpenAPI `/v1/namespaces/{namespace}/tables/{table}`.
-- **Configuration**: Explicitly configured via `--to-opt catalog_type=rest` and `--to-opt uri=https://catalog.example.com/v1`.
-
----
-
-## 9. Partition-Aware Zero-Copy Lakehouse Bridge (`--zero-copy`)
-
-`beam pipe --zero-copy` translates Delta Lake tables into Apache Iceberg v2 tables in-place without copying or re-encoding underlying Parquet data files (`bytes_copied: 0`):
-
-### Supported Capabilities
-1. **Partitioned & Unpartitioned Support**: Handles both flat tables and Hive-style partitioned tables (e.g. `date=2026-11-10/region=US/part-00000.parquet`).
-2. **Dynamic Manifest Schema Generation**: Dynamically inspects Delta partition columns, maps them into Iceberg schema field types, and generates dynamic Avro manifest schemas (`r102`) embedding typed partition records (`r102_partition`).
-3. **Iceberg v2 Metadata Generation**: Generates compliant `metadata.json` with `format-version: 2`, `partition-specs`, and `default-spec-id`.
-4. **Transparent Partition Column Reconstruction**: Reconstructs partition columns from manifest metadata during read operations across:
-   - In-process local fast reader (`read_iceberg_rows_local`)
-   - Portable Beam runner (`PrismRunner`)
-   - Google Cloud Dataflow (`DataflowRunner`)
-
-```bash
-# Zero-copy conversion of partitioned Delta table with BigQuery managed Iceberg catalog registration
-beam pipe --from delta://gs://my-lakehouse/orders_delta \
-          --to "iceberg://my-proj.analytics.orders_iceberg?catalog=bigquery" \
-          --zero-copy \
-          --verify --verify-key order_id \
-          --json
+beam pipe \
+  --from "kafka://broker:9092/transactions?format=json&auto_offset_reset=latest" \
+  --to "kafka://broker:9092/scored-transactions?format=json" \
+  --enrich "bigtable:project=my-proj,instance=risk-bt,table=velocity,key=card_id,columns=[stats:txn_1h:int,stats:spend_24h:float],redis=rediss://10.0.0.5:6379,on_miss=null" \
+  --infer "vertexai:endpoint=projects/my-proj/locations/us-central1/endpoints/123,min_batch_size=1,max_batch_size=16,max_batch_duration_ms=10,rate_limit=2000" \
+  --infer-fields "amount, txn_1h, spend_24h" --infer-flatten \
+  --dlq gs://my-bkt/dlq/txn_scoring/ --dlq-redact-fields card_id \
+  --from-opt-file kafka.opts --runner=DataflowRunner --project=my-proj --region=us-central1 --json
 ```
 
 ---
 
-## 10. Pre-Flight Schema Contract & Compatibility Guard (`beam schema diff`)
+## 5. Confirm-Before-Write Checklist
 
-Detect schema regressions, dropped columns, and incompatible type coercions **before** launching distributed compute on Dataflow:
-```bash
-# Validate that source Parquet schema safely maps to target BigQuery table
-beam schema diff gs://my-bucket/raw/orders_v2.parquet \
-                 bigquery://my-proj.analytics.orders \
-                 --mode=backward \
-                 --json
-```
-
-### Compatibility Modes
-- `BACKWARD` (default): Source can be safely written to target. Target may contain additional nullable columns. Source cannot drop non-nullable target columns or narrow column data types.
-- `FORWARD`: Readers expecting older schemas can read new source datasets without failure.
-- `FULL`: Enforces strict bidirectional compatibility across both source and target.
-
-### Detected Violations & Risk Classification
-- **`DROPPED_REQUIRED_COLUMN`**: Target schema requires a non-null column that the source does not provide (Exits with code `2`).
-- **`TYPE_NARROWING_ERROR`**: Unsafe type coercion that causes fractional precision loss, integer overflow, or runtime parse errors (e.g. `STRING` $\to$ `INT64`, `FLOAT64` $\to$ `INT32`).
-- **`NULLABILITY_MISMATCH`**: Source column allows `NULL`, but target table constraint is `REQUIRED`.
-- **`SAFE_TYPE_WIDENING`**: Safe type expansions (e.g. `INT32` $\to$ `INT64`, `FLOAT32` $\to$ `FLOAT64`) are logged as informational warnings under standard execution, or flagged as violations under `--strict`.
-
-### Actionable Remediation Hints
-When contract violations are detected, `beam schema diff` outputs concrete command remediation hints:
-```json
-{
-  "action": "explicit_type_cast",
-  "field": "customer_id",
-  "command_hint": "--select \"CAST(customer_id AS INT64) AS customer_id, *\"",
-  "description": "Explicitly cast column 'customer_id' to INT64 before writing."
-}
-```
-
----
-
-## 11. Turnkey Stream-to-Lakehouse Pipeline Declarations (Kafka $\to$ Iceberg/BigLake)
-
-`beam pipe` enables one-line continuous stream ingestion from Apache Kafka into Apache Iceberg v2 and Google Cloud BigLake REST catalogs with automatic schema resolution and runner tuning:
-
-```bash
-beam pipe --from "kafka://broker:9092/orders_topic?schema_registry=http://registry:8081&consumer_group=lakehouse_sync" \
-          --to "iceberg://biglake.prod_analytics.events?warehouse=gs://my-bkt/wh" \
-          --runner=DataflowRunner \
-          --project=my-project \
-          --region=us-central1 \
-          --json
-```
-
-### Supported Streaming Invariants & Auto-Tuning
-1. **Schema Registry Integration**:
-   - Parses `schema_registry`, `schema_registry_url`, `confluent_schema_registry_url`, and `schema_registry_subject`.
-   - Defaults Kafka format to `'AVRO'` when Schema Registry is specified unless explicit format is provided.
-2. **Consumer Group & Offset Guarantees**:
-   - `consumer_group` / `group_id` wired directly into Kafka consumer configuration.
-   - `auto_offset_reset` (`'earliest'` or `'latest'`) ensures deterministic replay or real-time ingestion.
-   - `timestamp_policy` (`'CreateTime'` or `'LogAppendTime'`) controls event-time extraction.
-3. **Dataflow Streaming Engine Auto-Injection**:
-   - For unbounded streaming sources (Kafka, Pub/Sub) targeting `DataflowRunner`, `beam` automatically injects `--streaming` and `--enable_streaming_engine`.
-   - Emits top-level `options: {'streaming': True}` into generated Beam YAML pipelines.
-4. **Triggering Frequency Derivation**:
-   - For Iceberg sinks, automatically derives commit frequency (`triggering_frequency_seconds`) from `--window` window period/size (e.g. `--window fixed:60s` $\to$ 60s) or defaults to 60s for unbounded streams.
-5. **BigLake REST Catalog Identification**:
-   - Detects `biglake.` and `bigquery.` prefixes on Iceberg table identifiers, automatically configuring Google Cloud BigLake REST Catalog (`https://biglake.googleapis.com/iceberg/v1/restcatalog`) with Google OAuth 2.0 authentication.
-
----
-
-## 12. Zero-Copy Lakehouse Catalog Synchronization (`beam catalog sync`)
-
-`beam catalog sync` enables sub-second (<200ms) metadata registration of Delta Lake tables, Apache Iceberg snapshots, or partitioned Parquet directory trees directly into modern lakehouse catalogs without copying underlying Parquet files:
-
-### Supported Source & Target Formats
-- **Sources**: Delta Lake directories (`delta://...` or directories containing `_delta_log`), Apache Iceberg tables (`iceberg://...` or directories with `metadata/`), or Parquet directory partition structures (`path/to/table/` with `**/*.parquet` or Hive-style partitions `col=val/`).
-- **Targets**:
-  1. **Google Cloud Lakehouse / BigLake REST Catalog**: `https://biglake.googleapis.com/iceberg/v1/restcatalog`.
-  2. **BigQuery Managed Iceberg Tables**: `iceberg://project.dataset.table?catalog=bigquery`.
-  3. **Generic Apache Iceberg REST Catalogs**: `iceberg://namespace.table?catalog=rest&uri=...`.
-
-### Command Usage & Flags
-- `--from <URI>`: Source directory or table URI.
-- `--to <URI>`: Target catalog destination URI.
-- `--table-name <NAME>`: Explicit table name (defaults to source directory name).
-- `--partition-col <COL>`: Explicit partition column name when syncing partitioned Parquet directories.
-- `--dry-run`: Pre-flight inspection reporting discovered files, partition columns, and candidate manifests without catalog modification.
-- `--format <delta|iceberg|parquet>`: Explicit format override.
-
-```bash
-# Sync Hive-partitioned Parquet files into BigLake REST catalog
-beam catalog sync --from "gs://my-bucket/lakehouse/transactions" \
-                  --to "iceberg://biglake.prod_analytics.transactions?warehouse=gs://my-bucket/wh" \
-                  --table-name transactions \
-                  --json
-
-# Pre-flight dry-run inspection of Delta Lake to BigQuery Managed Iceberg sync
-beam catalog sync --from "delta://gs://my-bucket/delta/orders" \
-                  --to "iceberg://prod-proj.analytics.orders?catalog=bigquery" \
-                  --dry-run \
-                  --json
-```
+Always preview (`--dry-run` / `--emit-yaml` / `beam inspect`) and obtain explicit human confirmation before running:
+1. **`beam catalog sync`** (without `--dry-run`) — updates target Iceberg catalog table pointers; run `beam catalog sync --dry-run` first.
+2. **`beam pipe --zero-copy`** — commits a new Iceberg snapshot referencing existing Parquet files (supports both partitioned and unpartitioned `delta://`, `iceberg://`, and Hive Parquet sources).
+3. **`--if-exists replace`** — overwrites destination files, BigQuery tables (`WRITE_TRUNCATE`), or Iceberg snapshots.
+4. **Remote cluster submission (`--runner=DataflowRunner`, `FlinkRunner`, `SparkRunner`)** — launches distributed worker compute.
+5. **`beam cancel <JOB_ID>`** — cancels or `--drain`s an active remote job.

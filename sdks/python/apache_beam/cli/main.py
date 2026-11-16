@@ -443,6 +443,7 @@ _CLI_ONE_FLAGS = {
         '--location',
         '--region',
         '--template-gcs-path',
+        '--template-spec',
         '--job-name',
         '--dag-id',
         '--service-account-email',
@@ -2245,6 +2246,8 @@ def _build_parser():
       help='GCP region/location (default: us-central1)')
   sched_p.add_argument(
       '--template-gcs-path',
+      '--template-spec',
+      dest='template_gcs_path',
       metavar='GCS_URI',
       help='GCS path to Flex Template JSON spec (defaults to gs://<project>-templates/<name>.json)')
   sched_p.add_argument(
@@ -2766,7 +2769,8 @@ def _tail(args, extra_args, *, json_session, t0: float) -> int:
       args.duration if args.duration is not None else (None if follow else '5s')
   )
 
-  interactive = bool(getattr(args, 'interactive', False) or (
+  explicit_interactive = bool(getattr(args, 'interactive', False))
+  interactive = bool(explicit_interactive or (
       hasattr(sys.stdout, 'isatty')
       and sys.stdout.isatty()
       and not json_session.enabled
@@ -2776,7 +2780,9 @@ def _tail(args, extra_args, *, json_session, t0: float) -> int:
   on_record = None
   tail_formatter = None
   if interactive:
-    tail_formatter = tail.InteractiveTailFormatter(args.uri, follow=follow)
+    tui_stream = sys.stderr if json_session.enabled else sys.stdout
+    tail_formatter = tail.InteractiveTailFormatter(
+        args.uri, follow=follow, stream=tui_stream)
     tail_formatter.render_start_banner()
     if follow:
       on_record = tail_formatter.on_stream_record
@@ -2826,6 +2832,12 @@ def _tail(args, extra_args, *, json_session, t0: float) -> int:
   interrupted = bool(info.get('interrupted', False))
   rc = EXIT_INTERRUPTED if interrupted else EXIT_OK
   if json_session.enabled:
+    if interactive and tail_formatter is not None:
+      if not follow:
+        rows = (untrusted or {}).get('rows', ())
+        for idx, r in enumerate(rows, 1):
+          print(tail_formatter.format_record(r, idx), file=sys.stderr, flush=True)
+      tail_formatter.render_exit_summary(interrupted=interrupted)
     json_session.emit(
         output.build_envelope(
             ok=not interrupted,
@@ -4055,10 +4067,10 @@ def _pipe_impl(
         getattr(args, 'post_where', None) or args.cdc or args.zero_copy or
         args.window or has_b23_flags or getattr(args, 'dedupe_by', None) or
         getattr(args, 'enrich_specs', None) or
-        getattr(args, 'infer_specs', None) or getattr(args, 'expect', None)):
+        getattr(args, 'infer_specs', None)):
       raise _CliError(
           '--sql cannot be combined with --pre-select, --enrich, --infer, '
-          '--post-where, --window, --allowed-lateness, --trigger, --expect, '
+          '--post-where, --window, --allowed-lateness, --trigger, '
           '--cdc, --dedupe-by, or --zero-copy; '
           'express those stages inside --sql (or omit --sql)',
           EXIT_USAGE)
@@ -4143,7 +4155,10 @@ def _pipe_impl(
           prefer_python_lowering=prefer_py_sql,
           strict_python_lowering=strict_py_sql,
           pre_where=args.where,
-          post_select=args.select)
+          post_select=args.select,
+          expect=getattr(args, 'expect', None),
+          on_violation=getattr(args, 'on_violation', 'dlq'),
+          drop_bad=bool(getattr(args, 'drop_bad', False)))
     except (uris.UriError, pipe_sql.SqlPipeError) as e:
       raise _CliError(str(e), EXIT_USAGE) from None
 
@@ -4362,18 +4377,24 @@ def _pipe_impl(
       # --if-exists replace: the inputs (possibly the output itself, for an
       # in-place append) are read first; stale files go after the write.
 
+    sql_exp_metrics: dict[str, int] = {}
     try:
       sql_warnings: list[str] = []
       out_cols, out_rows, dlq_recs, total_read = pipe_sql.run_in_memory_sql(
           named_sources,
           args.sql,
           default_project=default_proj,
-          enable_dlq=bool(dlq_ep is not None or getattr(args, 'drop_bad', False)),
+          enable_dlq=bool(
+              dlq_ep is not None or getattr(args, 'drop_bad', False)),
           dlq_redact_fields=getattr(args, 'dlq_redact_fields', None),
           engine=args.sql_engine,
           warnings=sql_warnings,
           pre_where=args.where,
-          post_select=args.select)
+          post_select=args.select,
+          expect=getattr(args, 'expect', None),
+          on_violation=getattr(args, 'on_violation', 'dlq'),
+          drop_bad=bool(getattr(args, 'drop_bad', False)),
+          expect_metrics_out=sql_exp_metrics)
       written_sql: list[str] = []
       dlq_written: list[str] = []
       staged_sql_pairs: list[tuple[str, str]] = []
@@ -4384,22 +4405,71 @@ def _pipe_impl(
               '://' not in sink_prefix) else contextlib.nullcontext())
       try:
         sink_sql_pair: tuple[str, str] | None = None
+        remote_sink_uri: str | None = None
         dlq_sql_pair: tuple[str, str] | None = None
         with append_cm:
           if sink_ep is not None:
-            if '://' in (sink_prefix or ''):
-              raise _CliError(
-                  f'remote sink {args.sink!r} with --sql requires '
-                  '--runner=DataflowRunner or a local destination path',
-                  EXIT_USAGE)
-            sink_sql_pair = pipe_sql.stage_rows_to_local_file(
-                out_cols,
-                out_rows,
-                sink_ep,
-                if_exists=args.if_exists,
-                warnings=sql_warnings,
-                tag='sink')
-            staged_sql_pairs.append(sink_sql_pair)
+            if '://' in (sink_prefix or '') and not str(
+                sink_prefix).lower().startswith('file://'):
+              if args.if_exists == 'append':
+                raise _CliError(
+                    f'--if-exists append on remote object {sink_prefix!r} '
+                    'requires a table sink or --if-exists replace',
+                    EXIT_USAGE)
+              from apache_beam.io.filesystems import FileSystems
+              from apache_beam.options.pipeline_options import PipelineOptions
+              FileSystems.set_options(PipelineOptions(resolved_args))
+              if args.if_exists == 'fail':
+                existing_m = FileSystems.match([sink_prefix])
+                if existing_m and existing_m[0].metadata_list:
+                  raise _format_existing_output_error(
+                      sink_prefix,
+                      [md.path for md in existing_m[0].metadata_list])
+              ext_rem = (
+                  os.path.splitext(sink_prefix)[1] or f'.{sink_ep.format}')
+              fd_rem, tmp_rem_target = tempfile.mkstemp(
+                  prefix='.beam_sql_remote.', suffix=ext_rem)
+              os.close(fd_rem)
+              try:
+                os.unlink(tmp_rem_target)
+              except OSError:
+                pass
+              local_proxy_ep = uris.parse_endpoint(
+                  tmp_rem_target,
+                  is_read=False,
+                  explicit_format=sink_ep.format,
+                  options=dict(sink_ep.config))
+              rem_stage_pair = pipe_sql.stage_rows_to_local_file(
+                  out_cols,
+                  out_rows,
+                  local_proxy_ep,
+                  if_exists='replace',
+                  warnings=sql_warnings,
+                  tag='sink')
+              staged_sql_pairs.append(rem_stage_pair)
+              with open(rem_stage_pair[0], 'rb') as rf:
+                with FileSystems.create(sink_prefix) as wf:
+                  shutil.copyfileobj(rf, wf, length=1024 * 1024)
+              remote_sink_uri = sink_prefix
+            else:
+              local_target = (
+                  urllib.parse.urlsplit(sink_prefix).path
+                  if str(sink_prefix).lower().startswith('file://') else None)
+              eff_sink_ep = (
+                  uris.parse_endpoint(
+                      local_target,
+                      is_read=False,
+                      explicit_format=sink_ep.format,
+                      options=dict(sink_ep.config))
+                  if local_target else sink_ep)
+              sink_sql_pair = pipe_sql.stage_rows_to_local_file(
+                  out_cols,
+                  out_rows,
+                  eff_sink_ep,
+                  if_exists=args.if_exists,
+                  warnings=sql_warnings,
+                  tag='sink')
+              staged_sql_pairs.append(sink_sql_pair)
           if dlq_ep is not None:
             dlq_sql_pair = pipe_sql.stage_rows_to_local_file(
                 ['step', 'error_type', 'error', 'raw_payload'],
@@ -4427,7 +4497,9 @@ def _pipe_impl(
               os.unlink(tmp_p)
             except OSError:
               pass
-      if sink_sql_pair is not None:
+      if remote_sink_uri is not None:
+        written_sql = [remote_sink_uri]
+      elif sink_sql_pair is not None:
         written_sql = [sink_sql_pair[1]]
         if args.if_exists == 'replace' and sink_prefix:
           _remove_existing_output_for_replace(sink_prefix, keep=written_sql)
@@ -4455,12 +4527,14 @@ def _pipe_impl(
     sql_filtered_out = (
         max(0, int(total_read) - int(len(out_rows)) - eff_dlq_count)
         if (len(named_sources) == 1 and not sql_changes_cardinality) else 0)
-    sql_metrics = {
+    sql_metrics: dict[str, Any] = {
         'rows_read': int(total_read),
         'rows_written': int(len(out_rows)),
         'rows_filtered_out': int(sql_filtered_out),
         'dlq_rows': eff_dlq_count,
     }
+    if sql_exp_metrics:
+      sql_metrics.update(sql_exp_metrics)
     if args.assert_counts:
       err_sql_cnt = jobs.check_assert_counts(sql_metrics)
       if err_sql_cnt:

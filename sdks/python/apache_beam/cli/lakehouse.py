@@ -2878,6 +2878,11 @@ def sync_lakehouse_catalog(
       raw_files = _fs_list_files(source_ep.config['path'])
       files_count = len(raw_files)
       total_bytes = sum(sz for _, sz in raw_files)
+      for p_raw, _ in raw_files:
+        hive_parts = dict(re.findall(r'[/\\-]([^/=\\]+)=([^/=\\]+)', p_raw))
+        if hive_parts and not partition_cols:
+          partition_cols = list(hive_parts.keys())
+          break
       if raw_files:
         import pyarrow.parquet as pq
         with _fs_open_read(raw_files[0][0]) as fobj:
@@ -3269,6 +3274,201 @@ def _load_prior_cdc_seq_map(
   return prior_map
 
 
+def _split_top_level_commas_lh(raw: str) -> list[str]:
+  s = raw.strip()
+  if s.startswith('[') and s.endswith(']'):
+    s = s[1:-1].strip()
+  out: list[str] = []
+  buf: list[str] = []
+  depth = 0
+  for ch in s:
+    if ch == '(':
+      depth += 1
+      buf.append(ch)
+    elif ch == ')':
+      depth = max(0, depth - 1)
+      buf.append(ch)
+    elif ch == ',' and depth == 0:
+      tok = ''.join(buf).strip()
+      if tok:
+        out.append(tok)
+      buf = []
+    else:
+      buf.append(ch)
+  tail = ''.join(buf).strip()
+  if tail:
+    out.append(tail)
+  return out
+
+
+def _eval_partition_transform(val: Any, transform: str) -> Any:
+  if val is None:
+    return None
+  tr = transform.strip().lower()
+  if tr == 'identity':
+    return val
+  if tr in ('year', 'month', 'day', 'hour'):
+    dt_obj: Optional[datetime.datetime] = None
+    micros = getattr(val, 'micros', None)
+    if isinstance(micros, int) and not isinstance(micros, bool):
+      dt_obj = datetime.datetime.fromtimestamp(
+          micros / 1_000_000.0, tz=datetime.timezone.utc)
+    elif isinstance(val, datetime.datetime):
+      dt_obj = (
+          val.replace(tzinfo=datetime.timezone.utc)
+          if val.tzinfo is None else val.astimezone(datetime.timezone.utc))
+    elif isinstance(val, datetime.date):
+      dt_obj = datetime.datetime(
+          val.year, val.month, val.day, tzinfo=datetime.timezone.utc)
+    else:
+      s_val = str(val).strip()
+      if s_val.endswith(('Z', 'z')):
+        s_val = s_val[:-1] + '+00:00'
+      try:
+        dt_obj = datetime.datetime.fromisoformat(s_val)
+      except ValueError:
+        try:
+          d_only = datetime.date.fromisoformat(s_val[:10])
+          dt_obj = datetime.datetime(
+              d_only.year, d_only.month, d_only.day, tzinfo=datetime.timezone.utc)
+        except ValueError:
+          return str(val)
+    if tr == 'year':
+      return f'{dt_obj.year:04d}'
+    if tr == 'month':
+      return f'{dt_obj.year:04d}-{dt_obj.month:02d}'
+    if tr == 'day':
+      return f'{dt_obj.year:04d}-{dt_obj.month:02d}-{dt_obj.day:02d}'
+    return f'{dt_obj.year:04d}-{dt_obj.month:02d}-{dt_obj.day:02d}-{dt_obj.hour:02d}'
+  m_tr = re.match(r'^truncate\[(\d+)\]$', tr)
+  if m_tr:
+    width = max(1, int(m_tr.group(1)))
+    if isinstance(val, int) and not isinstance(val, bool):
+      return val - (val % width)
+    return str(val)[:width]
+  return val
+
+
+def _resolve_iceberg_partition_plan(
+    raw_partition_fields: Any,
+    eff_fields: list[dict[str, Any]],
+    existing_state: Optional[dict[str, Any]],
+) -> tuple[Optional[dict[str, Any]], list[tuple[str, str, str]]]:
+  """Returns `(partition_spec, [(part_name, source_col, transform), ...])`."""
+  name_to_fid = {str(f['name']): int(f['id']) for f in eff_fields}
+  fid_to_name = {int(f['id']): str(f['name']) for f in eff_fields}
+  raw_items: list[str] = []
+  if raw_partition_fields is not None:
+    if isinstance(raw_partition_fields, (list, tuple)):
+      for x in raw_partition_fields:
+        raw_items.extend(_split_top_level_commas_lh(str(x)))
+    else:
+      raw_items = _split_top_level_commas_lh(str(raw_partition_fields))
+
+  if raw_items:
+    part_fields: list[dict[str, Any]] = []
+    plan: list[tuple[str, str, str]] = []
+    for idx, tok in enumerate(raw_items, start=1000):
+      m_temporal = re.match(
+          r'^(year|month|day|hour)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)$',
+          tok,
+          re.I)
+      m_trunc = re.match(
+          r'^truncate\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*,\s*(\d+)\s*\)$',
+          tok,
+          re.I)
+      if m_temporal:
+        tr_name = m_temporal.group(1).lower()
+        src_col = m_temporal.group(2)
+        p_name = f'{src_col}_{tr_name}'
+      elif m_trunc:
+        src_col = m_trunc.group(1)
+        tr_name = f'truncate[{int(m_trunc.group(2))}]'
+        p_name = f'{src_col}_trunc'
+      else:
+        src_col = tok.strip()
+        tr_name = 'identity'
+        p_name = src_col
+      if src_col not in name_to_fid:
+        raise LakehouseError(
+            f'Iceberg partition column {src_col!r} not found in schema '
+            f'columns {sorted(name_to_fid)}')
+      part_fields.append({
+          'source-id': name_to_fid[src_col],
+          'field-id': idx,
+          'name': p_name,
+          'transform': tr_name,
+      })
+      plan.append((p_name, src_col, tr_name))
+    return {'spec-id': 0, 'fields': part_fields}, plan
+
+  if existing_state is not None:
+    meta_obj = existing_state.get('metadata') or {}
+    pspecs = meta_obj.get('partition-specs') or []
+    def_spec_id = meta_obj.get('default-spec-id', 0)
+    active_spec = next(
+        (ps for ps in pspecs if ps.get('spec-id') == def_spec_id),
+        pspecs[-1]
+        if pspecs else {'spec-id': 0, 'fields': meta_obj.get('partition-spec') or []})
+    inh_plan: list[tuple[str, str, str]] = []
+    for pf in active_spec.get('fields') or []:
+      tr_low = str(pf.get('transform') or 'identity').lower()
+      if tr_low == 'void':
+        continue
+      src_id = int(pf.get('source-id', 0))
+      src_col = fid_to_name.get(src_id) or str(pf.get('name') or '')
+      p_name = str(pf.get('name') or src_col)
+      if src_col:
+        inh_plan.append((p_name, src_col, tr_low))
+    if inh_plan:
+      return active_spec, inh_plan
+
+  return None, []
+
+
+def _write_iceberg_data_batches(
+    data_dir: str,
+    batch_id: str,
+    rows: list[dict[str, Any]],
+    eff_fields: list[dict[str, Any]],
+    part_plan: list[tuple[str, str, str]],
+) -> list[dict[str, Any]]:
+  if not rows:
+    return []
+  if not part_plan:
+    d_path = _join_fs(data_dir, f'00000-0-{batch_id}.parquet')
+    return [write_parquet_with_field_ids(d_path, rows, eff_fields)]
+  grouped: dict[
+      tuple[tuple[str, Any], ...],
+      tuple[dict[str, Any], list[dict[str, Any]]]] = {}
+  for r in rows:
+    p_dict: dict[str, Any] = {}
+    key_items: list[tuple[str, Any]] = []
+    for p_name, src_col, tr_name in part_plan:
+      pval = _eval_partition_transform(r.get(src_col), tr_name)
+      p_dict[p_name] = pval
+      key_items.append((p_name, pval))
+    kt = tuple(key_items)
+    if kt not in grouped:
+      grouped[kt] = (p_dict, [])
+    grouped[kt][1].append(r)
+
+  written: list[dict[str, Any]] = []
+  for p_idx, (_, (p_dict, p_rows)) in enumerate(grouped.items()):
+    sub_dir = data_dir
+    for p_name, _, _ in part_plan:
+      pval = p_dict.get(p_name)
+      seg_val = (
+          '__HIVE_DEFAULT_PARTITION__' if pval is None else
+          urllib.parse.quote(str(pval), safe='-_:.'))
+      sub_dir = _join_fs(sub_dir, f'{p_name}={seg_val}')
+    d_path = _join_fs(sub_dir, f'00000-{p_idx}-{batch_id}.parquet')
+    meta_entry = write_parquet_with_field_ids(d_path, p_rows, eff_fields)
+    meta_entry['partition'] = p_dict
+    written.append(meta_entry)
+  return written
+
+
 def cli_write_to_iceberg(
     table: str,
     *,
@@ -3278,6 +3478,8 @@ def cli_write_to_iceberg(
     equality_columns: Optional[list[str]] = None,
     change_type_column: Optional[str] = None,
     sequence_number_column: Optional[str] = None,
+    partition_fields: Optional[list[str] | str] = None,
+    partition_by: Optional[list[str] | str] = None,
     if_exists: str = 'append',
     triggering_frequency_seconds: Optional[int] = None,
     **_extra_kwargs: Any,
@@ -3287,6 +3489,10 @@ def cli_write_to_iceberg(
   from apache_beam.transforms import trigger
   from apache_beam.transforms import window
 
+  eff_raw_partitions = (
+      partition_fields if partition_fields is not None else
+      (partition_by if partition_by is not None else
+       _extra_kwargs.get('partition_columns')))
   cfg = {
       'table': table,
       'catalog_name': catalog_name,
@@ -3372,6 +3578,8 @@ def cli_write_to_iceberg(
               f'Iceberg table already exists at {table_dir!r}; pass '
               '--if-exists=append or --if-exists=replace')
         eff_fields = _resolve_iceberg_write_fields(st, list(self._fields))
+        part_spec_out, part_plan = _resolve_iceberg_partition_plan(
+            eff_raw_partitions, eff_fields, st if table_exists else None)
 
         batch_id = uuid.uuid4().hex
         data_dir = _join_fs(table_dir, 'data')
@@ -3383,9 +3591,9 @@ def cli_write_to_iceberg(
           clean_rows = [{
               f['name']: r.get(f['name']) for f in eff_fields
           } for r in raw_list]
-          d_path = _join_fs(data_dir, f'00000-0-{batch_id}.parquet')
-          new_data.append(
-              write_parquet_with_field_ids(d_path, clean_rows, eff_fields))
+          new_data.extend(
+              _write_iceberg_data_batches(
+                  data_dir, batch_id, clean_rows, eff_fields, part_plan))
         else:
           if not eq_cols:
             raise ValueError(
@@ -3447,9 +3655,9 @@ def cli_write_to_iceberg(
               for ck, s in prior_seqs.items()
           }
           if upserts:
-            d_path = _join_fs(data_dir, f'00000-0-{batch_id}.parquet')
-            new_data.append(
-                write_parquet_with_field_ids(d_path, upserts, eff_fields))
+            new_data.extend(
+                _write_iceberg_data_batches(
+                    data_dir, batch_id, upserts, eff_fields, part_plan))
           if eq_delete_keys:
             eq_field_specs = [f for f in eff_fields if f['name'] in eq_col_set]
             del_path = _join_fs(data_dir, f'00000-0-{batch_id}-eq-del.parquet')
@@ -3464,6 +3672,7 @@ def cli_write_to_iceberg(
               identifier_columns=eq_cols if is_mor else None,
               new_data_files=new_data,
               new_eq_delete_files=new_eq_del,
+              partition_spec=part_spec_out,
               replace_table=should_replace,
               fail_if_exists=(if_exists == 'fail'),
               cdc_seq_state=cdc_seq_state_out)

@@ -615,6 +615,54 @@ class _Expect3VLTransformer(ast.NodeTransformer):
     return self._lazy_bool3(True, parts)
 
 
+def _mask_val_fn(v: Any, keep_last: int = 4, mask_char: str = '*') -> str | None:
+  if v is None:
+    return None
+  s = str(v)
+  k = max(0, int(keep_last))
+  mc = (str(mask_char) or '*')[0]
+  if len(s) <= k:
+    return mc * len(s)
+  return (mc * (len(s) - k)) + (s[-k:] if k > 0 else '')
+
+
+def _mask_email_fn(v: Any) -> str | None:
+  if v is None:
+    return None
+  s = str(v).strip()
+  if '@' not in s:
+    return '*' * len(s)
+  local, domain = s.split('@', 1)
+  if len(local) <= 1:
+    return f'***@{domain}'
+  return f'{local[0]}***@{domain}'
+
+
+def _sha256_fn(v: Any) -> str | None:
+  if v is None:
+    return None
+  import hashlib
+  return hashlib.sha256(str(v).encode('utf-8')).hexdigest()
+
+
+def _substr_fn(v: Any, start: int, length: int | None = None) -> str | None:
+  if v is None or start is None:
+    return None
+  s = str(v)
+  st = int(start)
+  idx = max(0, len(s) + st) if st < 0 else max(0, st - 1)
+  if length is None:
+    return s[idx:]
+  ln = max(0, int(length))
+  return s[idx:idx + ln]
+
+
+def _concat_fn(*vals: Any) -> str | None:
+  if any(v is None for v in vals):
+    return None
+  return ''.join(str(v) for v in vals)
+
+
 _SAFE_BUILTINS.update({
     'ifnull': _SAFE_BUILTINS['coalesce'],
     'trim': _SAFE_BUILTINS['strip'],
@@ -623,6 +671,14 @@ _SAFE_BUILTINS.update({
     'lower': lambda s: None if s is None else str(s).lower(),
     'upper': lambda s: None if s is None else str(s).upper(),
     'strip': lambda s: None if s is None else str(s).strip(),
+    'sha256': _sha256_fn,
+    'mask': _mask_val_fn,
+    'mask_last4': lambda v: _mask_val_fn(v, 4, '*'),
+    'mask_email': _mask_email_fn,
+    'redact': lambda v: None if v is None else '<REDACTED>',
+    'substr': _substr_fn,
+    'substring': _substr_fn,
+    'concat': _concat_fn,
     'sql_like': _sql_like_fn,
     'sql_ilike': _sql_ilike_fn,
     '_cli_exp_mul': _exp_mul,
@@ -631,8 +687,21 @@ _SAFE_BUILTINS.update({
     '_cli_exp_or': _exp_or,
     '_cli_exp_cmp': _exp_cmp,
 })
-_SAFE_CALL_NAMES = _SAFE_CALL_NAMES | frozenset(
-    ['ifnull', 'trim', 'length', 'sql_like', 'sql_ilike'])
+_SAFE_CALL_NAMES = _SAFE_CALL_NAMES | frozenset([
+    'ifnull',
+    'trim',
+    'length',
+    'sha256',
+    'mask',
+    'mask_last4',
+    'mask_email',
+    'redact',
+    'substr',
+    'substring',
+    'concat',
+    'sql_like',
+    'sql_ilike',
+])
 
 _EXPECT_CAST_MAP: dict[str, str] = {
     'int': 'int',

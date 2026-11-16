@@ -168,15 +168,18 @@ runners—working safely even when column names collide with reserved words
   `<>` / `!=`, `<`, `<=`, `>`, `>=`, `[NOT] IN (...)`, `[NOT] BETWEEN a AND b`,
   `[NOT] LIKE`, `ILIKE`, `IS NULL`, `IS NOT NULL`, `CAST(col AS INT|FLOAT|STRING|BOOL)`
 - **Arithmetic**: `+`, `-`, `*`, `/`, `//`, `%`
-- **Scalar & string helpers**: `lower`, `upper`, `strip`/`trim`, `len`/`length`,
-  `coalesce`/`ifnull`, `abs`, `round`, `min`, `max`, `int`, `float`, `str`, `bool`
+- **Scalar, string & PII masking helpers**: `lower`, `upper`, `strip`/`trim`,
+  `len`/`length`, `substr`/`substring`, `concat`, `coalesce`/`ifnull`, `abs`,
+  `round`, `min`, `max`, `int`, `float`, `str`, `bool`, `sha256`, `mask`,
+  `mask_last4`, `mask_email`, `redact`
 - **UTC timestamp & JSON helpers**: `parse_timestamp` / `to_utc` (normalizes ISO
   offsets and epoch sec/ms/us to UTC `YYYY-MM-DDTHH:MM:SSZ`), `epoch_ms` /
   `to_epoch_ms`, `year`, `month`, `day`, `hour`, `minute`, `second`,
   `date_part`, and `json_get` / `json_extract_scalar` / `json_value`
 - **Data quality expectations (`--expect`)**: Enforce named rules such as
-  `--expect "positive_amt: amount > 0 -> dlq"` (`dlq`, `drop`, or `fail`) with
-  live `beam_cli` monitoring counters.
+  `--expect "positive_amt: amount > 0 -> dlq"` (`dlq`, `drop`, or `fail`) both
+  standalone and combined with multi-table `--sql`, emitting live `beam_cli`
+  monitoring counters.
 
 ### Analytical SQL, Multi-Source Joins & Zero-JVM SQL Lowering (`--sql`)
 
@@ -185,10 +188,12 @@ analytics with distributed Beam pipelines:
 
 - **Sub-100ms Local SQL (`sqlite` default & `--sql-engine duckdb`)**: Query and
   `--join` across CSV, Parquet, JSONL, Avro, `delta://`, and `iceberg://` in a
-  read-only `:memory:` SQLite sandbox (with built-in `median`, `quantile`,
-  `percentile`, `stddev`, `corr`, `regr_slope`, and `to_utc`) or an in-memory
-  DuckDB sandbox (`PERCENTILE_CONT`, `QUALIFY`, `GROUPING SETS`), optionally
-  writing keyed JSON objects (`--to-opt key=region`).
+  read-only `:memory:` SQLite sandbox (with built-in `median`,
+  `quantile(col, 0.95)` on a `0.0..1.0` scale, `percentile(col, 95)` on a
+  `0..100` scale, `stddev`, `corr`, `regr_slope`, `sha256`, `mask`,
+  `mask_email`, and `to_utc`) or an in-memory DuckDB sandbox
+  (`PERCENTILE_CONT`, `QUALIFY`, `GROUPING SETS`), optionally enforcing
+  `--expect` quality gates or writing keyed JSON objects (`--to-opt key=region`).
 - **Zero-JVM Pure-Python SQL Lowering (`--sql-engine python`)**: Lowers
   `SELECT ... FROM TABLE(TUMBLE|HOP|SESSION(TABLE src, DESCRIPTOR(ts), INTERVAL '5' MINUTE)) WHERE ... GROUP BY ... HAVING ...`
   (including `COUNT(DISTINCT col)`, `SUM`, `AVG`, `MIN`, `MAX`, `STDDEV_POP`,
@@ -215,7 +220,7 @@ beam pipe "gs://my-bucket/raw/orders_*.csv" \
 
 - `--check-schema` (and `beam schema diff`) detects dropped required columns,
   type narrowing, and nullability mismatches in `<100 ms` before launching
-  workers.
+  workers (exiting `2` on `SchemaContractViolationError`).
 - `--max-bytes` evaluates source byte size pre-flight (`$0` metadata / `dryRun`
   on BigQuery `TABLE`, `VIEW`, and `EXTERNAL` tables; `pg_partition_tree` on
   PostgreSQL; paged listings on object stores) and exits `8` before compute
@@ -231,11 +236,14 @@ beam pipe "gs://my-bucket/raw/orders_*.csv" \
 
 ### Zero-Copy Lakehouse (`--zero-copy`, `beam catalog sync`) & Cross-Engine CDC (`--cdc`)
 
-- **Zero-Copy Lakehouse Bridges (`--zero-copy` & `beam catalog sync`)**:
-  Registers existing partitioned Parquet directories or active Delta Lake
-  (`delta://`) files into Apache Iceberg v2 (`format-version: 2`, partition
-  specs, monotonic column IDs) or enterprise catalogs (Iceberg REST, BigLake
-  REST, BigQuery Managed Iceberg) in `<200 ms` with **`bytes_copied = 0`**:
+- **Partitioned & Unpartitioned Iceberg Writes & Zero-Copy Bridges**:
+  Write partitioned Iceberg v2 tables via `--to-opt partition_fields=dt` (or
+  `day(event_ts)`, auto-inheriting partition specs on subsequent `--if-exists append`
+  runs), or register existing **partitioned or unpartitioned** Parquet
+  directories, `delta://`, or `iceberg://` tables into Apache Iceberg v2
+  (`format-version: 2`, partition specs, monotonic column IDs) or enterprise
+  catalogs (Iceberg REST, BigLake REST, BigQuery Managed Iceberg) in `<200 ms`
+  with **`bytes_copied = 0`**:
   ```sh
   beam pipe delta://gs://my-bucket/delta/orders \
     "iceberg://lake.orders?warehouse=gs://my-bucket/iceberg_wh" \
@@ -243,8 +251,9 @@ beam pipe "gs://my-bucket/raw/orders_*.csv" \
   ```
 - **Cross-Engine CDC (`--cdc --primary-key <PK>`)**: Compacts CDC logs into
   latest-row Parquet/JSON files in `<250 ms` locally, or applies ordered
-  `UPSERT` + `DELETE` mutations to **BigQuery Storage Write API** (`_CHANGE_TYPE`
-  + 16-digit hex `_CHANGE_SEQUENCE_NUMBER`, auto-DDL
+  `UPSERT` + `DELETE` mutations from PostgreSQL/MySQL (`ReadFromDebezium`),
+  Delta Lake, Pub/Sub, or Kafka to **BigQuery Storage Write API**
+  (`_CHANGE_TYPE` + 16-digit hex `_CHANGE_SEQUENCE_NUMBER`, auto-DDL
   `PRIMARY KEY (...) NOT ENFORCED`) and **Apache Iceberg v2 Merge-on-Read**
   (`equality-deletes`):
   ```sh
@@ -272,12 +281,14 @@ beam pipe "gs://my-bucket/raw/orders_*.csv" \
   Cloud Composer / Apache Airflow DAGs (`DataflowStartFlexTemplateOperator`) or
   serverless Cloud Scheduler HTTP triggers directly from validated pipelines.
 - **Non-Destructive Stream & Commit Tailing (`beam tail -f -i`)**: Streams live
-  records as flushed NDJSON (`--json`), interactive TUI throughput cards (`-i`),
-  or sanitized terminal lines across Pub/Sub, Kafka (ephemeral consumer group,
-  `enable.auto.commit=false`), newly landing shards, and live Delta/Iceberg
-  commits.
+  records as flushed NDJSON (`--json`), interactive TUI throughput cards (`-i`,
+  rendered to `stderr` when paired with `--json`), or sanitized terminal lines
+  across Pub/Sub, Kafka (ephemeral `'beam-tail-<uuid>'` consumer group,
+  `enable.auto.commit=False`, SASL/SSL `--from-opt-file` / `BEAM_KAFKA_*`, and
+  `?schema_registry=https://...` Confluent Avro wire-format decoding), newly
+  landing shards, and live Delta/Iceberg commits.
 
-### Stateful Streaming, Online Enrichment & ML Inference
+### Stateful Streaming, Online Enrichment & Low-Delay ML Inference
 
 `beam pipe` provides record-level failure isolation across stateful streaming,
 external enrichment, and ML inference (detailed with end-to-end recipes in
@@ -290,11 +301,12 @@ external enrichment, and ML inference (detailed with end-to-end recipes in
   parameterized BigQuery (`UNNEST(@keys)`), Cloud Bigtable, Vertex AI Feature
   Store, Feast, and `file:` with optional TLS `rediss://` read-through caching
   (`BEAM_REDIS_PASSWORD`), `AdaptiveThrottler`, and `on_miss=null|drop|dlq|fail`.
-- **ML Inference (`--infer`)**: `RunInference` integration for Vertex AI
-  Endpoints (`<1.4 MB` payload auto-split + `rate_limit`) and commit-pinned
-  HuggingFace `safetensors` models (`trust_remote_code=False`) with in-worker
-  singleton bisection so 1 malformed record routes to `--dlq` without dropping
-  healthy batch peers or reloading model weights.
+- **Low-Delay ML Inference (`--infer`)**: `RunInference` integration for Vertex
+  AI Endpoints (`<1.4 MB` payload auto-split, `rate_limit`, and millisecond
+  micro-batch caps via `max_batch_duration_ms=10,min_batch_size=1`) and
+  commit-pinned HuggingFace `safetensors` models (`trust_remote_code=False`)
+  with in-worker singleton bisection so 1 malformed record routes to `--dlq`
+  without dropping healthy batch peers or reloading model weights.
 - **Temporal Joins, Bounded CEP & Window Triggers**: Point-in-time `ASOF JOIN`
   (`--asof-join` or SQL `ASOF LEFT JOIN`), event-time `--interval-join` with
   `--max-watermark-skew` OOM circuit breakers, bounded sequence/absence matching
@@ -322,21 +334,22 @@ machine-readable contract (`schema_version: "1.0"`):
    (including a validation-aware 30-minute idempotency ledger that prevents
    duplicate `--if-exists=append` resubmissions), and resumes via
    `beam wait <job_id> --json`.
-4. **Right-Sized Routing**: Keep `<100 MB` local file inspection, filtering,
-   SQL, and reconciliation on the default local fast path / local runner; pass
-   `--runner=DataflowRunner`, `FlinkRunner`, or `SparkRunner` for
-   multi-gigabyte, cross-network, or unbounded streaming workloads.
+4. **Confirm-Before-Write & Right-Sized Routing**: Prompt for human confirmation
+   before `beam catalog sync` (preview with `--dry-run`), `--zero-copy`,
+   `--if-exists replace`, remote cluster submission (`--runner=DataflowRunner`,
+   `FlinkRunner`, `SparkRunner`), or `beam cancel`. Keep `<100 MB` local file
+   runs on the default local fast path / local runner.
 
 ### Exit Code Contract
 
 | Exit Code | Constant | Meaning |
 | :--- | :--- | :--- |
-| `0` | `EXIT_OK` | Command succeeded (`beam diff` datasets matched; pipeline completed). |
-| `1` | `EXIT_PIPELINE_FAILED` | Pipeline execution failed or `--assert-counts` row conservation failed. |
-| `2` | `EXIT_USAGE` | CLI usage, YAML/schema contract, AST expression, existing-output, or inline-secret error. |
+| `0` | `EXIT_OK` | Command succeeded (`beam schema` compatible; `beam diff` datasets matched; pipeline completed). |
+| `1` | `EXIT_PIPELINE_FAILED` | Runtime execution failure: unquarantined mid-stream JSONL `SchemaDriftError` (without `--dlq`/`--drop-bad`), `--expect "... -> fail"`, or `--assert-counts` conservation failure. |
+| `2` | `EXIT_USAGE` | Pre-flight error (zero compute run): `beam schema` / `--check-schema` `SchemaContractViolationError`, invalid CLI/YAML/SQL/AST usage, existing output, or inline secret detected. |
 | `3` | `EXIT_CAPABILITY` | Requested feature or flag combination is unsupported on the selected runner. |
-| `4` | `EXIT_MISSING_PACKAGE` | Missing optional Python extra (`[yaml]`, `[gcp]`, `pyarrow`, `duckdb`) or Java 11–25 runtime (`next_actions` gives exact install command). |
-| `6` | `EXIT_DIFF_MISMATCH` | `beam diff` or `beam pipe --verify` found schema, key, or value drift. |
+| `4` | `EXIT_MISSING_PACKAGE` | Missing optional Python extra (`[yaml]`, `[gcp]`, `pyarrow`, `duckdb`, `confluent-kafka`) or Java 11–25 runtime (`next_actions` gives exact install command). |
+| `6` | `EXIT_DIFF_MISMATCH` | Post-hoc reconciliation drift: `beam diff` or `beam pipe --verify` found schema, row-count, key, or value mismatch between materialized datasets. |
 | `7` | `EXIT_TIMEOUT` | `--wait-timeout` or `beam wait --timeout` expired (`detached: true` for active remote jobs). |
 | `8` | `EXIT_COST_LIMIT` | Pre-flight `--max-bytes` scan guardrail exceeded (`CostLimitExceededError`). |
 | `130` | `EXIT_SIGINT` | Interrupted by `SIGINT` (`Ctrl-C`); local pipelines stop cleanly. |

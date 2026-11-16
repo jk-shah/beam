@@ -126,7 +126,7 @@ _SHARD_SUFFIX_RE = re.compile(r'-\d+-of-\d+$')
 _SECRET_KEY_RE = re.compile(
     r'(password|passwd|passphrase|secret|token|private_key|signing_key|'
     r'encryption_key|client_secret|access_key|api[-_]?key|authorization|'
-    r'bearer|jaas|credential|connection_string|'
+    r'bearer|jaas|credential|connection_string|user[._-]?info|'
     r'(?:^|[_.-])(?:auth|pwd|cookie)(?:$|[_.-]))',
     re.IGNORECASE)
 _BQ_TABLE_ID_RE = re.compile(
@@ -309,6 +309,27 @@ def _load_checked_opt_file(opt_file: str) -> dict[str, Any]:
         os.close(fd)
       except OSError:
         pass
+
+  if isinstance(loaded, str):
+    kv_lines = [
+        ln.strip()
+        for ln in raw_text.splitlines()
+        if ln.strip() and not ln.lstrip().startswith('#')
+    ]
+    if kv_lines and all('=' in ln for ln in kv_lines):
+      kv_parsed: dict[str, Any] = {}
+      for ln in kv_lines:
+        k_raw, v_raw = ln.split('=', 1)
+        k_clean = k_raw.strip()
+        if not k_clean:
+          raise UriError(f'expected key/value mapping in {opt_file!r}')
+        v_clean = v_raw.strip()
+        if len(v_clean) >= 2 and v_clean[0] == v_clean[-1] and v_clean[0] in (
+            "'", '"'):
+          kv_parsed[k_clean] = v_clean[1:-1]
+        else:
+          kv_parsed[k_clean] = _coerce_opt_value(v_clean)
+      loaded = kv_parsed
 
   if not isinstance(loaded, dict):
     raise UriError(f'expected key/value mapping in {opt_file!r}')
@@ -999,17 +1020,61 @@ def parse_endpoint(
         is_java_xlang=False,
         is_unbounded=is_read)
 
-  # 6. Kafka (`kafka://host:port/topic`)
+  # 6. Kafka (`kafka://host:port/topic` or `kafka:///topic` with BEAM_KAFKA_BOOTSTRAP_SERVERS)
   if scheme == 'kafka':
     parsed = urllib.parse.urlsplit(location)
     topic = parsed.path.strip('/')
-    if not parsed.netloc or not topic or parsed.query or parsed.fragment:
+    if parsed.fragment or not topic:
       raise UriError(
           f'invalid Kafka URI {location!r}; expected '
           'kafka://BOOTSTRAP_SERVERS/TOPIC')
-    if not (allow_jinja and _has_jinja_syntax(parsed.netloc)) and not re.fullmatch(
-        r'[A-Za-z0-9._:,\[\]-]+', parsed.netloc):
-      raise UriError(f'invalid Kafka bootstrap_servers {parsed.netloc!r}')
+    _ALLOWED_KAFKA_QUERY_KEYS = frozenset([
+        'allow_duplicates',
+        'auto_offset_reset',
+        'bootstrap_servers',
+        'commit_offset_in_finalize',
+        'confluent_schema_registry_subject',
+        'confluent_schema_registry_url',
+        'consumer_group',
+        'format',
+        'group_id',
+        'max_num_records',
+        'max_read_time_seconds',
+        'no_group',
+        'raw_bytes',
+        'redistribute',
+        'sasl_mechanism',
+        'sasl_username',
+        'schema_registry',
+        'schema_registry_subject',
+        'schema_registry_url',
+        'security_protocol',
+        'ssl_cafile',
+        'ssl_certfile',
+        'ssl_keyfile',
+        'timestamp_policy',
+    ])
+    qparams = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
+    for qk, qv in qparams.items():
+      if _SECRET_KEY_RE.search(qk):
+        raise UriError(
+            f'refusing secret query parameter {qk!r} in Kafka URI; '
+            'use --from-opt-file (chmod 0600) or BEAM_KAFKA_SASL_PASSWORD')
+      if qk not in _ALLOWED_KAFKA_QUERY_KEYS:
+        raise UriError(
+            f'unsupported Kafka URI query parameter {qk!r} in {location!r}')
+      if qv:
+        opts.setdefault(qk, _coerce_opt_value(qv))
+    bootstrap = (
+        parsed.netloc or str(opts.pop('bootstrap_servers', '') or '').strip() or
+        os.environ.get('BEAM_KAFKA_BOOTSTRAP_SERVERS', '').strip())
+    if not bootstrap:
+      raise UriError(
+          f'invalid Kafka URI {location!r}; expected '
+          'kafka://BOOTSTRAP_SERVERS/TOPIC (or set BEAM_KAFKA_BOOTSTRAP_SERVERS)')
+    if not (allow_jinja and _has_jinja_syntax(bootstrap)) and not re.fullmatch(
+        r'[A-Za-z0-9._:,\[\]-]+', bootstrap):
+      raise UriError(f'invalid Kafka bootstrap_servers {bootstrap!r}')
     if not (allow_jinja and _has_jinja_syntax(topic)) and (
         topic in ('.', '..') or '..' in topic or
         not re.fullmatch(r'[A-Za-z0-9._-]+', topic)):
@@ -1032,12 +1097,57 @@ def parse_endpoint(
     if schema_subj:
       opts['confluent_schema_registry_subject'] = str(schema_subj).strip()
 
-    # Consumer group / group.id configuration
+    # Consumer group & SASL / SSL client security configuration
+    c_cfg_raw = opts.get('consumer_config')
+    c_cfg: dict[str, Any] = dict(c_cfg_raw) if isinstance(c_cfg_raw, dict) else {}
     consumer_grp = opts.pop('consumer_group', None) or opts.pop('group_id', None)
     if consumer_grp:
-      c_cfg = opts.setdefault('consumer_config', {})
-      if isinstance(c_cfg, dict):
-        c_cfg['group.id'] = str(consumer_grp).strip()
+      c_cfg['group.id'] = str(consumer_grp).strip()
+
+    sec_proto = (
+        opts.pop('security_protocol', None) or
+        opts.pop('security.protocol', None) or
+        os.environ.get('BEAM_KAFKA_SECURITY_PROTOCOL'))
+    if sec_proto:
+      c_cfg.setdefault('security.protocol', str(sec_proto).strip())
+
+    sasl_mech = (
+        opts.pop('sasl_mechanism', None) or
+        opts.pop('sasl_mechanisms', None) or
+        opts.pop('sasl.mechanism', None) or
+        opts.pop('sasl.mechanisms', None) or
+        os.environ.get('BEAM_KAFKA_SASL_MECHANISM'))
+    if sasl_mech:
+      c_cfg.setdefault('sasl.mechanism', str(sasl_mech).strip())
+
+    sasl_user = (
+        opts.pop('sasl_username', None) or
+        opts.pop('sasl.username', None) or
+        os.environ.get('BEAM_KAFKA_SASL_USERNAME'))
+    if sasl_user:
+      c_cfg.setdefault('sasl.username', str(sasl_user).strip())
+
+    sasl_pwd = (
+        opts.pop('sasl_password', None) or
+        opts.pop('sasl.password', None) or
+        os.environ.get('BEAM_KAFKA_SASL_PASSWORD'))
+    if sasl_pwd:
+      c_cfg.setdefault('sasl.password', str(sasl_pwd))
+
+    for opt_k, kafka_k in (
+        ('ssl_ca_location', 'ssl.ca.location'),
+        ('ssl.ca.location', 'ssl.ca.location'),
+        ('ssl_certificate_location', 'ssl.certificate.location'),
+        ('ssl.certificate.location', 'ssl.certificate.location'),
+        ('ssl_key_location', 'ssl.key.location'),
+        ('ssl.key.location', 'ssl.key.location'),
+    ):
+      val_ssl = opts.pop(opt_k, None)
+      if val_ssl:
+        c_cfg.setdefault(kafka_k, str(val_ssl).strip())
+
+    if c_cfg:
+      opts['consumer_config'] = c_cfg
 
     # Offset reset configuration
     offset_reset = (
@@ -1058,7 +1168,7 @@ def parse_endpoint(
     default_kafka_fmt = 'AVRO' if schema_reg else 'JSON'
     fmt = (explicit_format or opts.pop('format', default_kafka_fmt)).upper()
     cfg = {
-        'bootstrap_servers': parsed.netloc,
+        'bootstrap_servers': bootstrap,
         'topic': topic,
         'format': fmt,
         **opts,
@@ -1175,6 +1285,39 @@ def parse_endpoint(
 
   for qk, qv in qparams.items():
     opts.setdefault(qk, _coerce_opt_value(qv))
+  if not is_read:
+    raw_pf = (
+        opts.pop('partition_fields', None) or opts.pop('partition_by', None) or
+        opts.pop('partition_columns', None))
+    if raw_pf is not None:
+      if isinstance(raw_pf, (list, tuple)):
+        pf_list = [str(x).strip() for x in raw_pf if str(x).strip()]
+      else:
+        s_pf = str(raw_pf).strip()
+        if s_pf.startswith('[') and s_pf.endswith(']'):
+          s_pf = s_pf[1:-1].strip()
+        pf_list = []
+        buf: list[str] = []
+        depth = 0
+        for ch in s_pf:
+          if ch == '(':
+            depth += 1
+            buf.append(ch)
+          elif ch == ')':
+            depth = max(0, depth - 1)
+            buf.append(ch)
+          elif ch == ',' and depth == 0:
+            tok = ''.join(buf).strip()
+            if tok:
+              pf_list.append(tok)
+            buf = []
+          else:
+            buf.append(ch)
+        tail_tok = ''.join(buf).strip()
+        if tail_tok:
+          pf_list.append(tail_tok)
+      if pf_list:
+        opts['partition_fields'] = pf_list
   if cat_props:
     opts['catalog_properties'] = cat_props
 

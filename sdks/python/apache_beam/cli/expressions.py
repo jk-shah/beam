@@ -53,6 +53,7 @@ _SAFE_FUNCS = frozenset([
     'abs',
     'bool',
     'coalesce',
+    'concat',
     'date_part',
     'day',
     'epoch_ms',
@@ -66,17 +67,24 @@ _SAFE_FUNCS = frozenset([
     'len',
     'length',
     'lower',
+    'mask',
+    'mask_email',
+    'mask_last4',
     'max',
     'min',
     'minute',
     'month',
     'parse_timestamp',
+    'redact',
     'round',
     'second',
+    'sha256',
     'sql_ilike',
     'sql_like',
     'str',
     'strip',
+    'substr',
+    'substring',
     'to_epoch_ms',
     'to_utc',
     'trim',
@@ -665,6 +673,7 @@ class _RowExprCompiler(ast.NodeTransformer):
     self.uses_datetime = False
     self.uses_json = False
     self.uses_like = False
+    self.uses_mask = False
     self.uses_temporal_cmp = False
     self._colref_map = colref_map or {}
     self._jinja_tokens = jinja_tokens or frozenset()
@@ -1002,6 +1011,58 @@ class _RowExprCompiler(ast.NodeTransformer):
             func=ast.Name(id='_cli_json_get', ctx=ast.Load()),
             args=compiled_args,
             keywords=[])
+      if lowered == 'sha256':
+        if len(compiled_args) != 1:
+          raise ExpressionError(f'{fn_name}() expects 1 argument (val)')
+        self.uses_mask = True
+        return ast.Call(
+            func=ast.Name(id='_cli_sha256', ctx=ast.Load()),
+            args=compiled_args,
+            keywords=[])
+      if lowered in ('mask', 'mask_last4'):
+        if lowered == 'mask_last4' and len(compiled_args) != 1:
+          raise ExpressionError(f'{fn_name}() expects 1 argument (val)')
+        if not 1 <= len(compiled_args) <= 3:
+          raise ExpressionError(
+              f'{fn_name}() expects 1 to 3 arguments (val[, keep_last, mask_char])')
+        self.uses_mask = True
+        return ast.Call(
+            func=ast.Name(id='_cli_mask', ctx=ast.Load()),
+            args=compiled_args,
+            keywords=[])
+      if lowered == 'mask_email':
+        if len(compiled_args) != 1:
+          raise ExpressionError(f'{fn_name}() expects 1 argument (val)')
+        self.uses_mask = True
+        return ast.Call(
+            func=ast.Name(id='_cli_mask_email', ctx=ast.Load()),
+            args=compiled_args,
+            keywords=[])
+      if lowered == 'redact':
+        if len(compiled_args) != 1:
+          raise ExpressionError(f'{fn_name}() expects 1 argument (val)')
+        self.uses_mask = True
+        return ast.Call(
+            func=ast.Name(id='_cli_redact', ctx=ast.Load()),
+            args=compiled_args,
+            keywords=[])
+      if lowered in ('substr', 'substring'):
+        if len(compiled_args) not in (2, 3):
+          raise ExpressionError(
+              f'{fn_name}() expects 2 or 3 arguments (val, start[, length])')
+        self.uses_mask = True
+        return ast.Call(
+            func=ast.Name(id='_cli_substr', ctx=ast.Load()),
+            args=compiled_args,
+            keywords=[])
+      if lowered == 'concat':
+        if len(compiled_args) < 1:
+          raise ExpressionError('concat() expects at least 1 argument')
+        self.uses_mask = True
+        return ast.Call(
+            func=ast.Name(id='_cli_concat', ctx=ast.Load()),
+            args=compiled_args,
+            keywords=[])
       if lowered in ('int', 'float', 'abs', 'round', 'str') and compiled_args:
         rest = compiled_args[1:]
         return self._null_safe([compiled_args[0]],
@@ -1057,8 +1118,11 @@ def _infer_json_schema_type(tree_body: ast.AST) -> str | None:
         return 'integer'
       if fn in ('float', 'round'):
         return 'number'
-      if fn in ('str', 'lower', 'upper', 'strip', 'trim', 'parse_timestamp',
-                'to_utc', 'json_get', 'json_extract_scalar', 'json_value'):
+      if fn in (
+          'str', 'lower', 'upper', 'strip', 'trim', 'parse_timestamp', 'to_utc',
+          'json_get', 'json_extract_scalar', 'json_value', 'sha256', 'mask',
+          'mask_last4', 'mask_email', 'redact', 'substr', 'substring', 'concat',
+      ):
         return 'string'
     if isinstance(tree_body.func, ast.Attribute):
       if tree_body.func.attr in ('startswith', 'endswith'):
@@ -1089,6 +1153,7 @@ def _build_callable_source(
     uses_datetime: bool = False,
     uses_json: bool = False,
     uses_like: bool = False,
+    uses_mask: bool = False,
     uses_temporal_cmp: bool = False,
     return_annotation: str | None = None,
 ) -> str:
@@ -1309,6 +1374,43 @@ def _build_callable_source(
         '      return None',
         '    return cur if isinstance(cur, str) else (str(cur) if isinstance(cur, (int, float, bool)) else _json.dumps(cur))',
     ])
+  if uses_mask:
+    lines.extend([
+        '  import hashlib as _hashlib',
+        '  def _cli_sha256(v):',
+        '    return None if v is None else _hashlib.sha256(str(v).encode("utf-8")).hexdigest()',
+        '  def _cli_mask(v, keep_last=4, mask_char="*"):',
+        '    if v is None:',
+        '      return None',
+        '    s = str(v)',
+        '    k = max(0, int(keep_last))',
+        '    mc = (str(mask_char) or "*")[0]',
+        '    if len(s) <= k:',
+        '      return mc * len(s)',
+        '    return (mc * (len(s) - k)) + (s[-k:] if k > 0 else "")',
+        '  def _cli_mask_email(v):',
+        '    if v is None:',
+        '      return None',
+        '    s = str(v).strip()',
+        '    if "@" not in s:',
+        '      return "*" * len(s)',
+        '    loc, dom = s.split("@", 1)',
+        '    return ("***@" + dom) if len(loc) <= 1 else (loc[0] + "***@" + dom)',
+        '  def _cli_redact(v):',
+        '    return None if v is None else "<REDACTED>"',
+        '  def _cli_substr(v, start, length=None):',
+        '    if v is None or start is None:',
+        '      return None',
+        '    s = str(v)',
+        '    st = int(start)',
+        '    idx = max(0, len(s) + st) if st < 0 else max(0, st - 1)',
+        '    return s[idx:] if length is None else s[idx:idx + max(0, int(length))]',
+        '  def _cli_concat(*vals):',
+        '    for _cv in vals:',
+        '      if _cv is None:',
+        '        return None',
+        '    return "".join(str(_cv) for _cv in vals)',
+    ])
   ret = f'bool({compiled_expr})' if as_bool else compiled_expr
   lines.append(f'  return {ret}')
   return '\n'.join(lines) + '\n'
@@ -1316,7 +1418,7 @@ def _build_callable_source(
 
 def _safe_expr_import(name, globals=None, locals=None, fromlist=(), level=0):  # pylint: disable=redefined-builtin
   if level != 0 or name not in (
-      'datetime', 'json', '_strptime', 'time', 'calendar', 'locale'):
+      'datetime', 'hashlib', 'json', '_strptime', 'time', 'calendar', 'locale'):
     raise ImportError(f'import {name!r} is not allowed in expressions')
   return __import__(name, globals, locals, fromlist, level)
 
@@ -1376,6 +1478,7 @@ def compile_scalar_callable(
       uses_datetime=compiler.uses_datetime,
       uses_json=compiler.uses_json,
       uses_like=compiler.uses_like,
+      uses_mask=compiler.uses_mask,
       uses_temporal_cmp=compiler.uses_temporal_cmp)
   ns: dict[str, Any] = {'__builtins__': _SAFE_EXEC_BUILTINS}
   exec(compile(callable_src, '<beam_cli_expr>', 'exec'), ns)  # pylint: disable=exec-used
@@ -1433,6 +1536,7 @@ def compile_where(
       uses_datetime=compiler.uses_datetime,
       uses_json=compiler.uses_json,
       uses_like=compiler.uses_like,
+      uses_mask=compiler.uses_mask,
       uses_temporal_cmp=compiler.uses_temporal_cmp)
   return (
       {
@@ -1767,6 +1871,7 @@ def compile_select(
         uses_datetime=compiler.uses_datetime,
         uses_json=compiler.uses_json,
         uses_like=compiler.uses_like,
+        uses_mask=compiler.uses_mask,
         uses_temporal_cmp=compiler.uses_temporal_cmp)
     field_entry: dict[str, Any] = {'callable': callable_src}
     if inferred_type is not None:

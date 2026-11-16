@@ -42,8 +42,13 @@ def render_llms_txt() -> str:
    with `--assert-counts`, and reconcile critical migrations with `beam diff`.
 4. Never embed passwords or tokens in URIs or CLI flags (`UriError` exit 2). Use
    Application Default Credentials (ADC), environment variables
-   (`BEAM_POSTGRES_USER` / `BEAM_POSTGRES_PASSWORD`), or `0600` `--from-opt-file`.
-5. Right-size execution: keep `<100 MB` local/single-file runs on the default
+   (`BEAM_POSTGRES_USER` / `BEAM_POSTGRES_PASSWORD`, `BEAM_KAFKA_SASL_PASSWORD`),
+   or `0600` `--from-opt-file`.
+5. Confirm before catalog/table mutations or paid cloud VMs: prompt the human user
+   before executing `beam catalog sync` (run `--dry-run` first), `--zero-copy`,
+   `--if-exists replace`, remote cluster runners (`--runner=DataflowRunner`,
+   `FlinkRunner`, `SparkRunner`), or `beam cancel`.
+6. Right-size execution: keep `<100 MB` local/single-file runs on the default
    local runner (never launch `DataflowRunner` VMs for tiny datasets); use
    `--runner=DataflowRunner` / `FlinkRunner` / `SparkRunner` for multi-GB,
    cross-network, or unbounded streaming workloads, and always bound
@@ -56,35 +61,44 @@ def render_llms_txt() -> str:
     Non-destructive bounded stream peek (default `5s` / `-n 5` for agents) or live
     follow (`-f` / `--follow` like Unix `tail -f`, streaming NDJSON across
     `pubsub://`, `kafka://`, `delta://`, `iceberg://`, and local/`gs://` files
-    including append-only `.log` / extensionless plain-text logs such as `/var/log/messages`;
-    for continuous production `beam pipe` pipelines, ingest via `pubsub://` or `kafka://`).
-    Pass `-i` / `--interactive` for terminal TUI with live msg/s throughput and field highlighting.
+    including append-only `.log` / extensionless plain-text logs such as `/var/log/messages`).
+    On `kafka://`, uses an ephemeral `'beam-tail-<uuid>'` consumer group with
+    `enable.auto.commit=False` (or `?no_group=true` partition `assign()` with zero
+    broker group registration), supports SASL/SSL via `--from-opt-file` or `BEAM_KAFKA_*`
+    env vars, surfaces Confluent wire `schema_id` & `raw_hex` (`?raw_bytes=true`), and
+    decodes/validates Avro & JSON Schema payloads (`?schema_registry=https://...`).
+    Pass `-i` / `--interactive` for live `msg/s` TUI and field highlighting (rendered to
+    `stderr` when combined with `--json`, preserving pure RFC-8259 JSON on `stdout`).
 - `beam catalog sync [<SRC> <TGT> | --from URI --to URI] [--zero-copy|--no-zero-copy] [--table NAME] [--dry-run] [--profile P] [--json]`
-    Zero-copy Lakehouse catalog synchronization in `<200ms`. Translates Delta Lake transaction
-    logs, Apache Iceberg metadata, or Parquet directory partition structures directly into target
-    Lakehouse catalogs (Google Cloud Lakehouse / BigLake REST, BigQuery managed Iceberg, or generic
-    Iceberg REST catalogs) with 0 data bytes copied.
+    Zero-copy Lakehouse catalog synchronization in `<200ms`. Translates **partitioned and
+    unpartitioned** Delta Lake (`delta://`), Apache Iceberg (`iceberg://`), or Hive-partitioned
+    Parquet (`col=val/*.parquet`) structures directly into target Lakehouse catalogs
+    (Google Cloud Lakehouse / BigLake REST, BigQuery managed Iceberg, or generic Iceberg
+    REST/Hadoop catalogs) with `0` data bytes copied. Always preview with `--dry-run` and
+    confirm with the user before writing.
 - `beam pipe [<SOURCE> [<SINK>] | --from|-i [ALIAS=]URI [--to|-o URI]] [-n|--limit N] [flags]`
     Move, convert, filter (`--where` / `--filter`, SQL `AND`/`OR`/`=`/`IS NOT NULL`/`IN (...)` auto-normalized),
-    project (`--select`), cap output rows (`-n` / `--limit N`), omit `--to` locally to preview result rows on `stdout`
-    (or `untrusted_data.rows` with `--json`), run multi-input
-    SQL joins & aggregations (`--sql "SELECT ..."` or `--sql-file query.sql` / `--sql @query.sql` across CSV, Parquet, JSONL,
+    project & mask PII (`--select` with `sha256`, `mask`, `mask_last4`, `mask_email`, `redact`),
+    cap output rows (`-n` / `--limit N`), omit `--to` locally to preview result rows on `stdout`
+    (or `untrusted_data.rows` with `--json`), write **partitioned Iceberg v2 tables**
+    (`--to-opt partition_fields=dt` or `day(event_ts)`, auto-inheriting partition specs on subsequent `--if-exists append` runs),
+    run multi-input SQL joins & aggregations (`--sql "SELECT ..."` or `--sql-file query.sql` / `--sql @query.sql` across CSV, Parquet, JSONL,
     text `.txt` (`Row(line: str)`), mixed-format directory globs like `data/*`,
-    `delta://`, and `iceberg://` in `<100ms` locally or `type: Sql` on Dataflow;
+    `gs://`, `s3://`, `delta://`, `iceberg://`, `kafka://`, and `pubsub://` in `<100ms` locally or `type: Sql` on Dataflow/Flink;
     `--join` is accepted as an alias for repeating `--from` or as the right stream for `--interval-join`),
     apply event-time windowing, speculative/late triggers & late-data quarantine (`--window fixed:60s`, `sliding:5m,1m`, `session:30m`, or `session:gap=30m:key=user_id` with `--timestamp-col COL` and optional `--allowed-lateness 10m --trigger "watermark,early=every:10s,late=count:1" --accumulation accumulating|discarding --late-action dlq|drop --late-data-dlq URI --emit-pane-info`; `--window-size` is accepted),
     correlate event streams with declarative interval or point-in-time ASOF joins (`--from o=URI --join s=URI --interval-join "on=id,left_time=o_ts,right_time=s_ts,between=0s..15m,type=left"` or `--asof-join "on=sym,left_time=t_ts,right_time=q_ts,direction=backward|forward|nearest,within=5m"`, or 2-source SQL `BETWEEN ... INTERVAL` / `ASOF [LEFT|INNER] JOIN`) and watermark skew circuit breaking (`--max-watermark-skew 30m --skew-action dlq|drop|warn|fail`),
     detect ordered event sequences, bounded repetitions, and missing follow-up events (`--timestamp-col event_ts --pattern "on=user_id,seq=login -> mfa -> purchase within 5m"` or `--timestamp-col event_ts --pattern "checkout -> !payment within 15m" --pattern-opt key=order_id`),
     deduplicate at-least-once streams or batches (`--dedupe-by|--dedup-by COL[,COL2] [--dedupe-window 10m] [--dedupe-keep first|last] [--dedupe-order COL] [--dedupe-dlq [URI]]`),
     hydrate external features or lookup tables (`--pre-select EXPR --enrich "bigquery|bigtable|vertexai|feast|file:..." [--enrich-opt [STAGE:]K=V]`),
-    run streaming or batch ML inference (`--infer "vertexai|hf|mock:..." [--infer-fields "col AS feat, nested.col AS feat2"] [--infer-tag prediction] [--infer-flatten] [--infer-opt [STAGE:]K=V] [--post-where|--post-filter EXPR]`; stage order is `--where -> --pre-select -> --enrich -> --infer -> --post-where -> --window -> --select -> --expect`),
-    enforce data quality rules (`--expect "rule: expr -> dlq|drop|fail"`), run pre-flight
+    run low-delay streaming or batch ML inference (`--infer "vertexai|hf|mock:...,min_batch_size=1,max_batch_duration_ms=10" [--infer-fields "col AS feat, nested.col AS feat2"] [--infer-tag prediction] [--infer-flatten] [--infer-opt [STAGE:]K=V] [--post-where|--post-filter EXPR]`; stage order is `--where -> --pre-select -> --enrich -> --infer -> --post-where -> --window -> --select -> --expect`),
+    enforce data quality rules (`--expect "rule: expr -> dlq|drop|fail"`, supported both standalone and combined with multi-table `--sql`), run pre-flight
     schema contract comparison (`--check-schema`), quarantine dirty rows (`--dlq` or `--dead-letter-target`, scrubbing PII via `--dlq-redact-fields|--redact-fields COLS`),
     drop invalid rows (`--drop-bad` / `--skip-errors`), enforce scan budget (`--max-bytes`), verify
     conservation (`--assert-counts`), reconcile output (`--verify [--key COL]`), apply
-    cross-engine CDC (`--cdc --primary-key COL`), or register existing Parquet /
-    `delta://` files into `iceberg://` in `<100ms` with `0` bytes copied
-    (`--zero-copy`). Unknown `--flags` fail fast with *"did you mean ...?"* hints (pass `--allow-unknown-options` for custom `PipelineOptions` subclasses).
+    cross-engine CDC (`--cdc --primary-key COL`), or register existing **partitioned or
+    unpartitioned** Parquet / `delta://` / `iceberg://` files into `iceberg://` in `<100ms`
+    with `0` bytes copied (`--zero-copy`). Unknown `--flags` fail fast with *"did you mean ...?"* hints (pass `--allow-unknown-options` for custom `PipelineOptions` subclasses).
     Pass `--portable` (`--strict-beam`) to enforce Beam Calcite
     SQL & runner portability (also reported via `outputs.portable_to_runner`);
     pass `--preview` to include sampled `untrusted_data.rows` when `--to` writes
@@ -92,18 +106,20 @@ def render_llms_txt() -> str:
     (`outputs.yaml` with `--json`), even before source files exist.
     Local file sinks with explicit extensions (`out/clean.parquet`) materialize
     exact single files; sharded Beam prefixes are also auto-resolved.
-    Small local file-to-file jobs (CSV/JSONL/Parquet/Avro/Text in, up to 64 MB, an
+    Local file-to-file jobs (CSV/JSONL/Parquet/Avro/Text in, up to 256 MiB, an
     exact CSV/JSONL/Parquet/Text file out, no `--runner`) run in-process in
-    ~0.1-0.4 s with the same typing, DLQ records and metrics (`runner:
-    "local_fast"`); `BEAM_CLI_NO_FAST_PATH=1`, `--portable`, or `--runner` uses a Beam runner.
+    ~0.1-1.5 s with the same typing, DLQ records and metrics (`runner:
+    "local_fast"`); larger local files stream in bounded memory (`<350 MiB` heap)
+    on Beam's local Python runner.
 - `beam schema [diff|check] <SRC> <TGT> [--mode backward|forward|full] [--strict] [--source-format|--left-format FMT] [--target-format|--right-format FMT] [--json]`
-    Pre-flight schema contract and compatibility guard (<100ms, zero-runner; accepts positional `<SRC> <TGT>` or `--from SRC --to TGT`).
+    Pre-flight schema contract and compatibility guard (`<100ms`, zero-runner; exits `2` on
+    `SchemaContractViolationError`; accepts positional `<SRC> <TGT>` or `--from SRC --to TGT`).
     Detects dropped required columns, type narrowing (FLOAT64 -> INT32), and
     nullability mismatches between source and target datasets before launching compute,
     emitting actionable SQL remediation hints (`next_actions`) with `CAST(...)` syntax.
 - `beam export-schedule <FILE.yaml> --orchestrator composer|cloud-scheduler [-p|--param K=V] [--schedule CRON] [--json]`
-    Export a validated declarative pipeline to a production-grade orchestrator:
-    generates Google Cloud Composer (Airflow) DAGs using `DataflowStartFlexTemplateOperator`
+    Export a validated declarative pipeline to Cloud Composer (Airflow) or Cloud Scheduler:
+    generates Airflow DAGs using `DataflowStartFlexTemplateOperator`
     or serverless Cloud Scheduler HTTP triggers invoking `flexTemplates:launch`.
 - `beam package <FILE.yaml | FILE.py | -> --to|-o|--output <gs://.../spec.json> [--sdk yaml|python|auto] [flags] [--json]`
     Zero-Docker `<1s` Flex Template packager for Beam YAML (auto-extracts Jinja
@@ -112,7 +128,7 @@ def render_llms_txt() -> str:
     `Dockerfile` or `metadata.json`). Accepts case-insensitive `--sdk` (`yaml`/`YAML`)
     and `--to`, `-o`, `--output` destination flags.
 - `beam diff [<LEFT_URI> <RIGHT_URI> | --left URI --right URI] [--key COL ...] [--columns shared|all|col1,col2] [-n|--limit 100|all] [--to|-o FILE] [--exit-zero] [--rtol F] [--atol F] [--json]`
-    In-process (`local_fast` `<= 64 MB`) or distributed O(1)-memory key/multiset
+    In-process (`local_fast` `<= 256 MiB`) or distributed O(1)-memory key/multiset
     reconciliation across files, `delta://`, `iceberg://`, and `bigquery://` (`0`
     match, `6` drift). Compares shared columns (or `--columns all`, or an explicit
     subset `--columns qty,price`) and reports added/removed/retyped columns in
@@ -139,12 +155,12 @@ def render_llms_txt() -> str:
     Manage `~/.beam/config.yaml` profiles or run Beam Calcite SQL.
 
 ## 3. Exit Codes
-- `0`   Success (`diff` datasets match; `pipe`/`run` completed or submitted)
-- `1`   Pipeline execution failure or `--assert-counts` conservation failure
-- `2`   Usage, validation, schema, or inline-credential security error
+- `0`   Success (`beam schema` compatible; `beam diff` datasets match; `pipe`/`run` completed or submitted)
+- `1`   Runtime pipeline failure: unquarantined mid-stream JSONL `SchemaDriftError` (without `--dlq`/`--drop-bad`), `--expect "... -> fail"`, or `--assert-counts` conservation failure
+- `2`   Pre-flight usage, validation, `beam schema` / `--check-schema` `SchemaContractViolationError`, or inline-credential security error (zero compute run)
 - `3`   Feature or flag combination unsupported on selected runner
 - `4`   Missing optional Python extra or Java runtime (`next_actions` shows fix)
-- `6`   `beam diff` / `beam pipe --verify` detected data mismatch
+- `6`   `beam diff` / `beam pipe --verify` detected post-hoc dataset or schema drift between materialized datasets
 - `7`   `--wait-timeout` / `beam wait --timeout` expired (`detached: true` on remote)
 - `8`   `--max-bytes` pre-flight scan guardrail exceeded (`CostLimitExceededError`)
 - `130` Interrupted (`SIGINT` / Ctrl-C)
@@ -156,19 +172,21 @@ def render_llms_txt() -> str:
 - BigQuery: `bigquery://PROJECT.DATASET.TABLE` (CDC UPSERT/DELETE via `--cdc --primary-key id`)
 - PostgreSQL / MySQL: `postgres://HOST:5432/DB?table=public.users`, `mysql://HOST:3306/DB?table=orders`
 - Cloud Spanner: `spanner://PROJECT/INSTANCE/DB?change_stream=orders_cs`
-- Pub/Sub & Kafka: `pubsub://projects/PROJECT/subscriptions/SUB`, `kafka://HOST:9092/TOPIC`
+- Pub/Sub & Kafka: `pubsub://projects/PROJECT/subscriptions/SUB`, `kafka://HOST:9092/TOPIC[?schema_registry=https://...&auto_offset_reset=latest&timestamp_policy=CreateTime]`
 
-## 5. Safe `--where`, `--select`, & Multi-Input `--sql`
+## 5. Safe `--where`, `--select`, PII Masking, & Multi-Input `--sql`
 - `--where "status = 'PAID' AND amount >= 100 AND deleted_at IS NULL"`
   (Supports SQL `=` / `<>` and Python `==` / `!=`, `AND`/`OR`/`NOT`, `<`, `<=`,
   `>`, `>=`, `IN (...)`, `IS [NOT] NULL`, `CAST(col AS INT|FLOAT|STRING|BOOL)`,
   keyword/backticked columns like `` `class` ``, scalar helpers `lower`,
-  `upper`, `strip`/`trim`, `len`/`length`, `coalesce`/`ifnull`, `abs`, `round`,
-  `int`, `float`, `str`, `bool`, and UTC timestamp helpers `parse_timestamp`/`to_utc`,
+  `upper`, `strip`/`trim`, `len`/`length`, `substr`/`substring`, `concat`,
+  `coalesce`/`ifnull`, `abs`, `round`, `int`, `float`, `str`, `bool`, PII masking & hashing
+  helpers `sha256(val)`, `mask(val[, keep_last=4, mask_char='*'])`, `mask_last4(val)`,
+  `mask_email(val)`, `redact(val)`, and UTC timestamp helpers `parse_timestamp`/`to_utc`,
   `epoch_ms`/`to_epoch_ms`, `year`, `month`, `day`, `hour`, `date_part`.)
-- `--select "CAST(user_id AS INT) AS user_id, lower(email) AS email, `class`, parse_timestamp(ts) AS utc_ts, round(amount * 1.08, 2) AS total"`
-- `--from o=orders.parquet --from c=customers.csv --sql "SELECT COALESCE(c.tier, 'UNMAPPED') AS tier, COUNT(*) AS n, ROUND(SUM(o.amount), 2) AS rev FROM o LEFT JOIN c ON o.cid = c.cid GROUP BY 1"`
-  (`--sql` composes with `--where` pre-filter, `--select` post-projection, `--drop-bad` / `--dlq`, and exports portable Beam Calcite `Sql` YAML via `--emit-yaml` or `--runner=DataflowRunner`.)
+- `--select "CAST(user_id AS INT) AS user_id, mask_email(email) AS email, sha256(ssn) AS ssn_hash, `class`, parse_timestamp(ts) AS utc_ts"`
+- `--from o=orders.parquet --from c=customers.csv --sql "SELECT COALESCE(c.tier, 'UNMAPPED') AS tier, COUNT(*) AS n, ROUND(SUM(o.amount), 2) AS rev FROM o LEFT JOIN c ON o.cid = c.cid GROUP BY 1" --expect "pos_rev: rev > 0 -> dlq" --dlq bad.jsonl`
+  (`--sql` composes with `--where` pre-filter, `--select` post-projection, `--expect` quality gates, `--drop-bad` / `--dlq`, and exports portable Beam Calcite `Sql` YAML via `--emit-yaml` or `--runner=DataflowRunner`.)
 - NULLs follow SQL three-valued logic everywhere: any comparison (`=`, `!=`, `<`, `IN`, `NOT IN`), arithmetic,
   `NOT`, nested access, string helpers and casts on NULL give NULL, and a row is kept only if the filter is TRUE.
   So `--where "state != 'CA'"` drops rows with no state, as in SQL. Test for NULL with `IS [NOT] NULL`
@@ -189,13 +207,12 @@ def render_llms_txt() -> str:
 - Nested JSON objects and Parquet/Avro structs use dots: `--where "props.amount >= 10" --select "user.id AS user_id"`.
   Local JSONL files (`<= 64 MB`) scan every record automatically for schema discovery so sparse fields past row 100 are
   included out of the box. On larger/remote streams (or explicit `--from-opt sample_rows=N`), unseen fields raise
-  `SchemaDriftError` (quarantined to `--dlq` with a warning in `warnings`, or failing fast without `--dlq`); pass
+  `SchemaDriftError` (quarantined to `--dlq` with a warning in `warnings`, or failing fast with exit `1` without `--dlq`); pass
   `--from-opt sample_rows=all` (or `fields=COL:TYPE`) to include them, or `--from-opt on_unknown_fields=ignore` to drop extra fields.
 - Local `--sql` is SQLite (inputs named `alias=URI`; unaliased inputs are named after the file, and the primary input
-  also binds `FROM source`) plus `to_utc(ts)`
-  (normalizes ISO `Z`/offsets/naive and epoch sec/ms to `YYYY-MM-DDTHH:MM:SSZ`), exact `median(x)`,
-  `percentile(x, 95)`, `quantile(x, 0.95)` (linear interpolation, like numpy), `stddev(x)`, `variance(x)`,
-  `var_samp(x)`, `var_pop(x)`, `stddev_pop(x)`, `covar_samp(x, y)`, `covar_pop(x, y)`, `corr(x, y)`,
+  also binds `FROM source`) plus `to_utc(ts)`, `sha256(v)`, `mask(v[, k, c])`, `mask_last4(v)`, `mask_email(v)`, `redact(v)`,
+  exact `median(x)`, `percentile(x, 95)` (`0..100` percentage scale), `quantile(x, 0.95)` (`0.0..1.0` fraction scale; linear interpolation, like numpy),
+  `stddev(x)`, `variance(x)`, `var_samp(x)`, `var_pop(x)`, `stddev_pop(x)`, `covar_samp(x, y)`, `covar_pop(x, y)`, `corr(x, y)`,
   `regr_slope(y, x)`, `regr_intercept(y, x)`, `regr_r2(y, x)`; window functions
   such as `ROW_NUMBER() OVER (PARTITION BY k ORDER BY to_utc(ts) DESC)` work. Schema-evolution append / column
   rename is one query: `SELECT id, name, CAST(NULL AS TEXT) AS tier FROM old UNION ALL SELECT id, full_name AS name, tier FROM batch2`
@@ -212,49 +229,59 @@ def render_llms_txt() -> str:
 
 ## 6. Canonical Agent Workflow Examples
 ```bash
-# 1. Inspect, guard, clean, and reconcile CSV -> BigQuery (or exact local Parquet)
-beam inspect gs://my-bucket/raw/orders.csv --json
-beam pipe --from gs://my-bucket/raw/orders.csv \\
-          --to bigquery://my-proj.analytics.orders_clean \\
-          --dlq gs://my-bucket/dlq/orders_bad.json \\
-          --where "amount > 0 AND status = 'PAID' AND order_id IS NOT NULL" \\
-          --max-bytes 10GB --assert-counts --json
+# 1. Nightly JSON to Partitioned Iceberg (+ Zero-Docker Flex Template & Composer DAG)
+beam pipe --from "gs://my-bucket/raw/events/{{{{ ds }}}}/*.jsonl" \\
+          --to "iceberg://lake.events?warehouse=gs://my-bucket/wh" \\
+          --select "*, '{{{{ ds }}}}' AS dt" --to-opt partition_fields=dt \\
+          --if-exists append --dlq "gs://my-bucket/dlq/events/{{{{ ds }}}}/" --emit-yaml > nightly.yaml
+beam package nightly.yaml --to gs://my-bucket/templates/nightly.json --json
+beam export-schedule nightly.yaml --template-spec gs://my-bucket/templates/nightly.json \\
+     --orchestrator composer --schedule "0 2 * * *" --to dags/nightly_dag.py --json
 
-# 2. Zero-gap Delta Lake -> Iceberg v2 full sync + incremental CDC (never misses intermediate commits)
+# 2. Kafka to Iceberg: Filter, Mask PII (sha256, mask_email, mask_last4), and Redact DLQ
+beam pipe --from "kafka://broker:9092/payments?auto_offset_reset=latest" \\
+          --to "iceberg://lake.payments?warehouse=gs://my-bucket/wh" \\
+          --where "status = 'CAPTURED' AND amount > 0" \\
+          --select "payment_id, sha256(user_id) AS user_hash, mask_email(email) AS email, mask_last4(card_number) AS card_masked, amount, event_ts" \\
+          --to-opt partition_fields="day(event_ts)" --dlq gs://my-bucket/dlq/payments/ \\
+          --dlq-redact-fields email,card_number --from-opt-file kafka.opts \\
+          --runner=DataflowRunner --project=my-proj --region=us-central1 --json
+
+# 3. Join Two Live Kafka Streams + Read-Only Kafka Peek (beam tail)
+beam tail "kafka://broker:9092/clicks?schema_registry=https://sr.internal:8081" -n 5 --duration 5s --from-opt-file kafka.opts --json
+beam pipe --from "c=kafka://broker:9092/clicks?timestamp_policy=CreateTime" \\
+          --join "o=kafka://broker:9092/orders?timestamp_policy=CreateTime" \\
+          --to "iceberg://lake.attributed_orders?warehouse=gs://my-bucket/wh" \\
+          --sql "SELECT o.order_id, o.user_id, c.campaign_id, o.amount, o.order_ts FROM c JOIN o ON c.user_id = o.user_id AND o.order_ts BETWEEN c.click_ts AND c.click_ts + INTERVAL '15' MINUTE" \\
+          --max-watermark-skew 30m --skew-action dlq --dlq gs://my-bucket/dlq/skew/ \\
+          --from-opt-file kafka.opts --runner=DataflowRunner --project=my-proj --region=us-central1 --json
+
+# 4. PostgreSQL Debezium CDC & Partitioned/Unpartitioned Delta Lake -> Iceberg v2
+beam pipe --from "postgres://pg.internal:5432/prod?table=public.orders" \\
+          --to "iceberg://lake.orders?warehouse=gs://my-bucket/wh" \\
+          --cdc --primary-key order_id --from-opt-file pg.opts \\
+          --runner=DataflowRunner --project=my-proj --region=us-central1 --json
+beam catalog sync --dry-run delta://gs://my-bucket/delta/orders "iceberg://lake.orders?warehouse=gs://my-bucket/wh" --json
+# After user confirmation:
 V0=$(beam inspect delta://gs://my-bucket/delta/orders --sample 0 --json | jq -r '.outputs.snapshot_version')
 beam pipe --from "delta://gs://my-bucket/delta/orders?version=${{V0}}" \\
-          --to "iceberg://lake.orders?warehouse=gs://my-bucket/iceberg" \\
+          --to "iceberg://lake.orders?warehouse=gs://my-bucket/wh" \\
           --zero-copy --verify --verify-key order_id --json
-V1=$(beam inspect delta://gs://my-bucket/delta/orders --sample 0 --json | jq -r '.outputs.snapshot_version')
-beam pipe --from "delta://gs://my-bucket/delta/orders?start_version=$((V0 + 1))&end_version=${{V1}}" \\
-          --to "iceberg://lake.orders?warehouse=gs://my-bucket/iceberg" \\
-          --cdc --primary-key order_id --if-exists append --json
 
-# 3. Multi-input SQL join + aggregation across Parquet / CSV / Iceberg (repeatable --from)
-beam pipe --from o=out/clean_orders.parquet \\
-          --from c=data/customers.csv \\
-          --to out/revenue_by_tier.json \\
-          --sql "SELECT COALESCE(c.tier, 'UNMAPPED') AS tier, COUNT(*) AS orders, ROUND(SUM(o.amount), 2) AS revenue FROM o LEFT JOIN c ON o.customer_id = c.customer_id GROUP BY 1 ORDER BY revenue DESC" \\
-          --json
+# 5. Multi-Table SQL Join with Per-Rule Quality Expectations (--expect)
+beam pipe --from o=out/clean_orders.parquet --from c=data/customers.csv \\
+          --to out/curated_orders.parquet --dlq out/quality_dlq.jsonl \\
+          --sql "SELECT o.order_id, o.customer_id, c.tier, ROUND(o.amount, 2) AS amount FROM o LEFT JOIN c ON o.customer_id = c.customer_id" \\
+          --expect "pk_present: order_id IS NOT NULL -> fail" \\
+          --expect "mapped_tier: tier IS NOT NULL AND amount > 0 -> dlq" --json
 
-# 4. OLTP Database + Debezium -> BigQuery UPSERT/DELETE (ReadFromDebezium or buffered Pub/Sub LSN stream)
-beam pipe --from pubsub://projects/my-proj/subscriptions/orders-cdc \\
-          --to bigquery://my-proj.analytics.orders_live \\
-          --cdc --primary-key order_id --dlq gs://my-bucket/dlq/cdc_bad.json \\
-          --from-opt fields="order_id:int,customer:str,amount:float" --json
-
-# 5. Enrich + ML Inference + PII-Redacted DLQ + Post-Filter
-beam pipe --from events.jsonl --to scored.parquet --dlq dlq/bad.jsonl --dlq-redact-fields email,ssn \\
-          --pre-select "*, lower(strip(raw_uid)) AS user_id" \\
-          --enrich "file:users.parquet,key=user_id,columns=[tier:str,country:str],on_miss=dlq" \\
-          --infer "mock:fraud_v1,fields=[amount,tier],flatten=true" \\
-          --post-where "prediction_score >= 0.8 AND tier = 'VIP'" --assert-counts --json
-
-# 6. Point-in-Time ASOF Join & Stateful CEP Pattern Detection
-beam pipe --from t=trades.jsonl --join q=quotes.jsonl --to matched.parquet \\
-          --asof-join "on=symbol,left_time=trade_ts,right_time=quote_ts,within=5s,direction=backward" --json
-beam pipe --from clicks.jsonl --to alerts.jsonl --timestamp-col event_ts \\
-          --pattern "on=user_id,seq=login -> mfa -> !logout within 10m,mode=relaxed" --json
+# 6. Low-Delay Streaming Transaction Scoring (Bigtable + TLS Redis + 10ms Micro-Batch Inference)
+beam pipe --from "kafka://broker:9092/transactions?auto_offset_reset=latest" \\
+          --to "kafka://broker:9092/scored-transactions" \\
+          --enrich "bigtable:project=my-proj,instance=risk-bt,table=velocity,key=card_id,columns=[stats:txn_1h:int],redis=rediss://10.0.0.5:6379,on_miss=null" \\
+          --infer "vertexai:endpoint=projects/my-proj/locations/us-central1/endpoints/123,min_batch_size=1,max_batch_size=16,max_batch_duration_ms=10" \\
+          --infer-fields "amount, txn_1h" --infer-flatten --dlq gs://my-bucket/dlq/scoring/ --dlq-redact-fields card_id \\
+          --from-opt-file kafka.opts --runner=DataflowRunner --project=my-proj --region=us-central1 --json
 ```
 """
 

@@ -511,7 +511,7 @@ def _check_parquet_untyped_python_expressions(
 
 
 _SAFE_CALLABLE_IMPORTS = frozenset(
-    ['json', 'math', 're', 'datetime', 'decimal', 'base64'])
+    ['json', 'math', 're', 'datetime', 'decimal', 'base64', 'hashlib'])
 _DANGEROUS_CALLABLE_NAMES = frozenset([
     '__import__',
     'eval',

@@ -567,31 +567,44 @@ def build_pipe_spec(
     if dst_ep.kind != 'iceberg':
       raise PipeSpecError(
           f'--zero-copy requires an iceberg:// destination, got {dst_ep.raw!r}')
-    if src_ep.kind != 'delta' and not (
+    if src_ep.kind not in ('delta', 'iceberg') and not (
         src_ep.kind == 'file' and src_ep.format == 'parquet'):
       raise PipeSpecError(
-          '--zero-copy requires a delta:// table or Parquet file/glob source, '
-          f'got {src_ep.raw!r}')
+          '--zero-copy requires a delta://, iceberg://, or Parquet file/glob '
+          f'source, got {src_ep.raw!r}')
 
     # Build canonical `IcebergAddFiles` YAML representation for `--emit-yaml`.
     zc_steps: list[dict[str, Any]] = []
     zc_providers: list[dict[str, Any]] = []
-    if src_ep.kind == 'delta':
+    if src_ep.kind in ('delta', 'iceberg'):
       active_paths: list[dict[str, str]] = []
+      fallback_pat: str | None = None
       try:
         from . import lakehouse
-        snap = lakehouse.parse_delta_log(
-            src_ep.config['table'],
-            target_version=(
-                int(src_ep.config['version'])
-                if src_ep.config.get('version') is not None else None))
-        active_paths = [{'path': f['path']} for f in snap['active_files']]
+        if src_ep.kind == 'delta':
+          fallback_pat = src_ep.config['table'].rstrip('/') + '/*.parquet'
+          snap = lakehouse.parse_delta_log(
+              src_ep.config['table'],
+              target_version=(
+                  int(src_ep.config['version'])
+                  if src_ep.config.get('version') is not None else None))
+          active_paths = [{'path': f['path']} for f in snap['active_files']]
+        else:
+          src_tdir = lakehouse.resolve_iceberg_table_dir(
+              src_ep.config, default_project=default_project)
+          fallback_pat = src_tdir.rstrip('/') + '/data/*.parquet'
+          src_st = lakehouse.load_iceberg_state(
+              src_tdir, snapshot_id=src_ep.config.get('snapshot_id'))
+          active_paths = [
+              {'path': f['path']} for f in src_st.get('data_files', [])
+          ]
       except Exception:  # pylint: disable=broad-except
         active_paths = []
       if active_paths:
         zc_steps.append({'type': 'Create', 'config': {'elements': active_paths}})
       else:
-        pat = src_ep.config['table'].rstrip('/') + '/*.parquet'
+        pat = fallback_pat or (
+            str(src_ep.config.get('table', '')).rstrip('/') + '/*.parquet')
         zc_steps.extend([
             {'type': 'ReadMatchFiles', 'config': {'file_pattern': pat}},
             {

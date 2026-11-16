@@ -332,9 +332,10 @@ window functions across heterogeneous files and Lakehouse tables, use `--sql`
 
 Alias each input with `alias=URI` via `--from` / `--join`. Locally (`<= 64 MB`),
 `beam pipe --sql` runs in `<80 ms` inside a read-only `:memory:` SQLite sandbox
-augmented with `median(x)`, `quantile(x, p)`, `percentile(x, 95)`, `stddev(x)`,
-`corr(x, y)`, `regr_slope(y, x)`, and `to_utc(ts)`—or in an in-memory DuckDB
-sandbox via `--sql-engine duckdb`:
+augmented with `median(x)`, `quantile(x, 0.95)` (`0.0..1.0` fraction scale),
+`percentile(x, 95)` (`0..100` percentage scale), `stddev(x)`, `corr(x, y)`,
+`regr_slope(y, x)`, `sha256(x)`, `mask_email(x)`, `mask_last4(x)`, and
+`to_utc(ts)`—or in an in-memory DuckDB sandbox via `--sql-engine duckdb`:
 
 ```sh
 beam pipe \
@@ -355,6 +356,8 @@ beam pipe \
     GROUP BY 1
     ORDER BY revenue_usd DESC
   " \
+  --expect "positive_rev: revenue_usd > 0 -> dlq" \
+  --dlq reports/quality_dlq.jsonl \
   --to reports/revenue_by_tier.json \
   --to-opt key=tier
 ```
@@ -363,8 +366,9 @@ beam pipe \
   object `{"ENTERPRISE": {"orders": ...}, "PRO": {...}}` instead of JSONL when
   generating configuration artifacts or API payloads.
 - **Composable pipeline stages**: Combine `--where` (pre-filter before SQL),
-  `--sql`, `--select` (post-SQL projection), and `--dlq` / `--drop-bad` in a
-  single command across `.parquet`, `.avro`, `.jsonl`, and `.csv` sinks.
+  `--sql`, `--select` (post-SQL projection), `--expect` (per-rule quality gates),
+  and `--dlq` / `--drop-bad` in a single command across `.parquet`, `.avro`,
+  `.jsonl`, and `.csv` sinks.
 - **ANSI OLAP extensions (`--sql-engine duckdb`)**: Pass `--sql-engine duckdb`
   whenever your query uses `PERCENTILE_CONT(...) WITHIN GROUP`, `QUALIFY`, or
   `GROUPING SETS`.

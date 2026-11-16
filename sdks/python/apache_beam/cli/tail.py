@@ -50,9 +50,12 @@ import json
 import os
 import re
 import signal
+import struct
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import Any
@@ -93,13 +96,20 @@ class InteractiveTailFormatter:
   keys and values are sanitized to prevent terminal control character / ANSI escape injection.
   """
 
-  def __init__(self, uri: str, follow: bool = False, use_color: bool | None = None):
+  def __init__(
+      self,
+      uri: str,
+      follow: bool = False,
+      use_color: bool | None = None,
+      stream: Any = None,
+  ):
     self.uri = _sanitize_terminal_str(str(uri))
     self.follow = follow
+    self._stream = stream if stream is not None else sys.stdout
     if use_color is None:
       self.use_color = (
-          hasattr(sys.stdout, 'isatty')
-          and sys.stdout.isatty()
+          hasattr(self._stream, 'isatty')
+          and self._stream.isatty()
           and 'NO_COLOR' not in os.environ
           and os.environ.get('TERM') != 'dumb'
       )
@@ -109,7 +119,7 @@ class InteractiveTailFormatter:
     self.start_time = time.monotonic()
     self.record_count = 0
     self.total_bytes = 0
-    self.timestamps: collections.deque[float] = collections.deque(maxlen=100)
+    self.timestamps: collections.deque[float] = collections.deque(maxlen=500)
     self.peak_rate = 0.0
 
   def _style(self, text: str, code: str) -> str:
@@ -149,10 +159,12 @@ class InteractiveTailFormatter:
     print(banner, file=sys.stderr, flush=True)
 
   def format_record(self, rec: dict[str, Any], idx: int) -> str:
-    """Formats a single stream record with timestamps, rolling rate, and sanitized fields."""
+    """Formats a single stream record with timestamps, 5s rolling rate, and sanitized fields."""
     now = time.monotonic()
     self.record_count += 1
     self.timestamps.append(now)
+    while len(self.timestamps) > 1 and (now - self.timestamps[0]) > 5.0:
+      self.timestamps.popleft()
     rec_bytes = len(json.dumps(rec, default=str))
     self.total_bytes += rec_bytes
 
@@ -165,16 +177,25 @@ class InteractiveTailFormatter:
       self.peak_rate = rate
 
     idx_str = self.dim(f'[#{idx}]')
-    ts_str = self.cyan(datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3])
+    ts_str = self.green(datetime.datetime.now().strftime('%H:%M:%S.%f')[:-3])
 
     parts = []
     for k, v in rec.items():
       safe_k = _sanitize_terminal_str(str(k))
+      kl = safe_k.lower()
       val_raw = json.dumps(v, default=str) if isinstance(v, (dict, list)) else str(v)
       safe_v = _sanitize_terminal_str(val_raw)
       if len(safe_v) > 60:
         safe_v = safe_v[:57] + '...'
-      parts.append(f"{self.bold(safe_k)}={self.yellow(safe_v)}")
+      if isinstance(v, (int, float)) and not isinstance(v, bool):
+        styled_v = self.yellow(safe_v)
+      elif kl.endswith(('_ts', '_time', 'timestamp', 'created_at', 'updated_at')):
+        styled_v = self.green(safe_v)
+      elif kl == 'id' or kl.endswith('_id') or kl in ('key', 'partition'):
+        styled_v = self.cyan(safe_v)
+      else:
+        styled_v = self.yellow(safe_v)
+      parts.append(f"{self.bold(safe_k)}={styled_v}")
 
     fields_str = '  '.join(parts)
     rate_str = self.dim(f"({rate:.1f} msg/s)") if self.follow else ""
@@ -183,7 +204,7 @@ class InteractiveTailFormatter:
   def on_stream_record(self, rec: dict[str, Any], idx: int) -> None:
     """Callback invoked on every record arrival to print the formatted line."""
     line = self.format_record(rec, idx)
-    print(line, flush=True)
+    print(line, file=self._stream, flush=True)
 
   def render_exit_summary(self, interrupted: bool = False) -> None:
     """Renders the summary card upon stream completion or Ctrl-C interrupt."""
@@ -802,6 +823,130 @@ def _tail_pubsub(
   }
 
 
+_BLOCKED_METADATA_HOSTS = frozenset({
+    '169.254.169.254',
+    'fd00:ec2::254',
+    '[fd00:ec2::254]',
+    'metadata.google.internal',
+    'metadata',
+    '100.100.100.200',
+})
+
+
+def _fetch_confluent_schema_doc(
+    registry_url: str,
+    schema_id: int,
+    cache: dict[int, Any],
+    basic_auth: str | None = None,
+) -> dict[str, Any]:
+  """Fetches and caches `{schema_type, parsed}` from Confluent Schema Registry."""
+  if schema_id in cache:
+    cached_val = cache[schema_id]
+    if isinstance(cached_val, dict) and '_beam_schema_type' in cached_val:
+      return cached_val
+    return {'_beam_schema_type': 'AVRO', 'parsed': cached_val}
+  parsed_u = urllib.parse.urlsplit(registry_url)
+  host = (parsed_u.hostname or '').lower()
+  if (parsed_u.scheme not in ('http', 'https') or not host or
+      host in _BLOCKED_METADATA_HOSTS):
+    raise TailError(f'disallowed Schema Registry URL {registry_url!r}', 2)
+  endpoint = f"{registry_url.rstrip('/')}/schemas/ids/{int(schema_id)}"
+  headers = {'Accept': 'application/json'}
+  if basic_auth:
+    import base64
+    b64_tok = base64.b64encode(basic_auth.encode('utf-8')).decode('ascii')
+    headers['Authorization'] = f'Basic {b64_tok}'
+  req = urllib.request.Request(endpoint, headers=headers)
+  with urllib.request.urlopen(req, timeout=5.0) as resp:  # nosec B310
+    raw_body = resp.read(1024 * 1024 + 1)
+  if len(raw_body) > 1024 * 1024:
+    raise TailError('Schema Registry response exceeded 1 MiB limit', 2)
+  doc = json.loads(raw_body.decode('utf-8'))
+  schema_type = str(doc.get('schemaType') or 'AVRO').upper()
+  schema_json = doc.get('schema')
+  schema_obj = (
+      json.loads(schema_json) if isinstance(schema_json, str) else schema_json)
+  if schema_type == 'AVRO':
+    try:
+      import fastavro
+    except ImportError:
+      raise TailError(
+          'fastavro is required to decode Confluent Schema Registry Avro '
+          "payloads; install: pip install 'fastavro'",
+          EXIT_MISSING_PACKAGE) from None
+    entry = {
+        '_beam_schema_type': 'AVRO',
+        'parsed': fastavro.parse_schema(schema_obj),
+    }
+  else:
+    entry = {'_beam_schema_type': schema_type, 'parsed': schema_obj}
+  cache[schema_id] = entry
+  return entry
+
+
+def _fetch_confluent_avro_schema(
+    registry_url: str,
+    schema_id: int,
+    cache: dict[int, Any],
+) -> Any:
+  """Backwards-compatible helper returning a parsed `fastavro` schema."""
+  entry = _fetch_confluent_schema_doc(registry_url, schema_id, cache)
+  return entry['parsed']
+
+
+def _decode_kafka_wire_message(
+    raw_val: bytes,
+    registry_url: str | None,
+    schema_cache: dict[int, Any],
+    basic_auth: str | None = None,
+) -> tuple[Any, int | None, bool | None, str | None]:
+  """Returns `(payload, schema_id, schema_valid, schema_error)`."""
+  if len(raw_val) >= 5 and raw_val[0] == 0:
+    schema_id = struct.unpack('>I', raw_val[1:5])[0]
+    body_bytes = raw_val[5:]
+    if registry_url:
+      try:
+        # Preserve backwards compatibility when tests mock `_fetch_confluent_avro_schema`.
+        if getattr(
+            _fetch_confluent_avro_schema, '__module__', '') != __name__:
+          import fastavro
+          avro_sc = _fetch_confluent_avro_schema(
+              registry_url, schema_id, schema_cache)
+          decoded = fastavro.schemaless_reader(io.BytesIO(body_bytes), avro_sc)
+          return decoded, schema_id, True, None
+        entry = _fetch_confluent_schema_doc(
+            registry_url, schema_id, schema_cache, basic_auth=basic_auth)
+        st = entry.get('_beam_schema_type', 'AVRO')
+        if st == 'AVRO':
+          import fastavro
+          decoded = fastavro.schemaless_reader(
+              io.BytesIO(body_bytes), entry['parsed'])
+          return decoded, schema_id, True, None
+        if st == 'JSON':
+          decoded_json = json.loads(body_bytes.decode('utf-8'))
+          try:
+            import jsonschema  # type: ignore
+            jsonschema.validate(instance=decoded_json, schema=entry['parsed'])
+            return decoded_json, schema_id, True, None
+          except ImportError:
+            return decoded_json, schema_id, None, None
+          except Exception as val_exc:  # pylint: disable=broad-except
+            return decoded_json, schema_id, False, str(val_exc).splitlines()[0]
+      except TailError:
+        raise
+      except Exception:  # pylint: disable=broad-except
+        pass
+    # Even without registry_url, Confluent JSON Schema wire payloads are UTF-8 JSON after byte 5!
+    try:
+      txt_body = body_bytes.decode('utf-8').strip()
+      if txt_body and txt_body[0] in ('{', '['):
+        return json.loads(txt_body), schema_id, None, None
+    except Exception:  # pylint: disable=broad-except
+      pass
+    return _decode_payload_bytes(raw_val), schema_id, None, None
+  return _decode_payload_bytes(raw_val), None, None, None
+
+
 def _tail_kafka(
     ep: uris.ParsedEndpoint,
     *,
@@ -813,6 +958,15 @@ def _tail_kafka(
 ) -> dict[str, Any]:
   bootstrap = ep.config['bootstrap_servers']
   topic = ep.config['topic']
+  registry_url = ep.config.get('confluent_schema_registry_url')
+  sr_auth = (
+      ep.config.get('schema_registry_basic_auth') or
+      ep.config.get('schema_registry_user_info') or
+      os.environ.get('BEAM_SCHEMA_REGISTRY_USER_INFO'))
+  want_raw = bool(
+      ep.format in ('raw', 'bytes', 'hex') or ep.config.get('raw_bytes'))
+  no_group = bool(ep.config.get('no_group'))
+  schema_cache: dict[int, Any] = {}
   try:
     import confluent_kafka  # type: ignore
   except ImportError:
@@ -821,19 +975,47 @@ def _tail_kafka(
         "install: pip install 'confluent-kafka'",
         EXIT_MISSING_PACKAGE) from None
 
-  consumer = confluent_kafka.Consumer({
+  extra_consumer_cfg = ep.config.get('consumer_config')
+  offset_reset = str(
+      ep.config.get('auto_offset_reset_config') or
+      ('latest' if follow else 'earliest'))
+  consumer_cfg: dict[str, Any] = {
       'bootstrap.servers': bootstrap,
-      'group.id': f'beam-cli-peek-{uuid.uuid4().hex[:10]}',
-      'enable.auto.commit': False,
-      'auto.offset.reset': 'latest' if follow else 'earliest',
       'socket.timeout.ms': 5000,
-  })
+  }
+  if isinstance(extra_consumer_cfg, dict):
+    for k, v in extra_consumer_cfg.items():
+      if k not in ('group.id', 'enable.auto.commit'):
+        consumer_cfg[str(k)] = v
+  # Always enforce an ephemeral non-committing `beam-tail-<uuid>` consumer group.
+  consumer_cfg['group.id'] = f'beam-tail-{uuid.uuid4().hex[:12]}'
+  consumer_cfg['enable.auto.commit'] = False
+  consumer_cfg['auto.offset.reset'] = offset_reset
+
+  consumer = confluent_kafka.Consumer(consumer_cfg)
   rows: list[dict[str, Any]] = []
   scanned_bytes = 0
   truncated_budget = False
   interrupted = False
   try:
-    consumer.subscribe([topic])
+    if no_group and hasattr(consumer, 'assign') and hasattr(
+        confluent_kafka, 'TopicPartition'):
+      off_const = (
+          getattr(confluent_kafka, 'OFFSET_END', -1)
+          if offset_reset == 'latest' else
+          getattr(confluent_kafka, 'OFFSET_BEGINNING', -2))
+      part_ids = [0]
+      if hasattr(consumer, 'list_topics'):
+        meta = consumer.list_topics(topic=topic, timeout=5.0)
+        t_meta = (getattr(meta, 'topics', None) or {}).get(topic)
+        if t_meta is not None and getattr(t_meta, 'partitions', None):
+          part_ids = sorted(t_meta.partitions.keys())
+      consumer.assign([
+          confluent_kafka.TopicPartition(topic, pid, off_const)
+          for pid in part_ids
+      ])
+    else:
+      consumer.subscribe([topic])
     deadline = (
         time.monotonic() + duration_sec if duration_sec is not None else None)
     try:
@@ -854,17 +1036,37 @@ def _tail_kafka(
           break
         scanned_bytes += len(raw_val)
         raw_key = msg.key()
-        _emit_record(
-            rows,
-            {
-                'partition': msg.partition(),
-                'offset': msg.offset(),
-                'key': (
-                    raw_key.decode('utf-8', errors='replace')
-                    if raw_key else None),
-                'payload': _decode_payload_bytes(raw_val),
-            },
-            on_record)
+        decoded_payload, schema_id, schema_valid, schema_err = (
+            _decode_kafka_wire_message(
+                raw_val,
+                registry_url,
+                schema_cache,
+                basic_auth=str(sr_auth) if sr_auth else None))
+        rec_out: dict[str, Any] = {
+            'partition': msg.partition(),
+            'offset': msg.offset(),
+            'key': (
+                raw_key.decode('utf-8', errors='replace')
+                if raw_key else None),
+            'payload': decoded_payload,
+        }
+        if schema_id is not None:
+          rec_out['schema_id'] = schema_id
+        if schema_valid is not None:
+          rec_out['schema_valid'] = schema_valid
+        if schema_err is not None:
+          rec_out['schema_error'] = schema_err
+        if want_raw:
+          rec_out['size_bytes'] = len(raw_val)
+          rec_out['raw_hex'] = raw_val[:256].hex()
+        if hasattr(msg, 'timestamp'):
+          try:
+            ts_pair = msg.timestamp()
+            if isinstance(ts_pair, tuple) and len(ts_pair) == 2 and ts_pair[0] > 0:
+              rec_out['timestamp_ms'] = int(ts_pair[1])
+          except Exception:  # pylint: disable=broad-except
+            pass
+        _emit_record(rows, rec_out, on_record)
     except KeyboardInterrupt:
       if not follow:
         raise

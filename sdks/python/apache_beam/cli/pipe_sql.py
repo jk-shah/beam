@@ -2507,11 +2507,35 @@ def build_sql_yaml_spec(
     strict_python_lowering: bool = False,
     pre_where: str | None = None,
     post_select: str | None = None,
+    expect: Sequence[str] | None = None,
+    on_violation: str = 'dlq',
+    drop_bad: bool = False,
 ) -> dict[str, Any]:
   """Builds portable Beam YAML spec (`type: Sql` or lowered pure-Python transforms)."""
   redact_tuple = _parse_redact_fields(dlq_redact_fields)
   if redact_tuple and dlq_ep is None:
     raise SqlPipeError('--dlq-redact-fields requires --dlq <SINK>')
+  parsed_expect_rules = []
+  if expect:
+    from . import expect as expect_mod
+    eff_default_viol = (
+        'drop' if (drop_bad and on_violation == 'dlq' and dlq_ep is None) else
+        on_violation)
+    for item in expect:
+      try:
+        r = expect_mod.parse_expectation_rule(
+            item, default_on_violation=eff_default_viol)
+        if r.on_violation == 'dlq' and dlq_ep is None and drop_bad:
+          r = expect_mod.ExpectationRule(
+              name=r.name, expression=r.expression, on_violation='drop')
+        parsed_expect_rules.append(r)
+      except (ValueError, TypeError) as e:
+        raise SqlPipeError(f'invalid --expect rule {item!r}: {e}') from None
+    if any(
+        r.on_violation == 'dlq' for r in parsed_expect_rules) and dlq_ep is None:
+      raise SqlPipeError(
+          'cannot route expectation violations to DLQ without a DLQ sink; '
+          'specify --dlq <PATH> or use --on-violation {fail|drop}')
   clean_q = validate_readonly_select_sql(sql_query, allow_jinja=allow_jinja)
   has_unbounded = any(ns.endpoint.is_unbounded for ns in named_sources)
   transforms: list[dict[str, Any]] = []
@@ -2636,44 +2660,94 @@ def build_sql_yaml_spec(
       raise SqlPipeError(str(e)) from None
 
   def _attach_post_select(spec_d: dict[str, Any]) -> dict[str, Any]:
-    if post_s_cfg is None:
+    if post_s_cfg is None and not parsed_expect_rules:
       return spec_d
     t_list = spec_d.get('pipeline', {}).get('transforms')
     if not isinstance(t_list, list) or 'local_asof_sql' in spec_d.get(
         'pipeline', {}):
       return spec_d
-    cfg_ps = dict(post_s_cfg)
-    sink_idx = next(
-        (i for i, t in enumerate(t_list) if t.get('name') == 'WriteSink'), None)
-    if sink_idx is not None:
-      prev_in = t_list[sink_idx]['input']
-      if wire_yaml_dlq:
-        cfg_ps['error_handling'] = {'output': 'errors'}
-      ps_step = {
-          'name': 'PostSqlSelect',
-          'type': 'MapToFields',
-          'input': prev_in,
-          'config': cfg_ps,
-      }
-      t_list.insert(sink_idx, ps_step)
-      t_list[sink_idx + 1]['input'] = 'PostSqlSelect'
-      if wire_yaml_dlq:
-        norm_ps = dlq.build_dlq_normalizer_transform(
-            'NormalizePostSqlSelectDlq',
-            'PostSqlSelect.errors',
-            'MapToFields',
-            redact_fields=redact_tuple)
-        t_list.insert(sink_idx + 1, norm_ps)
-        _merge_extra_sql_dlq_refs(spec_d, ['NormalizePostSqlSelectDlq'], dlq_ep)
-    elif t_list:
-      last_name = t_list[-1].get('name')
-      if last_name:
-        t_list.append({
+    if post_s_cfg is not None:
+      cfg_ps = dict(post_s_cfg)
+      sink_idx = next(
+          (i for i, t in enumerate(t_list) if t.get('name') == 'WriteSink'),
+          None)
+      if sink_idx is not None:
+        prev_in = t_list[sink_idx]['input']
+        if wire_yaml_dlq:
+          cfg_ps['error_handling'] = {'output': 'errors'}
+        ps_step = {
             'name': 'PostSqlSelect',
             'type': 'MapToFields',
-            'input': last_name,
+            'input': prev_in,
             'config': cfg_ps,
-        })
+        }
+        t_list.insert(sink_idx, ps_step)
+        t_list[sink_idx + 1]['input'] = 'PostSqlSelect'
+        if wire_yaml_dlq:
+          norm_ps = dlq.build_dlq_normalizer_transform(
+              'NormalizePostSqlSelectDlq',
+              'PostSqlSelect.errors',
+              'MapToFields',
+              redact_fields=redact_tuple)
+          t_list.insert(sink_idx + 1, norm_ps)
+          _merge_extra_sql_dlq_refs(
+              spec_d, ['NormalizePostSqlSelectDlq'], dlq_ep)
+      elif t_list:
+        last_name = t_list[-1].get('name')
+        if last_name:
+          t_list.append({
+              'name': 'PostSqlSelect',
+              'type': 'MapToFields',
+              'input': last_name,
+              'config': cfg_ps,
+          })
+    if parsed_expect_rules:
+      exp_cfg: dict[str, Any] = {
+          'rules': [{
+              'name': r.name,
+              'expression': r.expression,
+              'on_violation': r.on_violation,
+          } for r in parsed_expect_rules],
+      }
+      sink_idx = next(
+          (i for i, t in enumerate(t_list) if t.get('name') == 'WriteSink'),
+          None)
+      if sink_idx is not None:
+        prev_in = t_list[sink_idx]['input']
+        if wire_yaml_dlq:
+          exp_cfg['error_handling'] = {'output': 'errors'}
+        exp_step = {
+            'name': 'ValidateExpect',
+            'type': 'CliExpect',
+            'input': prev_in,
+            'config': exp_cfg,
+        }
+        t_list.insert(sink_idx, exp_step)
+        t_list[sink_idx + 1]['input'] = (
+            'ValidateExpect.good' if wire_yaml_dlq else 'ValidateExpect')
+        if wire_yaml_dlq:
+          norm_exp = dlq.build_dlq_normalizer_transform(
+              'NormalizeExpectDlq',
+              'ValidateExpect.errors',
+              'CliExpect',
+              redact_fields=redact_tuple)
+          t_list.insert(sink_idx + 1, norm_exp)
+          _merge_extra_sql_dlq_refs(spec_d, ['NormalizeExpectDlq'], dlq_ep)
+      elif t_list:
+        last_name = t_list[-1].get('name')
+        if last_name:
+          t_list.append({
+              'name': 'ValidateExpect',
+              'type': 'CliExpect',
+              'input': last_name,
+              'config': exp_cfg,
+          })
+      provs = spec_d.setdefault('providers', [])
+      cli_prov = dlq.cli_yaml_provider_spec()
+      if not any(
+          isinstance(p, dict) and 'CliExpect' in (p.get('transforms') or {})
+          for p in provs):
+        provs.append(cli_prov)
     return spec_d
 
   code_only = ' '.join(
@@ -2821,6 +2895,33 @@ def build_sql_yaml_spec(
               redact_fields=redact_tuple))
       sql_dlq_norm_refs.append('NormalizePostSqlSelectDlq')
     sql_out_ref = 'PostSqlSelect'
+  if parsed_expect_rules:
+    exp_cfg_c: dict[str, Any] = {
+        'rules': [{
+            'name': r.name,
+            'expression': r.expression,
+            'on_violation': r.on_violation,
+        } for r in parsed_expect_rules],
+    }
+    if wire_yaml_dlq:
+      exp_cfg_c['error_handling'] = {'output': 'errors'}
+    transforms.append({
+        'name': 'ValidateExpect',
+        'type': 'CliExpect',
+        'input': sql_out_ref,
+        'config': exp_cfg_c,
+    })
+    if wire_yaml_dlq:
+      transforms.append(
+          dlq.build_dlq_normalizer_transform(
+              'NormalizeExpectDlq',
+              'ValidateExpect.errors',
+              'CliExpect',
+              redact_fields=redact_tuple))
+      sql_dlq_norm_refs.append('NormalizeExpectDlq')
+      sql_out_ref = 'ValidateExpect.good'
+    else:
+      sql_out_ref = 'ValidateExpect'
   if sink_ep is not None:
     sink_cfg = dict(sink_ep.config)
     if wire_yaml_dlq and sink_ep.yaml_type in dlq.TRANSFORMS_SUPPORTING_ERROR_HANDLING:
@@ -2860,7 +2961,7 @@ def build_sql_yaml_spec(
           'transforms': transforms,
       }
   }
-  if sql_dlq_norm_refs:
+  if sql_dlq_norm_refs or parsed_expect_rules:
     spec_out['providers'] = [dlq.cli_yaml_provider_spec()]
   if has_unbounded:
     spec_out['options'] = {'streaming': True}
@@ -3558,6 +3659,45 @@ def _register_scalar_functions(conn: sqlite3.Connection) -> None:
     return parts[pos - 1]
 
   conn.create_function('SPLIT_PART', 3, _split_part, deterministic=True)
+  import hashlib as _hashlib
+
+  def _sha256_sql(val: Any) -> str | None:
+    if val is None:
+      return None
+    return _hashlib.sha256(str(val).encode('utf-8')).hexdigest()
+
+  def _mask_sql(
+      val: Any, keep_last: Any = 4, mask_char: Any = '*') -> str | None:
+    if val is None:
+      return None
+    s = str(val)
+    k = max(0, int(keep_last))
+    mc = (str(mask_char) or '*')[0]
+    if len(s) <= k:
+      return mc * len(s)
+    return (mc * (len(s) - k)) + (s[-k:] if k > 0 else '')
+
+  def _mask_email_sql(val: Any) -> str | None:
+    if val is None:
+      return None
+    s = str(val).strip()
+    if '@' not in s:
+      return '*' * len(s)
+    loc, dom = s.split('@', 1)
+    return ('***@' + dom) if len(loc) <= 1 else (loc[0] + '***@' + dom)
+
+  conn.create_function('SHA256', 1, _sha256_sql, deterministic=True)
+  conn.create_function('MASK', 1, lambda v: _mask_sql(v, 4, '*'), deterministic=True)
+  conn.create_function('MASK', 2, lambda v, k: _mask_sql(v, k, '*'), deterministic=True)
+  conn.create_function('MASK', 3, _mask_sql, deterministic=True)
+  conn.create_function(
+      'MASK_LAST4', 1, lambda v: _mask_sql(v, 4, '*'), deterministic=True)
+  conn.create_function('MASK_EMAIL', 1, _mask_email_sql, deterministic=True)
+  conn.create_function(
+      'REDACT',
+      1,
+      lambda v: None if v is None else '<REDACTED>',
+      deterministic=True)
   def _to_utc(val: Any) -> str | None:
     """Normalizes ISO-8601 (Z / offset / naive) or epoch sec/ms to ISO UTC."""
     if val is None:
@@ -4610,11 +4750,35 @@ def _build_local_sql_pre_where_fn(
               f"{type(exc).__name__}: {exc} [while running '--where']"
           ) from None
         dlq_records.append(
-            dlq.make_transform_dlq_row(
-                'Filter', exc, r, redact_fields=redact_tuple))
+            _make_local_transform_dlq_dict(
+                'Filter', type(exc).__name__, str(exc), r, redact_tuple))
     return kept
 
   return _filter_rows
+
+
+def _make_local_transform_dlq_dict(
+    step: str,
+    error_type: str,
+    error_msg: str,
+    row: Any,
+    redact_tuple: tuple[str, ...],
+) -> dict[str, Any]:
+  from . import output as out_mod
+  clean_rec = (
+      dlq.redact_nested_fields(row, redact_tuple) if redact_tuple else row)
+  raw_json = dlq.safe_json_dumps(clean_rec)
+  clean_err = out_mod.redact_inline_secrets(
+      out_mod.sanitize_untrusted_text(str(error_msg), max_chars=4096),
+      placeholder='<REDACTED_SECRET>')[:4096]
+  return _redact_dlq_entry(
+      {
+          'step': str(step),
+          'error_type': str(error_type),
+          'error': clean_err,
+          'raw_payload': raw_json,
+      },
+      redact_tuple)
 
 
 def _apply_local_sql_post_select(
@@ -4665,11 +4829,90 @@ def _apply_local_sql_post_select(
             f"{type(exc).__name__}: {exc} [while running '--select']"
         ) from None
       dlq_records.append(
-          dlq.make_transform_dlq_row(
-              'MapToFields', exc, r, redact_fields=redact_tuple))
+          _make_local_transform_dlq_dict(
+              'MapToFields', type(exc).__name__, str(exc), r, redact_tuple))
   _SQL_THREAD_LOCAL.last_cols = None
   _SQL_THREAD_LOCAL.last_arrow_types = None
   return final_cols, projected
+
+
+def _apply_local_sql_expect(
+    out_rows: list[dict[str, Any]],
+    expect: Sequence[str] | None,
+    on_violation: str,
+    dlq_records: list[dict[str, Any]] | None,
+    dlq_redact_fields: Sequence[str] | str | None,
+    *,
+    drop_bad: bool = False,
+    expect_metrics_out: dict[str, int] | None = None,
+) -> list[dict[str, Any]]:
+  if not expect:
+    return out_rows
+  from . import expect as expect_mod
+  redact_tuple = _parse_redact_fields(dlq_redact_fields)
+  eff_default = (
+      'drop'
+      if (drop_bad and on_violation == 'dlq' and dlq_records is not None) else
+      on_violation)
+  parsed_rules = []
+  for item in expect:
+    try:
+      r = expect_mod.parse_expectation_rule(
+          item, default_on_violation=eff_default)
+      parsed_rules.append(r)
+    except (ValueError, TypeError) as e:
+      raise SqlPipeError(f'invalid --expect rule {item!r}: {e}') from None
+  compiled_rules = [
+      (r, expect_mod.compile_expectation_expression(r.expression))
+      for r in parsed_rules
+  ]
+  metrics_d = expect_metrics_out if expect_metrics_out is not None else {}
+  kept: list[dict[str, Any]] = []
+  for row in out_rows:
+    metrics_d['expectations_evaluated'] = (
+        metrics_d.get('expectations_evaluated', 0) + 1)
+    failed_rule = None
+    for rule, code in compiled_rules:
+      if expect_mod.evaluate_record(code, row):
+        metrics_d[f'expectation_passed_{rule.name}'] = (
+            metrics_d.get(f'expectation_passed_{rule.name}', 0) + 1)
+      else:
+        failed_rule = rule
+        break
+    if failed_rule is None:
+      kept.append(row)
+      continue
+    metrics_d['expectation_violations_total'] = (
+        metrics_d.get('expectation_violations_total', 0) + 1)
+    action = failed_rule.on_violation
+    if action == 'fail':
+      metrics_d[f'expectation_failed_{failed_rule.name}'] = (
+          metrics_d.get(f'expectation_failed_{failed_rule.name}', 0) + 1)
+      raise expect_mod.ExpectationViolationError(
+          f'Expectation rule {failed_rule.name!r} ({failed_rule.expression}) '
+          'violated')
+    if action == 'dlq':
+      if dlq_records is None:
+        raise expect_mod.ExpectationViolationError(
+            f'Expectation rule {failed_rule.name!r} violated and no DLQ route '
+            'configured')
+      metrics_d[f'expectation_quarantined_{failed_rule.name}'] = (
+          metrics_d.get(f'expectation_quarantined_{failed_rule.name}', 0) + 1)
+      metrics_d['expectation_quarantined_rows'] = (
+          metrics_d.get('expectation_quarantined_rows', 0) + 1)
+      dlq_records.append(
+          _make_local_transform_dlq_dict(
+              'CliExpect',
+              'ExpectationViolation',
+              f'Rule {failed_rule.name!r} violated: {failed_rule.expression}',
+              row,
+              redact_tuple))
+    elif action == 'drop':
+      metrics_d[f'expectation_dropped_{failed_rule.name}'] = (
+          metrics_d.get(f'expectation_dropped_{failed_rule.name}', 0) + 1)
+      metrics_d['expectation_dropped_rows'] = (
+          metrics_d.get('expectation_dropped_rows', 0) + 1)
+  return kept
 
 
 def run_in_memory_sql(
@@ -4683,6 +4926,10 @@ def run_in_memory_sql(
     warnings: list[str] | None = None,
     pre_where: str | None = None,
     post_select: str | None = None,
+    expect: Sequence[str] | None = None,
+    on_violation: str = 'dlq',
+    drop_bad: bool = False,
+    expect_metrics_out: dict[str, int] | None = None,
 ) -> tuple[list[str], list[dict[str, Any]], list[dict[str, Any]], int]:
   """Executes `sql_query` in a sandboxed in-memory SQLite or DuckDB database.
 
@@ -4712,6 +4959,14 @@ def run_in_memory_sql(
         pre_where_fn=pre_where_fn)
     out_cols, out_rows = _apply_local_sql_post_select(
         out_cols, out_rows, post_select, dlq_records, dlq_redact_fields)
+    out_rows = _apply_local_sql_expect(
+        out_rows,
+        expect,
+        on_violation,
+        dlq_records,
+        dlq_redact_fields,
+        drop_bad=drop_bad,
+        expect_metrics_out=expect_metrics_out)
     return out_cols, out_rows, (dlq_records or []), total_read
 
   is_sqlite_asof = bool(re.search(r'\bASOF\b', orig_code_only, re.I))
@@ -5161,6 +5416,14 @@ def run_in_memory_sql(
 
     out_cols, out_rows = _apply_local_sql_post_select(
         out_cols, out_rows, post_select, dlq_records, dlq_redact_fields)
+    out_rows = _apply_local_sql_expect(
+        out_rows,
+        expect,
+        on_violation,
+        dlq_records,
+        dlq_redact_fields,
+        drop_bad=drop_bad,
+        expect_metrics_out=expect_metrics_out)
     return out_cols, out_rows, (dlq_records or []), total_read
   finally:
     conn.close()

@@ -241,11 +241,12 @@ V0=$(beam inspect "delta://gs://<BUCKET>/delta/orders" --sample 0 --json \
      | python3 -c "import json,sys; print(json.load(sys.stdin)['outputs']['snapshot_version'])")
 
 # Step 2: Initial full sync pinned strictly at ?version=${V0} into Iceberg v2
-#         (Use --zero-copy if unpartitioned on the same bucket, or omit --zero-copy to rewrite Parquet)
+#         (Pass --zero-copy for partitioned or unpartitioned Delta tables in the same bucket,
+#          or omit --zero-copy if Delta v3+ Deletion Vectors / Column Mapping require rewriting Parquet)
 beam pipe \
   --from "delta://gs://<BUCKET>/delta/orders?version=${V0}" \
   --to "iceberg://lake.orders?warehouse=gs://<BUCKET>/iceberg_wh" \
-  --assert-counts --json
+  --zero-copy --verify --verify-key id --json
 
 # Step 3: Pin upper bound V1 for your incremental CDC run so the watermark advances deterministically
 V1=$(beam inspect "delta://gs://<BUCKET>/delta/orders" --sample 0 --json \

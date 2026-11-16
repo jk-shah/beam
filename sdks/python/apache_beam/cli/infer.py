@@ -116,6 +116,7 @@ _COMMON_INFER_KEYS = frozenset([
     'min_batch_size',
     'max_batch_size',
     'max_batch_duration_secs',
+    'max_batch_duration_ms',
     'rate_limit',
     'num_retries',
     'dlq_redact_fields',
@@ -552,8 +553,17 @@ def parse_infer_config(
   if min_batch_size > max_batch_size:
     min_batch_size = max_batch_size
 
-  max_batch_duration_secs = _parse_non_negative_float(
-      norm.get('max_batch_duration_secs', 0.2), 'max_batch_duration_secs')
+  if 'max_batch_duration_ms' in norm and 'max_batch_duration_secs' in norm:
+    raise ValueError(
+        'specify at most one of max_batch_duration_ms or '
+        'max_batch_duration_secs')
+  if 'max_batch_duration_ms' in norm:
+    max_batch_duration_secs = (
+        _parse_non_negative_float(
+            norm['max_batch_duration_ms'], 'max_batch_duration_ms') / 1000.0)
+  else:
+    max_batch_duration_secs = _parse_non_negative_float(
+        norm.get('max_batch_duration_secs', 0.2), 'max_batch_duration_secs')
 
   rate_limit: float | None = None
   if norm.get('rate_limit') is not None and str(norm.get('rate_limit')).strip():

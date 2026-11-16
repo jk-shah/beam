@@ -53,7 +53,7 @@ from typing import NamedTuple
 from . import dlq
 from . import uris
 
-MAX_INPUT_BYTES = 64 * 1024 * 1024
+MAX_INPUT_BYTES = 256 * 1024 * 1024
 DISABLE_ENV_VAR = 'BEAM_CLI_NO_FAST_PATH'
 RUNNER_NAME = 'local_fast'
 
@@ -323,7 +323,7 @@ _safe_row_getattr = _ISOLATED_NS['_safe_row_getattr']
 
 
 _ALLOWED_FAST_IMPORTS = frozenset([
-    'datetime', 'math', 're', 'json', 'decimal', 'base64',
+    'datetime', 'math', 're', 'json', 'decimal', 'base64', 'hashlib',
     '_strptime', 'time', 'calendar', 'locale',
 ])
 
