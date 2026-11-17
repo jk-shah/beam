@@ -30,6 +30,7 @@ import hashlib
 import json
 import os
 import sys
+import threading
 from typing import Any
 
 EXIT_OK = 0
@@ -102,7 +103,8 @@ def run_check(
 
   if not isinstance(spec, dict) or 'pipeline' not in spec:
     raise CheckError(
-        f'{source_label}: top-level YAML mapping must contain a "pipeline:" key')
+        f'{source_label}: top-level YAML mapping must contain a "pipeline:" key'
+    )
 
   pipeline_block = spec['pipeline']
   if not isinstance(pipeline_block, dict) or 'transforms' not in pipeline_block:
@@ -195,6 +197,22 @@ def run_check(
         raise CheckError(
             f'{source_label}: invalid CliLimitRows limit {lim!r}; expected integer >= 0'
         )
+    if t['type'] in (
+        'ReadFromIceberg',
+        'WriteToIceberg',
+        'CliWriteToIceberg',
+        'ReadFromIcebergPy',
+        'ReadFromIcebergCdcPy',
+    ) and isinstance(t.get('config'), dict):
+      cat_props = t['config'].get('catalog_properties')
+      if isinstance(cat_props, dict) and cat_props.get('uri'):
+        from . import lakehouse
+        try:
+          lakehouse._validate_rest_catalog_security(
+              str(cat_props['uri']), cat_props)
+        except ValueError as e:
+          raise CheckError(
+              f'{source_label}: invalid {t["type"]} config: {e}') from None
 
   def _walk_and_validate_cli_transforms(items: Any) -> None:
     if isinstance(items, dict):
@@ -237,8 +255,8 @@ def run_check(
       has_untrusted_providers = True
       break
     t_map = prov.get('transforms')
-    if not isinstance(t_map, dict) or any(
-        val not in _builtin_cli_targets for val in t_map.values()):
+    if not isinstance(t_map, dict) or any(val not in _builtin_cli_targets
+                                          for val in t_map.values()):
       has_untrusted_providers = True
       break
   has_untrusted_code = _has_executable_python_transforms(pipeline_block)
@@ -289,7 +307,8 @@ def run_check(
           'informational, not an error (the check passed): '
           f'{str(e).splitlines()[0][:300]}')
 
-  check_warnings: list[str] = _check_parquet_untyped_python_expressions(pipeline_block)
+  check_warnings: list[str] = _check_parquet_untyped_python_expressions(
+      pipeline_block)
   non_portable: list[str] = _check_portability(pipeline_block)
   if portable and non_portable:
     raise CheckError(
@@ -304,8 +323,8 @@ def run_check(
   result = {
       'valid': True,
       'source': source_label,
-      'mode': 'expanded_plan' if expanded_transforms is not None else
-      'offline_static',
+      'mode': 'expanded_plan'
+      if expanded_transforms is not None else 'offline_static',
       'plan_hash': plan_hash,
       'transform_count': len(stages),
       'transforms': stages,
@@ -372,16 +391,35 @@ def _check_portability(pipeline_block: dict[str, Any]) -> list[str]:
 # such as `path:` next to `type: ReadFromCsv`, is a parameter that belongs
 # under `config:`; Beam only reports it at expansion, with a schema dump.
 _LEAF_TRANSFORM_KEYS = frozenset([
-    'type', 'name', 'input', 'output', 'output_schema', 'windowing',
-    'resource_hints', 'config', '__line__', '__uuid__'
+    'type',
+    'name',
+    'input',
+    'output',
+    'output_schema',
+    'windowing',
+    'resource_hints',
+    'config',
+    '__line__',
+    '__uuid__'
 ])
 _NESTED_TRANSFORM_KEYS = frozenset([
-    'type', 'name', 'input', 'output', 'windowing', 'resource_hints',
-    'transforms', 'extra_transforms', 'source', 'sink', '__line__', '__uuid__'
+    'type',
+    'name',
+    'input',
+    'output',
+    'windowing',
+    'resource_hints',
+    'transforms',
+    'extra_transforms',
+    'source',
+    'sink',
+    '__line__',
+    '__uuid__'
 ])
 
 
-def _check_transform_keys(transforms, source_label: str, path: str = '') -> None:
+def _check_transform_keys(
+    transforms, source_label: str, path: str = '') -> None:
   """Offline check that each transform only uses keys Beam YAML accepts."""
   for idx, t in enumerate(transforms or []):
     if not isinstance(t, dict) or 'type' not in t:
@@ -394,7 +432,8 @@ def _check_transform_keys(transforms, source_label: str, path: str = '') -> None
       if nested:
         raise CheckError(
             f'{source_label}: {label} has unknown keys {", ".join(unknown)}; '
-            f'a {t["type"]} transform takes {", ".join(sorted(allowed - {"__line__", "__uuid__"}))}')
+            f'a {t["type"]} transform takes {", ".join(sorted(allowed - {"__line__", "__uuid__"}))}'
+        )
       example = unknown[0]
       raise CheckError(
           f'{source_label}: {label} has {", ".join(unknown)} outside '
@@ -426,7 +465,8 @@ def _extract_untyped_python_map_fields(transform: dict[str, Any]) -> list[str]:
   for fname, fval in fields.items():
     if isinstance(fval, str):
       untyped.append(str(fname))
-    elif isinstance(fval, dict) and not fval.get('output_type') and not fval.get('type'):
+    elif isinstance(
+        fval, dict) and not fval.get('output_type') and not fval.get('type'):
       c_src = str(fval.get('callable') or '')
       if '->' not in c_src.splitlines()[0] if c_src else True:
         untyped.append(str(fname))
@@ -467,7 +507,9 @@ def _check_parquet_untyped_python_expressions(
                 'consider adding output_type: <type> (or using language: sql) '
                 'to prevent PyArrow LogicalType Any conversion errors.')
             break
-          elif d_type in ('SqlTransform', 'Sql', 'beam:transform:org.apache.beam:sql:v1'):
+          elif d_type in ('SqlTransform',
+                          'Sql',
+                          'beam:transform:org.apache.beam:sql:v1'):
             break
           elif d_type in ('chain', 'composite'):
             inner = _flatten_sequence(downstream)
@@ -492,7 +534,8 @@ def _check_parquet_untyped_python_expressions(
   for t in root_seq:
     if t.get('type') == 'WriteToParquet':
       inp = t.get('input')
-      inputs = inp if isinstance(inp, list) else ([inp] if isinstance(inp, str) else [])
+      inputs = inp if isinstance(
+          inp, list) else ([inp] if isinstance(inp, str) else [])
       for ref in inputs:
         producer = named_transforms.get(ref)
         if producer:
@@ -546,6 +589,10 @@ _DANGEROUS_CALLABLE_NAMES = frozenset([
     'pickle',
     'marshal',
     'pow',
+    'io',
+    '_io',
+    'codecs',
+    'enum',
 ])
 _FORBIDDEN_ATTR_NAMES = frozenset([
     'gi_frame',
@@ -557,6 +604,7 @@ _FORBIDDEN_ATTR_NAMES = frozenset([
     'format',
     'format_map',
 ])
+_ALLOWED_SINGLE_UNDERSCORE_ATTRS = frozenset(['_asdict', '_replace'])
 _SAFE_BUILTINS_COMBINE_FNS = frozenset([
     'sum',
     'min',
@@ -574,6 +622,27 @@ _SAFE_BUILTINS_COMBINE_FNS = frozenset([
     'apache_beam.cli.windowing.varpopcombinefn',
     'apache_beam.cli.windowing.stddevpopcombinefn',
 ])
+_ICEBERG_TRANSFORM_TYPES = frozenset([
+    'ReadFromIceberg',
+    'WriteToIceberg',
+    'CliWriteToIceberg',
+    'ReadFromIcebergPy',
+    'ReadFromIcebergCdcPy',
+])
+
+
+def _is_official_biglake_https_uri(raw_uri: str) -> bool:
+  import re
+  import urllib.parse
+  parsed = urllib.parse.urlsplit(raw_uri.strip())
+  if (parsed.scheme or '').lower() != 'https':
+    return False
+  if parsed.username or parsed.password or parsed.fragment:
+    return False
+  host = (parsed.hostname or '').lower()
+  return bool(
+      host == 'biglake.googleapis.com' or
+      re.fullmatch(r'[a-z0-9-]+-biglake\.googleapis\.com', host))
 
 
 def _ast_within_budget(root: Any, *, max_nodes: int, max_depth: int) -> bool:
@@ -593,7 +662,8 @@ def _ast_within_budget(root: Any, *, max_nodes: int, max_depth: int) -> bool:
 def _is_safe_inline_expression(src: str) -> bool:
   """True only for a single side-effect-free Python expression (`mode='eval'`)."""
   import ast
-  if not isinstance(src, str) or not src.strip() or len(src) > 8192:
+  if (not isinstance(src, str) or '\r' in src or '\x00' in src or
+      not src.strip() or len(src) > 8192):
     return False
   try:
     parsed = ast.parse(src, mode='eval')
@@ -604,22 +674,23 @@ def _is_safe_inline_expression(src: str) -> bool:
 
   direct_attr_funcs: set[int] = set()
   for node in ast.walk(parsed):
-    if isinstance(node, (
-        ast.Lambda,
-        ast.ListComp,
-        ast.SetComp,
-        ast.DictComp,
-        ast.GeneratorExp,
-        ast.NamedExpr,
-        ast.Yield,
-        ast.YieldFrom,
-        ast.Await,
-        ast.Pow,
-        ast.LShift,
-        ast.RShift,
-        ast.JoinedStr,
-        ast.FormattedValue,
-    )):
+    if isinstance(node,
+                  (
+                      ast.Lambda,
+                      ast.ListComp,
+                      ast.SetComp,
+                      ast.DictComp,
+                      ast.GeneratorExp,
+                      ast.NamedExpr,
+                      ast.Yield,
+                      ast.YieldFrom,
+                      ast.Await,
+                      ast.Pow,
+                      ast.LShift,
+                      ast.RShift,
+                      ast.JoinedStr,
+                      ast.FormattedValue,
+                  )):
       return False
     if isinstance(node, ast.Call) and isinstance(
         node.func, ast.Name) and node.func.id in ('getattr', 'hasattr'):
@@ -629,9 +700,14 @@ def _is_safe_inline_expression(src: str) -> bool:
       if not (isinstance(attr_arg, ast.Constant) and
               isinstance(attr_arg.value, str)):
         return False
-      if (attr_arg.value.startswith('_') or
+      if ((attr_arg.value.startswith('_') and
+           attr_arg.value not in _ALLOWED_SINGLE_UNDERSCORE_ATTRS) or
           attr_arg.value in _FORBIDDEN_ATTR_NAMES):
         return False
+      if not (isinstance(node.args[0], ast.Name) and
+              node.args[0].id == '__row__'):
+        if attr_arg.value in _DANGEROUS_CALLABLE_NAMES:
+          return False
       direct_attr_funcs.add(id(node.func))
 
   for node in ast.walk(parsed):
@@ -639,26 +715,51 @@ def _is_safe_inline_expression(src: str) -> bool:
       if node.id in ('getattr',
                      'hasattr') and id(node) not in direct_attr_funcs:
         return False
-      if node.id in _DANGEROUS_CALLABLE_NAMES or (
-          node.id.startswith('_') and node.id != '__row__'):
+      if node.id in _DANGEROUS_CALLABLE_NAMES or (node.id.startswith('_') and
+                                                  node.id != '__row__'):
         return False
     elif isinstance(node, ast.Attribute):
-      if node.attr.startswith('_') or node.attr in _FORBIDDEN_ATTR_NAMES:
+      if ((node.attr.startswith('_') and
+           node.attr not in _ALLOWED_SINGLE_UNDERSCORE_ATTRS) or
+          node.attr in _FORBIDDEN_ATTR_NAMES or
+          node.attr in _DANGEROUS_CALLABLE_NAMES):
         return False
   return True
+
+
+def _is_safe_for_iter(
+    iter_node: Any, *, require_range_or_tuple: bool = False) -> bool:
+  import ast
+  if isinstance(iter_node, ast.Call):
+    if (isinstance(iter_node.func, ast.Name) and iter_node.func.id == 'range'):
+      for r_arg in iter_node.args:
+        c_arg = (
+            r_arg.operand if isinstance(r_arg, ast.UnaryOp) and
+            isinstance(r_arg.op, (ast.USub, ast.UAdd)) else r_arg)
+        if (isinstance(c_arg, ast.Constant) and isinstance(c_arg.value, int) and
+            not isinstance(c_arg.value, bool) and abs(c_arg.value) > 4096):
+          return False
+      return True
+    return not require_range_or_tuple
+  if isinstance(iter_node, (ast.Tuple, ast.List)):
+    return True
+  if require_range_or_tuple:
+    return False
+  return isinstance(iter_node, (ast.Name, ast.Subscript))
 
 
 def _is_safe_inline_callable(src: str) -> bool:
   """True only for pure side-effect-free `def fn(row):` or `lambda row:`."""
   import ast
-  if not isinstance(src, str) or len(src) > 32768:
+  if (not isinstance(src, str) or '\r' in src or '\x00' in src or
+      len(src) > 32768):
     return False
   try:
     mod = ast.parse(src)
   except SyntaxError:
     return False
   if len(mod.body) != 1 or not _ast_within_budget(
-      mod, max_nodes=2048, max_depth=32):
+      mod, max_nodes=4096, max_depth=64):
     return False
   stmt = mod.body[0]
   if isinstance(stmt, ast.FunctionDef):
@@ -674,8 +775,8 @@ def _is_safe_inline_callable(src: str) -> bool:
           continue
         if isinstance(rnode, ast.Constant) and rnode.value is None:
           continue
-        if isinstance(rnode, ast.Name) and rnode.id in (
-            'int', 'float', 'str', 'bool'):
+        if isinstance(rnode,
+                      ast.Name) and rnode.id in ('int', 'float', 'str', 'bool'):
           continue
         return False
     all_arg_nodes = (
@@ -693,22 +794,38 @@ def _is_safe_inline_callable(src: str) -> bool:
 
   direct_attr_funcs: set[int] = set()
   for node in ast.walk(stmt):
-    if isinstance(node, (
-        ast.While,
-        ast.AsyncFunctionDef,
-        ast.ClassDef,
-        ast.Await,
-        ast.Yield,
-        ast.YieldFrom,
-        ast.Global,
-        ast.Nonlocal,
-        ast.Pow,
-        ast.LShift,
-        ast.RShift,
-        ast.JoinedStr,
-        ast.FormattedValue,
-    )):
+    if isinstance(node,
+                  (
+                      ast.While,
+                      ast.AsyncFor,
+                      ast.AsyncFunctionDef,
+                      ast.ClassDef,
+                      ast.Await,
+                      ast.Yield,
+                      ast.YieldFrom,
+                      ast.Global,
+                      ast.Nonlocal,
+                      ast.Pow,
+                      ast.LShift,
+                      ast.RShift,
+                      ast.JoinedStr,
+                      ast.FormattedValue,
+                  )):
       return False
+    if isinstance(node, ast.For):
+      if node.orelse or not _is_safe_for_iter(node.iter):
+        return False
+      nested_fors = [
+          sub for body_stmt in node.body for sub in ast.walk(body_stmt)
+          if isinstance(sub, ast.For)
+      ]
+      for nf in nested_fors:
+        if nf.orelse or not _is_safe_for_iter(nf.iter,
+                                              require_range_or_tuple=True):
+          return False
+        if any(isinstance(deep, ast.For) for b_s in nf.body
+               for deep in ast.walk(b_s)):
+          return False
     if isinstance(node, ast.Call) and isinstance(
         node.func, ast.Name) and node.func.id in ('getattr', 'hasattr'):
       if node.keywords or not (2 <= len(node.args) <= 3):
@@ -717,9 +834,14 @@ def _is_safe_inline_callable(src: str) -> bool:
       if not (isinstance(attr_arg, ast.Constant) and
               isinstance(attr_arg.value, str)):
         return False
-      if (attr_arg.value.startswith('__') or
+      if ((attr_arg.value.startswith('_') and
+           attr_arg.value not in _ALLOWED_SINGLE_UNDERSCORE_ATTRS) or
           attr_arg.value in _FORBIDDEN_ATTR_NAMES):
         return False
+      if not (isinstance(node.args[0], ast.Name) and
+              node.args[0].id == '__row__'):
+        if attr_arg.value in _DANGEROUS_CALLABLE_NAMES:
+          return False
       direct_attr_funcs.add(id(node.func))
 
   for node in ast.walk(stmt):
@@ -737,7 +859,10 @@ def _is_safe_inline_callable(src: str) -> bool:
                                                   node.id != '__row__'):
         return False
     elif isinstance(node, ast.Attribute):
-      if node.attr.startswith('__') or node.attr in _FORBIDDEN_ATTR_NAMES:
+      if ((node.attr.startswith('_') and
+           node.attr not in _ALLOWED_SINGLE_UNDERSCORE_ATTRS) or
+          node.attr in _FORBIDDEN_ATTR_NAMES or
+          node.attr in _DANGEROUS_CALLABLE_NAMES):
         return False
   return True
 
@@ -772,9 +897,17 @@ def _config_has_untrusted_python(obj: Any) -> bool:
 def _config_has_untrusted_udf_hooks(obj: Any) -> bool:
   """Detects Python callables, UDF hooks, or trust_remote_code outside `language: python`."""
   if isinstance(obj, dict):
+    if 'path' in obj and ('name' in obj or
+                          (isinstance(obj.get('path'), str) and
+                           obj['path'].strip().lower().endswith('.py'))):
+      return True
     if 'callable' in obj:
       c = obj.get('callable')
       if not isinstance(c, str) or not _is_safe_inline_callable(c):
+        return True
+    if 'expression' in obj:
+      e = obj.get('expression')
+      if not isinstance(e, str) or not _is_safe_inline_expression(e):
         return True
     if bool(obj.get('trust_remote_code')):
       return True
@@ -801,50 +934,69 @@ def _has_executable_python_transforms(block: Any) -> bool:
       'MLTransform',
       'Enrichment',
       'RunInference',
+      'AnomalyDetection',
   ):
     return True
   cfg = block.get('config')
   if isinstance(cfg, dict):
+    if t_type in _ICEBERG_TRANSFORM_TYPES:
+      cat_props = cfg.get('catalog_properties')
+      if isinstance(cat_props, dict) and cat_props.get('uri'):
+        if not _is_official_biglake_https_uri(str(cat_props['uri'])):
+          return True
     lang = str(cfg.get('language') or '').lower()
-    if lang == 'python':
-      if _config_has_untrusted_python(cfg):
-        return True
-      # Validate string shorthand expressions normalized by Beam YAML mapping/filter.
-      for expr_key in ('keep', 'by', 'timestamp'):
-        val = cfg.get(expr_key)
-        if isinstance(val, str) and not _is_safe_inline_expression(val):
+    if lang == 'javascript':
+      return True
+    if lang in ('', 'generic', 'python'):
+      is_udf_transform = (
+          lang in ('python', 'generic') or t_type in (
+              'MapToFields',
+              'Filter',
+              'Partition',
+              'AssignTimestamps',
+              'Combine',
+              'FlatMap',
+              'Explode',
+          ))
+      if is_udf_transform:
+        if _config_has_untrusted_python(cfg):
           return True
-      fields_map = cfg.get('fields')
-      if isinstance(fields_map, dict):
-        for fv in fields_map.values():
-          if isinstance(fv, str) and not _is_safe_inline_expression(fv):
+        # Validate string shorthand expressions normalized by Beam YAML mapping/filter.
+        for expr_key in ('keep', 'by', 'timestamp'):
+          val = cfg.get(expr_key)
+          if isinstance(val, str) and not _is_safe_inline_expression(val):
             return True
-      if t_type == 'Combine':
-        comb_map = cfg.get('combine')
-        if not isinstance(comb_map, dict):
-          return True
-        for spec in comb_map.values():
-          if isinstance(spec, str):
-            if spec.lower() not in _SAFE_BUILTINS_COMBINE_FNS:
+        fields_map = cfg.get('fields')
+        if isinstance(fields_map, dict):
+          for fv in fields_map.values():
+            if isinstance(fv, str) and not _is_safe_inline_expression(fv):
               return True
-          elif isinstance(spec, dict):
-            fn_spec = spec.get('fn')
-            if isinstance(fn_spec, str):
-              fn_name = fn_spec
-            elif isinstance(fn_spec, dict):
-              if fn_spec.get('config'):
+        if t_type == 'Combine':
+          comb_map = cfg.get('combine')
+          if not isinstance(comb_map, dict):
+            return True
+          for spec in comb_map.values():
+            if isinstance(spec, str):
+              if spec.lower() not in _SAFE_BUILTINS_COMBINE_FNS:
                 return True
-              fn_name = str(fn_spec.get('type') or '')
+            elif isinstance(spec, dict):
+              fn_spec = spec.get('fn')
+              if isinstance(fn_spec, str):
+                fn_name = fn_spec
+              elif isinstance(fn_spec, dict):
+                if fn_spec.get('config'):
+                  return True
+                fn_name = str(fn_spec.get('type') or '')
+              else:
+                return True
+              if fn_name.lower() not in _SAFE_BUILTINS_COMBINE_FNS:
+                return True
+              val_spec = spec.get('value')
+              if isinstance(val_spec,
+                            str) and not _is_safe_inline_expression(val_spec):
+                return True
             else:
               return True
-            if fn_name.lower() not in _SAFE_BUILTINS_COMBINE_FNS:
-              return True
-            val_spec = spec.get('value')
-            if isinstance(val_spec, str) and not _is_safe_inline_expression(
-                val_spec):
-              return True
-          else:
-            return True
     if _config_has_untrusted_udf_hooks(cfg):
       return True
     if 'constructor' in cfg and t_type not in ('ReadFromCsv',
@@ -861,12 +1013,24 @@ def _has_executable_python_transforms(block: Any) -> bool:
 
 
 _REMOTE_ACCESS_MARKERS = (
-    'gs://', 's3://', 'azfs://', 'hdfs://', 'list operation failed',
-    'operation not permitted', 'defaultcredentialserror',
-    'could not automatically determine credentials', 'name resolution',
-    'nodename nor servname', 'failed to establish a new connection',
-    'connection refused', 'maven', 'http error 403', 'refresherror',
-    'mutualtlschannelerror', 'reauthentication', 'invalid_grant',
+    'gs://',
+    's3://',
+    'azfs://',
+    'hdfs://',
+    'list operation failed',
+    'operation not permitted',
+    'defaultcredentialserror',
+    'could not automatically determine credentials',
+    'name resolution',
+    'nodename nor servname',
+    'failed to establish a new connection',
+    'connection refused',
+    'maven',
+    'http error 403',
+    'refresherror',
+    'mutualtlschannelerror',
+    'reauthentication',
+    'invalid_grant',
     'transporterror')
 
 
@@ -874,6 +1038,14 @@ def _is_remote_access_error(exc: BaseException) -> bool:
   """True if `exc` (from --plan expansion) comes from missing network/creds."""
   text = f'{type(exc).__name__}: {exc}'.lower()
   return any(marker in text for marker in _REMOTE_ACCESS_MARKERS)
+
+
+_QUIET_LOCK = threading.Lock()
+_QUIET_REFCOUNT = 0
+_QUIET_PREV_DISABLE: int = 0
+_QUIET_PREV_GRPC: str | None = None
+_QUIET_PREV_STDERR: Any = None
+_QUIET_PREV_WARNINGS: list[Any] = []
 
 
 @contextlib.contextmanager
@@ -890,17 +1062,35 @@ def _quiet_expansion(enabled: bool = True):
   import io
   import logging
   import warnings
-  prev_disable = logging.root.manager.disable
-  prev_grpc = os.environ.get('GRPC_VERBOSITY')
-  os.environ['GRPC_VERBOSITY'] = 'NONE'
-  logging.disable(logging.CRITICAL)
-  try:
-    with warnings.catch_warnings(), contextlib.redirect_stderr(io.StringIO()):
+  global _QUIET_REFCOUNT
+  global _QUIET_PREV_DISABLE
+  global _QUIET_PREV_GRPC
+  global _QUIET_PREV_STDERR
+  global _QUIET_PREV_WARNINGS
+  with _QUIET_LOCK:
+    if _QUIET_REFCOUNT == 0:
+      _QUIET_PREV_DISABLE = logging.root.manager.disable
+      _QUIET_PREV_GRPC = os.environ.get('GRPC_VERBOSITY')
+      _QUIET_PREV_STDERR = sys.stderr
+      _QUIET_PREV_WARNINGS = list(warnings.filters)
+      os.environ['GRPC_VERBOSITY'] = 'NONE'
+      logging.disable(logging.CRITICAL)
+      sys.stderr = io.StringIO()
       warnings.simplefilter('ignore')
-      yield
+    _QUIET_REFCOUNT += 1
+  try:
+    yield
   finally:
-    logging.disable(prev_disable)
-    if prev_grpc is None:
-      os.environ.pop('GRPC_VERBOSITY', None)
-    else:
-      os.environ['GRPC_VERBOSITY'] = prev_grpc
+    with _QUIET_LOCK:
+      _QUIET_REFCOUNT = max(0, _QUIET_REFCOUNT - 1)
+      if _QUIET_REFCOUNT == 0:
+        if _QUIET_PREV_STDERR is not None:
+          sys.stderr = _QUIET_PREV_STDERR
+          _QUIET_PREV_STDERR = None
+        warnings.filters[:] = _QUIET_PREV_WARNINGS
+        _QUIET_PREV_WARNINGS = []
+        logging.disable(_QUIET_PREV_DISABLE)
+        if _QUIET_PREV_GRPC is None:
+          os.environ.pop('GRPC_VERBOSITY', None)
+        else:
+          os.environ['GRPC_VERBOSITY'] = _QUIET_PREV_GRPC

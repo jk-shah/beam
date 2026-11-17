@@ -184,9 +184,21 @@ def encode_canonical_key_values(values: Iterable[Any]) -> bytes:
   return b''.join(parts)
 
 
-def _make_dlq_row(step: str, err_type: str, msg: str, elem: Any) -> beam.Row:
+def _make_dlq_row(
+    step: str,
+    err_type: str,
+    msg: str,
+    elem: Any,
+    redact_fields: Iterable[str] = (),
+) -> beam.Row:
   from . import dlq
-  return dlq.make_transform_dlq_row(step, err_type, msg, _to_plain_dict(elem))
+  scrubbed = output.scrub_error_message(str(msg))
+  return dlq.make_transform_dlq_row(
+      step,
+      err_type,
+      scrubbed,
+      _to_plain_dict(elem),
+      redact_fields=redact_fields)
 
 
 def parse_interval_duration(raw: str | int | float) -> float:
@@ -290,6 +302,7 @@ class IntervalJoinConfig(NamedTuple):
   right_fields: tuple[str, ...] = ()
   force_stateful: bool = False
   allowed_lateness: float = 0.0
+  dlq_redact_fields: tuple[str, ...] = ()
 
   @property
   def lower_bound_sec(self) -> float:
@@ -308,6 +321,7 @@ def parse_interval_join_spec_str(
     left_alias: str | None = None,
     right_alias: str | None = None,
     allowed_lateness: str | None = None,
+    dlq_redact_fields: Iterable[str] | str | None = None,
 ) -> dict[str, Any]:
   """Parses CLI `--interval-join SPEC` shorthand into a YAML-ready config dict."""
   if not isinstance(spec_str, str) or not spec_str.strip():
@@ -362,6 +376,8 @@ def parse_interval_join_spec_str(
       cfg['skew_action'] = v
     elif k in ('allowed_lateness', 'lateness'):
       cfg['allowed_lateness'] = v
+    elif k == 'dlq_redact_fields':
+      cfg['dlq_redact_fields'] = list(parse_column_list(v))
     elif k == 'force_stateful':
       cfg['force_stateful'] = v.lower() in ('1', 'true', 'yes')
     else:
@@ -388,6 +404,7 @@ def parse_interval_join_spec_str(
           'max_skew',
           'skew_action',
           'allowed_lateness',
+          'dlq_redact_fields',
       ]
       close = difflib.get_close_matches(k, valid_ij, n=1, cutoff=0.55)
       hint = f' (did you mean {close[0]!r}?)' if close else ''
@@ -404,6 +421,10 @@ def parse_interval_join_spec_str(
     cfg['skew_action'] = skew_action
   if allowed_lateness is not None and 'allowed_lateness' not in cfg:
     cfg['allowed_lateness'] = allowed_lateness
+  if dlq_redact_fields is not None and 'dlq_redact_fields' not in cfg:
+    parsed_rf = list(parse_column_list(dlq_redact_fields))
+    if parsed_rf:
+      cfg['dlq_redact_fields'] = parsed_rf
   # Validate eagerly so invalid CLI flags fail immediately at build time.
   parse_interval_join_config(cfg)
   return cfg
@@ -508,12 +529,15 @@ def parse_interval_join_config(cfg: dict[str, Any]) -> IntervalJoinConfig:
   allowed_lateness = (
       parse_interval_duration(lat_raw) if lat_raw is not None else 0.0)
   if allowed_lateness < 0:
-    raise ValueError(
-        f'allowed_lateness must be >= 0 (got {allowed_lateness}s)')
+    raise ValueError(f'allowed_lateness must be >= 0 (got {allowed_lateness}s)')
 
   left_fields = parse_column_list(cfg.get('left_fields'))
   right_fields = parse_column_list(cfg.get('right_fields'))
   force_stateful = bool(cfg.get('force_stateful'))
+  dlq_redact_fields = parse_column_list(cfg.get('dlq_redact_fields'))
+  for rf in dlq_redact_fields:
+    if not output.SAFE_IDENTIFIER_RE.match(rf):
+      raise ValueError(f'invalid column identifier {rf!r} in dlq_redact_fields')
 
   return IntervalJoinConfig(
       left_alias=left_alias,
@@ -532,6 +556,7 @@ def parse_interval_join_config(cfg: dict[str, Any]) -> IntervalJoinConfig:
       right_fields=right_fields,
       force_stateful=force_stateful,
       allowed_lateness=allowed_lateness,
+      dlq_redact_fields=dlq_redact_fields,
   )
 
 
@@ -916,7 +941,12 @@ class _BoundedIntervalJoinDoFn(beam.DoFn):
             raise
           yield pvalue.TaggedOutput(
               self.err_tag,
-              _make_dlq_row('CliIntervalJoin', type(e).__name__, str(e), r))
+              _make_dlq_row(
+                  'CliIntervalJoin',
+                  type(e).__name__,
+                  str(e),
+                  r,
+                  redact_fields=self.config.dlq_redact_fields))
         elif self.config.skew_action == 'fail':
           raise
         else:
@@ -933,7 +963,12 @@ class _BoundedIntervalJoinDoFn(beam.DoFn):
             raise
           yield pvalue.TaggedOutput(
               self.err_tag,
-              _make_dlq_row('CliIntervalJoin', type(e).__name__, str(e), r))
+              _make_dlq_row(
+                  'CliIntervalJoin',
+                  type(e).__name__,
+                  str(e),
+                  r,
+                  redact_fields=self.config.dlq_redact_fields))
         elif self.config.skew_action == 'fail':
           raise
         else:
@@ -957,7 +992,8 @@ class _BoundedIntervalJoinDoFn(beam.DoFn):
                     'WatermarkSkewError',
                     f'left record timestamp {t_l} lagged right max {max_r} by '
                     f'> {self.config.max_watermark_skew}s',
-                    r))
+                    r,
+                    redact_fields=self.config.dlq_redact_fields))
             continue
           if self.config.skew_action == 'fail':
             raise ValueError(
@@ -980,7 +1016,8 @@ class _BoundedIntervalJoinDoFn(beam.DoFn):
                     'WatermarkSkewError',
                     f'right record timestamp {t_r} lagged left max {max_l} by '
                     f'> {self.config.max_watermark_skew}s',
-                    r))
+                    r,
+                    redact_fields=self.config.dlq_redact_fields))
             continue
           if self.config.skew_action == 'fail':
             raise ValueError(
@@ -1032,14 +1069,21 @@ class IntervalJoinStatefulDoFn(beam.DoFn):
   def _handle_bad_or_skewed(
       self, err_type: str, msg: str, payload: Any, *, is_skew: bool = False):
     action = self.config.skew_action
+    scrubbed_msg = output.scrub_error_message(str(msg))
     if action == 'dlq' or (not is_skew and self.route_errors):
       if not self.route_errors:
-        raise ValueError(f'{err_type}: {msg} (configure --dlq to quarantine)')
+        raise ValueError(
+            f'{err_type}: {scrubbed_msg} (configure --dlq to quarantine)')
       return pvalue.TaggedOutput(
           self.err_tag,
-          _make_dlq_row('CliIntervalJoin', err_type, msg, payload))
+          _make_dlq_row(
+              'CliIntervalJoin',
+              err_type,
+              scrubbed_msg,
+              payload,
+              redact_fields=self.config.dlq_redact_fields))
     if action == 'fail':
-      raise ValueError(f'{err_type}: {msg}')
+      raise ValueError(f'{err_type}: {scrubbed_msg}')
     self.skew_dropped_counter.inc(1)
     self.cli_skew_dropped_counter.inc(1)
     return None
@@ -1195,7 +1239,8 @@ class IntervalJoinStatefulDoFn(beam.DoFn):
                   'CliIntervalJoin',
                   'LateArrivalError',
                   f'late left record at {t} arrived after GC watermark {evicted_wm}',
-                  row_payload))
+                  row_payload,
+                  redact_fields=self.config.dlq_redact_fields))
         return
 
       left_buf.add((t, encoded_self, left_matched))
@@ -1235,7 +1280,8 @@ class IntervalJoinStatefulDoFn(beam.DoFn):
                   'CliIntervalJoin',
                   'LateArrivalError',
                   f'late right record at {t} arrived after GC watermark {evicted_wm}',
-                  row_payload))
+                  row_payload,
+                  redact_fields=self.config.dlq_redact_fields))
         return
 
       right_buf.add((t, encoded_self, right_matched))
@@ -1323,11 +1369,16 @@ class IntervalJoinStatefulDoFn(beam.DoFn):
 def cli_assign_timestamps(
     timestamp_col: str,
     error_handling: dict[str, Any] | None = None,
+    dlq_redact_fields: Iterable[str] | str | None = None,
 ) -> beam.PTransform:
   """Safe event-time assigner supporting ISO-8601 strings, epoch sec/ms, & DLQ."""
   col = str(timestamp_col or '').strip()
   if not col:
     raise ValueError('CliAssignTimestamps requires timestamp_col')
+  redact_fields = parse_column_list(dlq_redact_fields)
+  for rf in redact_fields:
+    if not output.SAFE_IDENTIFIER_RE.match(rf):
+      raise ValueError(f'invalid column identifier {rf!r} in dlq_redact_fields')
   err_tag = (error_handling or {}).get('output', 'errors')
   route_errors = bool(error_handling and 'output' in error_handling)
   dlq_row_type = RowTypeConstraint.from_fields([
@@ -1350,7 +1401,11 @@ def cli_assign_timestamps(
           yield pvalue.TaggedOutput(
               err_tag,
               _make_dlq_row(
-                  'CliAssignTimestamps', type(e).__name__, str(e), element))
+                  'CliAssignTimestamps',
+                  type(e).__name__,
+                  str(e),
+                  element,
+                  redact_fields=redact_fields))
         else:
           raise
 
@@ -1485,6 +1540,7 @@ def cli_interval_join(
     left: Any = None,
     right: Any = None,
     error_handling: dict[str, Any] | None = None,
+    dlq_redact_fields: Iterable[str] | str | None = None,
     **kwargs,
 ) -> beam.PTransform:
   """Beam YAML factory callable for `type: CliIntervalJoin` / `IntervalJoin`."""
@@ -1493,6 +1549,8 @@ def cli_interval_join(
     cfg_dict['left'] = left
   if right is not None and 'right' not in cfg_dict:
     cfg_dict['right'] = right
+  if dlq_redact_fields is not None and 'dlq_redact_fields' not in cfg_dict:
+    cfg_dict['dlq_redact_fields'] = dlq_redact_fields
 
   base_cfg = parse_interval_join_config(cfg_dict)
   err_tag = (error_handling or {}).get('output', 'errors')
@@ -1543,7 +1601,12 @@ def cli_interval_join(
         if route_errors:
           yield pvalue.TaggedOutput(
               err_tag,
-              _make_dlq_row('CliIntervalJoin', type(e).__name__, str(e), d))
+              _make_dlq_row(
+                  'CliIntervalJoin',
+                  type(e).__name__,
+                  str(e),
+                  d,
+                  redact_fields=base_cfg.dlq_redact_fields))
         elif base_cfg.skew_action == 'fail':
           raise
         else:

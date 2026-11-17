@@ -39,6 +39,7 @@ import math
 import os
 import re
 import sys
+import threading
 from pathlib import Path
 from typing import Any
 from typing import Iterable
@@ -71,8 +72,8 @@ _CONTROL_AND_INJECTION_RE = re.compile(
 # a short literal (column 'zip': ...) is never mistaken for the start of one
 # and ordinary error text between two literals is left readable.
 _LONG_QUOTED_RE = re.compile(
-    r"""(?<![\w'"])(['"])(?:\\.|(?!\1).){28,}?\1""", re.DOTALL)
-
+    r"""(?<![\w'"])(?:'(?:\\.|[^'\\]){28,}'|"(?:\\.|[^"\\]){28,}")""",
+    re.DOTALL)
 
 # Set by `beam pipe` when --dlq was passed, so a failure doesn't suggest it.
 DLQ_REQUESTED = False
@@ -147,8 +148,8 @@ def sanitize_untrusted_value(value: Any, max_depth: int = 12) -> Any:
   return sanitize_untrusted_text(str(value))
 
 
-def wrap_untrusted_rows(
-    rows: Iterable[Any], truncated: bool = False) -> dict[str, Any]:
+def wrap_untrusted_rows(rows: Iterable[Any],
+                        truncated: bool = False) -> dict[str, Any]:
   """Wraps sampled dataset rows in the explicit `untrusted_data` envelope."""
   return {
       'notice': UNTRUSTED_DATA_NOTICE,
@@ -176,24 +177,34 @@ def _keep_quoted(literal: str) -> bool:
   import os
   if re.fullmatch(r'\d{4}-\d{2}-\d{2}_\d{2}_\d{2}_\d{2}-\d+', literal):
     return True  # Dataflow job ID (e.g. 2026-11-10_14_34_36-14034864922449419400)
-  if re.fullmatch(r'[A-Za-z0-9_.:/()\[\]<> -]+', literal) and (
-      '/' in literal and not literal.startswith('/') and
-      ('<lambda at ' in literal or ' ' not in literal) and
-      not re.search(r'[A-Za-z0-9+/]{40,}', literal)):
+  if re.fullmatch(
+      r'[A-Za-z0-9_.:/()\[\]<> -]+',
+      literal) and ('/' in literal and not literal.startswith('/') and
+                    ('<lambda at ' in literal or ' ' not in literal) and
+                    not re.search(r'[A-Za-z0-9+/]{40,}', literal)):
     return True  # A step label such as AssignTimestamps/Map(<lambda at ...>)
   if re.fullmatch(
       r'(gs|s3|azfs|hdfs|file|bigquery|bq|delta|iceberg|pubsub|kafka|'
-      r'postgres|postgresql|mysql|spanner)://[^\s@?#]+', literal):
+      r'postgres|postgresql|mysql|spanner)://[^\s@?#]+',
+      literal):
     return True
   # Safe local file/glob path (Unix or Windows drive path, even when missing):
   norm_lit = literal.replace('\\\\', '/').replace('\\', '/')
   path_tail = norm_lit[2:] if re.match(r'^[A-Za-z]:/', norm_lit) else norm_lit
-  if re.fullmatch(r'[A-Za-z0-9_./*?\[\]-]+', path_tail) and (
-      '/' in norm_lit or norm_lit.lower().endswith((
-          '.csv', '.json', '.jsonl', '.parquet', '.avro', '.yaml', '.yml',
-          '.txt', '.sql', '.py'))):
-    if not any(
-        len(seg) >= 32 and '.' not in seg for seg in path_tail.split('/')):
+  if re.fullmatch(r'[A-Za-z0-9_./*?\[\]-]+',
+                  path_tail) and ('/' in norm_lit or norm_lit.lower().endswith(
+                      ('.csv',
+                       '.json',
+                       '.jsonl',
+                       '.parquet',
+                       '.avro',
+                       '.yaml',
+                       '.yml',
+                       '.txt',
+                       '.sql',
+                       '.py'))):
+    if not any(len(seg) >= 32 and '.' not in seg
+               for seg in path_tail.split('/')):
       return True
   try:
     return os.path.exists(literal)
@@ -203,16 +214,17 @@ def _keep_quoted(literal: str) -> bool:
 
 # Explicit credential patterns (unquoted or <28 chars) scrubbed in error text.
 _URI_USERINFO_SECRET_RE = re.compile(
-    r'([A-Za-z][A-Za-z0-9+.-]*://[^/\s:@\'"]*:)(?!<(?:redacted|REDACTED))(?:[^@\s/\'"]+)(@)'
-)
+    r'(?<![A-Za-z0-9+.-])([A-Za-z][A-Za-z0-9+.-]{0,31}://[^/\s:@\'"]*:)'
+    r'(?!<(?:redacted|REDACTED))(?:[^@\s/\'"]+)(@)')
 _AUTH_HEADER_SECRET_RE = re.compile(
     r'\b(Bearer|Basic)\s+(?!<(?:redacted|REDACTED))[A-Za-z0-9._~+/=-]{8,}',
     re.IGNORECASE)
 _KV_SECRET_RE = re.compile(
-    r'(\b(?:password|passwd|pwd|passphrase|secret|token|api[-_]?key|'
-    r'x-api-key|access_key|private_key|signing_key|encryption_key|'
-    r'client_secret|auth|aws_secret_access_key|sasl\.jaas\.config)\b\s*[:=]\s*)'
-    r"""(?!['"]?<(?:redacted|REDACTED))(?:(['"])(?:\\.|(?!\2).)*?\2|[^\s,'";)\]}]+)""",
+    r'((?:\b|(?<=_))(?:password|passwd|pwd|passphrase|secret|token|'
+    r'api[-_]?key|x-api-key|access[-_]?key|private[-_]?key|signing[-_]?key|'
+    r'encryption[-_]?key|client[-_]?secret|auth|aws_secret_access_key|'
+    r'sasl\.jaas\.config)\b\s*[:=]\s*)'
+    r"""(?!['"]?<(?:redacted|REDACTED))(?:'(?:\\.|[^'\\])*'|"(?:\\.|[^"\\])*"|[^\s,'";)\]}]+)""",
     re.IGNORECASE)
 _KNOWN_TOKEN_RE = re.compile(
     r'\b(?:'
@@ -233,7 +245,9 @@ def redact_inline_secrets(
   """Redacts URI userinfo passwords, bearer headers, KV secrets, and known tokens."""
   if not text:
     return text
-  clean = _URI_USERINFO_SECRET_RE.sub(rf'\1{placeholder}\2', text)
+  clean = (
+      _URI_USERINFO_SECRET_RE.sub(rf'\1{placeholder}\2', text)
+      if '://' in text else text)
   clean = _AUTH_HEADER_SECRET_RE.sub(rf'\1 {placeholder}', clean)
   clean = _KV_SECRET_RE.sub(rf'\1{placeholder}', clean)
   return _KNOWN_TOKEN_RE.sub(placeholder, clean)
@@ -254,9 +268,11 @@ def scrub_error_message(
     return clean
 
   def _redact(m):
-    if _keep_quoted(m.group(0)[1:-1]):
-      return m.group(0)
-    return f'{m.group(1)}<redacted-value>{m.group(1)}'
+    matched = m.group(0)
+    if _keep_quoted(matched[1:-1]):
+      return matched
+    quote = matched[0]
+    return f'{quote}<redacted-value>{quote}'
 
   return _LONG_QUOTED_RE.sub(_redact, clean)
 
@@ -286,8 +302,7 @@ def safe_yaml_load(
           f'YAML exceeds maximum expanded node budget ({max_expanded_nodes:,} '
           'nodes)')
     if depth > max_depth:
-      raise yaml.YAMLError(
-          f'YAML nesting exceeds maximum depth ({max_depth})')
+      raise yaml.YAMLError(f'YAML nesting exceeds maximum depth ({max_depth})')
     if isinstance(obj, dict):
       oid = id(obj)
       if oid in active_ids:
@@ -330,8 +345,7 @@ def read_bounded_text(
     with open(path_or_stream, 'rb') as f:
       chunk = f.read(max_bytes + 1)
     if len(chunk) > max_bytes:
-      raise ValueError(
-          f'{label} exceeds maximum size ({max_bytes:,} bytes)')
+      raise ValueError(f'{label} exceeds maximum size ({max_bytes:,} bytes)')
     return chunk.decode('utf-8')
   # File-like stream (`sys.stdin` or `io.StringIO` / binary stream).
   data = path_or_stream.read(max_bytes + 1)
@@ -357,6 +371,19 @@ def validate_safe_jinja_template(template_text: str) -> None:
     raise ValueError(
         f'invalid Jinja2 syntax (line {e.lineno}): {e.message}') from None
 
+  def _validate_filter_attr_arg(arg_node: Any, filter_name: str) -> None:
+    if not isinstance(arg_node, jnodes.Const) or not isinstance(arg_node.value,
+                                                                str):
+      raise ValueError(
+          f'disallowed non-constant attribute argument on |{filter_name} '
+          'in template')
+    attr_val = arg_node.value
+    if (not attr_val or attr_val.startswith('_') or '._' in attr_val or
+        '__' in attr_val):
+      raise ValueError(
+          f'disallowed private Jinja2 attribute {attr_val!r} on '
+          f'|{filter_name} in template')
+
   for inc_node in parsed.find_all(
       (jnodes.Include, jnodes.Import, jnodes.FromImport, jnodes.Extends)):
     raise ValueError(
@@ -364,15 +391,62 @@ def validate_safe_jinja_template(template_text: str) -> None:
   for pow_node in parsed.find_all(jnodes.Pow):
     del pow_node
     raise ValueError('disallowed Jinja2 power operator (**) in template')
+  for mul_node in parsed.find_all(jnodes.Mul):
+    for side in (mul_node.left, mul_node.right):
+      c_node = (
+          side.node if isinstance(side, (jnodes.Neg, jnodes.Pos)) else side)
+      if (isinstance(c_node, jnodes.Const) and isinstance(c_node.value, int) and
+          not isinstance(c_node.value, bool) and abs(c_node.value) > 4096):
+        raise ValueError(
+            'disallowed Jinja2 multiplication operand > 4096 in template')
   for fnode in parsed.find_all(jnodes.Filter):
-    if str(fnode.name) in ('attr', 'format'):
-      raise ValueError(
-          f'disallowed Jinja2 filter |{fnode.name} in template')
+    fname = str(fnode.name)
+    if fname in ('attr', 'format'):
+      raise ValueError(f'disallowed Jinja2 filter |{fname} in template')
+    if fname == 'map' and fnode.args:
+      sub_f = fnode.args[0]
+      if not isinstance(sub_f, jnodes.Const) or not isinstance(
+          sub_f.value, str) or sub_f.value in (
+              'attr',
+              'format',
+              'map',
+              'selectattr',
+              'rejectattr',
+              'groupby',
+              'sort',
+              'min',
+              'max',
+              'unique',
+              'sum',
+          ):
+        raise ValueError('disallowed sub-filter in |map(...) in template')
+    has_kw_attr = False
+    for kw in fnode.kwargs:
+      if kw.key in ('attribute', 'attr'):
+        has_kw_attr = True
+        _validate_filter_attr_arg(kw.value, fname)
+    if fname in ('selectattr', 'rejectattr', 'groupby'):
+      if fnode.args:
+        _validate_filter_attr_arg(fnode.args[0], fname)
+      elif not has_kw_attr:
+        raise ValueError(
+            f'missing constant attribute argument on |{fname} in template')
+    elif fname == 'sum' and len(fnode.args) >= 1:
+      if not (isinstance(fnode.args[0], jnodes.Const) and
+              fnode.args[0].value is None):
+        _validate_filter_attr_arg(fnode.args[0], fname)
+    elif fname in ('min', 'max', 'unique') and len(fnode.args) >= 2:
+      if not (isinstance(fnode.args[1], jnodes.Const) and
+              fnode.args[1].value is None):
+        _validate_filter_attr_arg(fnode.args[1], fname)
+    elif fname == 'sort' and len(fnode.args) >= 3:
+      if not (isinstance(fnode.args[2], jnodes.Const) and
+              fnode.args[2].value is None):
+        _validate_filter_attr_arg(fnode.args[2], fname)
   for nnode in parsed.find_all(jnodes.Name):
     name_s = str(nnode.name)
     if name_s.startswith('_') or name_s in _BLOCKED_JINJA_GLOBALS:
-      raise ValueError(
-          f'disallowed Jinja2 identifier {name_s!r} in template')
+      raise ValueError(f'disallowed Jinja2 identifier {name_s!r} in template')
   for gnode in parsed.find_all(jnodes.Getattr):
     if str(gnode.attr).startswith('_'):
       raise ValueError(
@@ -517,11 +591,10 @@ def classify_error(
     error_type = 'InterruptedError'
   else:
     error_type = 'PipelineExecutionError'
-    if re.search(
-        r'(custom subnet mode|networkInterfaces\[0\]\.subnetwork|'
-        r'vmExternalIpAccess|no_use_public_ips)',
-        message,
-        re.IGNORECASE):
+    if re.search(r'(custom subnet mode|networkInterfaces\[0\]\.subnetwork|'
+                 r'vmExternalIpAccess|no_use_public_ips)',
+                 message,
+                 re.IGNORECASE):
       next_actions.append({
           'command': (
               f'beam {command or "pipe"} ... '
@@ -550,8 +623,8 @@ def classify_error(
           'requires_human': False,
       })
     elif command == 'pipe' and not DLQ_REQUESTED and not (
-        '--cdc:' in message and 'share the latest sequence value' in message
-    ) and '--assert-counts failed' not in message:
+        '--cdc:' in message and 'share the latest sequence value'
+        in message) and '--assert-counts failed' not in message:
       next_actions.append({
           'command': 'beam pipe ... --dlq ./dlq/errors.json',
           'description': 'Route malformed or failing records to a dead-letter sink.',
@@ -620,6 +693,9 @@ def build_envelope(
 
 _REAL_STDOUT_FD: int | None = None
 _RESTORED_PY_STDOUT: Any = None
+_STDOUT_REDIRECT_LOCK = threading.Lock()
+_STDOUT_REDIRECT_DEPTH = 0
+_SAVED_ORIG_STDOUT: Any = None
 
 
 class JsonOutputSession:
@@ -641,52 +717,60 @@ class JsonOutputSession:
     self._owns_fd = False
     self._restore_stdout = None
     self._emitted = False
+    self._entered = False
 
   def __enter__(self):
     global _REAL_STDOUT_FD
     global _RESTORED_PY_STDOUT
+    global _STDOUT_REDIRECT_DEPTH
+    global _SAVED_ORIG_STDOUT
     if not self.enabled:
       return self
-    prev_stdout = sys.stdout
-    self._restore_stdout = prev_stdout
-    use_os_fd = False
-    if prev_stdout is sys.__stdout__ or (
-        _RESTORED_PY_STDOUT is not None and prev_stdout is _RESTORED_PY_STDOUT):
-      try:
-        os.fstat(1)
-        os.fstat(2)
-        use_os_fd = True
-      except OSError:
-        use_os_fd = False
+    with _STDOUT_REDIRECT_LOCK:
+      if _STDOUT_REDIRECT_DEPTH == 0:
+        orig_stdout = sys.stdout
+        _SAVED_ORIG_STDOUT = orig_stdout
+      else:
+        orig_stdout = _SAVED_ORIG_STDOUT
+      self._restore_stdout = orig_stdout
+      use_os_fd = False
+      if orig_stdout is sys.__stdout__ or (_RESTORED_PY_STDOUT is not None and
+                                           orig_stdout is _RESTORED_PY_STDOUT):
+        try:
+          os.fstat(1)
+          os.fstat(2)
+          use_os_fd = True
+        except OSError:
+          use_os_fd = False
 
-    if use_os_fd:
-      try:
-        prev_stdout.flush()
-        sys.stderr.flush()
-      except OSError:
-        pass
-      try:
-        if _REAL_STDOUT_FD is None:
-          _REAL_STDOUT_FD = os.dup(1)
-          # Permanent OS FD redirection: intentionally NOT undone in `__exit__`
-          # so C++/gRPC/Prism `atexit` teardown writes to FD 2 rather than FD 1.
-          os.dup2(2, 1)
-          _RESTORED_PY_STDOUT = os.fdopen(
-              os.dup(_REAL_STDOUT_FD),
-              'w',
-              buffering=1,
-              encoding='utf-8')
-        self._json_stream = os.fdopen(
-            os.dup(_REAL_STDOUT_FD), 'w', encoding='utf-8')
-        self._owns_fd = True
-        self._restore_stdout = _RESTORED_PY_STDOUT
+      if use_os_fd:
+        try:
+          orig_stdout.flush()
+          sys.stderr.flush()
+        except OSError:
+          pass
+        try:
+          if _REAL_STDOUT_FD is None:
+            _REAL_STDOUT_FD = os.dup(1)
+            # Permanent OS FD redirection: intentionally NOT undone in `__exit__`
+            # so C++/gRPC/Prism `atexit` teardown writes to FD 2 rather than FD 1.
+            os.dup2(2, 1)
+            _RESTORED_PY_STDOUT = os.fdopen(
+                os.dup(_REAL_STDOUT_FD), 'w', buffering=1, encoding='utf-8')
+          self._json_stream = os.fdopen(
+              os.dup(_REAL_STDOUT_FD), 'w', encoding='utf-8')
+          self._owns_fd = True
+          _SAVED_ORIG_STDOUT = _RESTORED_PY_STDOUT
+          self._restore_stdout = _RESTORED_PY_STDOUT
+          sys.stdout = sys.stderr
+        except OSError:
+          self._json_stream = orig_stdout
+          sys.stdout = sys.stderr
+      else:
+        self._json_stream = orig_stdout
         sys.stdout = sys.stderr
-      except OSError:
-        self._json_stream = prev_stdout
-        sys.stdout = sys.stderr
-    else:
-      self._json_stream = prev_stdout
-      sys.stdout = sys.stderr
+      _STDOUT_REDIRECT_DEPTH += 1
+      self._entered = True
     return self
 
   def emit_stream_line(self, payload: dict[str, Any]) -> None:
@@ -694,18 +778,30 @@ class JsonOutputSession:
     if not self.enabled or self._emitted or self._json_stream is None:
       return
     serialized = json.dumps(payload, allow_nan=False)
-    self._json_stream.write(serialized + '\n')
-    self._json_stream.flush()
+    if self._owns_fd:
+      self._json_stream.write(serialized + '\n')
+      self._json_stream.flush()
+    else:
+      with _STDOUT_REDIRECT_LOCK:
+        self._json_stream.write(serialized + '\n')
+        self._json_stream.flush()
 
   def emit(self, payload: dict[str, Any]) -> None:
     if not self.enabled or self._emitted or self._json_stream is None:
       return
     serialized = json.dumps(payload, allow_nan=False)
-    self._json_stream.write(serialized + '\n')
-    self._json_stream.flush()
+    if self._owns_fd:
+      self._json_stream.write(serialized + '\n')
+      self._json_stream.flush()
+    else:
+      with _STDOUT_REDIRECT_LOCK:
+        self._json_stream.write(serialized + '\n')
+        self._json_stream.flush()
     self._emitted = True
 
   def __exit__(self, exc_type, exc_val, exc_tb):
+    global _STDOUT_REDIRECT_DEPTH
+    global _SAVED_ORIG_STDOUT
     if not self.enabled:
       return False
     if self._owns_fd and self._json_stream is not None:
@@ -713,7 +809,12 @@ class JsonOutputSession:
         self._json_stream.close()
       except OSError:
         pass
-    if self._restore_stdout is not None:
-      sys.stdout = self._restore_stdout
+    with _STDOUT_REDIRECT_LOCK:
+      if self._entered:
+        self._entered = False
+        _STDOUT_REDIRECT_DEPTH = max(0, _STDOUT_REDIRECT_DEPTH - 1)
+        if _STDOUT_REDIRECT_DEPTH == 0:
+          if _SAVED_ORIG_STDOUT is not None:
+            sys.stdout = _SAVED_ORIG_STDOUT
+          _SAVED_ORIG_STDOUT = None
     return False
-

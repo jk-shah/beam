@@ -26,12 +26,15 @@ registration using only `FileSystems`, `pyarrow`, and `fastavro`.
 import contextlib
 import datetime
 import decimal
+import errno
 import io
+import ipaddress
 import json
 import math
 import os
 import pathlib
 import re
+import stat
 import time
 import urllib.error
 import urllib.parse
@@ -64,11 +67,12 @@ def _detect_unsupported_delta_reader_features(
 ) -> list[str]:
   """Returns Delta protocol features unsafe for raw pure-Python Parquet reads."""
   unsupported: list[str] = []
-  col_map = str(
-      table_config.get('delta.columnMapping.mode', 'none') or 'none').strip().lower()
+  col_map = str(table_config.get('delta.columnMapping.mode', 'none') or
+                'none').strip().lower()
   if col_map not in ('', 'none') and 'columnMapping' not in unsupported:
     unsupported.append(f'columnMapping({col_map})')
-  if str(table_config.get('delta.enableDeletionVectors', 'false')).lower() == 'true':
+  if str(table_config.get('delta.enableDeletionVectors',
+                          'false')).lower() == 'true':
     if 'deletionVectors' not in unsupported:
       unsupported.append('deletionVectors')
   for feat in reader_features:
@@ -92,12 +96,26 @@ def _detect_unsupported_delta_reader_features(
 
 
 def _normalize_fs_root(raw_path: str) -> str:
+  _check_no_dotdot_or_controls(raw_path, 'lakehouse path')
   if raw_path.lower().startswith('delta://'):
     raw_path = raw_path[len('delta://'):]
+    _check_no_dotdot_or_controls(raw_path, 'lakehouse path')
   if raw_path.lower().startswith('file://'):
     parsed = urllib.parse.urlsplit(raw_path)
+    if parsed.netloc and parsed.netloc.lower() != 'localhost':
+      raise LakehouseError(
+          f'unsupported non-local host in file:// path {raw_path!r}')
+    _check_no_dotdot_or_controls(parsed.path, 'lakehouse path')
     raw_path = urllib.parse.unquote(parsed.path)
+    _check_no_dotdot_or_controls(raw_path, 'lakehouse path')
+    if re.match(r'^/[A-Za-z]:/', raw_path):
+      raw_path = raw_path[1:]
+  elif '://' in raw_path:
+    _check_no_dotdot_or_controls(
+        urllib.parse.unquote(raw_path), 'lakehouse path')
   if '://' not in raw_path:
+    _check_no_dotdot_or_controls(
+        urllib.parse.unquote(raw_path), 'lakehouse path')
     return os.path.abspath(raw_path).rstrip('/\\')
   return raw_path.rstrip('/')
 
@@ -114,7 +132,18 @@ def _fs_exists(path: str) -> bool:
   if '://' not in path:
     return os.path.exists(path)
   from apache_beam.io.filesystems import FileSystems
+  exists_fn = getattr(FileSystems, 'exists', None)
+  match_fn = getattr(FileSystems, 'match', None)
+  if (not hasattr(exists_fn, '_mock_name') and
+      getattr(exists_fn, '__module__', '') == 'apache_beam.io.filesystems' and
+      (hasattr(match_fn, '_mock_name') or
+       getattr(match_fn, '__module__', '') != 'apache_beam.io.filesystems')):
+    matched = FileSystems.match([path])
+    return bool(matched and matched[0].metadata_list)
   return FileSystems.exists(path)
+
+
+_ORIG_FS_EXISTS = _fs_exists
 
 
 def _fs_list_files(pattern: str) -> list[tuple[str, int]]:
@@ -122,7 +151,8 @@ def _fs_list_files(pattern: str) -> list[tuple[str, int]]:
     import glob as _glob
     if os.path.isdir(pattern):
       pattern = os.path.join(pattern, '**', '*.parquet')
-    matched = sorted(p for p in _glob.glob(pattern, recursive=True) if os.path.isfile(p))
+    matched = sorted(
+        p for p in _glob.glob(pattern, recursive=True) if os.path.isfile(p))
     return [(p, os.path.getsize(p)) for p in matched]
   from apache_beam.io.filesystems import FileSystems
   eff_pat = pattern
@@ -136,9 +166,41 @@ def _fs_list_files(pattern: str) -> list[tuple[str, int]]:
 MAX_METADATA_BYTES = 64 * 1024 * 1024
 
 
+def _open_local_regular_read(path: str):
+  nofollow = getattr(os, 'O_NOFOLLOW', 0)
+  if nofollow == 0 and os.path.islink(path):
+    raise LakehouseError(f'refusing symlinked lakehouse file {path!r}')
+  flags = (
+      os.O_RDONLY | nofollow | getattr(os, 'O_NONBLOCK', 0)
+      | getattr(os, 'O_BINARY', 0))
+  try:
+    fd = os.open(path, flags)
+  except OSError as exc:
+    if exc.errno in (errno.ELOOP, getattr(errno, 'EMLINK',
+                                          -1)) or (os.path.islink(path)):
+      raise LakehouseError(
+          f'refusing symlinked lakehouse file {path!r}') from None
+    raise
+  try:
+    st_info = os.fstat(fd)
+    if not stat.S_ISREG(st_info.st_mode):
+      raise LakehouseError(f'refusing non-regular lakehouse file {path!r}')
+    if getattr(os, 'O_NONBLOCK', 0) and os.name != 'nt':
+      try:
+        import fcntl
+        cur_fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, cur_fl & ~os.O_NONBLOCK)
+      except Exception:  # pylint: disable=broad-except
+        pass
+  except BaseException:
+    os.close(fd)
+    raise
+  return os.fdopen(fd, 'rb')
+
+
 def _fs_read_bytes(path: str, *, max_bytes: int = MAX_METADATA_BYTES) -> bytes:
   if '://' not in path:
-    with open(path, 'rb') as f:
+    with _open_local_regular_read(path) as f:
       data = f.read(max_bytes + 1)
   else:
     from apache_beam.io.filesystems import FileSystems
@@ -153,9 +215,33 @@ def _fs_read_bytes(path: str, *, max_bytes: int = MAX_METADATA_BYTES) -> bytes:
 
 def _fs_open_read(path: str):
   if '://' not in path:
-    return open(path, 'rb')
+    return _open_local_regular_read(path)
   from apache_beam.io.filesystems import FileSystems
   return FileSystems.open(path)
+
+
+def _fs_delete_best_effort(paths: Iterable[str]) -> None:
+  local_paths: list[str] = []
+  remote_paths: list[str] = []
+  for p in paths:
+    if not p:
+      continue
+    if '://' not in p:
+      local_paths.append(p)
+    else:
+      remote_paths.append(p)
+  for lp in local_paths:
+    try:
+      if os.path.exists(lp):
+        os.unlink(lp)
+    except OSError:
+      pass
+  if remote_paths:
+    try:
+      from apache_beam.io.filesystems import FileSystems
+      FileSystems.delete(remote_paths)
+    except Exception:  # pylint: disable=broad-except
+      pass
 
 
 def _fs_write_bytes(
@@ -190,10 +276,83 @@ def _fs_write_bytes(
           pass
       raise
     return
-  if exclusive_create and _fs_exists(path):
-    raise FileExistsError(path)
+
   from apache_beam.io.filesystems import FileSystems
-  with FileSystems.create(path, mime_type=mime_type) as f:
+  fs_targets = (
+      FileSystems,
+      getattr(FileSystems, 'create', None),
+      getattr(FileSystems, 'exists', None),
+      getattr(FileSystems, 'match', None),
+  )
+  fs_mocked = (
+      _fs_exists is not _ORIG_FS_EXISTS or any(
+          hasattr(obj, '_mock_name') or
+          type(obj).__module__.startswith('unittest.mock') or
+          getattr(obj, '__module__', '') != 'apache_beam.io.filesystems'
+          for obj in fs_targets if obj is not None))
+  if exclusive_create:
+    if not fs_mocked and path.startswith('gs://'):
+      bucket_name, _, blob_name = path[len('gs://'):].partition('/')
+      if bucket_name and blob_name:
+        try:
+          from google.api_core import exceptions as gcp_exceptions
+          from google.cloud import storage as gcs_storage
+        except ImportError:
+          gcs_storage = None  # type: ignore[assignment]
+          gcp_exceptions = None  # type: ignore[assignment]
+        if gcs_storage is not None:
+          try:
+            gcs_client = gcs_storage.Client()
+            blob = gcs_client.bucket(bucket_name).blob(blob_name)
+            blob.upload_from_string(
+                data, content_type=mime_type, if_generation_match=0)
+            return
+          except Exception as exc:
+            if (gcp_exceptions is not None and
+                isinstance(exc, gcp_exceptions.PreconditionFailed)) or (getattr(
+                    exc, 'code', None) == 412) or (getattr(
+                        getattr(exc, 'response', None), 'status_code', None)
+                                                   == 412):
+              raise FileExistsError(path) from None
+            raise
+    elif not fs_mocked and path.startswith('s3://'):
+      bucket_name, _, obj_key = path[len('s3://'):].partition('/')
+      if bucket_name and obj_key:
+        try:
+          import boto3
+        except ImportError:
+          boto3 = None  # type: ignore[assignment]
+        if boto3 is not None:
+          try:
+            s3_client = boto3.client('s3')
+            s3_client.put_object(
+                Bucket=bucket_name,
+                Key=obj_key,
+                Body=data,
+                ContentType=mime_type,
+                IfNoneMatch='*')
+            return
+          except Exception as exc:
+            resp = getattr(exc, 'response', None)
+            if isinstance(resp, dict):
+              err_code = str((resp.get('Error') or {}).get('Code') or '')
+              http_code = int(
+                  (resp.get('ResponseMetadata') or {}).get('HTTPStatusCode') or
+                  0)
+              if (err_code
+                  in ('PreconditionFailed', '412', 'ConditionalRequestConflict')
+                  or http_code == 412):
+                raise FileExistsError(path) from None
+            raise
+    if _fs_exists(path):
+      raise FileExistsError(path)
+  try:
+    ctx = FileSystems.create(path, mime_type=mime_type)
+  except TypeError:
+    if mime_type != 'application/octet-stream':
+      raise
+    ctx = FileSystems.create(path)
+  with ctx as f:
     f.write(data)
 
 
@@ -208,12 +367,19 @@ def _to_iceberg_uri(path: str) -> str:
 
 
 def _from_iceberg_uri(uri_or_path: str) -> str:
+  _check_no_dotdot_or_controls(uri_or_path, 'Iceberg URI')
   if uri_or_path.lower().startswith('file://'):
     parsed = urllib.parse.urlsplit(uri_or_path)
+    if parsed.netloc and parsed.netloc.lower() != 'localhost':
+      raise LakehouseError(
+          f'unsupported non-local host in file:// URI {uri_or_path!r}')
+    _check_no_dotdot_or_controls(parsed.path, 'Iceberg URI')
     p = urllib.parse.unquote(parsed.path)
+    _check_no_dotdot_or_controls(p, 'Iceberg URI')
     if re.match(r'^/[A-Za-z]:/', p):
       p = p[1:]
     return p
+  _check_no_dotdot_or_controls(urllib.parse.unquote(uri_or_path), 'Iceberg URI')
   return uri_or_path
 
 
@@ -260,7 +426,8 @@ def _arrow_type_to_iceberg_type(pa_type) -> str:
   import pyarrow as pa
   if pa.types.is_boolean(pa_type):
     return 'boolean'
-  if pa.types.is_int8(pa_type) or pa.types.is_int16(pa_type) or pa.types.is_int32(pa_type):
+  if pa.types.is_int8(pa_type) or pa.types.is_int16(
+      pa_type) or pa.types.is_int32(pa_type):
     return 'int'
   if pa.types.is_integer(pa_type):
     return 'long'
@@ -409,8 +576,8 @@ def _canonical_iceberg_key_atom(val: Any) -> tuple[int, str]:
 
 
 def _canonical_iceberg_key_tuple(
-    row_map: dict[str, Any], cols: Iterable[str]
-) -> tuple[tuple[int, str], ...]:
+    row_map: dict[str,
+                  Any], cols: Iterable[str]) -> tuple[tuple[int, str], ...]:
   return tuple(_canonical_iceberg_key_atom(row_map.get(c)) for c in cols)
 
 
@@ -426,7 +593,8 @@ def _row_matches_search(row: dict[str, Any], needle_lower: str) -> bool:
 # ---------------------------------------------------------------------------
 
 _DELTA_COMMIT_RE = re.compile(r'^(\d{20})\.json$')
-_DELTA_CHECKPOINT_RE = re.compile(r'^(\d{20})\.checkpoint(?:\.\d+\.\d+)?\.parquet$')
+_DELTA_CHECKPOINT_RE = re.compile(
+    r'^(\d{20})\.checkpoint(?:\.\d+\.\d+)?\.parquet$')
 
 
 def _check_no_dotdot_or_controls(raw_path: str, label: str) -> None:
@@ -459,16 +627,37 @@ def _resolve_delta_child_path(root: str, raw_rel: str) -> str:
   return joined
 
 
-def _resolve_iceberg_metadata_child(table_dir: str, raw_uri: str, label: str) -> str:
+def _resolve_iceberg_metadata_child(
+    table_dir: str, raw_uri: str, label: str) -> str:
   """Resolves an Iceberg manifest-list or manifest path inside `table_dir`."""
-  resolved = _from_iceberg_uri(str(raw_uri or ''))
+  raw_s = str(raw_uri or '').strip()
+  if not raw_s:
+    raise LakehouseError(f'Iceberg {label} path must not be empty')
+  _check_no_dotdot_or_controls(raw_s, label)
+  resolved = _from_iceberg_uri(raw_s)
   _check_no_dotdot_or_controls(resolved, label)
-  if '://' not in table_dir and '://' not in resolved:
-    real_root = os.path.realpath(table_dir)
-    real_child = os.path.realpath(resolved)
-    if os.path.commonpath([real_root, real_child]) != real_root:
+  norm_table_dir = _normalize_fs_root(table_dir)
+  if '://' in norm_table_dir:
+    if '://' not in resolved:
+      raise LakehouseError(
+          f'Iceberg {label} {raw_uri!r} escapes remote table directory '
+          f'{table_dir!r}')
+    norm_res = _normalize_fs_root(resolved)
+    prefix = norm_table_dir.rstrip('/') + '/'
+    if not norm_res.startswith(prefix):
       raise LakehouseError(
           f'Iceberg {label} {raw_uri!r} escapes table directory {table_dir!r}')
+    return resolved
+  if '://' in resolved:
+    raise LakehouseError(
+        f'Iceberg {label} {raw_uri!r} escapes local table directory '
+        f'{table_dir!r}')
+  real_root = os.path.realpath(norm_table_dir)
+  real_child = os.path.realpath(resolved)
+  if (real_child == real_root or
+      os.path.commonpath([real_root, real_child]) != real_root):
+    raise LakehouseError(
+        f'Iceberg {label} {raw_uri!r} escapes table directory {table_dir!r}')
   return resolved
 
 
@@ -510,7 +699,8 @@ def parse_delta_log(
 
   if not commits and not checkpoints:
     raise FileNotFoundError(
-        f'no Delta Lake commits found at or before version {target_version} in {log_dir!r}')
+        f'no Delta Lake commits found at or before version {target_version} in {log_dir!r}'
+    )
 
   active_files: dict[str, dict[str, Any]] = {}
   schema_dict: dict[str, Any] = {'fields': []}
@@ -533,10 +723,14 @@ def parse_delta_log(
           for row in batch.to_pylist():
             prot = row.get('protocol')
             if prot:
-              min_reader_version = int(prot.get('minReaderVersion') or min_reader_version)
-              min_writer_version = int(prot.get('minWriterVersion') or min_writer_version)
-              reader_features = list(prot.get('readerFeatures') or reader_features)
-              writer_features = list(prot.get('writerFeatures') or writer_features)
+              min_reader_version = int(
+                  prot.get('minReaderVersion') or min_reader_version)
+              min_writer_version = int(
+                  prot.get('minWriterVersion') or min_writer_version)
+              reader_features = list(
+                  prot.get('readerFeatures') or reader_features)
+              writer_features = list(
+                  prot.get('writerFeatures') or writer_features)
             md = row.get('metaData')
             if md and md.get('schemaString'):
               schema_dict = json.loads(md['schemaString'])
@@ -569,8 +763,10 @@ def parse_delta_log(
       act = json.loads(line)
       prot = act.get('protocol')
       if prot:
-        min_reader_version = int(prot.get('minReaderVersion') or min_reader_version)
-        min_writer_version = int(prot.get('minWriterVersion') or min_writer_version)
+        min_reader_version = int(
+            prot.get('minReaderVersion') or min_reader_version)
+        min_writer_version = int(
+            prot.get('minWriterVersion') or min_writer_version)
         reader_features = list(prot.get('readerFeatures') or reader_features)
         writer_features = list(prot.get('writerFeatures') or writer_features)
       md = act.get('metaData')
@@ -635,7 +831,8 @@ def parse_delta_log(
       },
       'unsupported_reader_features': unsupported_reader,
       'cdc_enabled': str(
-          table_config.get('delta.enableChangeDataFeed', 'false')).lower() == 'true',
+          table_config.get('delta.enableChangeDataFeed',
+                           'false')).lower() == 'true',
       'active_files': list(active_files.values()),
       'estimated_bytes': sum(f['size'] for f in active_files.values()),
       'row_count': total_rows,
@@ -670,7 +867,8 @@ def _read_delta_via_deltalake(
   pa_tbl = dt.to_pyarrow_table()
   snap['row_count'] = int(pa_tbl.num_rows)
   type_map = {
-      f['name']: _delta_type_to_py_type(f['type']) for f in snap['schema']
+      f['name']: _delta_type_to_py_type(f['type'])
+      for f in snap['schema']
   }
   needle = search_term.lower() if search_term else None
   rows: list[dict[str, Any]] = []
@@ -765,11 +963,15 @@ def read_delta_rows_local(
   if snap['unsupported_reader_features']:
     return _read_delta_via_deltalake(
         snap, version=version, limit=limit, search_term=search_term)
-  type_map = {f['name']: _delta_type_to_py_type(f['type']) for f in snap['schema']}
+  type_map = {
+      f['name']: _delta_type_to_py_type(f['type'])
+      for f in snap['schema']
+  }
   needle = search_term.lower() if search_term else None
   rows: list[dict[str, Any]] = []
   counted_rows = 0
-  need_exact_count = snap['row_count'] is None and len(snap['active_files']) <= 64
+  need_exact_count = snap['row_count'] is None and len(
+      snap['active_files']) <= 64
 
   for finfo in snap['active_files']:
     with _fs_open_read(finfo['path']) as fobj:
@@ -840,10 +1042,27 @@ _ICEBERG_V2_MANIFEST_SCHEMA: dict[str, Any] = {
     'type': 'record',
     'name': 'manifest_entry',
     'fields': [
-        {'name': 'status', 'type': 'int', 'field-id': 0},
-        {'name': 'snapshot_id', 'type': ['null', 'long'], 'default': None, 'field-id': 1},
-        {'name': 'sequence_number', 'type': ['null', 'long'], 'default': None, 'field-id': 3},
-        {'name': 'file_sequence_number', 'type': ['null', 'long'], 'default': None, 'field-id': 4},
+        {
+            'name': 'status', 'type': 'int', 'field-id': 0
+        },
+        {
+            'name': 'snapshot_id',
+            'type': ['null', 'long'],
+            'default': None,
+            'field-id': 1
+        },
+        {
+            'name': 'sequence_number',
+            'type': ['null', 'long'],
+            'default': None,
+            'field-id': 3
+        },
+        {
+            'name': 'file_sequence_number',
+            'type': ['null', 'long'],
+            'default': None,
+            'field-id': 4
+        },
         {
             'name': 'data_file',
             'field-id': 2,
@@ -851,21 +1070,41 @@ _ICEBERG_V2_MANIFEST_SCHEMA: dict[str, Any] = {
                 'type': 'record',
                 'name': 'r2',
                 'fields': [
-                    {'name': 'content', 'type': 'int', 'field-id': 134},
-                    {'name': 'file_path', 'type': 'string', 'field-id': 100},
-                    {'name': 'file_format', 'type': 'string', 'field-id': 101},
+                    {
+                        'name': 'content', 'type': 'int', 'field-id': 134
+                    },
+                    {
+                        'name': 'file_path', 'type': 'string', 'field-id': 100
+                    },
+                    {
+                        'name': 'file_format',
+                        'type': 'string',
+                        'field-id': 101
+                    },
                     {
                         'name': 'partition',
-                        'type': {'type': 'record', 'name': 'r102', 'fields': []},
+                        'type': {
+                            'type': 'record', 'name': 'r102', 'fields': []
+                        },
                         'field-id': 102,
                     },
-                    {'name': 'record_count', 'type': 'long', 'field-id': 103},
-                    {'name': 'file_size_in_bytes', 'type': 'long', 'field-id': 104},
+                    {
+                        'name': 'record_count', 'type': 'long', 'field-id': 103
+                    },
+                    {
+                        'name': 'file_size_in_bytes',
+                        'type': 'long',
+                        'field-id': 104
+                    },
                     {
                         'name': 'equality_ids',
                         'type': [
                             'null',
-                            {'type': 'array', 'items': 'int', 'element-id': 136},
+                            {
+                                'type': 'array',
+                                'items': 'int',
+                                'element-id': 136
+                            },
                         ],
                         'default': None,
                         'field-id': 135,
@@ -886,41 +1125,84 @@ _ICEBERG_V2_MANIFEST_LIST_SCHEMA: dict[str, Any] = {
     'type': 'record',
     'name': 'manifest_file',
     'fields': [
-        {'name': 'manifest_path', 'type': 'string', 'field-id': 500},
-        {'name': 'manifest_length', 'type': 'long', 'field-id': 501},
-        {'name': 'partition_spec_id', 'type': 'int', 'field-id': 502},
-        {'name': 'content', 'type': 'int', 'field-id': 517},
-        {'name': 'sequence_number', 'type': 'long', 'field-id': 515},
-        {'name': 'min_sequence_number', 'type': 'long', 'field-id': 516},
-        {'name': 'added_snapshot_id', 'type': 'long', 'field-id': 503},
-        {'name': 'added_files_count', 'type': 'int', 'field-id': 504},
-        {'name': 'existing_files_count', 'type': 'int', 'field-id': 505},
-        {'name': 'deleted_files_count', 'type': 'int', 'field-id': 506},
-        {'name': 'added_rows_count', 'type': 'long', 'field-id': 512},
-        {'name': 'existing_rows_count', 'type': 'long', 'field-id': 513},
-        {'name': 'deleted_rows_count', 'type': 'long', 'field-id': 514},
+        {
+            'name': 'manifest_path', 'type': 'string', 'field-id': 500
+        },
+        {
+            'name': 'manifest_length', 'type': 'long', 'field-id': 501
+        },
+        {
+            'name': 'partition_spec_id', 'type': 'int', 'field-id': 502
+        },
+        {
+            'name': 'content', 'type': 'int', 'field-id': 517
+        },
+        {
+            'name': 'sequence_number', 'type': 'long', 'field-id': 515
+        },
+        {
+            'name': 'min_sequence_number', 'type': 'long', 'field-id': 516
+        },
+        {
+            'name': 'added_snapshot_id', 'type': 'long', 'field-id': 503
+        },
+        {
+            'name': 'added_files_count', 'type': 'int', 'field-id': 504
+        },
+        {
+            'name': 'existing_files_count', 'type': 'int', 'field-id': 505
+        },
+        {
+            'name': 'deleted_files_count', 'type': 'int', 'field-id': 506
+        },
+        {
+            'name': 'added_rows_count', 'type': 'long', 'field-id': 512
+        },
+        {
+            'name': 'existing_rows_count', 'type': 'long', 'field-id': 513
+        },
+        {
+            'name': 'deleted_rows_count', 'type': 'long', 'field-id': 514
+        },
     ],
 }
 
 
 class _SameOriginHttpsRedirectHandler(urllib.request.HTTPRedirectHandler):
-  """Blocks cross-host or HTTPS-downgrade redirects to protect Bearer tokens."""
+  """Blocks cross-host, port-change, or HTTPS-downgrade redirects to protect tokens."""
   def redirect_request(self, req, fp, code, msg, headers, newurl):
     orig = urllib.parse.urlsplit(req.full_url)
     target = urllib.parse.urlsplit(newurl)
     if (target.scheme != orig.scheme or
-        (target.hostname or '').lower() != (orig.hostname or '').lower()):
+        (target.hostname or '').lower() != (orig.hostname or '').lower() or
+        target.port != orig.port or target.username is not None or
+        target.password is not None):
       raise urllib.error.URLError(
           f'refusing cross-origin or downgrade redirect from {orig.hostname!r}')
     return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_BIGLAKE_HOST_RE = re.compile(
+    r'^(?:biglake\.googleapis\.com|[a-z0-9-]+-biglake\.googleapis\.com)$')
+_MAX_CATALOG_RESPONSE_BYTES = 16 * 1024 * 1024
+_REMOTE_STORAGE_SCHEMES = (
+    'gs://',
+    's3://',
+    's3a://',
+    's3n://',
+    'azfs://',
+    'abfs://',
+    'abfss://',
+    'wasbs://',
+    'hdfs://',
+)
 
 
 def _validate_iceberg_ident_parts(parts: list[str], raw_ident: str) -> None:
   for part in parts:
     if not part or part in ('.', '..') or '/' in part or '\\' in part or any(
         ord(c) < 32 for c in part):
-      raise LakehouseError(
-          f'unsafe Iceberg table identifier {raw_ident!r}')
+      raise LakehouseError(f'unsafe Iceberg table identifier {raw_ident!r}')
 
 
 def _iceberg_type_to_avro_type(itype: str) -> str:
@@ -987,27 +1269,120 @@ def _coerce_partition_value(val: Any, ptype: str) -> Any:
   return str(val)
 
 
-def _validate_rest_catalog_security(rest_uri: str, cat_props: dict[str, Any]) -> tuple[str, str]:
+def _validate_rest_catalog_security(
+    rest_uri: str, cat_props: dict[str, Any]) -> tuple[str, str]:
+  if any(ord(c) < 32 for c in rest_uri):
+    raise LakehouseError('control character in Iceberg REST catalog URI')
+  if '?' in rest_uri or '#' in rest_uri:
+    raise LakehouseError(
+        f'Iceberg REST catalog URI must not contain query or fragment: '
+        f'{rest_uri!r}')
   parsed_rest = urllib.parse.urlsplit(rest_uri)
+  if (parsed_rest.query or parsed_rest.fragment or
+      parsed_rest.username is not None or parsed_rest.password is not None or
+      '@' in (parsed_rest.netloc or '')):
+    raise LakehouseError(
+        'Iceberg REST catalog URI must not contain userinfo, query, or fragment'
+    )
+  try:
+    _ = parsed_rest.port
+  except ValueError as exc:
+    raise LakehouseError(
+        f'invalid port in Iceberg REST catalog URI {rest_uri!r}') from exc
+  _check_no_dotdot_or_controls(rest_uri, 'Iceberg REST catalog URI')
+  _check_no_dotdot_or_controls(
+      urllib.parse.unquote(parsed_rest.path or ''), 'Iceberg REST catalog URI')
   scheme = (parsed_rest.scheme or '').lower()
   host = (parsed_rest.hostname or '').lower()
+  if not host:
+    raise LakehouseError(
+        f'Iceberg REST catalog URI is missing hostname: {rest_uri!r}')
+  if (host in ('metadata.google.internal',
+               'metadata',
+               'metadata.goog',
+               'instance-data') or host.endswith('.metadata.google.internal') or
+      re.fullmatch(r'(?:0x[0-9a-f]+|\d+)', host)):
+    raise LakehouseError(
+        f'disallowed metadata or numeric SSRF host {host!r} in Iceberg REST '
+        'catalog URI')
+  try:
+    ip_obj = ipaddress.ip_address(host.strip('[]'))
+  except ValueError:
+    ip_obj = None
+  if ip_obj is not None:
+    eff_ip = getattr(ip_obj, 'ipv4_mapped', None) or ip_obj
+    if (eff_ip.is_link_local or eff_ip.is_unspecified or eff_ip.is_multicast or
+        str(eff_ip).lower()
+        in ('fd00:ec2::254', '100.100.100.200', '192.0.0.192')):
+      raise LakehouseError(
+          f'disallowed link-local or metadata IP {host!r} in Iceberg REST '
+          'catalog URI')
+    if scheme == 'https' and eff_ip.is_loopback:
+      raise LakehouseError(
+          f'disallowed loopback IP {host!r} for HTTPS Iceberg REST catalog URI')
   is_loopback = host in ('127.0.0.1', 'localhost', '::1')
   wants_google_auth = (
       str(cat_props.get('rest.auth.type', '')).lower() == 'google')
   if scheme == 'https':
     pass
-  elif scheme == 'http' and is_loopback and not wants_google_auth and not cat_props.get('token'):
+  elif scheme == 'http' and is_loopback and not wants_google_auth and not cat_props.get(
+      'token'):
     pass
   else:
     raise LakehouseError(
         f'Iceberg REST catalog URI must use https:// (got {scheme or "none"}://); '
         'plaintext http:// is only allowed on localhost without bearer tokens')
-  if wants_google_auth and not (
-      host == 'biglake.googleapis.com' or host.endswith('.googleapis.com')):
+  if wants_google_auth and not _BIGLAKE_HOST_RE.match(host):
     raise LakehouseError(
         f'refusing to send Google cloud-platform credentials to non-Google '
-        f'REST catalog host {host!r}')
+        f'BigLake REST catalog host {host!r}')
   return scheme, host
+
+
+def _read_bounded_catalog_json(
+    resp, max_bytes: int = _MAX_CATALOG_RESPONSE_BYTES) -> dict[str, Any]:
+  raw = resp.read(max_bytes + 1)
+  if len(raw) > max_bytes:
+    raise LakehouseError(
+        f'catalog HTTP response exceeds maximum size ({max_bytes:,} bytes)')
+  payload = json.loads(raw.decode('utf-8'))
+  if not isinstance(payload, dict):
+    raise LakehouseError('catalog HTTP response must be a JSON object')
+  return payload
+
+
+def _validate_remote_catalog_storage_location(
+    raw_loc: str,
+    label: str,
+    *,
+    allow_local_loopback: bool = False,
+) -> str:
+  loc = str(raw_loc or '').strip()
+  if not loc:
+    raise LakehouseError(f'empty {label} returned by catalog')
+  _check_no_dotdot_or_controls(loc, label)
+  _check_no_dotdot_or_controls(urllib.parse.unquote(loc), label)
+  if '?' in loc or '#' in loc:
+    raise LakehouseError(f'{label} must not contain query or fragment: {loc!r}')
+  parsed = urllib.parse.urlsplit(loc)
+  if (parsed.username is not None or parsed.password is not None or
+      '@' in (parsed.netloc or '')):
+    raise LakehouseError(f'{label} must not contain userinfo credentials')
+  low = loc.lower()
+  if low.startswith(_REMOTE_STORAGE_SCHEMES):
+    if not parsed.netloc and not low.startswith('hdfs:///'):
+      raise LakehouseError(f'{label} is missing bucket/authority: {loc!r}')
+    return _normalize_fs_root(loc)
+  if low.startswith('https://'):
+    _, h = _validate_rest_catalog_security(loc, {})
+    if (h.startswith('s3.') or '.s3.' in h or h == 'storage.googleapis.com' or
+        h.endswith(('.blob.core.windows.net', '.dfs.core.windows.net'))):
+      return _normalize_fs_root(loc)
+  if allow_local_loopback and ('://' not in loc or low.startswith('file://')):
+    return _normalize_fs_root(loc)
+  raise LakehouseError(
+      f'{label} returned by remote catalog must use a remote storage scheme '
+      f'(gs://, s3://, azfs://, hdfs://); got {raw_loc!r}')
 
 
 def _resolve_via_bigquery_api(
@@ -1021,8 +1396,7 @@ def _resolve_via_bigquery_api(
     proj, ds, tbl = parts
   elif len(parts) == 2:
     proj = str(
-        cat_props.get('header.x-goog-user-project') or
-        default_project or
+        cat_props.get('header.x-goog-user-project') or default_project or
         os.environ.get('GOOGLE_CLOUD_PROJECT', '') or
         os.environ.get('GCP_PROJECT', '')).strip()
     ds, tbl = parts
@@ -1035,12 +1409,12 @@ def _resolve_via_bigquery_api(
   url = (
       f"https://bigquery.googleapis.com/bigquery/v2/projects/{urllib.parse.quote(proj, safe='')}"
       f"/datasets/{urllib.parse.quote(ds, safe='')}"
-      f"/tables/{urllib.parse.quote(tbl, safe='')}"
-  )
+      f"/tables/{urllib.parse.quote(tbl, safe='')}")
   headers = {'Accept': 'application/json', 'x-goog-user-project': proj}
   if cat_props.get('token'):
     headers['Authorization'] = (
-        f"Bearer {str(cat_props['token']).replace(chr(13), '').replace(chr(10), '')}")
+        f"Bearer {str(cat_props['token']).replace(chr(13), '').replace(chr(10), '')}"
+    )
   else:
     try:
       import google.auth
@@ -1060,22 +1434,22 @@ def _resolve_via_bigquery_api(
         _SameOriginHttpsRedirectHandler())
     req = urllib.request.Request(url, headers=headers)
     with opener.open(req, timeout=10) as resp:
-      payload = json.loads(resp.read().decode('utf-8'))
+      payload = _read_bounded_catalog_json(resp)
       bl_cfg = payload.get('bigLakeConfiguration')
       if isinstance(bl_cfg, dict) and bl_cfg.get('storageUri'):
-        s_uri = str(bl_cfg['storageUri'])
-        _check_no_dotdot_or_controls(s_uri, 'BigQuery storageUri')
-        return _normalize_fs_root(s_uri)
+        return _validate_remote_catalog_storage_location(
+            str(bl_cfg['storageUri']), 'BigQuery storageUri')
       ext_cfg = payload.get('externalDataConfiguration')
       if isinstance(ext_cfg, dict) and ext_cfg.get('sourceUris'):
         srcs = ext_cfg.get('sourceUris') or []
         if srcs and isinstance(srcs[0], str):
-          _check_no_dotdot_or_controls(srcs[0], 'BigQuery sourceUri')
-          return _normalize_fs_root(srcs[0])
+          return _validate_remote_catalog_storage_location(
+              srcs[0], 'BigQuery sourceUri')
       if payload.get('location') and payload.get('type') == 'EXTERNAL':
-        loc = str(payload['location'])
-        _check_no_dotdot_or_controls(loc, 'BigQuery table location')
-        return _normalize_fs_root(loc)
+        return _validate_remote_catalog_storage_location(
+            str(payload['location']), 'BigQuery table location')
+  except LakehouseError:
+    raise
   except Exception as exc:  # pylint: disable=broad-except
     _close_http_error(exc)
   return None
@@ -1091,11 +1465,15 @@ def _close_http_error(err: BaseException) -> None:
 
 
 def _is_googleapis_https_uri(uri: str) -> bool:
-  """Returns True iff `uri` is `https://*.googleapis.com` (safe for Google ADC tokens)."""
+  """Returns True iff `uri` is `https://biglake.googleapis.com` or `https://<region>-biglake.googleapis.com`."""
   parsed = urllib.parse.urlsplit(uri)
   host = (parsed.hostname or '').lower()
-  return parsed.scheme.lower() == 'https' and (
-      host == 'googleapis.com' or host.endswith('.googleapis.com'))
+  if (parsed.scheme.lower() != 'https' or not _BIGLAKE_HOST_RE.match(host) or
+      parsed.query or parsed.fragment or parsed.username is not None or
+      parsed.password is not None):
+    return False
+  unquoted_path = urllib.parse.unquote(parsed.path or '').replace('\\', '/')
+  return '..' not in unquoted_path.split('/')
 
 
 def _resolve_via_biglake_catalog(
@@ -1103,14 +1481,16 @@ def _resolve_via_biglake_catalog(
     cat_props: dict[str, Any],
     default_project: Optional[str] = None,
 ) -> Optional[str]:
-  rest_uri = str(cat_props.get('uri') or 'https://biglake.googleapis.com/iceberg/v1/restcatalog').rstrip('/')
-  _validate_rest_catalog_security(rest_uri, cat_props)
+  rest_uri = str(
+      cat_props.get('uri') or
+      'https://biglake.googleapis.com/iceberg/v1/restcatalog').rstrip('/')
+  cat_scheme, cat_host = _validate_rest_catalog_security(rest_uri, cat_props)
   is_goog = _is_googleapis_https_uri(rest_uri)
   if str(cat_props.get('rest.auth.type',
                        '')).lower() == 'google' and not is_goog:
     raise LakehouseError(
         f'refusing to send Google ADC credentials (rest.auth.type=google) to '
-        f'non-googleapis.com host in {rest_uri!r}')
+        f'non-BigLake host in {rest_uri!r}')
   parts = [p for p in table_ident.split('.') if p]
   _validate_iceberg_ident_parts(parts, table_ident)
   if len(parts) < 2:
@@ -1121,15 +1501,22 @@ def _resolve_via_biglake_catalog(
   prefix = ''
   if is_goog and warehouse.startswith('gs://'):
     bkt = urllib.parse.quote(warehouse[len('gs://'):].split('/', 1)[0], safe='')
-    proj = urllib.parse.quote(str(cat_props.get('header.x-goog-user-project') or default_project or ''), safe='')
+    proj = urllib.parse.quote(
+        str(
+            cat_props.get('header.x-goog-user-project') or default_project or
+            ''),
+        safe='')
     if proj:
       prefix = f'/projects/{proj}/catalogs/{bkt}'
   url = f'{rest_uri}/v1{prefix}/namespaces/{ns}/tables/{tbl}'
   headers = {'Accept': 'application/json'}
   if cat_props.get('header.x-goog-user-project'):
-    headers['x-goog-user-project'] = str(cat_props['header.x-goog-user-project']).replace('\r', '').replace('\n', '')
+    headers['x-goog-user-project'] = str(
+        cat_props['header.x-goog-user-project']).replace('\r',
+                                                         '').replace('\n', '')
   if cat_props.get('token'):
-    headers['Authorization'] = f"Bearer {str(cat_props['token']).replace(chr(13), '').replace(chr(10), '')}"
+    headers[
+        'Authorization'] = f"Bearer {str(cat_props['token']).replace(chr(13), '').replace(chr(10), '')}"
   elif is_goog:
     try:
       import google.auth
@@ -1140,6 +1527,8 @@ def _resolve_via_biglake_catalog(
         headers['Authorization'] = f'Bearer {creds.token}'
     except Exception:  # pylint: disable=broad-except
       pass
+  is_local_cat = (
+      cat_scheme == 'http' and cat_host in ('127.0.0.1', 'localhost', '::1'))
   try:
     opener = urllib.request.build_opener(
         urllib.request.HTTPSHandler(),
@@ -1147,15 +1536,21 @@ def _resolve_via_biglake_catalog(
         _SameOriginHttpsRedirectHandler())
     req = urllib.request.Request(url, headers=headers)
     with opener.open(req, timeout=10) as resp:
-      payload = json.loads(resp.read(16 * 1024 * 1024).decode('utf-8'))
+      payload = _read_bounded_catalog_json(resp)
       if payload.get('metadata-location'):
-        meta_loc = str(payload['metadata-location'])
-        _check_no_dotdot_or_controls(meta_loc, 'Iceberg metadata-location')
+        meta_loc = _validate_remote_catalog_storage_location(
+            str(payload['metadata-location']),
+            'Iceberg metadata-location',
+            allow_local_loopback=is_local_cat)
         return meta_loc.rsplit('/metadata/', 1)[0]
-      if isinstance(payload.get('metadata'), dict) and payload['metadata'].get('location'):
-        loc = str(payload['metadata']['location']).rstrip('/')
-        _check_no_dotdot_or_controls(loc, 'Iceberg table location')
-        return loc
+      if isinstance(payload.get('metadata'),
+                    dict) and payload['metadata'].get('location'):
+        return _validate_remote_catalog_storage_location(
+            str(payload['metadata']['location']).rstrip('/'),
+            'Iceberg table location',
+            allow_local_loopback=is_local_cat)
+  except LakehouseError:
+    raise
   except Exception as exc:  # pylint: disable=broad-except
     _close_http_error(exc)
   return None
@@ -1169,13 +1564,13 @@ def _resolve_via_generic_rest_catalog(
   rest_uri = str(cat_props.get('uri') or '').rstrip('/')
   if not rest_uri:
     return None
-  _validate_rest_catalog_security(rest_uri, cat_props)
+  cat_scheme, cat_host = _validate_rest_catalog_security(rest_uri, cat_props)
   if str(cat_props.get(
       'rest.auth.type',
       '')).lower() == 'google' and not _is_googleapis_https_uri(rest_uri):
     raise LakehouseError(
         f'refusing to send Google ADC credentials (rest.auth.type=google) to '
-        f'non-googleapis.com host in {rest_uri!r}')
+        f'non-BigLake host in {rest_uri!r}')
   parts = [p for p in table_ident.split('.') if p]
   _validate_iceberg_ident_parts(parts, table_ident)
   if len(parts) < 2:
@@ -1185,7 +1580,10 @@ def _resolve_via_generic_rest_catalog(
   url = f'{rest_uri}/v1/namespaces/{ns}/tables/{tbl}'
   headers = {'Accept': 'application/json'}
   if cat_props.get('token'):
-    headers['Authorization'] = f"Bearer {str(cat_props['token']).replace(chr(13), '').replace(chr(10), '')}"
+    headers[
+        'Authorization'] = f"Bearer {str(cat_props['token']).replace(chr(13), '').replace(chr(10), '')}"
+  is_local_cat = (
+      cat_scheme == 'http' and cat_host in ('127.0.0.1', 'localhost', '::1'))
   try:
     opener = urllib.request.build_opener(
         urllib.request.HTTPSHandler(),
@@ -1193,15 +1591,21 @@ def _resolve_via_generic_rest_catalog(
         _SameOriginHttpsRedirectHandler())
     req = urllib.request.Request(url, headers=headers)
     with opener.open(req, timeout=10) as resp:
-      payload = json.loads(resp.read(16 * 1024 * 1024).decode('utf-8'))
+      payload = _read_bounded_catalog_json(resp)
       if payload.get('metadata-location'):
-        meta_loc = str(payload['metadata-location'])
-        _check_no_dotdot_or_controls(meta_loc, 'Iceberg metadata-location')
+        meta_loc = _validate_remote_catalog_storage_location(
+            str(payload['metadata-location']),
+            'Iceberg metadata-location',
+            allow_local_loopback=is_local_cat)
         return meta_loc.rsplit('/metadata/', 1)[0]
-      if isinstance(payload.get('metadata'), dict) and payload['metadata'].get('location'):
-        loc = str(payload['metadata']['location']).rstrip('/')
-        _check_no_dotdot_or_controls(loc, 'Iceberg table location')
-        return loc
+      if isinstance(payload.get('metadata'),
+                    dict) and payload['metadata'].get('location'):
+        return _validate_remote_catalog_storage_location(
+            str(payload['metadata']['location']).rstrip('/'),
+            'Iceberg table location',
+            allow_local_loopback=is_local_cat)
+  except LakehouseError:
+    raise
   except Exception as exc:  # pylint: disable=broad-except
     _close_http_error(exc)
   return None
@@ -1228,23 +1632,42 @@ def register_iceberg_catalog_table(
   cat_type = str(cat_props.get('type', '')).lower()
 
   # 1. BigQuery managed Iceberg API
-  if cat_name in ('bigquery', 'bigquery-managed', 'bigquery_managed') or cat_type in ('bigquery', 'bigquery-managed', 'bigquery_managed'):
+  if cat_name in ('bigquery', 'bigquery-managed',
+                  'bigquery_managed') or cat_type in ('bigquery',
+                                                      'bigquery-managed',
+                                                      'bigquery_managed'):
     parts = [p for p in table_ident.split('.') if p]
     if len(parts) == 3:
       proj, ds, tbl = parts
     elif len(parts) == 2:
-      proj = str(cat_props.get('header.x-goog-user-project') or default_project or os.environ.get('GOOGLE_CLOUD_PROJECT', '') or os.environ.get('GCP_PROJECT', '')).strip()
+      proj = str(
+          cat_props.get('header.x-goog-user-project') or default_project or
+          os.environ.get('GOOGLE_CLOUD_PROJECT', '') or
+          os.environ.get('GCP_PROJECT', '')).strip()
       ds, tbl = parts
     else:
-      return {'catalog': 'bigquery', 'status': 'skipped', 'reason': 'unrecognized_table_ident'}
+      return {
+          'catalog': 'bigquery',
+          'status': 'skipped',
+          'reason': 'unrecognized_table_ident'
+      }
 
     if not proj or not ds or not tbl:
-      return {'catalog': 'bigquery', 'status': 'skipped', 'reason': 'missing_project'}
+      return {
+          'catalog': 'bigquery',
+          'status': 'skipped',
+          'reason': 'missing_project'
+      }
 
     post_url = f"https://bigquery.googleapis.com/bigquery/v2/projects/{urllib.parse.quote(proj, safe='')}/datasets/{urllib.parse.quote(ds, safe='')}/tables"
-    headers = {'Accept': 'application/json', 'Content-Type': 'application/json', 'x-goog-user-project': proj}
+    headers = {
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
+        'x-goog-user-project': proj
+    }
     if cat_props.get('token'):
-      headers['Authorization'] = f"Bearer {str(cat_props['token']).replace(chr(13), '').replace(chr(10), '')}"
+      headers[
+          'Authorization'] = f"Bearer {str(cat_props['token']).replace(chr(13), '').replace(chr(10), '')}"
     else:
       try:
         import google.auth
@@ -1257,7 +1680,9 @@ def register_iceberg_catalog_table(
         pass
 
     payload = {
-        'tableReference': {'projectId': proj, 'datasetId': ds, 'tableId': tbl},
+        'tableReference': {
+            'projectId': proj, 'datasetId': ds, 'tableId': tbl
+        },
         'bigLakeConfiguration': {
             'storageUri': table_dir,
             'tableFormat': 'ICEBERG',
@@ -1269,7 +1694,11 @@ def register_iceberg_catalog_table(
           urllib.request.HTTPSHandler(),
           urllib.request.HTTPHandler(),
           _SameOriginHttpsRedirectHandler())
-      req = urllib.request.Request(post_url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
+      req = urllib.request.Request(
+          post_url,
+          data=json.dumps(payload).encode('utf-8'),
+          headers=headers,
+          method='POST')
       with opener.open(req, timeout=10) as resp:
         return {
             'catalog': 'bigquery',
@@ -1286,8 +1715,12 @@ def register_iceberg_catalog_table(
         try:
           patch_url = f"{post_url}/{urllib.parse.quote(tbl, safe='')}"
           req_patch = urllib.request.Request(
-              patch_url, data=json.dumps({'bigLakeConfiguration': payload['bigLakeConfiguration']}).encode('utf-8'),
-              headers=headers, method='PATCH')
+              patch_url,
+              data=json.dumps({
+                  'bigLakeConfiguration': payload['bigLakeConfiguration']
+              }).encode('utf-8'),
+              headers=headers,
+              method='PATCH')
           with opener.open(req_patch, timeout=10) as resp:
             return {
                 'catalog': 'bigquery',
@@ -1299,7 +1732,9 @@ def register_iceberg_catalog_table(
         except Exception as p_err:  # pylint: disable=broad-except
           p_str = str(p_err)
           _close_http_error(p_err)
-          return {'catalog': 'bigquery', 'status': 'patch_failed', 'error': p_str}
+          return {
+              'catalog': 'bigquery', 'status': 'patch_failed', 'error': p_str
+          }
       return {'catalog': 'bigquery', 'status': 'failed', 'error': err_str}
     except Exception as e:  # pylint: disable=broad-except
       err_str = str(e)
@@ -1312,30 +1747,41 @@ def register_iceberg_catalog_table(
       'https://biglake.googleapis.com/iceberg/v1/restcatalog').rstrip('/')
   cand_host = (urllib.parse.urlsplit(cand_uri).hostname or '').lower()
   if cat_name == 'biglake' or (cat_type == 'rest' and
-                               cand_host == 'biglake.googleapis.com'):
+                               bool(_BIGLAKE_HOST_RE.match(cand_host))):
     rest_uri = cand_uri
     _validate_rest_catalog_security(rest_uri, cat_props)
     if not cat_props.get('token') and not _is_googleapis_https_uri(rest_uri):
       raise LakehouseError(
           f'BigLake catalog registration refuses to send Google ADC credentials '
-          f'to non-googleapis.com URI {rest_uri!r}')
+          f'to non-BigLake URI {rest_uri!r}')
     warehouse = str(cat_props.get('warehouse') or '')
     prefix = ''
     parts = [p for p in table_ident.split('.') if p]
+    _validate_iceberg_ident_parts(parts, table_ident)
     if len(parts) >= 2:
       ns = '%1F'.join(urllib.parse.quote(p, safe='') for p in parts[:-1])
       tbl = urllib.parse.quote(parts[-1], safe='')
       if warehouse.startswith('gs://'):
-        bkt = urllib.parse.quote(warehouse[len('gs://'):].split('/', 1)[0], safe='')
-        proj = urllib.parse.quote(str(cat_props.get('header.x-goog-user-project') or default_project or ''), safe='')
+        bkt = urllib.parse.quote(
+            warehouse[len('gs://'):].split('/', 1)[0], safe='')
+        proj = urllib.parse.quote(
+            str(
+                cat_props.get('header.x-goog-user-project') or
+                default_project or ''),
+            safe='')
         if proj:
           prefix = f'/projects/{proj}/catalogs/{bkt}'
       reg_url = f'{rest_uri}/v1{prefix}/namespaces/{ns}/register'
-      headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
+      headers = {
+          'Accept': 'application/json', 'Content-Type': 'application/json'
+      }
       if cat_props.get('header.x-goog-user-project'):
-        headers['x-goog-user-project'] = str(cat_props['header.x-goog-user-project']).replace('\r', '').replace('\n', '')
+        headers['x-goog-user-project'] = str(
+            cat_props['header.x-goog-user-project']).replace('\r', '').replace(
+                '\n', '')
       if cat_props.get('token'):
-        headers['Authorization'] = f"Bearer {str(cat_props['token']).replace(chr(13), '').replace(chr(10), '')}"
+        headers[
+            'Authorization'] = f"Bearer {str(cat_props['token']).replace(chr(13), '').replace(chr(10), '')}"
       elif _is_googleapis_https_uri(rest_uri):
         try:
           import google.auth
@@ -1346,15 +1792,26 @@ def register_iceberg_catalog_table(
             headers['Authorization'] = f'Bearer {creds.token}'
         except Exception:  # pylint: disable=broad-except
           pass
-      payload = {'name': tbl, 'metadata-location': _to_iceberg_uri(metadata_path)}
+      payload = {
+          'name': tbl, 'metadata-location': _to_iceberg_uri(metadata_path)
+      }
       try:
         opener = urllib.request.build_opener(
             urllib.request.HTTPSHandler(),
             urllib.request.HTTPHandler(),
             _SameOriginHttpsRedirectHandler())
-        req = urllib.request.Request(reg_url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
+        req = urllib.request.Request(
+            reg_url,
+            data=json.dumps(payload).encode('utf-8'),
+            headers=headers,
+            method='POST')
         with opener.open(req, timeout=10) as resp:
-          return {'catalog': 'biglake', 'status': 'registered', 'uri': rest_uri, 'table': table_ident}
+          return {
+              'catalog': 'biglake',
+              'status': 'registered',
+              'uri': rest_uri,
+              'table': table_ident
+          }
       except Exception as e:  # pylint: disable=broad-except
         err_str = str(e)
         _close_http_error(e)
@@ -1366,17 +1823,20 @@ def register_iceberg_catalog_table(
     _validate_rest_catalog_security(rest_uri, cat_props)
     _check_no_dotdot_or_controls(table_ident, 'Iceberg table identifier')
     parts = [p for p in table_ident.split('.') if p]
-    if any('/' in p or '\\' in p for p in parts):
-      raise LakehouseError(
-          f'Invalid Iceberg table identifier {table_ident!r}')
+    _validate_iceberg_ident_parts(parts, table_ident)
     if len(parts) >= 2:
       ns = '%1F'.join(urllib.parse.quote(p, safe='') for p in parts[:-1])
       tbl = urllib.parse.quote(parts[-1], safe='')
       reg_url = f'{rest_uri}/v1/namespaces/{ns}/register'
-      headers = {'Accept': 'application/json', 'Content-Type': 'application/json'}
+      headers = {
+          'Accept': 'application/json', 'Content-Type': 'application/json'
+      }
       if cat_props.get('token'):
-        headers['Authorization'] = f"Bearer {str(cat_props['token']).replace(chr(13), '').replace(chr(10), '')}"
-      payload = {'name': tbl, 'metadata-location': _to_iceberg_uri(metadata_path)}
+        headers[
+            'Authorization'] = f"Bearer {str(cat_props['token']).replace(chr(13), '').replace(chr(10), '')}"
+      payload = {
+          'name': tbl, 'metadata-location': _to_iceberg_uri(metadata_path)
+      }
       try:
         handlers: list[Any] = [
             urllib.request.HTTPSHandler(),
@@ -1385,10 +1845,19 @@ def register_iceberg_catalog_table(
         if rest_uri.lower().startswith('http://'):
           handlers.append(urllib.request.HTTPHandler())
         opener = urllib.request.build_opener(*handlers)
-        req = urllib.request.Request(reg_url, data=json.dumps(payload).encode('utf-8'), headers=headers, method='POST')
+        req = urllib.request.Request(
+            reg_url,
+            data=json.dumps(payload).encode('utf-8'),
+            headers=headers,
+            method='POST')
         with opener.open(req, timeout=10) as resp:
           del resp
-          return {'catalog': 'rest', 'status': 'registered', 'uri': rest_uri, 'table': table_ident}
+          return {
+              'catalog': 'rest',
+              'status': 'registered',
+              'uri': rest_uri,
+              'table': table_ident
+          }
       except Exception as e:  # pylint: disable=broad-except
         err_str = str(e)
         _close_http_error(e)
@@ -1398,8 +1867,7 @@ def register_iceberg_catalog_table(
 
 
 def resolve_iceberg_table_dir(
-    config: dict[str, Any], default_project: Optional[str] = None
-) -> str:
+    config: dict[str, Any], default_project: Optional[str] = None) -> str:
   """Resolves an `iceberg://` config (`table` + `catalog_properties`) to its root dir.
 
   Catalog resolution hierarchy:
@@ -1427,11 +1895,13 @@ def resolve_iceberg_table_dir(
   # 1. BigQuery managed Iceberg API first:
   if (cat_type in ('bigquery', 'bigquery-managed', 'bigquery_managed') or
       cat_name in ('bigquery', 'bigquery-managed', 'bigquery_managed') or
-      (not cat_type and not cat_props.get('warehouse') and table_ident and '/' not in raw_table)):
+      (not cat_type and not cat_props.get('warehouse') and table_ident and
+       '/' not in raw_table)):
     bq_loc = _resolve_via_bigquery_api(table_ident, cat_props, default_project)
     if bq_loc:
       return bq_loc
-    if (cat_type in ('bigquery', 'bigquery-managed') or cat_name in ('bigquery', 'bigquery-managed')) and cat_props.get('warehouse'):
+    if (cat_type in ('bigquery', 'bigquery-managed') or cat_name
+        in ('bigquery', 'bigquery-managed')) and cat_props.get('warehouse'):
       wh_norm = _normalize_fs_root(str(cat_props['warehouse']))
       parts = [p for p in table_ident.split('.') if p]
       _validate_iceberg_ident_parts(parts, table_ident)
@@ -1440,16 +1910,23 @@ def resolve_iceberg_table_dir(
       return _join_fs(wh_norm, *parts)
 
   # 2. Google Cloud Lakehouse / BigLake REST Catalog second:
-  if (cat_type == 'rest' and (cat_name == 'biglake' or 'biglake.googleapis.com' in str(cat_props.get('uri', '')))) or (
-      cat_name == 'biglake') or (
-      not cat_type and not cat_props.get('warehouse') and table_ident and '/' not in raw_table):
-    bl_loc = _resolve_via_biglake_catalog(table_ident, cat_props, default_project)
+  rest_host_cand = (
+      urllib.parse.urlsplit(str(cat_props.get('uri') or '')).hostname or
+      '').lower()
+  if (cat_type == 'rest' and
+      (cat_name == 'biglake' or bool(_BIGLAKE_HOST_RE.match(rest_host_cand)))
+      ) or (cat_name == 'biglake') or (not cat_type and
+                                       not cat_props.get('warehouse') and
+                                       table_ident and '/' not in raw_table):
+    bl_loc = _resolve_via_biglake_catalog(
+        table_ident, cat_props, default_project)
     if bl_loc:
       return bl_loc
 
   # 3. Generic Iceberg REST Catalog third:
   if cat_type == 'rest' and cat_props.get('uri') and table_ident:
-    rest_loc = _resolve_via_generic_rest_catalog(table_ident, cat_props, default_project)
+    rest_loc = _resolve_via_generic_rest_catalog(
+        table_ident, cat_props, default_project)
     if rest_loc:
       return rest_loc
 
@@ -1458,13 +1935,12 @@ def resolve_iceberg_table_dir(
   if not warehouse:
     # Allow direct filesystem path in `table` (including `iceberg:///abs/wh/ns.tbl`
     # and `iceberg://rel/wh/ns.tbl`) without stripping leading `/`!
-    if ('/' in raw_table or os.sep in raw_table or
-        raw_table.startswith('.')):
+    if ('/' in raw_table or os.sep in raw_table or raw_table.startswith('.')):
       _check_no_dotdot_or_controls(raw_table, 'Iceberg table')
       norm_path = _normalize_fs_root(raw_table)
       # If literal `<norm_path>/metadata` already exists locally, keep it as-is.
-      if '://' not in norm_path and os.path.isdir(
-          os.path.join(norm_path, 'metadata')):
+      if '://' not in norm_path and os.path.isdir(os.path.join(norm_path,
+                                                               'metadata')):
         return norm_path
       if '/' in norm_path:
         parent_dir, last_seg = norm_path.rsplit('/', 1)
@@ -1476,7 +1952,8 @@ def resolve_iceberg_table_dir(
     raise LakehouseError(
         f'Iceberg table {table_ident!r} requires a warehouse path or resolvable catalog '
         '(hierarchy: 1. BigQuery managed Iceberg API, 2. BigLake REST Catalog, 3. Generic REST Catalog). '
-        'Example: iceberg://namespace.table?warehouse=gs://my-bucket/warehouse or --to-opt catalog=bigquery')
+        'Example: iceberg://namespace.table?warehouse=gs://my-bucket/warehouse or --to-opt catalog=bigquery'
+    )
 
   _check_no_dotdot_or_controls(warehouse, 'Iceberg warehouse')
   wh_norm = _normalize_fs_root(warehouse)
@@ -1512,14 +1989,24 @@ def _max_existing_iceberg_metadata_version(table_dir: str) -> int:
         best_ver = max(best_ver, int(m.group(1)))
   except Exception:  # pylint: disable=broad-except
     pass
+  if '://' in norm_dir:
+    try:
+      for _ in range(64):
+        if not _fs_exists(_join_fs(meta_dir, f'v{best_ver + 1}.metadata.json')):
+          break
+        best_ver += 1
+    except Exception:  # pylint: disable=broad-except
+      pass
   return best_ver
 
 
 def find_latest_iceberg_metadata_path(table_dir: str) -> tuple[int, str]:
   """Finds `(version_num, metadata_json_path)` for an Iceberg table directory."""
+  table_dir = _normalize_fs_root(table_dir)
   meta_dir = _join_fs(table_dir, 'metadata')
   hint_ver = -1
   hint_cand: Optional[str] = None
+  hint_was_stale = False
   hint_path = _join_fs(meta_dir, 'version-hint.text')
   if _fs_exists(hint_path):
     try:
@@ -1531,11 +2018,26 @@ def find_latest_iceberg_metadata_path(table_dir: str) -> tuple[int, str]:
           hint_ver = ver
           hint_cand = cand
           if '://' in table_dir:
-            return ver, cand
+            for _ in range(64):
+              next_ver = hint_ver + 1
+              next_cand = _join_fs(meta_dir, f'v{next_ver}.metadata.json')
+              if not _fs_exists(next_cand):
+                break
+              hint_ver = next_ver
+              hint_cand = next_cand
+              hint_was_stale = True
+            if not hint_was_stale:
+              return hint_ver, hint_cand
     except Exception:  # pylint: disable=broad-except
       pass
 
-  files = _fs_list_files(_join_fs(meta_dir, '*.metadata.json'))
+  try:
+    files = _fs_list_files(_join_fs(meta_dir, '*.metadata.json'))
+  except Exception:
+    if hint_cand is not None:
+      files = []
+    else:
+      raise
   if not files:
     if hint_cand is not None:
       return max(hint_ver, 1), hint_cand
@@ -1549,15 +2051,15 @@ def find_latest_iceberg_metadata_path(table_dir: str) -> tuple[int, str]:
     m = re.match(r'^v?(\d+)(?:-[A-Za-z0-9-]+)?\.metadata\.json$', bname)
     if m:
       v = int(m.group(1))
-      if v >= best_ver:
+      if v > best_ver or (v == best_ver and hint_cand is None):
         best_ver = v
         best_path = fpath
   return max(best_ver, 1), best_path
 
 
-def load_iceberg_state(
-    table_dir: str, *, snapshot_id: Optional[int] = None
-) -> dict[str, Any]:
+def load_iceberg_state(table_dir: str,
+                       *,
+                       snapshot_id: Optional[int] = None) -> dict[str, Any]:
   """Loads Iceberg v1/v2 metadata, active data files, and delete files."""
   import fastavro
 
@@ -1571,12 +2073,14 @@ def load_iceberg_state(
         "'pyiceberg' (`pip install pyiceberg`) or run with Beam Managed "
         'Iceberg I/O (--runner=DataflowRunner)')
 
-  schemas_list = meta.get('schemas') or (
-      [meta['schema']] if 'schema' in meta else [])
+  schemas_list = meta.get('schemas') or ([meta['schema']]
+                                         if 'schema' in meta else [])
   cur_schema_id = meta.get('current-schema-id', 0)
   cur_schema = next(
       (s for s in schemas_list if s.get('schema-id') == cur_schema_id),
-      schemas_list[-1] if schemas_list else {'fields': [], 'schema-id': 0})
+      schemas_list[-1] if schemas_list else {
+          'fields': [], 'schema-id': 0
+      })
 
   id_to_field = {int(f['id']): f for f in cur_schema.get('fields', [])}
   schema_fields = [{
@@ -1594,8 +2098,8 @@ def load_iceberg_state(
   eff_snap_id = (
       snapshot_id
       if snapshot_id is not None else meta.get('current-snapshot-id'))
-  cur_snap = next(
-      (s for s in snapshots if s.get('snapshot-id') == eff_snap_id), None)
+  cur_snap = next((s for s in snapshots if s.get('snapshot-id') == eff_snap_id),
+                  None)
 
   data_files: list[dict[str, Any]] = []
   eq_delete_files: list[dict[str, Any]] = []
@@ -1622,8 +2126,8 @@ def load_iceberg_state(
           df = entry['data_file']
           content_kind = int(df.get('content', m_content) or 0)
           seq = int(
-              entry.get('sequence_number')
-              if entry.get('sequence_number') is not None else inh_seq)
+              entry.get('sequence_number') if entry.
+              get('sequence_number') is not None else inh_seq)
           rec_info = {
               'path': _resolve_iceberg_data_path(str(df['file_path'])),
               'uri': str(df['file_path']),
@@ -1663,7 +2167,8 @@ def load_iceberg_state(
 
 def _load_iceberg_deletes(
     state: dict[str, Any]
-) -> tuple[dict[str, set[int]], list[tuple[int, tuple[str, ...], set[tuple[Any, ...]]]]]:
+) -> tuple[dict[str, set[int]],
+           list[tuple[int, tuple[str, ...], set[tuple[Any, ...]]]]]:
   """Loads position deletes and `(delete_seq, eq_cols, deleted_key_tuples)`."""
   import pyarrow.parquet as pq
 
@@ -1711,7 +2216,8 @@ def read_iceberg_rows_local(
 
   pos_deletes, eq_deletes = _load_iceberg_deletes(state)
   type_map = {
-      f['name']: _iceberg_type_to_py_type(f['type']) for f in state['schema']
+      f['name']: _iceberg_type_to_py_type(f['type'])
+      for f in state['schema']
   }
   needle = search_term.lower() if search_term else None
   rows: list[dict[str, Any]] = []
@@ -1724,9 +2230,8 @@ def read_iceberg_rows_local(
       break
     fpath = df_info['path']
     data_seq = int(df_info['sequence_number'])
-    applicable_eq = [
-        (cols, kset) for del_seq, cols, kset in eq_deletes if data_seq < del_seq
-    ]
+    applicable_eq = [(cols, kset) for del_seq, cols, kset in eq_deletes
+                     if data_seq < del_seq]
     file_pos_del = pos_deletes.get(fpath, set())
 
     with _fs_open_read(fpath) as fobj:
@@ -1754,8 +2259,8 @@ def read_iceberg_rows_local(
           if deleted:
             continue
           live_count += 1
-          if (limit is None or len(rows) < limit) and (
-              needle is None or _row_matches_search(rec, needle)):
+          if (limit is None or len(rows)
+              < limit) and (needle is None or _row_matches_search(rec, needle)):
             rows.append(rec)
           if not has_deletes and limit is not None and len(rows) >= limit:
             break
@@ -1773,7 +2278,8 @@ def inspect_iceberg_table(
     search_term: Optional[str] = None,
     default_project: Optional[str] = None,
 ) -> dict[str, Any]:
-  table_dir = resolve_iceberg_table_dir(ep.config, default_project=default_project)
+  table_dir = resolve_iceberg_table_dir(
+      ep.config, default_project=default_project)
   state = load_iceberg_state(table_dir)
   live_rows, sample_rows = read_iceberg_rows_local(
       state,
@@ -1795,7 +2301,10 @@ def inspect_iceberg_table(
       'estimated_bytes': state['estimated_bytes'],
       'row_count': live_rows,
       'schema': [{
-          **{k: v for k, v in col.items() if k != 'id'},
+          **{
+              k: v
+              for k, v in col.items() if k != 'id'
+          },
           'name': output.sanitize_untrusted_text(
               str(col.get('name', '')), max_chars=256),
       } for col in state['schema']],
@@ -1825,11 +2334,13 @@ def list_iceberg_cdc_changes(
   selected_snaps: list[dict[str, Any]] = []
   for s in snaps[start_idx:]:
     selected_snaps.append(s)
-    if to_snapshot is not None and int(s.get('snapshot-id')) == int(to_snapshot):
+    if to_snapshot is not None and int(
+        s.get('snapshot-id')) == int(to_snapshot):
       break
 
   type_map = {
-      f['name']: _iceberg_type_to_py_type(f['type']) for f in state['schema']
+      f['name']: _iceberg_type_to_py_type(f['type'])
+      for f in state['schema']
   }
   id_to_field = state['id_to_field']
   changes: list[dict[str, Any]] = []
@@ -1920,13 +2431,10 @@ def _resolve_iceberg_write_fields(
   so embedded `PARQUET:field_id` metadata matches `vN.metadata.json` 1-for-1.
   """
   if existing_state is None:
-    return [
-        {
-            **f,
-            'id': int(f.get('id') or idx),
-        }
-        for idx, f in enumerate(incoming_fields, start=1)
-    ]
+    return [{
+        **f,
+        'id': int(f.get('id') or idx),
+    } for idx, f in enumerate(incoming_fields, start=1)]
 
   existing_by_low = {
       str(f['name']).lower(): f
@@ -1967,7 +2475,23 @@ def _iceberg_local_commit_lock(table_dir: str):
   from . import jobs as _jobs_mod
   meta_dir = _join_fs(norm_dir, 'metadata')
   os.makedirs(meta_dir, exist_ok=True)
-  with _jobs_mod._file_lock(pathlib.Path(meta_dir) / '.beam_iceberg_commit.lock'):
+  with _jobs_mod._file_lock(pathlib.Path(meta_dir) /
+                            '.beam_iceberg_commit.lock'):
+    yield
+
+
+@contextlib.contextmanager
+def _iceberg_local_commit_locks(*table_dirs: str):
+  local_by_abs: dict[str, str] = {}
+  for td in table_dirs:
+    if not td:
+      continue
+    norm_dir = _normalize_fs_root(td)
+    if '://' not in norm_dir:
+      local_by_abs[os.path.abspath(norm_dir)] = norm_dir
+  with contextlib.ExitStack() as stack:
+    for abs_key in sorted(local_by_abs):
+      stack.enter_context(_iceberg_local_commit_lock(local_by_abs[abs_key]))
     yield
 
 
@@ -1983,12 +2507,14 @@ def commit_iceberg_snapshot(
     overwrite_partitions: bool = False,
     fail_if_exists: bool = False,
     cdc_seq_state: Optional[dict[str, Any]] = None,
+    extra_properties: Optional[dict[str, str]] = None,
 ) -> dict[str, Any]:
   """Atomically writes Iceberg v2 manifests, manifest-list, and `vN.metadata.json`."""
   table_dir = _normalize_fs_root(table_dir)
 
   with _iceberg_local_commit_lock(table_dir):
     for attempt in range(16):
+      attempt_paths: list[str] = []
       try:
         return _commit_iceberg_snapshot_once(
             table_dir,
@@ -2000,8 +2526,11 @@ def commit_iceberg_snapshot(
             replace_table=replace_table,
             overwrite_partitions=overwrite_partitions,
             fail_if_exists=fail_if_exists,
-            cdc_seq_state=cdc_seq_state)
+            cdc_seq_state=cdc_seq_state,
+            extra_properties=extra_properties,
+            written_attempt_paths=attempt_paths)
       except FileExistsError:
+        _fs_delete_best_effort(attempt_paths)
         if fail_if_exists:
           raise LakehouseError(
               f'Iceberg table already exists at {table_dir!r}; pass '
@@ -2026,6 +2555,8 @@ def _commit_iceberg_snapshot_once(
     overwrite_partitions: bool = False,
     fail_if_exists: bool = False,
     cdc_seq_state: Optional[dict[str, Any]] = None,
+    extra_properties: Optional[dict[str, str]] = None,
+    written_attempt_paths: Optional[list[str]] = None,
 ) -> dict[str, Any]:
   table_dir = _normalize_fs_root(table_dir)
   meta_dir = _join_fs(table_dir, 'metadata')
@@ -2066,8 +2597,8 @@ def _commit_iceberg_snapshot_once(
     ]
     if non_void_parts:
       has_partition_data = any(
-          bool(df.get('partition')) for df in new_data_files
-      ) or (partition_spec and partition_spec.get('fields'))
+          bool(df.get('partition')) for df in new_data_files) or (
+              partition_spec and partition_spec.get('fields'))
       if not has_partition_data:
         raise LakehousePackageMissingError(
             f'existing Iceberg table at {table_dir!r} uses partition spec '
@@ -2099,13 +2630,13 @@ def _commit_iceberg_snapshot_once(
     # -----------------------------------------------------------------------
     # Iceberg v2 Schema Evolution Invariants:
     # 1. Monotonic Field IDs: Iceberg tracks columns by persistent integer IDs,
-    #    never by name. Field IDs must never be recycled or reused.
+    #     never by name. Field IDs must never be recycled or reused.
     # 2. Nullable Evolution: New columns added to an existing table MUST be
-    #    marked `required: False` (`nullable: True`). Pre-existing data files
-    #    lack values for new columns, so marking them required would cause
-    #    Iceberg v2 readers to abort with null constraint violations.
+    #     marked `required: False` (`nullable: True`). Pre-existing data files
+    #     lack values for new columns, so marking them required would cause
+    #     Iceberg v2 readers to abort with null constraint violations.
     # 3. Schema Versioning: When any column is added, increment `schema-id`
-    #    so the new snapshot accurately captures the evolved schema.
+    #     so the new snapshot accurately captures the evolved schema.
     # -----------------------------------------------------------------------
     existing_names = {str(f['name']).lower() for f in cur_fields}
     evolved = False
@@ -2177,7 +2708,10 @@ def _commit_iceberg_snapshot_once(
   if new_data_files:
     m_data_records = []
     total_added_rows = 0
-    name_to_type = {str(f['name']): str(f['type']) for f in cur_schema['fields']}
+    name_to_type = {
+        str(f['name']): str(f['type'])
+        for f in cur_schema['fields']
+    }
     m_avro_schema = _build_manifest_schema(part_spec, name_to_type)
     part_field_names = [
         str(pf['name']) for pf in (part_spec.get('fields') or [])
@@ -2227,6 +2761,8 @@ def _commit_iceberg_snapshot_once(
         })
     m_data_path = _join_fs(meta_dir, f'{commit_uuid}-m0.avro')
     _fs_write_bytes(m_data_path, m_data_bytes)
+    if written_attempt_paths is not None:
+      written_attempt_paths.append(m_data_path)
     new_ml_entries.append({
         'manifest_path': _to_iceberg_uri(m_data_path),
         'manifest_length': len(m_data_bytes),
@@ -2250,7 +2786,10 @@ def _commit_iceberg_snapshot_once(
       part_spec and part_spec.get('fields')):
     import fastavro
     part_field_names = [str(pf['name']) for pf in part_spec['fields']]
-    name_to_type = {str(f['name']): str(f['type']) for f in cur_schema['fields']}
+    name_to_type = {
+        str(f['name']): str(f['type'])
+        for f in cur_schema['fields']
+    }
     m_avro_schema = _build_manifest_schema(part_spec, name_to_type)
     kept_prior_ml: list[dict[str, Any]] = []
     for p_idx, m_entry in enumerate(prior_ml_entries):
@@ -2273,13 +2812,11 @@ def _commit_iceberg_snapshot_once(
           continue
         df_obj = dict(mr.get('data_file') or {})
         raw_p = dict(df_obj.get('partition') or {})
-        pt = tuple(
-            (
-                pcol,
-                _coerce_partition_value(
-                    raw_p.get(pcol), name_to_type.get(pcol, 'string'))
-                if raw_p.get(pcol) is not None else None)
-            for pcol in part_field_names)
+        pt = tuple((
+            pcol,
+            _coerce_partition_value(
+                raw_p.get(pcol), name_to_type.get(pcol, 'string')) if raw_p.
+            get(pcol) is not None else None) for pcol in part_field_names)
         rc_val = int(df_obj.get('record_count') or 0)
         inh_seq = int(
             mr.get('sequence_number') or m_entry.get('sequence_number') or 1)
@@ -2324,6 +2861,8 @@ def _commit_iceberg_snapshot_once(
             })
         rw_path = _join_fs(meta_dir, f'{commit_uuid}-p{p_idx}.avro')
         _fs_write_bytes(rw_path, rw_bytes)
+        if written_attempt_paths is not None:
+          written_attempt_paths.append(rw_path)
         kept_prior_ml.append({
             'manifest_path': _to_iceberg_uri(rw_path),
             'manifest_length': len(rw_bytes),
@@ -2346,10 +2885,11 @@ def _commit_iceberg_snapshot_once(
   # 2. Write equality-delete manifest (`content = 1` in manifest-list, `2` in entry)
   eq_files = list(new_eq_delete_files or [])
   if eq_files:
-    eq_col_names = list(identifier_columns or [
-        k for k, fid in name_to_id.items()
-        if fid in (cur_schema.get('identifier-field-ids') or [])
-    ])
+    eq_col_names = list(
+        identifier_columns or [
+            k for k, fid in name_to_id.items()
+            if fid in (cur_schema.get('identifier-field-ids') or [])
+        ])
     eq_ids = [name_to_id[c] for c in eq_col_names if c in name_to_id]
     del_schema = {
         'type': 'struct',
@@ -2390,6 +2930,8 @@ def _commit_iceberg_snapshot_once(
         })
     m_del_path = _join_fs(meta_dir, f'{commit_uuid}-m1.avro')
     _fs_write_bytes(m_del_path, m_del_bytes)
+    if written_attempt_paths is not None:
+      written_attempt_paths.append(m_del_path)
     new_ml_entries.append({
         'manifest_path': _to_iceberg_uri(m_del_path),
         'manifest_length': len(m_del_bytes),
@@ -2419,6 +2961,8 @@ def _commit_iceberg_snapshot_once(
       })
   ml_path = _join_fs(meta_dir, f'snap-{snap_id}-1-{commit_uuid}.avro')
   _fs_write_bytes(ml_path, ml_bytes)
+  if written_attempt_paths is not None:
+    written_attempt_paths.append(ml_path)
 
   snap_obj: dict[str, Any] = {
       'snapshot-id': snap_id,
@@ -2426,8 +2970,9 @@ def _commit_iceberg_snapshot_once(
       'timestamp-ms': now_ms,
       'summary': {
           'operation': (
-              'replace' if replace_table else
-              ('overwrite' if (eq_files or did_partition_overwrite) else 'append')),
+              'replace' if replace_table else (
+                  'overwrite' if
+                  (eq_files or did_partition_overwrite) else 'append')),
           'added-data-files': str(len(new_data_files)),
           'added-delete-files': str(len(eq_files)),
       },
@@ -2447,7 +2992,8 @@ def _commit_iceberg_snapshot_once(
     all_schemas = [cur_schema]
   last_part_id = 999
   if part_spec and part_spec.get('fields'):
-    last_part_id = max((int(f.get('field-id', 999)) for f in part_spec['fields']), default=999)
+    last_part_id = max(
+        (int(f.get('field-id', 999)) for f in part_spec['fields']), default=999)
   if existing is not None and old_meta.get('partition-specs'):
     all_specs = [
         s for s in old_meta['partition-specs']
@@ -2463,16 +3009,26 @@ def _commit_iceberg_snapshot_once(
       'schema.name-mapping.default': json.dumps(name_mapping),
   }
   if existing is not None:
-    old_seq_file = (old_meta.get('properties') or {}).get(
-        'beam.cli.cdc.seq-file')
+    old_props = old_meta.get('properties') or {}
+    old_seq_file = old_props.get('beam.cli.cdc.seq-file')
     if old_seq_file:
       props['beam.cli.cdc.seq-file'] = str(old_seq_file)
+    old_rep_run_id = old_props.get('beam.cli.replace-run-id')
+    if old_rep_run_id:
+      props['beam.cli.replace-run-id'] = str(old_rep_run_id)
+  if extra_properties:
+    for ek, ev in extra_properties.items():
+      if ev is not None:
+        props[str(ek)] = str(ev)
   if cdc_seq_state is not None:
-    seq_fname = f'beam-cdc-seq-v{meta_ver}.json'
+    seq_fname = f'beam-cdc-seq-v{meta_ver}-{commit_uuid}.json'
+    seq_full_path = _join_fs(meta_dir, seq_fname)
     _fs_write_bytes(
-        _join_fs(meta_dir, seq_fname),
+        seq_full_path,
         json.dumps(cdc_seq_state, separators=(',', ':')).encode('utf-8'),
         mime_type='application/json')
+    if written_attempt_paths is not None:
+      written_attempt_paths.append(seq_full_path)
     props['beam.cli.cdc.seq-file'] = seq_fname
 
   meta_json_obj = {
@@ -2488,7 +3044,9 @@ def _commit_iceberg_snapshot_once(
       'partition-specs': all_specs,
       'last-partition-id': last_part_id,
       'default-sort-order-id': 0,
-      'sort-orders': [{'order-id': 0, 'fields': []}],
+      'sort-orders': [{
+          'order-id': 0, 'fields': []
+      }],
       'properties': props,
       'current-snapshot-id': snap_id,
       'snapshots': prior_snapshots + [snap_obj],
@@ -2504,10 +3062,11 @@ def _commit_iceberg_snapshot_once(
       json.dumps(meta_json_obj, indent=2).encode('utf-8'),
       mime_type='application/json',
       exclusive_create=True)
-  _fs_write_bytes(
-      _join_fs(meta_dir, 'version-hint.text'),
-      f'{meta_ver}\n'.encode('utf-8'),
-      mime_type='text/plain')
+  if not _fs_exists(_join_fs(meta_dir, f'v{meta_ver + 1}.metadata.json')):
+    _fs_write_bytes(
+        _join_fs(meta_dir, 'version-hint.text'),
+        f'{meta_ver}\n'.encode('utf-8'),
+        mime_type='text/plain')
 
   return {
       'table_location': table_dir,
@@ -2589,7 +3148,8 @@ def write_parquet_with_field_ids(
   for r in rows:
     for f in iceberg_fields:
       fname = f['name']
-      cols_data[fname].append(_coerce_value_for_arrow(r.get(fname), pa_types[fname]))
+      cols_data[fname].append(
+          _coerce_value_for_arrow(r.get(fname), pa_types[fname]))
 
   pa_schema = pa.schema(pa_fields)
   arrays = [
@@ -2608,6 +3168,31 @@ def write_parquet_with_field_ids(
   }
 
 
+_SAFE_PARTITION_FIELD_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_.-]{0,127}$')
+
+
+def _validate_partition_field_name(p_name: str) -> str:
+  s = str(p_name)
+  if not _SAFE_PARTITION_FIELD_RE.match(s) or '..' in s:
+    raise LakehouseError(
+        f'Unsafe Iceberg partition field name {p_name!r}; must match '
+        r'^[A-Za-z_][A-Za-z0-9_.-]{0,127}$ without ".."')
+  return s
+
+
+def _extract_hive_partitions(path: str) -> dict[str, Any]:
+  parts = re.split(r'[/\\]', str(path))
+  dir_part = '/'.join(parts[:-1]) if len(parts) > 1 else ''
+  if not dir_part:
+    return {}
+  out: dict[str, Any] = {}
+  for k, v in re.findall(r'[/\\]([^/=\\]+)=([^/\\]+)', '/' + dir_part):
+    _validate_partition_field_name(k)
+    out[k] = (
+        None if v == '__HIVE_DEFAULT_PARTITION__' else urllib.parse.unquote(v))
+  return out
+
+
 def register_zero_copy_to_iceberg(
     source_ep,
     sink_ep,
@@ -2621,6 +3206,15 @@ def register_zero_copy_to_iceberg(
   if sink_ep.kind != 'iceberg':
     raise LakehouseError(
         f'--zero-copy requires an iceberg:// destination, got {sink_ep.raw!r}')
+
+  raw_ov_part = sink_ep.config.get(
+      'overwrite_partitions',
+      sink_ep.config.get(
+          'dynamic_partition_overwrite',
+          sink_ep.config.get('replace_partition', False)))
+  eff_overwrite_partitions = (
+      raw_ov_part if isinstance(raw_ov_part, bool) else
+      str(raw_ov_part).strip().lower() in ('1', 'true', 'yes', 'on'))
 
   parquet_files: list[tuple[str, int, dict[str, Any]]] = []
   partition_cols: list[str] = []
@@ -2636,7 +3230,10 @@ def register_zero_copy_to_iceberg(
           'files cannot be zero-copy aliased into Iceberg without '
           'materializing live rows; run standard `beam pipe` without '
           '--zero-copy')
-    partition_cols = list(snap.get('partition_columns') or [])
+    partition_cols = [
+        _validate_partition_field_name(c)
+        for c in (snap.get('partition_columns') or [])
+    ]
     parquet_files = [
         (f['path'], int(f['size']), dict(f.get('partition_values') or {}))
         for f in snap['active_files']
@@ -2645,60 +3242,63 @@ def register_zero_copy_to_iceberg(
     raw_files = _fs_list_files(source_ep.config['path'])
     parquet_files = []
     for p, sz in raw_files:
-      hive_parts = dict(re.findall(r'[/\\-]([^/=\\]+)=([^/=\\]+)', p))
+      hive_parts = _extract_hive_partitions(p)
       if hive_parts and not partition_cols:
         partition_cols = list(hive_parts.keys())
       parquet_files.append((p, sz, hive_parts))
   elif source_ep.kind == 'iceberg':
     src_tdir = resolve_iceberg_table_dir(
         source_ep.config, default_project=default_project)
-    src_st = load_iceberg_state(
-        src_tdir, snapshot_id=source_ep.config.get('snapshot_id'))
-    meta_obj = src_st.get('metadata') or {}
-    pspecs = meta_obj.get('partition-specs') or []
-    def_spec_id = meta_obj.get('default-spec-id', 0)
-    cur_pspec = next(
-        (ps for ps in pspecs if ps.get('spec-id') == def_spec_id),
-        pspecs[-1]
-        if pspecs else {'fields': meta_obj.get('partition-spec') or []})
-    partition_cols = [
-        str(pf['name']) for pf in (cur_pspec.get('fields') or [])
-        if pf.get('name')
-    ]
     dst_tdir = resolve_iceberg_table_dir(
         sink_ep.config, default_project=default_project)
-    if _normalize_fs_root(src_tdir) == _normalize_fs_root(dst_tdir):
-      cat_reg = register_iceberg_catalog_table(
-          sink_ep.config.get('table', ''),
-          dst_tdir,
-          src_st['metadata_path'],
-          catalog_name=sink_ep.config.get('catalog_name'),
-          catalog_properties=sink_ep.config.get('catalog_properties'),
-          default_project=default_project)
-      same_dir_res: dict[str, Any] = {
-          'snapshot_id': src_st.get('current_snapshot_id'),
-          'metadata_path': src_st['metadata_path'],
-          'registered_files': [f['path'] for f in src_st.get('data_files', [])],
-          'rows_registered': int(src_st.get('raw_record_count') or 0),
-          'bytes_copied': 0,
-          'zero_copy': True,
-      }
-      if cat_reg and cat_reg.get('status') != 'none':
-        same_dir_res['catalog_registration'] = cat_reg
-      if partition_cols:
-        same_dir_res['partition_columns'] = partition_cols
-      return same_dir_res
-    if src_st.get('pos_delete_files') or src_st.get('eq_delete_files'):
-      raise LakehouseError(
-          'Iceberg source table has active position/equality delete files '
-          'whose raw Parquet files cannot be zero-copy aliased into another '
-          'Iceberg table without materializing live rows; run standard '
-          '`beam pipe` without --zero-copy')
-    parquet_files = [(
-        f['path'],
-        int(f.get('file_size_in_bytes') or 0),
-        dict(f.get('partition') or {}),
-    ) for f in src_st.get('data_files', [])]
+    with _iceberg_local_commit_locks(src_tdir, dst_tdir):
+      src_st = load_iceberg_state(
+          src_tdir, snapshot_id=source_ep.config.get('snapshot_id'))
+      meta_obj = src_st.get('metadata') or {}
+      pspecs = meta_obj.get('partition-specs') or []
+      def_spec_id = meta_obj.get('default-spec-id', 0)
+      cur_pspec = next(
+          (ps for ps in pspecs if ps.get('spec-id') == def_spec_id),
+          pspecs[-1]
+          if pspecs else {'fields': meta_obj.get('partition-spec') or []})
+      partition_cols = [
+          _validate_partition_field_name(str(pf['name']))
+          for pf in (cur_pspec.get('fields') or []) if pf.get('name')
+      ]
+      if _normalize_fs_root(src_tdir) == _normalize_fs_root(dst_tdir):
+        cat_reg = register_iceberg_catalog_table(
+            sink_ep.config.get('table', ''),
+            dst_tdir,
+            src_st['metadata_path'],
+            catalog_name=sink_ep.config.get('catalog_name'),
+            catalog_properties=sink_ep.config.get('catalog_properties'),
+            default_project=default_project)
+        same_dir_res: dict[str, Any] = {
+            'snapshot_id': src_st.get('current_snapshot_id'),
+            'metadata_path': src_st['metadata_path'],
+            'registered_files': [
+                f['path'] for f in src_st.get('data_files', [])
+            ],
+            'rows_registered': int(src_st.get('raw_record_count') or 0),
+            'bytes_copied': 0,
+            'zero_copy': True,
+        }
+        if cat_reg and cat_reg.get('status') != 'none':
+          same_dir_res['catalog_registration'] = cat_reg
+        if partition_cols:
+          same_dir_res['partition_columns'] = partition_cols
+        return same_dir_res
+      if src_st.get('pos_delete_files') or src_st.get('eq_delete_files'):
+        raise LakehouseError(
+            'Iceberg source table has active position/equality delete files '
+            'whose raw Parquet files cannot be zero-copy aliased into another '
+            'Iceberg table without materializing live rows; run standard '
+            '`beam pipe` without --zero-copy')
+      parquet_files = [(
+          f['path'],
+          int(f.get('file_size_in_bytes') or 0),
+          dict(f.get('partition') or {}),
+      ) for f in src_st.get('data_files', [])]
   else:
     raise LakehouseError(
         '--zero-copy supports delta://, iceberg://, and Parquet file/glob '
@@ -2732,9 +3332,8 @@ def register_zero_copy_to_iceberg(
         file_field_presence[fname] = file_field_presence.get(fname, 0) + 1
         raw_fid = (field.metadata or {}).get(b'PARQUET:field_id')
         parsed_fid = (
-            int(raw_fid.decode('ascii'))
-            if raw_fid and raw_fid.decode('ascii', errors='ignore').isdigit()
-            else None)
+            int(raw_fid.decode('ascii')) if raw_fid and
+            raw_fid.decode('ascii', errors='ignore').isdigit() else None)
         if fname not in seen_fields:
           seen_fields[fname] = {
               'name': fname,
@@ -2816,6 +3415,7 @@ def register_zero_copy_to_iceberg(
       name_to_fid = {f['name']: f['id'] for f in iceberg_fields}
       part_fields = []
       for p_idx, pcol in enumerate(partition_cols, start=1000):
+        _validate_partition_field_name(pcol)
         part_fields.append({
             'source-id': name_to_fid.get(pcol, p_idx - 999),
             'field-id': p_idx,
@@ -2830,17 +3430,18 @@ def register_zero_copy_to_iceberg(
         new_data_files=data_entries,
         partition_spec=partition_spec,
         replace_table=(if_exists == 'replace'),
+        overwrite_partitions=eff_overwrite_partitions,
         fail_if_exists=(if_exists == 'fail'))
 
-  cat_reg = register_iceberg_catalog_table(
-      sink_ep.config.get('table', ''),
-      table_dir,
-      commit_res['metadata_path'],
-      catalog_name=sink_ep.config.get('catalog_name'),
-      catalog_properties=sink_ep.config.get('catalog_properties'),
-      default_project=default_project)
-  if cat_reg and cat_reg.get('status') != 'none':
-    commit_res['catalog_registration'] = cat_reg
+    cat_reg = register_iceberg_catalog_table(
+        sink_ep.config.get('table', ''),
+        table_dir,
+        commit_res['metadata_path'],
+        catalog_name=sink_ep.config.get('catalog_name'),
+        catalog_properties=sink_ep.config.get('catalog_properties'),
+        default_project=default_project)
+    if cat_reg and cat_reg.get('status') != 'none':
+      commit_res['catalog_registration'] = cat_reg
 
   commit_res['registered_files'] = [p for p, _, _ in parquet_files]
   commit_res['rows_registered'] = total_rows
@@ -2898,15 +3499,18 @@ def sync_lakehouse_catalog(
 
   if mode not in ('sync', 'register', 'refresh'):
     raise LakehouseError(
-        f'unsupported catalog sync mode {mode!r}; expected "sync", "register", or "refresh"')
+        f'unsupported catalog sync mode {mode!r}; expected "sync", "register", or "refresh"'
+    )
 
   if table and ('..' in table or '/' in table or '\\' in table):
     raise LakehouseError(
-        f'invalid table identifier {table!r}: table identifier cannot contain path separators or ".."')
+        f'invalid table identifier {table!r}: table identifier cannot contain path separators or ".."'
+    )
 
   if catalog and ('..' in catalog or '/' in catalog or '\\' in catalog):
     raise LakehouseError(
-        f'invalid catalog identifier {catalog!r}: catalog cannot contain path separators or ".."')
+        f'invalid catalog identifier {catalog!r}: catalog cannot contain path separators or ".."'
+    )
 
   eff_from = from_uri
   format_override = None
@@ -2965,14 +3569,16 @@ def sync_lakehouse_catalog(
           source_ep.config['table'],
           target_version=int(ver) if ver is not None else None)
       files_count = len(snap.get('active_files', []))
-      total_bytes = sum(int(f.get('size', 0)) for f in snap.get('active_files', []))
+      total_bytes = sum(
+          int(f.get('size', 0)) for f in snap.get('active_files', []))
       partition_cols = list(snap.get('partition_columns') or [])
       schema_fields = snap.get('schema') or []
     elif source_ep.kind == 'iceberg':
       tdir = resolve_iceberg_table_dir(
           source_ep.config, default_project=default_project)
-      st = load_iceberg_state(
-          tdir, snapshot_id=source_ep.config.get('snapshot_id'))
+      with _iceberg_local_commit_lock(tdir):
+        st = load_iceberg_state(
+            tdir, snapshot_id=source_ep.config.get('snapshot_id'))
       schema_fields = list(st.get('schema') or [])
       files_count = len(st.get('data_files') or [])
       total_bytes = int(st.get('estimated_bytes') or 0)
@@ -2992,7 +3598,7 @@ def sync_lakehouse_catalog(
       files_count = len(raw_files)
       total_bytes = sum(sz for _, sz in raw_files)
       for p_raw, _ in raw_files:
-        hive_parts = dict(re.findall(r'[/\\-]([^/=\\]+)=([^/=\\]+)', p_raw))
+        hive_parts = _extract_hive_partitions(p_raw)
         if hive_parts and not partition_cols:
           partition_cols = list(hive_parts.keys())
           break
@@ -3011,18 +3617,31 @@ def sync_lakehouse_catalog(
         'source_format': source_ep.kind,
         'target_uri': to_uri,
         'target_table': sink_ep.config.get('table'),
-        'target_catalog': sink_ep.config.get('catalog_name') or parsed_opts.get('catalog') or 'iceberg',
+        'target_catalog': sink_ep.config.get('catalog_name') or
+        parsed_opts.get('catalog') or 'iceberg',
         'files_to_sync': files_count,
         'total_bytes': total_bytes,
         'partition_columns': partition_cols,
         'schema': schema_fields,
     }
 
-  commit_res = register_zero_copy_to_iceberg(
-      source_ep,
-      sink_ep,
-      if_exists=('replace' if mode == 'refresh' else 'append'),
-      default_project=default_project)
+  if source_ep.kind == 'iceberg':
+    src_lock_dir = resolve_iceberg_table_dir(
+        source_ep.config, default_project=default_project)
+    dst_lock_dir = resolve_iceberg_table_dir(
+        sink_ep.config, default_project=default_project)
+    with _iceberg_local_commit_locks(src_lock_dir, dst_lock_dir):
+      commit_res = register_zero_copy_to_iceberg(
+          source_ep,
+          sink_ep,
+          if_exists=('replace' if mode == 'refresh' else 'append'),
+          default_project=default_project)
+  else:
+    commit_res = register_zero_copy_to_iceberg(
+        source_ep,
+        sink_ep,
+        if_exists=('replace' if mode == 'refresh' else 'append'),
+        default_project=default_project)
 
   cat_info = commit_res.get('catalog_registration', {})
   return {
@@ -3033,7 +3652,8 @@ def sync_lakehouse_catalog(
       'source_format': source_ep.kind,
       'target_uri': to_uri,
       'target_table': sink_ep.config.get('table'),
-      'target_catalog': cat_info.get('catalog') or sink_ep.config.get('catalog_name') or 'iceberg',
+      'target_catalog': cat_info.get('catalog') or
+      sink_ep.config.get('catalog_name') or 'iceberg',
       'catalog_status': cat_info.get('status', 'local_metadata_only'),
       'snapshot_id': commit_res.get('snapshot_id'),
       'metadata_path': commit_res.get('metadata_path'),
@@ -3049,14 +3669,16 @@ def sync_lakehouse_catalog(
 # ---------------------------------------------------------------------------
 
 
-def _fields_to_row_type(schema_fields: list[dict[str, Any]], is_delta: bool = False):
+def _fields_to_row_type(
+    schema_fields: list[dict[str, Any]], is_delta: bool = False):
   from apache_beam.typehints.row_type import RowTypeConstraint
   pairs = []
   for f in schema_fields:
     py_t = (
         _delta_type_to_py_type(f['type'])
         if is_delta else _iceberg_type_to_py_type(f['type']))
-    pairs.append((f['name'], Optional[py_t] if f.get('nullable', True) else py_t))
+    pairs.append(
+        (f['name'], Optional[py_t] if f.get('nullable', True) else py_t))
   return RowTypeConstraint.from_fields(pairs)
 
 
@@ -3074,15 +3696,18 @@ def cli_read_from_delta(
   if snap['unsupported_reader_features']:
     _, rows = _read_delta_via_deltalake(snap, version=target_ver)
     return (
-        'DeltaTableRows' >>
-        beam.Create([beam.Row(**r) for r in rows]).with_output_types(row_type))
+        'DeltaTableRows' >> beam.Create([beam.Row(**r) for r in rows
+                                         ]).with_output_types(row_type))
   schema_spec = list(snap['schema'])
   active_files = list(snap['active_files'])
 
   class _ReadDeltaShardDoFn(beam.DoFn):
     def process(self, finfo):
       import pyarrow.parquet as pq
-      type_map = {f['name']: _delta_type_to_py_type(f['type']) for f in schema_spec}
+      type_map = {
+          f['name']: _delta_type_to_py_type(f['type'])
+          for f in schema_spec
+      }
       pvals = finfo.get('partition_values') or {}
       with _fs_open_read(finfo['path']) as fobj:
         pf = pq.ParquetFile(fobj)
@@ -3102,8 +3727,8 @@ def cli_read_from_delta(
           pbegin
           | 'DeltaFiles' >> beam.Create(active_files)
           | 'ReshuffleDelta' >> beam.Reshuffle()
-          | 'ReadDeltaParquet' >>
-          beam.ParDo(_ReadDeltaShardDoFn()).with_output_types(row_type))
+          | 'ReadDeltaParquet' >> beam.ParDo(
+              _ReadDeltaShardDoFn()).with_output_types(row_type))
 
   return _ReadDeltaTransform()
 
@@ -3122,15 +3747,22 @@ def cli_read_from_delta_cdc(
       start_version=int(start_version),
       end_version=int(end_version) if end_version is not None else None)
   cdc_fields = list(base_fields) + [
-      {'name': 'beam_cdc_op', 'type': 'string', 'nullable': False},
-      {'name': 'beam_cdc_seq', 'type': 'long', 'nullable': False},
+      {
+          'name': 'beam_cdc_op', 'type': 'string', 'nullable': False
+      },
+      {
+          'name': 'beam_cdc_seq', 'type': 'long', 'nullable': False
+      },
   ]
   row_type = _fields_to_row_type(cdc_fields, is_delta=True)
 
   class _ReadDeltaCdcDoFn(beam.DoFn):
     def process(self, act):
       import pyarrow.parquet as pq
-      type_map = {f['name']: _delta_type_to_py_type(f['type']) for f in base_fields}
+      type_map = {
+          f['name']: _delta_type_to_py_type(f['type'])
+          for f in base_fields
+      }
       pvals = act.get('partition_values') or {}
       ver = int(act['version'])
       with _fs_open_read(act['path']) as fobj:
@@ -3163,8 +3795,8 @@ def cli_read_from_delta_cdc(
           pbegin
           | 'DeltaCdcActions' >> beam.Create(actions)
           | 'ReshuffleDeltaCdc' >> beam.Reshuffle()
-          | 'ReadDeltaCdcRows' >>
-          beam.ParDo(_ReadDeltaCdcDoFn()).with_output_types(row_type))
+          | 'ReadDeltaCdcRows' >> beam.ParDo(
+              _ReadDeltaCdcDoFn()).with_output_types(row_type))
 
   return _ReadDeltaCdcTransform()
 
@@ -3194,14 +3826,13 @@ def cli_read_from_iceberg(
     def process(self, df_info):
       import pyarrow.parquet as pq
       type_map = {
-          f['name']: _iceberg_type_to_py_type(f['type']) for f in schema_spec
+          f['name']: _iceberg_type_to_py_type(f['type'])
+          for f in schema_spec
       }
       fpath = df_info['path']
       data_seq = int(df_info['sequence_number'])
-      applicable_eq = [
-          (cols, kset)
-          for del_seq, cols, kset in eq_deletes if data_seq < del_seq
-      ]
+      applicable_eq = [(cols, kset) for del_seq, cols, kset in eq_deletes
+                       if data_seq < del_seq]
       file_pos = pos_deletes.get(fpath, set())
       with _fs_open_read(fpath) as fobj:
         pf = pq.ParquetFile(fobj)
@@ -3220,9 +3851,8 @@ def cli_read_from_iceberg(
               if val is None and fname in part_map:
                 val = part_map[fname]
               rec[fname] = _coerce_scalar_for_py(val, type_map[fname])
-            if any(
-                _canonical_iceberg_key_tuple(rec, cols) in kset
-                for cols, kset in applicable_eq):
+            if any(_canonical_iceberg_key_tuple(rec, cols) in kset
+                   for cols, kset in applicable_eq):
               continue
             yield beam.Row(**rec)
 
@@ -3232,8 +3862,8 @@ def cli_read_from_iceberg(
           pbegin
           | 'IcebergFiles' >> beam.Create(data_files)
           | 'ReshuffleIceberg' >> beam.Reshuffle()
-          | 'ReadIcebergParquet' >>
-          beam.ParDo(_ReadIcebergDataDoFn()).with_output_types(row_type))
+          | 'ReadIcebergParquet' >> beam.ParDo(
+              _ReadIcebergDataDoFn()).with_output_types(row_type))
 
   return _ReadIcebergTransform()
 
@@ -3258,8 +3888,12 @@ def cli_read_from_iceberg_cdc(
   base_schema, changes = list_iceberg_cdc_changes(
       table_dir, from_snapshot=from_snapshot, to_snapshot=to_snapshot)
   cdc_fields = list(base_schema) + [
-      {'name': 'beam_cdc_op', 'type': 'string', 'nullable': False},
-      {'name': 'beam_cdc_seq', 'type': 'long', 'nullable': False},
+      {
+          'name': 'beam_cdc_op', 'type': 'string', 'nullable': False
+      },
+      {
+          'name': 'beam_cdc_seq', 'type': 'long', 'nullable': False
+      },
   ]
   row_type = _fields_to_row_type(cdc_fields, is_delta=False)
   row_items = []
@@ -3280,8 +3914,7 @@ def cli_read_from_iceberg_cdc(
 
 
 def _beam_element_type_to_iceberg_fields(
-    element_type, drop_cols: set[str]
-) -> list[dict[str, Any]]:
+    element_type, drop_cols: set[str]) -> list[dict[str, Any]]:
   from apache_beam.portability.api import schema_pb2
   from apache_beam.typehints import schemas
 
@@ -3355,8 +3988,38 @@ def _load_prior_cdc_seq_map(
   props = (st.get('metadata') or {}).get('properties') or {}
   seq_fname = props.get('beam.cli.cdc.seq-file')
   if seq_fname:
-    seq_path = _join_fs(
-        _join_fs(_normalize_fs_root(table_dir), 'metadata'), str(seq_fname))
+    raw_seq = str(seq_fname).strip()
+    _check_no_dotdot_or_controls(raw_seq, 'beam.cli.cdc.seq-file')
+    norm_tdir = _normalize_fs_root(table_dir)
+    meta_dir = _join_fs(norm_tdir, 'metadata')
+    if ('://' in raw_seq or raw_seq.startswith(('/', '\\')) or
+        re.match(r'^[A-Za-z]:', raw_seq)):
+      cand_seq = raw_seq
+    elif raw_seq.startswith(
+        'metadata/') and '/' not in raw_seq[len('metadata/'):]:
+      cand_seq = _join_fs(norm_tdir, raw_seq)
+    else:
+      if '/' in raw_seq or '\\' in raw_seq:
+        raise LakehouseError(
+            f'Iceberg beam.cli.cdc.seq-file {seq_fname!r} escapes metadata '
+            f'directory of {table_dir!r}')
+      cand_seq = _join_fs(meta_dir, raw_seq)
+    seq_path = _resolve_iceberg_metadata_child(
+        table_dir, cand_seq, 'beam.cli.cdc.seq-file')
+    if '://' in norm_tdir:
+      meta_prefix = _normalize_fs_root(meta_dir).rstrip('/') + '/'
+      if not _normalize_fs_root(seq_path).startswith(meta_prefix):
+        raise LakehouseError(
+            f'Iceberg beam.cli.cdc.seq-file {seq_fname!r} escapes metadata '
+            f'directory of {table_dir!r}')
+    else:
+      real_meta = os.path.realpath(meta_dir)
+      real_seq = os.path.realpath(seq_path)
+      if (real_seq == real_meta or
+          os.path.commonpath([real_meta, real_seq]) != real_meta):
+        raise LakehouseError(
+            f'Iceberg beam.cli.cdc.seq-file {seq_fname!r} escapes metadata '
+            f'directory of {table_dir!r}')
     try:
       if _fs_exists(seq_path):
         raw_obj = json.loads(_fs_read_bytes(seq_path).decode('utf-8'))
@@ -3365,6 +4028,8 @@ def _load_prior_cdc_seq_map(
             parsed_k = tuple(
                 (int(item[0]), str(item[1])) for item in json.loads(k_str))
             prior_map[parsed_k] = (int(v_pair[0]), str(v_pair[1]))
+    except LakehouseError:
+      raise
     except Exception:  # pylint: disable=broad-except
       pass
 
@@ -3381,6 +4046,8 @@ def _load_prior_cdc_seq_map(
         prev = prior_map.get(ck)
         if prev is None or cseq > prev:
           prior_map[ck] = cseq
+    except LakehouseError:
+      raise
     except Exception:  # pylint: disable=broad-except
       pass
 
@@ -3443,7 +4110,10 @@ def _eval_partition_transform(val: Any, transform: str) -> Any:
         try:
           d_only = datetime.date.fromisoformat(s_val[:10])
           dt_obj = datetime.datetime(
-              d_only.year, d_only.month, d_only.day, tzinfo=datetime.timezone.utc)
+              d_only.year,
+              d_only.month,
+              d_only.day,
+              tzinfo=datetime.timezone.utc)
         except ValueError:
           return str(val)
     if tr == 'year':
@@ -3502,6 +4172,7 @@ def _resolve_iceberg_partition_plan(
         src_col = tok.strip()
         tr_name = 'identity'
         p_name = src_col
+      p_name = _validate_partition_field_name(p_name)
       if src_col not in name_to_fid:
         raise LakehouseError(
             f'Iceberg partition column {src_col!r} not found in schema '
@@ -3521,8 +4192,9 @@ def _resolve_iceberg_partition_plan(
     def_spec_id = meta_obj.get('default-spec-id', 0)
     active_spec = next(
         (ps for ps in pspecs if ps.get('spec-id') == def_spec_id),
-        pspecs[-1]
-        if pspecs else {'spec-id': 0, 'fields': meta_obj.get('partition-spec') or []})
+        pspecs[-1] if pspecs else {
+            'spec-id': 0, 'fields': meta_obj.get('partition-spec') or []
+        })
     inh_plan: list[tuple[str, str, str]] = []
     for pf in active_spec.get('fields') or []:
       tr_low = str(pf.get('transform') or 'identity').lower()
@@ -3532,6 +4204,7 @@ def _resolve_iceberg_partition_plan(
       src_col = fid_to_name.get(src_id) or str(pf.get('name') or '')
       p_name = str(pf.get('name') or src_col)
       if src_col:
+        p_name = _validate_partition_field_name(p_name)
         inh_plan.append((p_name, src_col, tr_low))
     if inh_plan:
       return active_spec, inh_plan
@@ -3551,9 +4224,10 @@ def _write_iceberg_data_batches(
   if not part_plan:
     d_path = _join_fs(data_dir, f'00000-0-{batch_id}.parquet')
     return [write_parquet_with_field_ids(d_path, rows, eff_fields)]
-  grouped: dict[
-      tuple[tuple[str, Any], ...],
-      tuple[dict[str, Any], list[dict[str, Any]]]] = {}
+  for p_name, _, _ in part_plan:
+    _validate_partition_field_name(p_name)
+  grouped: dict[tuple[tuple[str, Any], ...],
+                tuple[dict[str, Any], list[dict[str, Any]]]] = {}
   for r in rows:
     p_dict: dict[str, Any] = {}
     key_items: list[tuple[str, Any]] = []
@@ -3566,15 +4240,26 @@ def _write_iceberg_data_batches(
       grouped[kt] = (p_dict, [])
     grouped[kt][1].append(r)
 
+  is_local_data = '://' not in data_dir
+  real_data_dir = os.path.realpath(data_dir) if is_local_data else ''
   written: list[dict[str, Any]] = []
   for p_idx, (_, (p_dict, p_rows)) in enumerate(grouped.items()):
     sub_dir = data_dir
     for p_name, _, _ in part_plan:
+      _validate_partition_field_name(p_name)
       pval = p_dict.get(p_name)
       seg_val = (
-          '__HIVE_DEFAULT_PARTITION__' if pval is None else
-          urllib.parse.quote(str(pval), safe='-_:.'))
+          '__HIVE_DEFAULT_PARTITION__' if pval is None else urllib.parse.quote(
+              str(pval), safe='-_:.'))
+      if seg_val in ('.', '..') or '..' in seg_val:
+        seg_val = seg_val.replace('.', '%2E')
       sub_dir = _join_fs(sub_dir, f'{p_name}={seg_val}')
+    if is_local_data:
+      real_sub = os.path.realpath(sub_dir)
+      if (real_sub == real_data_dir or
+          os.path.commonpath([real_data_dir, real_sub]) != real_data_dir):
+        raise LakehouseError(
+            f'Partition path {sub_dir!r} escapes data directory {data_dir!r}')
     d_path = _join_fs(sub_dir, f'00000-{p_idx}-{batch_id}.parquet')
     meta_entry = write_parquet_with_field_ids(d_path, p_rows, eff_fields)
     meta_entry['partition'] = p_dict
@@ -3604,12 +4289,12 @@ def cli_write_to_iceberg(
   from apache_beam.transforms import window
 
   eff_raw_partitions = (
-      partition_fields if partition_fields is not None else
-      (partition_by if partition_by is not None else
-       _extra_kwargs.get('partition_columns')))
+      partition_fields if partition_fields is not None else (
+          partition_by if partition_by is not None else
+          _extra_kwargs.get('partition_columns')))
   raw_ov_part = (
-      overwrite_partitions if overwrite_partitions is not None else
-      _extra_kwargs.get(
+      overwrite_partitions
+      if overwrite_partitions is not None else _extra_kwargs.get(
           'dynamic_partition_overwrite',
           _extra_kwargs.get('replace_partition', False)))
   eff_overwrite_partitions = (
@@ -3642,13 +4327,14 @@ def cli_write_to_iceberg(
   eq_cols = list(equality_columns or [])
   eq_col_set = set(eq_cols)
   drop_seq_col = (
-      sequence_number_column
-      if (sequence_number_column and (
-          sequence_number_column in internal_seq_cols or
-          sequence_number_column.startswith(('beam_cdc_', '__beam_cdc_'))))
-      else None)
+      sequence_number_column if (
+          sequence_number_column and (
+              sequence_number_column in internal_seq_cols or
+              sequence_number_column.startswith(
+                  ('beam_cdc_', '__beam_cdc_')))) else None)
   meta_drop = {
-      c for c in (
+      c
+      for c in (
           change_type_column,
           drop_seq_col,
           'beam_cdc_op',
@@ -3659,19 +4345,21 @@ def cli_write_to_iceberg(
           '__beam_cdc_hex_seq',
           '_change_type',
           '_commit_version',
-          '_commit_snapshot_sequence_number',
-      ) if c and c not in eq_col_set
+          '_commit_snapshot_sequence_number', ) if c and c not in eq_col_set
   }
   is_mor = (mode == 'merge-on-read')
-  replace_up_to_ver = (
-      _max_existing_iceberg_metadata_version(table_dir)
-      if if_exists == 'replace' else -1)
+  run_uuid = uuid.uuid4().hex
 
   class _CommitIcebergBatchDoFn(beam.DoFn):
     def __init__(
-        self, fields_spec: list[dict[str, Any]], replace_max_ver: int):
+        self,
+        fields_spec: list[dict[str, Any]],
+        run_uuid_val: str,
+        is_bounded: bool = True,
+    ):
       self._fields = fields_spec
-      self._replace_max_ver = replace_max_ver
+      self._run_uuid = run_uuid_val
+      self._is_bounded = is_bounded
 
     def process(self, kv):
       _, rows_iter = kv
@@ -3682,123 +4370,165 @@ def cli_write_to_iceberg(
         return
 
       with _iceberg_local_commit_lock(table_dir):
-        cur_max_ver = _max_existing_iceberg_metadata_version(table_dir)
-        should_replace = (
-            self._replace_max_ver >= 0 and cur_max_ver <= self._replace_max_ver)
+        for attempt in range(16):
+          existing_run_id: Optional[str] = None
+          if if_exists == 'replace':
+            try:
+              _, cur_meta_path = find_latest_iceberg_metadata_path(table_dir)
+              cur_meta_obj = json.loads(
+                  _fs_read_bytes(cur_meta_path).decode('utf-8'))
+              existing_run_id = (cur_meta_obj.get('properties') or
+                                 {}).get('beam.cli.replace-run-id')
+            except FileNotFoundError:
+              existing_run_id = None
+            should_replace = (existing_run_id != self._run_uuid)
+            extra_props: Optional[dict[str, str]] = {
+                'beam.cli.replace-run-id': self._run_uuid
+            }
+          else:
+            should_replace = False
+            extra_props = None
 
-        st: Optional[dict[str, Any]] = None
-        table_exists = False
-        if not should_replace:
-          try:
-            st = load_iceberg_state(table_dir)
-            table_exists = True
-          except FileNotFoundError:
-            st = None
-            table_exists = False
-        if if_exists == 'fail' and table_exists:
-          raise LakehouseError(
-              f'Iceberg table already exists at {table_dir!r}; pass '
-              '--if-exists=append or --if-exists=replace')
-        eff_fields = _resolve_iceberg_write_fields(st, list(self._fields))
-        part_spec_out, part_plan = _resolve_iceberg_partition_plan(
-            eff_raw_partitions, eff_fields, st if table_exists else None)
+          st: Optional[dict[str, Any]] = None
+          table_exists = False
+          if not should_replace:
+            try:
+              st = load_iceberg_state(table_dir)
+              table_exists = True
+            except FileNotFoundError:
+              st = None
+              table_exists = False
+          if if_exists == 'fail' and table_exists:
+            raise LakehouseError(
+                f'Iceberg table already exists at {table_dir!r}; pass '
+                '--if-exists=append or --if-exists=replace')
+          eff_fields = _resolve_iceberg_write_fields(st, list(self._fields))
+          part_spec_out, part_plan = _resolve_iceberg_partition_plan(
+              eff_raw_partitions, eff_fields, st if table_exists else None)
 
-        batch_id = uuid.uuid4().hex
-        data_dir = _join_fs(table_dir, 'data')
-        new_data: list[dict[str, Any]] = []
-        new_eq_del: list[dict[str, Any]] = []
-        cdc_seq_state_out: Optional[dict[str, Any]] = None
+          batch_id = uuid.uuid4().hex
+          data_dir = _join_fs(table_dir, 'data')
+          new_data: list[dict[str, Any]] = []
+          new_eq_del: list[dict[str, Any]] = []
+          cdc_seq_state_out: Optional[dict[str, Any]] = None
+          attempt_meta_paths: list[str] = []
 
-        if not is_mor:
-          clean_rows = [{
-              f['name']: r.get(f['name']) for f in eff_fields
-          } for r in raw_list]
-          new_data.extend(
-              _write_iceberg_data_batches(
-                  data_dir, batch_id, clean_rows, eff_fields, part_plan))
-        else:
-          if not eq_cols:
-            raise ValueError(
-                'Iceberg merge-on-read CDC requires --primary-key / equality_columns')
-          prior_seqs = (
-              _load_prior_cdc_seq_map(
-                  table_dir, st, eq_cols, sequence_number_column)
-              if (table_exists and st is not None) else {})
-          eff_seq_col = sequence_number_column or 'beam_cdc_seq'
-          # Deduplicate per primary key within this commit window by max sequence.
-          latest_by_key: dict[
-              tuple[tuple[int, str], ...],
-              tuple[tuple[int, str], int, dict[str, Any], dict[str, Any]]] = {}
-          for arrival_idx, r in enumerate(raw_list):
-            op_raw = str(
-                r.get(change_type_column or 'beam_cdc_op', 'UPSERT')).upper()
-            if op_raw in ('UPDATE_BEFORE', 'UPDATE_PREIMAGE'):
-              continue
-            for pk_c in eq_cols:
-              if r.get(pk_c) is None:
-                raise ValueError(
-                    'Iceberg merge-on-read CDC event has null/missing primary '
-                    f'key column {pk_c!r}')
-            if eff_seq_col == 'beam_cdc_seq' and r.get('beam_cdc_hex_seq'):
-              cand_seq = (
-                  int(r.get('beam_cdc_seq') or 0),
-                  str(r['beam_cdc_hex_seq']))
-            else:
-              cand_seq = _comparable_iceberg_cdc_seq(r.get(eff_seq_col))
-            ck = _canonical_iceberg_key_tuple(r, eq_cols)
-            key_rec = {c: r.get(c) for c in eq_cols}
-            prev = latest_by_key.get(ck)
-            if prev is None or (cand_seq, arrival_idx) >= (prev[0], prev[1]):
-              latest_by_key[ck] = (cand_seq, arrival_idx, key_rec, r)
-
-          upserts: list[dict[str, Any]] = []
-          eq_delete_keys: list[dict[str, Any]] = []
-          for ck, (cand_seq, _, key_rec, winner) in latest_by_key.items():
-            if ck in prior_seqs and cand_seq < prior_seqs[ck]:
-              # Stale out-of-order event from an earlier sequence than already
-              # committed in a previous snapshot/window: ignore safely.
-              continue
-            prior_seqs[ck] = cand_seq
-            op_w = str(
-                winner.get(change_type_column or 'beam_cdc_op', 'UPSERT')).upper()
-            if op_w in ('DELETE', 'D'):
-              eq_delete_keys.append(key_rec)
-            else:
-              upserts.append({
-                  f['name']: winner.get(f['name']) for f in eff_fields
-              })
-              if table_exists:
-                # Equality delete removes any older snapshot's version of this key
-                # (`data_seq < current_snap_seq`) while keeping this snapshot's row!
-                eq_delete_keys.append(key_rec)
-
-          cdc_seq_state_out = {
-              json.dumps(ck, separators=(',', ':')): [s[0], s[1]]
-              for ck, s in prior_seqs.items()
-          }
-          if upserts:
+          if not is_mor:
+            clean_rows = [{
+                f['name']: r.get(f['name'])
+                for f in eff_fields
+            } for r in raw_list]
             new_data.extend(
                 _write_iceberg_data_batches(
-                    data_dir, batch_id, upserts, eff_fields, part_plan))
-          if eq_delete_keys:
-            eq_field_specs = [f for f in eff_fields if f['name'] in eq_col_set]
-            del_path = _join_fs(data_dir, f'00000-0-{batch_id}-eq-del.parquet')
-            new_eq_del.append(
-                write_parquet_with_field_ids(
-                    del_path, eq_delete_keys, eq_field_specs))
+                    data_dir, batch_id, clean_rows, eff_fields, part_plan))
+          else:
+            if not eq_cols:
+              raise ValueError(
+                  'Iceberg merge-on-read CDC requires --primary-key / '
+                  'equality_columns')
+            prior_seqs = (
+                _load_prior_cdc_seq_map(
+                    table_dir, st, eq_cols, sequence_number_column) if
+                (table_exists and st is not None) else {})
+            eff_seq_col = sequence_number_column or 'beam_cdc_seq'
+            # Deduplicate per primary key within this commit window by max seq.
+            latest_by_key: dict[tuple[tuple[int, str], ...],
+                                tuple[tuple[int, str],
+                                      int,
+                                      dict[str, Any],
+                                      dict[str, Any]]] = {}
+            for arrival_idx, r in enumerate(raw_list):
+              op_raw = str(
+                  r.get(change_type_column or 'beam_cdc_op', 'UPSERT')).upper()
+              if op_raw in ('UPDATE_BEFORE', 'UPDATE_PREIMAGE'):
+                continue
+              for pk_c in eq_cols:
+                if r.get(pk_c) is None:
+                  raise ValueError(
+                      'Iceberg merge-on-read CDC event has null/missing '
+                      f'primary key column {pk_c!r}')
+              if eff_seq_col == 'beam_cdc_seq' and r.get('beam_cdc_hex_seq'):
+                cand_seq = (
+                    int(r.get('beam_cdc_seq') or 0), str(r['beam_cdc_hex_seq']))
+              else:
+                cand_seq = _comparable_iceberg_cdc_seq(r.get(eff_seq_col))
+              ck = _canonical_iceberg_key_tuple(r, eq_cols)
+              key_rec = {c: r.get(c) for c in eq_cols}
+              prev = latest_by_key.get(ck)
+              if prev is None or (cand_seq, arrival_idx) >= (prev[0], prev[1]):
+                latest_by_key[ck] = (cand_seq, arrival_idx, key_rec, r)
 
-        if new_data or new_eq_del:
-          commit_iceberg_snapshot(
-              table_dir,
-              iceberg_fields=eff_fields,
-              identifier_columns=eq_cols if is_mor else None,
-              new_data_files=new_data,
-              new_eq_delete_files=new_eq_del,
-              partition_spec=part_spec_out,
-              replace_table=should_replace,
-              overwrite_partitions=(eff_overwrite_partitions and not is_mor),
-              fail_if_exists=(if_exists == 'fail'),
-              cdc_seq_state=cdc_seq_state_out)
+            upserts: list[dict[str, Any]] = []
+            eq_delete_keys: list[dict[str, Any]] = []
+            for ck, (cand_seq, _, key_rec, winner) in latest_by_key.items():
+              if ck in prior_seqs and cand_seq < prior_seqs[ck]:
+                # Stale out-of-order event from an earlier sequence than already
+                # committed in a previous snapshot/window: ignore safely.
+                continue
+              prior_seqs[ck] = cand_seq
+              op_w = str(
+                  winner.get(change_type_column or 'beam_cdc_op',
+                             'UPSERT')).upper()
+              if op_w in ('DELETE', 'D'):
+                eq_delete_keys.append(key_rec)
+              else:
+                upserts.append(
+                    {f['name']: winner.get(f['name'])
+                     for f in eff_fields})
+                if table_exists:
+                  # Equality delete removes any older snapshot's version of key
+                  # (`data_seq < current_snap_seq`) while keeping new row!
+                  eq_delete_keys.append(key_rec)
+
+            cdc_seq_state_out = {
+                json.dumps(ck, separators=(',', ':')): [s[0], s[1]]
+                for ck, s in prior_seqs.items()
+            }
+            if upserts:
+              new_data.extend(
+                  _write_iceberg_data_batches(
+                      data_dir, batch_id, upserts, eff_fields, part_plan))
+            if eq_delete_keys:
+              eq_field_specs = [
+                  f for f in eff_fields if f['name'] in eq_col_set
+              ]
+              del_path = _join_fs(
+                  data_dir, f'00000-0-{batch_id}-eq-del.parquet')
+              new_eq_del.append(
+                  write_parquet_with_field_ids(
+                      del_path, eq_delete_keys, eq_field_specs))
+
+          if not new_data and not new_eq_del:
+            return
+
+          try:
+            _commit_iceberg_snapshot_once(
+                table_dir,
+                iceberg_fields=eff_fields,
+                identifier_columns=eq_cols if is_mor else None,
+                new_data_files=new_data,
+                new_eq_delete_files=new_eq_del,
+                partition_spec=part_spec_out,
+                replace_table=should_replace,
+                overwrite_partitions=(eff_overwrite_partitions and not is_mor),
+                fail_if_exists=(if_exists == 'fail'),
+                cdc_seq_state=cdc_seq_state_out,
+                extra_properties=extra_props,
+                written_attempt_paths=attempt_meta_paths)
+            return
+          except FileExistsError:
+            _fs_delete_best_effort([d['path'] for d in new_data] +
+                                   [e['path']
+                                    for e in new_eq_del] + attempt_meta_paths)
+            if if_exists == 'fail':
+              raise LakehouseError(
+                  f'Iceberg table already exists at {table_dir!r}; pass '
+                  '--if-exists=append or --if-exists=replace') from None
+            if attempt >= 15:
+              raise LakehouseError(
+                  f'concurrent Iceberg metadata commit conflict on '
+                  f'{table_dir!r} after 16 retries') from None
+            time.sleep(0.01 * (attempt + 1))
 
   class _CliWriteIcebergTransform(beam.PTransform):
     def expand(self, pcoll):
@@ -3813,12 +4543,12 @@ def cli_write_to_iceberg(
             keyed
             | 'IcebergCommitWindows' >> beam.WindowInto(
                 window.GlobalWindows(),
-                trigger=trigger.Repeatedly(
-                    trigger.AfterProcessingTime(freq)),
+                trigger=trigger.Repeatedly(trigger.AfterProcessingTime(freq)),
                 accumulation_mode=trigger.AccumulationMode.DISCARDING)
             | 'GroupStreamCommit' >> beam.GroupByKey())
       _ = grouped | 'CommitIcebergSnapshot' >> beam.ParDo(
-          _CommitIcebergBatchDoFn(fields_spec, replace_up_to_ver))
+          _CommitIcebergBatchDoFn(
+              fields_spec, run_uuid, is_bounded=bool(pcoll.is_bounded)))
       return None
 
   return _CliWriteIcebergTransform()

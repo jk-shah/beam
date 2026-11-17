@@ -45,14 +45,19 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import traceback
+import urllib.parse
 from pathlib import Path
 from typing import Any
 from typing import Iterable
 
 from . import _option_arity
 from . import output
+
+_JAVA_OPTS_LOCK = threading.Lock()
+_JAVA_OPTS_REFCOUNT = 0
 
 # Documented exit codes.
 EXIT_OK = 0
@@ -375,6 +380,7 @@ _CLI_ONE_FLAGS = {
         '--to',
         '-o',
         '--output-path',
+        '--if-exists',
         '--limit',
         '-n',
         '--max-bytes',
@@ -776,8 +782,8 @@ def main(argv=None) -> int:
         return _run(args, extra_args, json_session=json_session, t0=t0)
       if active_cmd == 'pipe':
         pipe_tail = (
-            stripped_argv[stripped_argv.index('pipe') + 1:]
-            if 'pipe' in stripped_argv else norm_argv[1:])
+            stripped_argv[stripped_argv.index('pipe') +
+                          1:] if 'pipe' in stripped_argv else norm_argv[1:])
         return _pipe(
             args,
             extra_args,
@@ -808,7 +814,8 @@ def main(argv=None) -> int:
       if active_cmd == 'package':
         return _package(args, extra_args, json_session=json_session, t0=t0)
       if active_cmd == 'export-schedule':
-        return _export_schedule(args, extra_args, json_session=json_session, t0=t0)
+        return _export_schedule(
+            args, extra_args, json_session=json_session, t0=t0)
       if active_cmd == 'schema':
         return _schema(args, extra_args, json_session=json_session, t0=t0)
       if active_cmd == 'catalog':
@@ -824,7 +831,9 @@ def main(argv=None) -> int:
 
     except _CliError as e:
       if not json_mode or verbose_flag:
-        print(f'error: {e}', file=sys.stderr)
+        safe_err_txt = output.sanitize_untrusted_text(
+            output.redact_inline_secrets(str(e)), max_chars=8192)
+        print(f'error: {safe_err_txt}', file=sys.stderr)
       if json_mode:
         err_obj, auto_actions = output.classify_error(
             str(e), e.exit_code, command=active_cmd, verbose=verbose_flag)
@@ -1041,14 +1050,11 @@ def _merge_opt_file_into_kv_list(
   if not opt_file:
     return list(opts or [])
   from . import uris
-  parsed = uris.parse_kv_options(opts or [], opt_file, flag_name)
-  out: list[str] = []
-  for k, v in parsed.items():
-    if isinstance(v, (dict, list, bool)):
-      out.append(f'{k}={json.dumps(v)}')
-    else:
-      out.append(f'{k}={v}')
-  return out
+  # Validate both the 0600 regular opt_file and CLI opts eagerly, then keep
+  # `@opt_file` intact so downstream `parse_kv_options` loads file secrets
+  # without tripping the CLI-argument secret guard.
+  _ = uris.parse_kv_options(opts or [], opt_file, flag_name)
+  return [f'@{opt_file}', *(opts or [])]
 
 
 _TOP_LEVEL_EPILOG = """\
@@ -1781,6 +1787,11 @@ def _build_parser():
       metavar='FILE',
       help='write the structured JSON reconciliation report to FILE')
   diff_p.add_argument(
+      '--if-exists',
+      choices=('fail', 'replace'),
+      default='fail',
+      help='behavior when --to FILE already exists (default: fail)')
+  diff_p.add_argument(
       '--limit',
       '-n',
       dest='limit',
@@ -1901,7 +1912,8 @@ def _build_parser():
   chk.add_argument(
       '--jinja-variables',
       metavar='JSON',
-      help='JSON mapping of Jinja variables when explicitly expanding templates')
+      help='JSON mapping of Jinja variables when explicitly expanding templates'
+  )
   chk.add_argument(
       '--portable',
       '--strict-beam',
@@ -1922,8 +1934,10 @@ def _build_parser():
       'io',
       help='list or describe supported Beam URI & YAML connectors (<50ms)',
       allow_abbrev=False)
-  io_sub = io_p.add_subparsers(dest='io_action', required=True, metavar='ACTION')
-  io_sub.add_parser('list', help='list supported connectors', allow_abbrev=False)
+  io_sub = io_p.add_subparsers(
+      dest='io_action', required=True, metavar='ACTION')
+  io_sub.add_parser(
+      'list', help='list supported connectors', allow_abbrev=False)
   io_desc = io_sub.add_parser(
       'describe', help='describe one connector in detail', allow_abbrev=False)
   io_desc.add_argument('connector', metavar='CONNECTOR', help='connector name')
@@ -1957,13 +1971,16 @@ def _build_parser():
       '-f',
       '--follow',
       action='store_true',
-      help='follow new messages/rows continuously until Ctrl-C, -n, or --duration')
+      help=
+      'follow new messages/rows continuously until Ctrl-C, -n, or --duration')
   tail_p.add_argument(
       '-i',
       '--interactive',
       action='store_true',
       default=False,
-      help='human interactive terminal mode with live throughput display, colors, and field inspector')
+      help=
+      'human interactive terminal mode with live throughput display, colors, and field inspector'
+  )
   tail_p.add_argument(
       '-n',
       '--limit',
@@ -2011,7 +2028,8 @@ def _build_parser():
       default=None,
       metavar='FILE',
       help=argparse.SUPPRESS)
-  tail_p.add_argument('--project', metavar='PROJECT', help='default GCP project')
+  tail_p.add_argument(
+      '--project', metavar='PROJECT', help='default GCP project')
   _add_config_selection_args(tail_p)
 
   # 9. `beam wait`
@@ -2036,9 +2054,7 @@ def _build_parser():
 
   # 10. `beam cancel`
   cancel_p = commands.add_parser(
-      'cancel',
-      help='cancel or drain a running remote job',
-      allow_abbrev=False)
+      'cancel', help='cancel or drain a running remote job', allow_abbrev=False)
   cancel_p.add_argument('job_id', metavar='JOB_ID', help='job identifier')
   cancel_p.add_argument(
       '--drain',
@@ -2254,23 +2270,26 @@ def _build_parser():
       '--schedule',
       default='@daily',
       metavar='CRON',
-      help='cron schedule expression (e.g. "0 2 * * *") or Airflow macro (e.g. @daily, @hourly)')
+      help=
+      'cron schedule expression (e.g. "0 2 * * *") or Airflow macro (e.g. @daily, @hourly)'
+  )
   sched_p.add_argument(
       '--orchestrator',
       choices=['composer', 'cloud-scheduler'],
       default='composer',
-      help='target orchestrator: composer (Cloud Composer Airflow DAG) or cloud-scheduler (Cloud Scheduler script)')
+      help=
+      'target orchestrator: composer (Cloud Composer Airflow DAG) or cloud-scheduler (Cloud Scheduler script)'
+  )
   sched_p.add_argument(
       '--to',
       '-o',
       '--output',
       dest='to_destination',
       metavar='DEST_FILE',
-      help='destination file path for the generated DAG or script (prints to stdout if omitted)')
-  sched_p.add_argument(
-      '--project',
-      metavar='PROJECT',
-      help='GCP project ID')
+      help=
+      'destination file path for the generated DAG or script (prints to stdout if omitted)'
+  )
+  sched_p.add_argument('--project', metavar='PROJECT', help='GCP project ID')
   sched_p.add_argument(
       '--location',
       '--region',
@@ -2282,7 +2301,9 @@ def _build_parser():
       '--template-spec',
       dest='template_gcs_path',
       metavar='GCS_URI',
-      help='GCS path to Flex Template JSON spec (defaults to gs://<project>-templates/<name>.json)')
+      help=
+      'GCS path to Flex Template JSON spec (defaults to gs://<project>-templates/<name>.json)'
+  )
   sched_p.add_argument(
       '--job-name',
       metavar='NAME',
@@ -2300,9 +2321,7 @@ def _build_parser():
       metavar='SUBNET',
       help='VPC subnetwork for Dataflow workers')
   sched_p.add_argument(
-      '--network',
-      metavar='NETWORK',
-      help='VPC network for Dataflow workers')
+      '--network', metavar='NETWORK', help='VPC network for Dataflow workers')
   sched_p.add_argument(
       '--parameter',
       '--param',
@@ -2316,7 +2335,9 @@ def _build_parser():
   sched_p.add_argument(
       '--catchup',
       action='store_true',
-      help='enable catchup for historical DAG execution runs in Airflow (default: False)')
+      help=
+      'enable catchup for historical DAG execution runs in Airflow (default: False)'
+  )
   sched_p.add_argument(
       '--max-active-runs',
       type=int,
@@ -2526,10 +2547,7 @@ def _build_parser():
       default=False,
       help='preview catalog metadata changes without committing')
   sync_p.add_argument(
-      '--project',
-      dest='project',
-      default=None,
-      help='default GCP project')
+      '--project', dest='project', default=None, help='default GCP project')
   sync_p.add_argument(
       '--from-opt',
       '--source-opt',
@@ -2625,7 +2643,8 @@ def _config(args, extra_args, *, json_session, t0: float) -> int:
                 'action': args.config_action,
                 'result': text_out,
             },
-            error=output.classify_error('option not set', rc, command='config')[0]
+            error=output.classify_error('option not set', rc,
+                                        command='config')[0]
             if rc != 0 else None))
   return rc
 
@@ -2729,12 +2748,17 @@ def _doctor(args, extra_args, *, json_session, t0: float) -> int:
             outputs=report))
   else:
     status = 'HEALTHY' if report['healthy'] else 'DEGRADED'
-    print(f"Beam CLI Doctor: {status} (beam {report['beam_version']}, "
-          f"python {report['python_version']})")
+    print(
+        f"Beam CLI Doctor: {status} (beam {report['beam_version']}, "
+        f"python {report['python_version']})")
     for k, ok_val in report['extras'].items():
       print(f"  extra.{k:14s}: {'ok' if ok_val else 'missing'}")
-    print(f"  java                : {'ok (' + report['java']['java_bin'] + ')' if report['java']['ok'] else report['java']['message']}")
-    print(f"  gcp_adc             : {'ok (project=' + str(report['gcp_adc'].get('default_project')) + ')' if report['gcp_adc']['ok'] else report['gcp_adc'].get('message')}")
+    print(
+        f"  java                : {'ok (' + report['java']['java_bin'] + ')' if report['java']['ok'] else report['java']['message']}"
+    )
+    print(
+        f"  gcp_adc             : {'ok (project=' + str(report['gcp_adc'].get('default_project')) + ')' if report['gcp_adc']['ok'] else report['gcp_adc'].get('message')}"
+    )
     for w in doc_warnings:
       print(f'  warning             : {w}', file=sys.stderr)
   return rc
@@ -2828,16 +2852,14 @@ def _tail(args, extra_args, *, json_session, t0: float) -> int:
   follow = bool(getattr(args, 'follow', False))
   eff_limit = args.limit if args.limit is not None else (None if follow else 5)
   eff_duration = (
-      args.duration if args.duration is not None else (None if follow else '5s')
-  )
+      args.duration if args.duration is not None else
+      (None if follow else '5s'))
 
   explicit_interactive = bool(getattr(args, 'interactive', False))
-  interactive = bool(explicit_interactive or (
-      hasattr(sys.stdout, 'isatty')
-      and sys.stdout.isatty()
-      and not json_session.enabled
-      and not getattr(args, 'ndjson', False)
-  ))
+  interactive = bool(
+      explicit_interactive or (
+          hasattr(sys.stdout, 'isatty') and sys.stdout.isatty() and
+          not json_session.enabled and not getattr(args, 'ndjson', False)))
 
   on_record = None
   tail_formatter = None
@@ -2850,6 +2872,7 @@ def _tail(args, extra_args, *, json_session, t0: float) -> int:
       on_record = tail_formatter.on_stream_record
   elif follow:
     if json_session.enabled:
+
       def _stream_ndjson(rec: dict[str, Any], idx: int) -> None:
         json_session.emit_stream_line({
             'event': 'record',
@@ -2898,7 +2921,8 @@ def _tail(args, extra_args, *, json_session, t0: float) -> int:
       if not follow:
         rows = (untrusted or {}).get('rows', ())
         for idx, r in enumerate(rows, 1):
-          print(tail_formatter.format_record(r, idx), file=sys.stderr, flush=True)
+          print(
+              tail_formatter.format_record(r, idx), file=sys.stderr, flush=True)
       tail_formatter.render_exit_summary(interrupted=interrupted)
     json_session.emit(
         output.build_envelope(
@@ -3010,9 +3034,8 @@ def _package(args, extra_args, *, json_session, t0: float) -> int:
             outputs=report))
   else:
     docker_msg = (
-        'yes (single-image Python container)'
-        if report['docker_build_required'] else
-        'no (zero-Docker managed YAML launcher)')
+        'yes (single-image Python container)' if report['docker_build_required']
+        else 'no (zero-Docker managed YAML launcher)')
     print(f"Template      : {report['name']} (sdk={report['sdk_language']})")
     print(f'Docker Build  : {docker_msg}')
     print(f"Launcher Image: {report['image']}")
@@ -3027,8 +3050,7 @@ def _package(args, extra_args, *, json_session, t0: float) -> int:
       for p in report['parameters']:
         req_s = 'optional' if p.get('isOptional') else 'required'
         def_s = (
-            f", default={p['defaultValue']!r}"
-            if 'defaultValue' in p else '')
+            f", default={p['defaultValue']!r}" if 'defaultValue' in p else '')
         print(f"  - {p['name']} ({req_s}{def_s})")
     for w in pkg_warnings:
       print(f'Warning       : {w}', file=sys.stderr)
@@ -3044,11 +3066,13 @@ def _export_schedule(args, extra_args, *, json_session, t0: float) -> int:
   from . import scheduler as sched_mod
   _reject_extra_args(extra_args, subcommand='export-schedule')
   cfg_args = _resolve_config_args(args, [])
-  eff_project = args.project or _extract_opt_from_resolved(cfg_args, '--project')
+  eff_project = args.project or _extract_opt_from_resolved(
+      cfg_args, '--project')
   eff_region = args.location or _extract_opt_from_resolved(cfg_args, '--region')
   eff_sa = args.service_account_email or _extract_opt_from_resolved(
       cfg_args, '--service_account_email', '--service-account-email')
-  eff_subnet = args.subnetwork or _extract_opt_from_resolved(cfg_args, '--subnetwork')
+  eff_subnet = args.subnetwork or _extract_opt_from_resolved(
+      cfg_args, '--subnetwork')
   eff_net = args.network or _extract_opt_from_resolved(cfg_args, '--network')
 
   kwargs: dict[str, Any] = {
@@ -3075,7 +3099,8 @@ def _export_schedule(args, extra_args, *, json_session, t0: float) -> int:
   except sched_mod.SchedulerError as e:
     raise _CliError(str(e), e.exit_code) from None
   except Exception as e:  # pylint: disable=broad-except
-    raise _CliError(f'export-schedule failed: {e}', EXIT_PIPELINE_FAILED) from None
+    raise _CliError(
+        f'export-schedule failed: {e}', EXIT_PIPELINE_FAILED) from None
 
   if json_session.enabled:
     json_session.emit(
@@ -3094,7 +3119,9 @@ def _export_schedule(args, extra_args, *, json_session, t0: float) -> int:
             }))
   else:
     if report.destination:
-      print(f"Exported {report.orchestrator} schedule to: {report.destination}", file=sys.stderr)
+      print(
+          f"Exported {report.orchestrator} schedule to: {report.destination}",
+          file=sys.stderr)
     else:
       print(report.content)
   return EXIT_OK
@@ -3112,7 +3139,8 @@ def _schema(args, extra_args, *, json_session, t0: float) -> int:
         EXIT_USAGE)
 
   cfg_args = _resolve_config_args(args, [])
-  eff_project = args.project or _extract_opt_from_resolved(cfg_args, '--project')
+  eff_project = args.project or _extract_opt_from_resolved(
+      cfg_args, '--project')
 
   mode = getattr(args, 'mode', 'BACKWARD') or 'BACKWARD'
   strict = bool(getattr(args, 'strict', False))
@@ -3169,13 +3197,19 @@ def _schema(args, extra_args, *, json_session, t0: float) -> int:
             next_actions=env_next))
   else:
     status_label = 'COMPATIBLE' if is_compat else 'INCOMPATIBLE'
-    print(f"Schema Contract Status: {status_label} (mode: {res['compatibility_mode']})")
+    print(
+        f"Schema Contract Status: {status_label} (mode: {res['compatibility_mode']})"
+    )
     print(f"Source: {source} ({len(res['source_columns'])} columns)")
     print(f"Target: {target} ({len(res['target_columns'])} columns)")
     if res['diff']['columns_added']:
-      print(f"  + Added in source ({len(res['diff']['columns_added'])}): {', '.join(res['diff']['columns_added'])}")
+      print(
+          f"  + Added in source ({len(res['diff']['columns_added'])}): {', '.join(res['diff']['columns_added'])}"
+      )
     if res['diff']['columns_missing']:
-      print(f"  - Missing in source ({len(res['diff']['columns_missing'])}): {', '.join(res['diff']['columns_missing'])}")
+      print(
+          f"  - Missing in source ({len(res['diff']['columns_missing'])}): {', '.join(res['diff']['columns_missing'])}"
+      )
     if res['violations']:
       print(f"\nContract Violations ({len(res['violations'])}):")
       for v in res['violations']:
@@ -3237,7 +3271,10 @@ def _catalog(
         default_project=eff_proj,
         catalog_opts=eff_cat_opts,
         source_opts=eff_src_opts)
-  except (lakehouse.LakehouseError, uris.UriError, ValueError, FileNotFoundError) as e:
+  except (lakehouse.LakehouseError,
+          uris.UriError,
+          ValueError,
+          FileNotFoundError) as e:
     raise _CliError(str(e), EXIT_USAGE) from None
   except Exception as e:
     raise _CliError(f'catalog sync failed: {e}', EXIT_PIPELINE_FAILED) from None
@@ -3251,15 +3288,15 @@ def _catalog(
             duration_ms=int((time.monotonic() - t0) * 1000),
             outputs=res))
   else:
-    status_label = 'Dry Run (Preview)' if res.get('status') == 'dry_run' else 'Synced'
+    status_label = 'Dry Run (Preview)' if res.get(
+        'status') == 'dry_run' else 'Synced'
     print(
         f"\nCatalog Sync [{status_label}]:\n"
         f"  Source:      {res.get('source_uri')} ({res.get('source_format')})\n"
         f"  Target:      {res.get('target_table')} (catalog={res.get('target_catalog')})\n"
         f"  Files:       {res.get('files_to_sync') if res.get('files_to_sync') is not None else res.get('registered_files', 0)} data file(s)\n"
         f"  Zero-Copy:   {res.get('zero_copy')}\n"
-        f"  Status:      {res.get('status')}"
-    )
+        f"  Status:      {res.get('status')}")
     if res.get('metadata_path'):
       print(f"  Metadata:    {res.get('metadata_path')}")
   return EXIT_OK
@@ -3387,7 +3424,8 @@ def _diff(args, extra_args, *, json_session, t0: float) -> int:
         f'a required package is missing: {e}', EXIT_MISSING_PACKAGE) from None
   except Exception as e:  # pylint: disable=broad-except
     _maybe_print_traceback(args.verbose)
-    raise _CliError(f'diff failed: {_summarize(e)}', EXIT_PIPELINE_FAILED) from None
+    raise _CliError(
+        f'diff failed: {_summarize(e)}', EXIT_PIPELINE_FAILED) from None
 
   untrusted = report.pop('untrusted_data', None)
   diff_job_id = report.pop('job_id', None)
@@ -3401,10 +3439,40 @@ def _diff(args, extra_args, *, json_session, t0: float) -> int:
       raise _CliError(
           'beam diff --to requires a local file path (for example out/diff.json)',
           EXIT_USAGE)
-    from . import pipe_sql as _ps_diff
-    _ps_diff.write_json_document(args.sink, report)
+    from . import jobs
+    diff_if_exists = getattr(args, 'if_exists', 'fail') or 'fail'
+    abs_diff_sink = os.path.abspath(args.sink)
+    diff_parent = os.path.dirname(abs_diff_sink) or '.'
+    os.makedirs(diff_parent, exist_ok=True)
+    fd_df, tmp_df = tempfile.mkstemp(
+        prefix=f'.{os.path.basename(abs_diff_sink)}.', suffix='.tmp', dir=diff_parent)
+    try:
+      with os.fdopen(fd_df, 'w', encoding='utf-8') as df_fh:
+        json.dump(report, df_fh, indent=2, default=str)
+        df_fh.write('\n')
+      try:
+        os.chmod(tmp_df, 0o600)
+      except OSError:
+        pass
+      jobs.atomic_commit_local_file(
+          tmp_df, args.sink, allow_overwrite=(diff_if_exists != 'fail'))
+    except FileExistsError:
+      if os.path.exists(tmp_df):
+        try:
+          os.unlink(tmp_df)
+        except OSError:
+          pass
+      raise _format_existing_output_error(args.sink, [args.sink]) from None
+    except BaseException:
+      if os.path.exists(tmp_df):
+        try:
+          os.unlink(tmp_df)
+        except OSError:
+          pass
+      raise
     report = {**report, 'file': args.sink}
-  eff_rc = EXIT_OK if (drift_detected and getattr(args, 'exit_zero', False)) else rc
+  eff_rc = EXIT_OK if (
+      drift_detected and getattr(args, 'exit_zero', False)) else rc
   if json_session.enabled:
     json_session.emit(
         output.build_envelope(
@@ -3426,8 +3494,8 @@ def _diff(args, extra_args, *, json_session, t0: float) -> int:
             },
             outputs=report,
             warnings=diff_warnings,
-            error=output.classify_error(
-                'datasets differ', rc, command='diff')[0]
+            error=output.classify_error('datasets differ', rc,
+                                        command='diff')[0]
             if eff_rc != EXIT_OK else None,
             untrusted_data=untrusted))
   else:
@@ -3554,22 +3622,88 @@ def _run(args, pipeline_args, *, json_session, t0: float) -> int:
     except ValueError as e:
       raise _CliError(str(e), EXIT_USAGE) from None
 
-  def _guard_yaml_budget(raw_text: str, *, jinja_active: bool) -> None:
+  def _reject_shadow_yaml_flags(p_args: list[str]) -> None:
+    forbidden = (
+        '--yaml_pipeline',
+        '--yaml-pipeline',
+        '--yaml_pipeline_file',
+        '--yaml-pipeline-file',
+    )
+    for tok in p_args:
+      if tok in forbidden or any(tok.startswith(f + '=') for f in forbidden):
+        raise _CliError(
+            f'cannot pass {tok.split("=", 1)[0]} alongside FILE on beam run',
+            EXIT_USAGE)
+
+  def _extract_passthrough_jinja_vars(p_args: list[str],
+                                      base_json: str | None) -> dict[str, Any]:
+    merged_v: dict[str, Any] = {}
+    if base_json:
+      loaded_b = json.loads(base_json)
+      if isinstance(loaded_b, dict):
+        merged_v.update(loaded_b)
+    flag_names: list[str] = []
+    i = 0
+    while i < len(p_args):
+      tok = p_args[i]
+      val: str | None = None
+      if tok.startswith(('--jinja_variables=', '--jinja-variables=')):
+        val = tok.split('=', 1)[1]
+      elif tok in ('--jinja_variables',
+                   '--jinja-variables') and i + 1 < len(p_args):
+        val = p_args[i + 1]
+        i += 1
+      elif tok.startswith(
+          ('--jinja_variable_flags=', '--jinja-variable-flags=')):
+        flag_names.extend(
+            x.strip() for x in tok.split('=', 1)[1].split(',') if x.strip())
+      elif tok in ('--jinja_variable_flags',
+                   '--jinja-variable-flags') and i + 1 < len(p_args):
+        flag_names.extend(
+            x.strip() for x in p_args[i + 1].split(',') if x.strip())
+        i += 1
+      if val is not None:
+        try:
+          parsed_j = json.loads(val)
+        except ValueError as e:
+          raise _CliError(
+              f'invalid --jinja_variables JSON: {e}', EXIT_USAGE) from None
+        if not isinstance(parsed_j, dict):
+          raise _CliError('--jinja_variables must be a JSON object', EXIT_USAGE)
+        merged_v.update(parsed_j)
+      i += 1
+    for fn in flag_names:
+      opt_v = _extract_opt_from_resolved(
+          p_args, f'--{fn}', f'--{fn.replace("_", "-")}')
+      if opt_v is not None:
+        merged_v[fn] = opt_v
+    return merged_v
+
+  def _guard_and_expand_yaml(
+      raw_text: str,
+      *,
+      jinja_active: bool,
+      jinja_vars: dict[str, Any],
+  ) -> str:
+    import yaml
+    expanded = raw_text
     if jinja_active and ('{{' in raw_text or '{%' in raw_text):
       try:
-        output.validate_safe_jinja_template(raw_text)
+        expanded = output.safe_expand_jinja(raw_text, jinja_vars)
       except ValueError as e:
         raise _CliError(str(e), EXIT_USAGE) from None
-      return
-    if '{{' in raw_text or '{%' in raw_text:
-      return
-    import yaml
+    elif '{{' in raw_text or '{%' in raw_text:
+      return raw_text
     try:
-      output.safe_yaml_load(raw_text)
+      output.safe_yaml_load(expanded)
+    except ValueError as e:
+      raise _CliError(str(e), EXIT_USAGE) from None
     except yaml.YAMLError as e:
       if 'node budget' in str(e) or 'maximum' in str(e) or 'cyclic' in str(e):
         raise _CliError(str(e), EXIT_USAGE) from None
+    return expanded
 
+  _reject_shadow_yaml_flags(pipeline_args)
   eff_jinja_json = _merge_jinja_variables(
       getattr(args, 'jinja_variables', None),
       getattr(args, 'jinja_params', None))
@@ -3582,36 +3716,40 @@ def _run(args, pipeline_args, *, json_session, t0: float) -> int:
     eff_p_args = list(pipeline_args)
     if eff_jinja_json is not None:
       eff_p_args.append(f'--jinja_variables={eff_jinja_json}')
+    all_jvars = _extract_passthrough_jinja_vars(eff_p_args, eff_jinja_json)
     try:
       stdin_yaml = output.read_bounded_text(sys.stdin, label='stdin YAML')
     except ValueError as e:
       raise _CliError(str(e), EXIT_USAGE) from None
     if not stdin_yaml.strip():
-      raise _CliError('stdin (-) is empty; expected Beam YAML pipeline', EXIT_USAGE)
+      raise _CliError(
+          'stdin (-) is empty; expected Beam YAML pipeline', EXIT_USAGE)
     stdin_jinja = bool(args.allow_stdin_jinja and not args.no_jinja)
-    _guard_yaml_budget(stdin_yaml, jinja_active=stdin_jinja)
+    expanded_stdin = _guard_and_expand_yaml(
+        stdin_yaml, jinja_active=stdin_jinja, jinja_vars=all_jvars)
     resolved_args = _maybe_stage_preview_worker_args(
         _resolve_config_args(args, eff_p_args), dry_run=bool(args.dry_run))
-    if stdin_jinja:
-      return _run_yaml(
-          ['--yaml_pipeline=' + stdin_yaml] + resolved_args,
-          args.verbose,
-          command_name='run',
-          dry_run_yaml=stdin_yaml if args.dry_run else None,
-          wait_timeout_sec=wait_timeout_sec,
-          json_session=json_session,
-          t0=t0)
     return _run_yaml(
         resolved_args,
         args.verbose,
-        direct_yaml_text=stdin_yaml,
+        direct_yaml_text=expanded_stdin,
         command_name='run',
-        dry_run_yaml=stdin_yaml if args.dry_run else None,
+        dry_run_yaml=expanded_stdin if args.dry_run else None,
         wait_timeout_sec=wait_timeout_sec,
         json_session=json_session,
         t0=t0)
 
-  if '://' not in file and not os.path.isfile(file):
+  local_file_path: str | None = None
+  if '://' not in file:
+    local_file_path = file
+  elif file.lower().startswith('file://'):
+    parsed_f = urllib.parse.urlsplit(file)
+    f_path = urllib.parse.unquote(parsed_f.path)
+    if re.match(r'^/[A-Za-z]:/', f_path):
+      f_path = f_path[1:]
+    local_file_path = f_path
+
+  if local_file_path is not None and not os.path.isfile(local_file_path):
     hint = ''
     if pipeline_args:
       hint = '\n  custom pipeline options go after FILE, written as --flag=value'
@@ -3624,18 +3762,34 @@ def _run(args, pipeline_args, *, json_session, t0: float) -> int:
   eff_p_args = list(pipeline_args)
   if eff_jinja_json is not None:
     eff_p_args.append(f'--jinja_variables={eff_jinja_json}')
-
-  if '://' not in file:
-    try:
-      file_yaml = output.read_bounded_text(file, label=file)
-    except ValueError as e:
-      raise _CliError(str(e), EXIT_USAGE) from None
-    _guard_yaml_budget(file_yaml, jinja_active=not bool(args.no_jinja))
-  else:
-    file_yaml = None
+  all_jvars = _extract_passthrough_jinja_vars(eff_p_args, eff_jinja_json)
 
   resolved_args = _maybe_stage_preview_worker_args(
       _resolve_config_args(args, eff_p_args), dry_run=bool(args.dry_run))
+
+  file_yaml: str | None = None
+  if local_file_path is not None:
+    try:
+      file_yaml = output.read_bounded_text(local_file_path, label=file)
+    except ValueError as e:
+      raise _CliError(str(e), EXIT_USAGE) from None
+  else:
+    try:
+      from apache_beam.io.filesystems import FileSystems
+      from apache_beam.options.pipeline_options import PipelineOptions
+      FileSystems.set_options(PipelineOptions(resolved_args))
+      with FileSystems.open(file) as rfh:
+        file_yaml = output.read_bounded_text(rfh, label=file)
+    except ValueError as e:
+      raise _CliError(str(e), EXIT_USAGE) from None
+    except Exception:  # pylint: disable=broad-except
+      file_yaml = None
+
+  expanded_file_yaml: str | None = None
+  if file_yaml is not None:
+    expanded_file_yaml = _guard_and_expand_yaml(
+        file_yaml, jinja_active=not bool(args.no_jinja), jinja_vars=all_jvars)
+
   if args.no_jinja and file_yaml is not None:
     return _run_yaml(
         resolved_args,
@@ -3647,16 +3801,27 @@ def _run(args, pipeline_args, *, json_session, t0: float) -> int:
         json_session=json_session,
         t0=t0)
 
-  dry_text = file_yaml if args.dry_run else None
+  if (local_file_path is None or
+      file.lower().startswith('file://')) and (expanded_file_yaml is not None):
+    return _run_yaml(
+        resolved_args,
+        args.verbose,
+        direct_yaml_text=expanded_file_yaml,
+        command_name='run',
+        dry_run_yaml=expanded_file_yaml if args.dry_run else None,
+        wait_timeout_sec=wait_timeout_sec,
+        json_session=json_session,
+        t0=t0)
 
-  return _run_yaml(
-      ['--yaml_pipeline_file=' + file] + resolved_args,
-      args.verbose,
-      command_name='run',
-      dry_run_yaml=dry_text,
-      wait_timeout_sec=wait_timeout_sec,
-      json_session=json_session,
-      t0=t0)
+  dry_text = expanded_file_yaml if args.dry_run else None
+
+  return _run_yaml(['--yaml_pipeline_file=' + file] + resolved_args,
+                   args.verbose,
+                   command_name='run',
+                   dry_run_yaml=dry_text,
+                   wait_timeout_sec=wait_timeout_sec,
+                   json_session=json_session,
+                   t0=t0)
 
 
 _PRISM_AVAILABLE_CACHE: bool | None = None
@@ -3720,7 +3885,7 @@ _EXACT_LOCAL_FILE_EXTENSIONS = frozenset([
 
 
 def _materialize_single_local_file(
-    prefix: str, written: list[str]) -> list[str]:
+    prefix: str, written: list[str], *, mode: int = 0o644) -> list[str]:
   """Materializes sharded local output onto exact `prefix` when explicit."""
   if not prefix or not written or '://' in prefix:
     return written
@@ -3735,6 +3900,10 @@ def _materialize_single_local_file(
     return written
 
   if len(written) == 1:
+    try:
+      os.chmod(written[0], mode)
+    except OSError:
+      pass
     os.replace(written[0], prefix)
     return [prefix]
 
@@ -3799,7 +3968,7 @@ def _materialize_single_local_file(
             if not data.endswith(b'\n'):
               out_f.write(b'\n')
     try:
-      os.chmod(tmp_path, 0o644)
+      os.chmod(tmp_path, mode)
     except OSError:
       pass
     os.replace(tmp_path, prefix)
@@ -4087,7 +4256,40 @@ def _pipe_impl(
           getattr(args, 'post_where', None) or
           getattr(args, 'enrich_specs', None) or
           getattr(args, 'infer_specs', None)):
+    from . import expressions as _expr_mod
     from . import pipe_sql as _ps_mod
+    sel_txt = str(args.select)
+    where_txt = str(args.where) if getattr(args, 'where', None) else ''
+    sel_code = ' '.join(
+        seg for is_c, seg in _ps_mod._scan_sql_outside_literals(sel_txt)
+        if is_c)
+    where_code = ' '.join(
+        seg for is_c, seg in _ps_mod._scan_sql_outside_literals(where_txt)
+        if is_c) if where_txt else ''
+    _bad_frag_re = re.compile(
+        r'(?:;|--|/\*|#|\b(?:UNION|INTERSECT|EXCEPT|FROM|JOIN|SELECT|INTO|'
+        r'PRAGMA|ATTACH|DETACH|INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|'
+        r'COPY|EXPORT|IMPORT|INSTALL|LOAD|READ_CSV|READ_CSV_AUTO|'
+        r'READ_PARQUET|READ_JSON|READ_JSON_AUTO|READ_TEXT|READ_BLOB|GLOB)\b)',
+        re.IGNORECASE)
+    _bad_where_re = re.compile(
+        r'(?:;|--|/\*|#|\b(?:UNION|INTERSECT|EXCEPT|FROM|JOIN|SELECT|GROUP|'
+        r'ORDER|LIMIT|HAVING|INTO|PRAGMA|ATTACH|DETACH|COPY|EXPORT|IMPORT|'
+        r'INSTALL|LOAD|READ_CSV|READ_CSV_AUTO|READ_PARQUET|READ_JSON|'
+        r'READ_JSON_AUTO|READ_TEXT|READ_BLOB|GLOB)\b)',
+        re.IGNORECASE)
+    if _bad_frag_re.search(sel_code) or (where_code and
+                                         _bad_where_re.search(where_code)):
+      raise _CliError(
+          'SQL clause keywords (UNION, FROM, JOIN, SELECT, comments, or ";") '
+          'are not allowed inside --select / --where; pass --sql "SELECT ..." '
+          'explicitly',
+          EXIT_USAGE)
+    if where_txt:
+      try:
+        _expr_mod.compile_where(where_txt, known_columns=None)
+      except _expr_mod.ExpressionError as e:
+        raise _CliError(str(e), EXIT_USAGE) from None
     first_src = raw_sources[0] if raw_sources else ''
     m_alias = _ps_mod._ALIAS_PREFIX_RE.match(first_src)
     if m_alias and not os.path.exists(first_src):
@@ -4136,8 +4338,8 @@ def _pipe_impl(
           'or --interval-join <SPEC>',
           EXIT_USAGE)
     has_non_lateness_b23 = bool(
-        getattr(args, 'trigger', None) or getattr(args, 'accumulation', None)
-        or getattr(args, 'late_action', None) or
+        getattr(args, 'trigger', None) or getattr(args, 'accumulation', None) or
+        getattr(args, 'late_action', None) or
         getattr(args, 'late_data_dlq', None) or
         getattr(args, 'emit_pane_info', False))
     if (getattr(args, 'pre_select', None) or
@@ -4165,9 +4367,9 @@ def _pipe_impl(
           uris.parse_kv_options(
               getattr(args, 'join_opts', None),
               getattr(args, 'join_opt_file', None),
-              '--join-opt')
-          if (getattr(args, 'join_opts', None) or
-              getattr(args, 'join_opt_file', None)) else None)
+              '--join-opt') if (
+                  getattr(args, 'join_opts', None) or
+                  getattr(args, 'join_opt_file', None)) else None)
       parsed_to_opts = uris.parse_kv_options(
           args.to_opts, args.to_opt_file, '--to-opt')
       named_sources = pipe_sql.parse_named_sources(
@@ -4195,9 +4397,9 @@ def _pipe_impl(
               allow_jinja=allow_jinja) if args.sink else None)
       dlq_sql_default_fmt = None
       if args.dlq and not args.dlq_format:
-        if not (uris.extension_of(args.dlq) or (
-            '://' in args.dlq and
-            args.dlq.split('://', 1)[0].lower() not in uris.FILE_SCHEMES)):
+        if not (uris.extension_of(args.dlq) or
+                ('://' in args.dlq and
+                 args.dlq.split('://', 1)[0].lower() not in uris.FILE_SCHEMES)):
           dlq_sql_default_fmt = (
               (uris._infer_jinja_file_format(args.dlq) or 'json')
               if allow_jinja and uris._has_jinja_syntax(args.dlq) else 'json')
@@ -4340,7 +4542,8 @@ def _pipe_impl(
     non_portable_sql = pipe_sql.analyze_sql_portability(
         args.sql,
         sql_engine='sqlite' if args.sql_engine == 'python' else args.sql_engine)
-    has_keyed_json = bool(sink_ep is not None and 'key' in (sink_ep.config or {}))
+    has_keyed_json = bool(
+        sink_ep is not None and 'key' in (sink_ep.config or {}))
     if getattr(args, 'portable', False):
       if has_keyed_json:
         raise _CliError(
@@ -4378,7 +4581,8 @@ def _pipe_impl(
       if has_keyed_json:
         raise _CliError(
             '--to-opt key= (one keyed JSON document) is only for local --sql '
-            'runs, not --emit-yaml or remote runners', EXIT_USAGE)
+            'runs, not --emit-yaml or remote runners',
+            EXIT_USAGE)
       sql_extra_warns: list[str] = []
       if args.sql_engine not in ('sqlite', 'python') and sql_uses_calcite:
         note_eng = (
@@ -4409,8 +4613,9 @@ def _pipe_impl(
                   is_local_runner and not args.dry_run and
                   args.if_exists != 'append')))
       run_sql_yaml = (
-          yaml.dump(staged_sql_spec, Dumper=dumper, sort_keys=False, width=100000)
-          if (sql_stage_prefix or sql_dlq_stage) else sql_yaml_str)
+          yaml.dump(
+              staged_sql_spec, Dumper=dumper, sort_keys=False, width=100000) if
+          (sql_stage_prefix or sql_dlq_stage) else sql_yaml_str)
       sql_run_extra_out = (
           None if args.dry_run else {
               'sql_engine': ('calcite' if sql_uses_calcite else 'python'),
@@ -4485,22 +4690,74 @@ def _pipe_impl(
           on_violation=getattr(args, 'on_violation', 'dlq'),
           drop_bad=bool(getattr(args, 'drop_bad', False)),
           expect_metrics_out=sql_exp_metrics)
+      eff_dlq_count = int(len(dlq_recs)) if dlq_ep is not None else 0
+      sql_filtered_out = (
+          max(0, int(total_read) - int(len(out_rows)) - eff_dlq_count) if
+          (len(named_sources) == 1 and not sql_changes_cardinality) else 0)
+      sql_metrics: dict[str, Any] = {
+          'rows_read': int(total_read),
+          'rows_written': int(len(out_rows)),
+          'rows_filtered_out': int(sql_filtered_out),
+          'dlq_rows': eff_dlq_count,
+      }
+      if sql_exp_metrics:
+        sql_metrics.update(sql_exp_metrics)
+      # Verify conservation BEFORE committing or deleting any sink/DLQ files!
+      if args.assert_counts:
+        err_sql_cnt = jobs.check_assert_counts(sql_metrics)
+        if err_sql_cnt:
+          raise _CliError(
+              err_sql_cnt, EXIT_PIPELINE_FAILED, extra={'metrics': sql_metrics})
+
+      def _canonical_sql_local_final(ep_obj) -> str | None:
+        if ep_obj is None:
+          return None
+        raw_p = str(ep_obj.output_prefix or ep_obj.config.get('path') or '')
+        if not raw_p:
+          return None
+        if raw_p.lower().startswith('file://'):
+          raw_p = urllib.parse.unquote(urllib.parse.urlsplit(raw_p).path)
+          if re.match(r'^/[A-Za-z]:/', raw_p):
+            raw_p = raw_p[1:]
+        elif '://' in raw_p:
+          return None
+        ext_p = os.path.splitext(raw_p)[1].lower()
+        has_ext = ext_p in (
+            '.csv',
+            '.tsv',
+            '.json',
+            '.jsonl',
+            '.ndjson',
+            '.parquet',
+            '.pq',
+            '.avro',
+            '.txt')
+        final_p = raw_p if has_ext else f'{raw_p}-00000-of-00001'
+        return os.path.abspath(final_p)
+
+      append_lock_paths: list[str] = []
+      if args.if_exists == 'append':
+        for cand_ep in (sink_ep, dlq_ep):
+          canon_p = _canonical_sql_local_final(cand_ep)
+          if canon_p:
+            append_lock_paths.append(f'{canon_p}.append.lock')
+      append_lock_paths = sorted(set(append_lock_paths))
+
       written_sql: list[str] = []
       dlq_written: list[str] = []
       staged_sql_pairs: list[tuple[str, str]] = []
-      append_cm = (
-          jobs._file_lock(
-              Path(f'{os.path.abspath(sink_prefix)}.append.lock'))
-          if (args.if_exists == 'append' and sink_prefix and
-              '://' not in sink_prefix) else contextlib.nullcontext())
+      remote_stage_dir: str | None = None
       try:
         sink_sql_pair: tuple[str, str] | None = None
         remote_sink_uri: str | None = None
         dlq_sql_pair: tuple[str, str] | None = None
-        with append_cm:
+        with contextlib.ExitStack() as lock_stack:
+          for lp in append_lock_paths:
+            lock_stack.enter_context(jobs._file_lock(Path(lp)))
           if sink_ep is not None:
-            if '://' in (sink_prefix or '') and not str(
-                sink_prefix).lower().startswith('file://'):
+            if '://' in (
+                sink_prefix or
+                '') and not str(sink_prefix).lower().startswith('file://'):
               if args.if_exists == 'append':
                 raise _CliError(
                     f'--if-exists append on remote object {sink_prefix!r} '
@@ -4508,6 +4765,7 @@ def _pipe_impl(
                     EXIT_USAGE)
               from apache_beam.io.filesystems import FileSystems
               from apache_beam.options.pipeline_options import PipelineOptions
+              from . import lakehouse as _lh_sql
               FileSystems.set_options(PipelineOptions(resolved_args))
               if args.if_exists == 'fail':
                 existing_m = FileSystems.match([sink_prefix])
@@ -4515,15 +4773,15 @@ def _pipe_impl(
                   raise _format_existing_output_error(
                       sink_prefix,
                       [md.path for md in existing_m[0].metadata_list])
+              if remote_stage_dir is None:
+                remote_stage_dir = tempfile.mkdtemp(prefix='.beam_sql_stage_')
+                try:
+                  os.chmod(remote_stage_dir, 0o700)
+                except OSError:
+                  pass
               ext_rem = (
                   os.path.splitext(sink_prefix)[1] or f'.{sink_ep.format}')
-              fd_rem, tmp_rem_target = tempfile.mkstemp(
-                  prefix='.beam_sql_remote.', suffix=ext_rem)
-              os.close(fd_rem)
-              try:
-                os.unlink(tmp_rem_target)
-              except OSError:
-                pass
+              tmp_rem_target = os.path.join(remote_stage_dir, f'sink{ext_rem}')
               local_proxy_ep = uris.parse_endpoint(
                   tmp_rem_target,
                   is_read=False,
@@ -4538,13 +4796,23 @@ def _pipe_impl(
                   tag='sink')
               staged_sql_pairs.append(rem_stage_pair)
               with open(rem_stage_pair[0], 'rb') as rf:
-                with FileSystems.create(sink_prefix) as wf:
-                  shutil.copyfileobj(rf, wf, length=1024 * 1024)
+                rem_bytes = rf.read()
+              try:
+                _lh_sql._fs_write_bytes(
+                    sink_prefix,
+                    rem_bytes,
+                    exclusive_create=(args.if_exists == 'fail'))
+              except FileExistsError:
+                raise _format_existing_output_error(
+                    sink_prefix, [sink_prefix]) from None
               remote_sink_uri = sink_prefix
             else:
-              local_target = (
-                  urllib.parse.urlsplit(sink_prefix).path
-                  if str(sink_prefix).lower().startswith('file://') else None)
+              local_target = None
+              if str(sink_prefix).lower().startswith('file://'):
+                local_target = urllib.parse.unquote(
+                    urllib.parse.urlsplit(sink_prefix).path)
+                if re.match(r'^/[A-Za-z]:/', local_target):
+                  local_target = local_target[1:]
               eff_sink_ep = (
                   uris.parse_endpoint(
                       local_target,
@@ -4563,21 +4831,21 @@ def _pipe_impl(
           if dlq_ep is not None:
             dlq_prefix_str = str(
                 dlq_ep.output_prefix or dlq_ep.config.get('path') or '')
-            if '://' in dlq_prefix_str and not dlq_prefix_str.lower().startswith(
-                'file://'):
+            if '://' in dlq_prefix_str and not dlq_prefix_str.lower(
+            ).startswith('file://'):
               if dlq_recs:
                 from apache_beam.io.filesystems import FileSystems
                 from apache_beam.options.pipeline_options import PipelineOptions
                 FileSystems.set_options(PipelineOptions(resolved_args))
+                if remote_stage_dir is None:
+                  remote_stage_dir = tempfile.mkdtemp(prefix='.beam_sql_stage_')
+                  try:
+                    os.chmod(remote_stage_dir, 0o700)
+                  except OSError:
+                    pass
                 ext_dlq = (
                     os.path.splitext(dlq_prefix_str)[1] or f'.{dlq_ep.format}')
-                fd_dlq, tmp_dlq_target = tempfile.mkstemp(
-                    prefix='.beam_sql_dlq.', suffix=ext_dlq)
-                os.close(fd_dlq)
-                try:
-                  os.unlink(tmp_dlq_target)
-                except OSError:
-                  pass
+                tmp_dlq_target = os.path.join(remote_stage_dir, f'dlq{ext_dlq}')
                 local_dlq_proxy = uris.parse_endpoint(
                     tmp_dlq_target,
                     is_read=False,
@@ -4598,7 +4866,8 @@ def _pipe_impl(
                   ['step', 'error_type', 'error', 'raw_payload'],
                   dlq_recs,
                   dlq_ep,
-                  if_exists='append' if args.if_exists == 'append' else 'replace',
+                  if_exists='append'
+                  if args.if_exists == 'append' else 'replace',
                   tag='dlq')
               staged_sql_pairs.append(dlq_sql_pair)
           if sink_sql_pair is not None:
@@ -4620,6 +4889,8 @@ def _pipe_impl(
               os.unlink(tmp_p)
             except OSError:
               pass
+        if remote_stage_dir is not None:
+          shutil.rmtree(remote_stage_dir, ignore_errors=True)
       if remote_sink_uri is not None:
         written_sql = [remote_sink_uri]
       elif sink_sql_pair is not None:
@@ -4646,25 +4917,6 @@ def _pipe_impl(
     non_portable_items = list(non_portable_sql)
     if has_keyed_json:
       non_portable_items.append('--to-opt key=')
-    eff_dlq_count = int(len(dlq_recs)) if dlq_ep is not None else 0
-    sql_filtered_out = (
-        max(0, int(total_read) - int(len(out_rows)) - eff_dlq_count)
-        if (len(named_sources) == 1 and not sql_changes_cardinality) else 0)
-    sql_metrics: dict[str, Any] = {
-        'rows_read': int(total_read),
-        'rows_written': int(len(out_rows)),
-        'rows_filtered_out': int(sql_filtered_out),
-        'dlq_rows': eff_dlq_count,
-    }
-    if sql_exp_metrics:
-      sql_metrics.update(sql_exp_metrics)
-    if args.assert_counts:
-      err_sql_cnt = jobs.check_assert_counts(sql_metrics)
-      if err_sql_cnt:
-        raise _CliError(
-            err_sql_cnt,
-            EXIT_PIPELINE_FAILED,
-            extra={'metrics': sql_metrics})
     sql_outputs: dict[str, Any] = {
         'files': written_sql,
         'file_count': len(written_sql),
@@ -4949,13 +5201,13 @@ def _pipe_impl(
     runner_norm = _runner_name(explicit_runner)
     if runner_norm == 'dataflow':
       has_streaming = any(
-          a == '--streaming' or a.startswith('--streaming=') for a in resolved_args)
+          a == '--streaming' or a.startswith('--streaming=')
+          for a in resolved_args)
       if not has_streaming:
         resolved_args.append('--streaming')
       has_streaming_engine = any(
           a in ('--enable_streaming_engine', '--enable-streaming-engine') or
-          a.startswith('--enable_streaming_engine=')
-          for a in resolved_args)
+          a.startswith('--enable_streaming_engine=') for a in resolved_args)
       if not has_streaming_engine:
         resolved_args.append('--enable_streaming_engine')
 
@@ -4986,8 +5238,8 @@ def _pipe_impl(
   # (`<100 ms` pure-Python manifest synthesis with `bytes_copied == 0`).
   if args.zero_copy and not args.dry_run:
     from . import lakehouse
-    if ('://' in source_uri or '://' in args.sink or any(
-        '://' in str(x) for x in (args.to_opts or ()))):
+    if ('://' in source_uri or '://' in args.sink or
+        any('://' in str(x) for x in (args.to_opts or ()))):
       from apache_beam.io.filesystems import FileSystems
       from apache_beam.options.pipeline_options import PipelineOptions
       FileSystems.set_options(PipelineOptions(resolved_args))
@@ -5025,8 +5277,10 @@ def _pipe_impl(
           source_uri,
           args.sink,
           keys=args.verify_keys,
-          left_opts=args.from_opts,
-          right_opts=args.to_opts,
+          left_opts=_merge_opt_file_into_kv_list(
+              args.from_opts, getattr(args, 'from_opt_file', None), '--from-opt'),
+          right_opts=_merge_opt_file_into_kv_list(
+              args.to_opts, getattr(args, 'to_opt_file', None), '--to-opt'),
           pipeline_args=resolved_args,
           default_project=default_proj)
       diff_rep.pop('untrusted_data', None)
@@ -5035,7 +5289,9 @@ def _pipe_impl(
         raise _CliError(
             f'--verify detected mismatch between {source_uri} and {args.sink}',
             EXIT_DIFF_MISMATCH,
-            extra={'outputs': zc_res, 'metrics': zc_metrics})
+            extra={
+                'outputs': zc_res, 'metrics': zc_metrics
+            })
 
     if json_session.enabled:
       json_session.emit(
@@ -5108,7 +5364,8 @@ def _pipe_impl(
   import yaml
   dumper = getattr(yaml, 'CSafeDumper', yaml.SafeDumper)
   canonical_spec = json.dumps(pipe.spec, sort_keys=True, separators=(',', ':'))
-  plan_hash = 'sha256:' + hashlib.sha256(canonical_spec.encode('utf-8')).hexdigest()
+  plan_hash = 'sha256:' + hashlib.sha256(
+      canonical_spec.encode('utf-8')).hexdigest()
 
   orig_out_prefix = pipe.output_prefix
   orig_dlq_prefix = (
@@ -5120,8 +5377,8 @@ def _pipe_impl(
       (pipe.dlq_endpoint is not None and
        pipe.late_dlq_endpoint is not None) else None)
   explicit_sharding = any(
-      str(opt).split('=', 1)[0].strip() in ('num_shards', 'shard_name_template')
-      for opt in (args.to_opts or ()))
+      str(opt).split('=', 1)[0].strip() in (
+          'num_shards', 'shard_name_template') for opt in (args.to_opts or ()))
   staged_spec, sink_stage_dir, sink_stage_prefix, dlq_stage_dir, dlq_stage_prefix = (
       _stage_spec_sinks(
           pipe.spec,
@@ -5135,8 +5392,9 @@ def _pipe_impl(
               args.if_exists != 'append')))
 
   if args.if_exists == 'replace' and not args.dry_run and not sink_stage_prefix:
-    src_path = (pipe.source_endpoint.config.get('path')
-                if pipe.source_endpoint is not None else None)
+    src_path = (
+        pipe.source_endpoint.config.get('path')
+        if pipe.source_endpoint is not None else None)
     if isinstance(src_path, str) and '://' not in src_path:
       from . import dlq as dlq_mod
       _refuse_replace_of_input(orig_out_prefix, dlq_mod._match_paths(src_path))
@@ -5158,8 +5416,12 @@ def _pipe_impl(
           'left': source_uri,
           'right': args.sink,
           'keys': list(args.verify_keys),
-          'left_opts': list(args.from_opts),
-          'right_opts': list(args.to_opts),
+          'left_opts': _merge_opt_file_into_kv_list(
+              args.from_opts,
+              getattr(args, 'from_opt_file', None),
+              '--from-opt'),
+          'right_opts': _merge_opt_file_into_kv_list(
+              args.to_opts, getattr(args, 'to_opt_file', None), '--to-opt'),
       } if args.verify else None,
   }
 
@@ -5275,8 +5537,7 @@ def _pipe_impl(
       extra_warnings.append(note_inf_pii)
       if not json_session.enabled:
         print(f'note: {note_inf_pii}', file=sys.stderr)
-  if (getattr(args, 'pattern', None) and
-      pipe.source_endpoint is not None and
+  if (getattr(args, 'pattern', None) and pipe.source_endpoint is not None and
       pipe.source_endpoint.kind == 'file' and
       not getattr(args, 'timestamp_col', None)):
     has_pat_ts = any(
@@ -5425,8 +5686,8 @@ def _commit_staged_local_files(
 def _bigquery_write_disposition(spec: dict[str, Any]) -> str | None:
   """The write_disposition of the first BigQuery sink in a pipe spec."""
   for t in spec.get('pipeline', {}).get('transforms', []):
-    if 'BigQuery' in str(t.get('type', '')) and str(
-        t.get('type', '')).startswith(('Write', 'CliWrite')):
+    if 'BigQuery' in str(t.get('type', '')) and str(t.get(
+        'type', '')).startswith(('Write', 'CliWrite')):
       return (t.get('config') or {}).get('write_disposition')
   return None
 
@@ -5602,8 +5863,10 @@ def _dry_run_offline_ok(exc: BaseException, yaml_text: str) -> bool:
   if not check_cmd._is_remote_access_error(exc):
     return False
   import tempfile
-  with tempfile.NamedTemporaryFile(
-      'w', suffix='.yaml', delete=False, encoding='utf-8') as f:
+  with tempfile.NamedTemporaryFile('w',
+                                   suffix='.yaml',
+                                   delete=False,
+                                   encoding='utf-8') as f:
     f.write(yaml_text)
     path = f.name
   try:
@@ -5666,10 +5929,17 @@ def _run_yaml(
   _dlq_mod.install_keyword_safe_row_hooks()
 
   # Bound local Java XLang expansion heap to 256MB when user hasn't set JVM opts.
-  prev_java_opts = os.environ.get('JAVA_TOOL_OPTIONS')
-  set_temp_java_opts = bool(requires_java_xlang and not prev_java_opts)
-  if set_temp_java_opts:
-    os.environ['JAVA_TOOL_OPTIONS'] = '-Xmx256m'
+  global _JAVA_OPTS_REFCOUNT
+  acquired_temp_java_opts = False
+  if requires_java_xlang:
+    with _JAVA_OPTS_LOCK:
+      if _JAVA_OPTS_REFCOUNT > 0:
+        _JAVA_OPTS_REFCOUNT += 1
+        acquired_temp_java_opts = True
+      elif not os.environ.get('JAVA_TOOL_OPTIONS'):
+        os.environ['JAVA_TOOL_OPTIONS'] = '-Xmx256m'
+        _JAVA_OPTS_REFCOUNT = 1
+        acquired_temp_java_opts = True
 
   pipeline = None
   result = None
@@ -5721,13 +5991,21 @@ def _run_yaml(
                 'yaml': pipe_spec.redact_yaml_text(direct_yaml_text)
             }
           else:
-            options, constructor, display_data = (
+            from . import pipe_spec
+            options, constructor, raw_display_data = (
                 yaml_main.build_pipeline_components_from_argv(
                     yaml_or_pipeline_argv))
+            display_data = {
+                dk: (
+                    pipe_spec.redact_yaml_text(dv)
+                    if isinstance(dv, str) else dv)
+                for dk, dv in (raw_display_data or {}).items()
+            }
 
           orig_runner_raw = options.view_as(StandardOptions).runner
-          if (dry_run_yaml is None and _runner_name(orig_runner_raw) == 'direct'
-              and not requires_java_xlang and not _can_use_prism_locally()):
+          if (dry_run_yaml is None and
+              _runner_name(orig_runner_raw) == 'direct' and
+              not requires_java_xlang and not _can_use_prism_locally()):
             options.view_as(StandardOptions).runner = 'FnApiRunner'
             switched_to_fnapi = True
 
@@ -5753,28 +6031,23 @@ def _run_yaml(
               EXIT_MISSING_PACKAGE) from None
         except Exception as e:  # pylint: disable=broad-except
           if dry_run_yaml is not None and requires_java_xlang and any(
-              tok in str(e) for tok in (
-                  'Unknown type or missing provider',
-                  'Unknown transform type',
-                  'Unknown type or urn',
-                  'Java',
-                  'Service failed to start')):
+              tok in str(e)
+              for tok in ('Unknown type or missing provider',
+                          'Unknown transform type', 'Unknown type or urn',
+                          'Java', 'Service failed to start')):
             options = PipelineOptions(yaml_or_pipeline_argv)
-          elif (dry_run_yaml is not None and command_name == 'pipe' and (
-              isinstance(e, FileNotFoundError) or any(
-                  tok in str(e) for tok in (
-                      'Unable to get schema',
-                      'Found no files',
-                      'No files found',
-                      'no such file',
-                      'does not exist',
-                      'empty or has no header')))):
+          elif (dry_run_yaml is not None and command_name == 'pipe' and
+                (isinstance(e, FileNotFoundError) or
+                 any(tok in str(e)
+                     for tok in ('Unable to get schema', 'Found no files',
+                                 'No files found', 'no such file',
+                                 'does not exist', 'empty or has no header')))):
             options = PipelineOptions(yaml_or_pipeline_argv)
             warnings_list.append(
                 'Source files do not exist yet; emitted portable YAML without '
                 'live schema inspection.')
-          elif dry_run_yaml is not None and _dry_run_offline_ok(
-              e, dry_run_yaml):
+          elif dry_run_yaml is not None and _dry_run_offline_ok(e,
+                                                                dry_run_yaml):
             # Like `beam check --plan`: building needs cloud storage or
             # credentials that aren't available, but the YAML is valid.
             options = PipelineOptions(yaml_or_pipeline_argv)
@@ -5791,6 +6064,8 @@ def _run_yaml(
         warnings_list.extend(_warn_if_local_paths(local_paths, options))
 
       if dry_run_yaml is not None:
+        from . import pipe_spec
+        safe_dry_yaml = pipe_spec.redact_yaml_text(dry_run_yaml)
         if json_session is not None and json_session.enabled:
           json_session.emit(
               output.build_envelope(
@@ -5801,11 +6076,11 @@ def _run_yaml(
                   duration_ms=int((time.monotonic() - t0) * 1000),
                   warnings=warnings_list,
                   outputs={
-                      'yaml': dry_run_yaml,
+                      'yaml': safe_dry_yaml,
                       'plan_hash': plan_hash,
                   }))
         else:
-          print(dry_run_yaml, end='')
+          print(safe_dry_yaml, end='')
           print(
               'Dry run: the pipeline was built and checked but not run. To run '
               'it, save the YAML (for example with > pipeline.yaml) and use: '
@@ -5827,138 +6102,185 @@ def _run_yaml(
         if json_session is None or not json_session.enabled:
           print(f'warning: {warn_nw}', file=sys.stderr)
 
-      # Remote submission 30-minute idempotency check!
+      # Remote submission 30-minute idempotency check (serialized across retries)!
       idem_key: str | None = None
-      if not is_local and raw_argv_for_idem and plan_hash:
-        idem_key = jobs.compute_idempotency_key(raw_argv_for_idem, plan_hash)
-        existing_rec = jobs.lookup_recent_submission(idem_key)
-        if existing_rec is not None:
-          ex_state = str(existing_rec.get('state') or '').upper()
-          if (not no_wait and ex_state not in jobs._TERMINAL_SUCCESS_STATES and
-              _runner_name(runner_raw) == 'dataflow'):
-            gcp_re = options.view_as(GoogleCloudOptions)
-            w_code, existing_rec = jobs.wait_for_job(
-                str(existing_rec['job_id']),
-                timeout_seconds=wait_timeout_sec,
-                project=gcp_re.project or existing_rec.get('project'),
-                region=gcp_re.region or existing_rec.get('region'),
-                show_progress=not (json_session is not None and
-                                   json_session.enabled))
-            if w_code == EXIT_TIMEOUT:
-              raise _CliError(
-                  f're-attached job {existing_rec["job_id"]!r} still running '
-                  f'after --wait-timeout ({wait_timeout_sec}s)',
-                  EXIT_TIMEOUT,
-                  extra={
-                      'detached': True,
-                      'deduplicated': True,
-                      'job_id': existing_rec.get('job_id'),
-                      'runner': existing_rec.get('runner'),
-                      'state': existing_rec.get('state'),
-                  })
-            if w_code != EXIT_OK:
-              err_detail = (
-                  existing_rec.get('post_check_error') or
-                  f"re-attached job {existing_rec.get('job_id')!r} failed "
-                  f"(state: {existing_rec.get('state')})")
-              raise _CliError(
-                  str(err_detail),
-                  w_code,
-                  extra={
-                      'outputs': existing_rec.get('outputs', {}),
-                      'metrics': existing_rec.get('metrics', {}),
-                  })
-          if json_session is not None and json_session.enabled:
-            json_session.emit(
-                output.build_envelope(
-                    ok=True,
-                    command=command_name,
-                    exit_code=EXIT_OK,
-                    runner=existing_rec.get('runner'),
-                    job_id=existing_rec.get('job_id'),
-                    state=existing_rec.get('state'),
-                    duration_ms=int((time.monotonic() - t0) * 1000),
-                    metrics=existing_rec.get('metrics') or None,
-                    warnings=warnings_list + [
-                        'Re-attached to recent identical remote submission '
-                        '(idempotency guard).'
-                    ],
-                    outputs={
-                        **existing_rec.get('outputs', {}),
-                        'deduplicated': True,
-                    }))
-          else:
-            print(
-                f"Re-attached to existing job {existing_rec['job_id']} "
-                f"(state: {existing_rec.get('state')}).")
-          return EXIT_OK
-
-      if (replace_commit_target is None and output_prefix is not None and
-          if_exists == 'replace'):
-        # Fallback for unstaged remote sinks after graph build & idempotency pass.
-        _remove_existing_output_for_replace(output_prefix)
-
-      state = None
-      timed_out = False
-      subproc_logger = logging.getLogger('apache_beam.utils.subprocess_server')
-      suppress_prism_log = bool(
-          not verbose and is_local and _runner_name(runner_raw) == 'direct')
-      prev_subproc_level = subproc_logger.level
-      if suppress_prism_log:
-        subproc_logger.setLevel(logging.CRITICAL)
-      if not is_local:
-        print(
-            f'[beam] Submitting job to {runner_raw or "remote runner"} '
-            '(staging SDK & packages)...',
-            file=sys.stderr,
-            flush=True)
+      existing_rec: dict[str, Any] | None = None
+      idem_stack = contextlib.ExitStack()
       try:
+        if not is_local and raw_argv_for_idem and plan_hash:
+          idem_key = jobs.compute_idempotency_key(raw_argv_for_idem, plan_hash)
+          idem_lock_fn = getattr(jobs, 'idem_submission_lock', None)
+          if callable(idem_lock_fn):
+            idem_stack.enter_context(idem_lock_fn(idem_key))
+          existing_rec = jobs.lookup_recent_submission(idem_key)
+          if existing_rec is not None:
+            idem_stack.close()
+            ex_state = str(existing_rec.get('state') or '').upper()
+            if (not no_wait and
+                ex_state not in jobs._TERMINAL_SUCCESS_STATES and
+                _runner_name(runner_raw) == 'dataflow'):
+              gcp_re = options.view_as(GoogleCloudOptions)
+              w_code, existing_rec = jobs.wait_for_job(
+                  str(existing_rec['job_id']),
+                  timeout_seconds=wait_timeout_sec,
+                  project=gcp_re.project or existing_rec.get('project'),
+                  region=gcp_re.region or existing_rec.get('region'),
+                  show_progress=not (json_session is not None and
+                                     json_session.enabled))
+              if w_code == EXIT_TIMEOUT:
+                raise _CliError(
+                    f're-attached job {existing_rec["job_id"]!r} still running '
+                    f'after --wait-timeout ({wait_timeout_sec}s)',
+                    EXIT_TIMEOUT,
+                    extra={
+                        'detached': True,
+                        'deduplicated': True,
+                        'job_id': existing_rec.get('job_id'),
+                        'runner': existing_rec.get('runner'),
+                        'state': existing_rec.get('state'),
+                    })
+              if w_code != EXIT_OK:
+                err_detail = (
+                    existing_rec.get('post_check_error') or
+                    f"re-attached job {existing_rec.get('job_id')!r} failed "
+                    f"(state: {existing_rec.get('state')})")
+                raise _CliError(
+                    str(err_detail),
+                    w_code,
+                    extra={
+                        'outputs': existing_rec.get('outputs', {}),
+                        'metrics': existing_rec.get('metrics', {}),
+                    })
+            if json_session is not None and json_session.enabled:
+              json_session.emit(
+                  output.build_envelope(
+                      ok=True,
+                      command=command_name,
+                      exit_code=EXIT_OK,
+                      runner=existing_rec.get('runner'),
+                      job_id=existing_rec.get('job_id'),
+                      state=existing_rec.get('state'),
+                      duration_ms=int((time.monotonic() - t0) * 1000),
+                      metrics=existing_rec.get('metrics') or None,
+                      warnings=warnings_list + [
+                          'Re-attached to recent identical remote submission '
+                          '(idempotency guard).'
+                      ],
+                      outputs={
+                          **existing_rec.get('outputs', {}),
+                          'deduplicated': True,
+                      }))
+            else:
+              print(
+                  f"Re-attached to existing job {existing_rec['job_id']} "
+                  f"(state: {existing_rec.get('state')}).")
+            return EXIT_OK
+
+        if (replace_commit_target is None and output_prefix is not None and
+            if_exists == 'replace'):
+          # Fallback for unstaged remote sinks after graph build & idempotency pass.
+          _remove_existing_output_for_replace(output_prefix)
+
+        def _on_remote_submitted(res_obj: Any) -> None:
+          try:
+            early_jid = _extract_job_id(res_obj)
+            if not is_local and early_jid:
+              early_gcp = options.view_as(GoogleCloudOptions)
+              early_url = (
+                  jobs.dataflow_console_url(
+                      early_jid, early_gcp.project, early_gcp.region)
+                  if _runner_name(runner_raw) == 'dataflow' else None)
+              early_outs: dict[str, Any] = {
+                  'output_prefix': output_prefix,
+                  'dlq_prefix': dlq_prefix,
+              }
+              if destination:
+                early_outs['destination'] = destination
+              if early_url:
+                early_outs['console_url'] = early_url
+              jobs.record_job_submission(
+                  early_jid,
+                  runner=str(runner_raw or 'DataflowRunner'),
+                  state=str(getattr(res_obj, 'state', 'RUNNING') or 'RUNNING'),
+                  command=command_name,
+                  project=early_gcp.project,
+                  region=early_gcp.region,
+                  idem_key=idem_key,
+                  post_checks=post_checks,
+                  outputs=early_outs)
+          except Exception:  # pylint: disable=broad-except
+            pass
+          finally:
+            # Release per-key submission lock BEFORE `wait_until_finish()` so
+            # concurrent retries immediately observe the recorded RUNNING job!
+            idem_stack.close()
+
+        state = None
+        timed_out = False
+        subproc_logger = logging.getLogger(
+            'apache_beam.utils.subprocess_server')
+        suppress_prism_log = bool(
+            not verbose and is_local and _runner_name(runner_raw) == 'direct')
+        prev_subproc_level = subproc_logger.level
+        if suppress_prism_log:
+          subproc_logger.setLevel(logging.CRITICAL)
+        if not is_local:
+          print(
+              f'[beam] Submitting job to {runner_raw or "remote runner"} '
+              '(staging SDK & packages)...',
+              file=sys.stderr,
+              flush=True)
         try:
-          result = _execute_with_optional_timeout(
-              pipeline,
-              options=options,
-              no_wait=no_wait,
-              wait_timeout_sec=wait_timeout_sec,
-              is_local=is_local)
-        except NotImplementedError:
-          # When Prism cannot bind a port in a restricted sandbox, DirectRunner
-          # falls back to BundleBasedDirectRunner which rejects batched PyArrow
-          # DoFns (`WriteToParquet`). Retry seamlessly on in-process FnApiRunner!
-          if is_local and _runner_name(runner_raw) == 'direct':
-            options.view_as(StandardOptions).runner = 'FnApiRunner'
-            pipeline = beam.Pipeline(options=options, display_data=display_data)
-            constructor(pipeline)
+          try:
             result = _execute_with_optional_timeout(
                 pipeline,
                 options=options,
                 no_wait=no_wait,
                 wait_timeout_sec=wait_timeout_sec,
-                is_local=True)
-            options.view_as(StandardOptions).runner = runner_raw
-          else:
-            raise
-        finally:
-          if switched_to_fnapi:
-            options.view_as(StandardOptions).runner = orig_runner_raw
-          if suppress_prism_log:
-            subproc_logger.setLevel(prev_subproc_level)
-        result, state, timed_out = result
-      except KeyboardInterrupt:
-        raise
-      except Exception as e:  # pylint: disable=broad-except
-        _maybe_print_traceback(verbose)
-        more = '' if verbose else '\n  rerun with --verbose for the traceback'
-        raise _CliError(
-            f'pipeline failed: {_summarize(e)}{more}',
-            EXIT_PIPELINE_FAILED) from None
+                is_local=is_local,
+                on_submitted=_on_remote_submitted if not is_local else None)
+          except NotImplementedError:
+            # When Prism cannot bind a port in a restricted sandbox, DirectRunner
+            # falls back to BundleBasedDirectRunner which rejects batched PyArrow
+            # DoFns (`WriteToParquet`). Retry seamlessly on in-process FnApiRunner!
+            if is_local and _runner_name(runner_raw) == 'direct':
+              options.view_as(StandardOptions).runner = 'FnApiRunner'
+              pipeline = beam.Pipeline(
+                  options=options, display_data=display_data)
+              constructor(pipeline)
+              result = _execute_with_optional_timeout(
+                  pipeline,
+                  options=options,
+                  no_wait=no_wait,
+                  wait_timeout_sec=wait_timeout_sec,
+                  is_local=True)
+              options.view_as(StandardOptions).runner = runner_raw
+            else:
+              raise
+          finally:
+            if switched_to_fnapi:
+              options.view_as(StandardOptions).runner = orig_runner_raw
+            if suppress_prism_log:
+              subproc_logger.setLevel(prev_subproc_level)
+          result, state, timed_out = result
+        except KeyboardInterrupt:
+          raise
+        except Exception as e:  # pylint: disable=broad-except
+          _maybe_print_traceback(verbose)
+          more = '' if verbose else '\n  rerun with --verbose for the traceback'
+          raise _CliError(
+              f'pipeline failed: {_summarize(e)}{more}',
+              EXIT_PIPELINE_FAILED) from None
+      finally:
+        idem_stack.close()
 
     # Persist remote job record when a remote job ID exists!
     job_id = _extract_job_id(result)
     gcp_opts = options.view_as(GoogleCloudOptions)
     console_url = (
-        jobs.dataflow_console_url(job_id, gcp_opts.project, gcp_opts.region)
-        if (not is_local and job_id and _runner_name(runner_raw) == 'dataflow')
-        else None)
+        jobs.dataflow_console_url(job_id, gcp_opts.project, gcp_opts.region) if
+        (not is_local and job_id and
+         _runner_name(runner_raw) == 'dataflow') else None)
     remote_outputs: dict[str, Any] = {
         'output_prefix': output_prefix,
         'dlq_prefix': dlq_prefix,
@@ -5994,7 +6316,8 @@ def _run_yaml(
           'requires_human': False,
       }] if job_id else []
       clean_remote_out = {
-          k: v for k, v in remote_outputs.items() if v is not None
+          k: v
+          for k, v in remote_outputs.items() if v is not None
       }
       extra_detached: dict[str, Any] = {
           'detached': True,
@@ -6093,7 +6416,8 @@ def _run_yaml(
       dlq_files = _matching_files(
           dlq_prefix, verbose, error_exit_code=EXIT_PIPELINE_FAILED)
       if allow_materialize:
-        dlq_files = _materialize_single_local_file(dlq_prefix, dlq_files)
+        dlq_files = _materialize_single_local_file(
+            dlq_prefix, dlq_files, mode=0o600)
       if is_local:
         _cleanup_empty_beam_temp_dirs(dlq_prefix)
       outputs_dict['dlq_files'] = dlq_files
@@ -6210,8 +6534,12 @@ def _run_yaml(
     # Break frame reference cycles for PortableRunner `atexit` handlers.
     pipeline = None
     result = None
-    if set_temp_java_opts:
-      os.environ.pop('JAVA_TOOL_OPTIONS', None)
+    if acquired_temp_java_opts:
+      with _JAVA_OPTS_LOCK:
+        _JAVA_OPTS_REFCOUNT = max(0, _JAVA_OPTS_REFCOUNT - 1)
+        if _JAVA_OPTS_REFCOUNT == 0 and os.environ.get(
+            'JAVA_TOOL_OPTIONS') == '-Xmx256m':
+          os.environ.pop('JAVA_TOOL_OPTIONS', None)
     del threading
 
 
@@ -6243,7 +6571,8 @@ def _log_remote_submission(
       suffix = f'; waiting up to {wait_timeout_sec:g}s before detaching...'
     else:
       suffix = '; waiting for completion...'
-    print(f'[beam] Submitted job {jid}{loc}{suffix}', file=sys.stderr, flush=True)
+    print(
+        f'[beam] Submitted job {jid}{loc}{suffix}', file=sys.stderr, flush=True)
   return jid, url
 
 
@@ -6254,15 +6583,19 @@ def _execute_with_optional_timeout(
     no_wait: bool,
     wait_timeout_sec: float | None,
     is_local: bool,
+    on_submitted=None,
 ):
   import threading
   if no_wait:
     res = pipeline.run()
+    if on_submitted is not None:
+      on_submitted(res)
     if not is_local:
       _log_remote_submission(res, options, no_wait=True, wait_timeout_sec=None)
     return res, None, False
 
-  def _start_remote_heartbeat(jid: str | None) -> tuple[threading.Event, threading.Thread | None]:
+  def _start_remote_heartbeat(
+      jid: str | None) -> tuple[threading.Event, threading.Thread | None]:
     stop_ev = threading.Event()
     if is_local or not jid:
       return stop_ev, None
@@ -6282,6 +6615,8 @@ def _execute_with_optional_timeout(
 
   if wait_timeout_sec is None:
     res = pipeline.run()
+    if on_submitted is not None:
+      on_submitted(res)
     jid = None
     if not is_local:
       jid, _ = _log_remote_submission(
@@ -6301,6 +6636,8 @@ def _execute_with_optional_timeout(
     # job inside `pipeline.run()`; complete submission first so `job_id` is
     # always captured and persisted before bounding `wait_until_finish()`.
     res = pipeline.run()
+    if on_submitted is not None:
+      on_submitted(res)
     jid, _ = _log_remote_submission(
         res, options, no_wait=False, wait_timeout_sec=wait_timeout_sec)
     stop_ev, _ = _start_remote_heartbeat(jid)
@@ -6402,15 +6739,15 @@ def _refuse_replace_of_input(prefix: str | None, input_files: Iterable[str]):
   if not prefix:
     return
   outputs = {os.path.abspath(p) for p in _output_files_for_replace(prefix)}
-  overlap = sorted(
-      p for p in input_files if os.path.abspath(p) in outputs)
+  overlap = sorted(p for p in input_files if os.path.abspath(p) in outputs)
   if overlap:
     raise _CliError(
         f'--to {prefix} is also an input ({overlap[0]}); with --if-exists '
         'replace on this runner the old output is deleted before the inputs '
         'are read. Write to a new file and move it over the old one, or run '
         'it as a small local job (in-process or local --sql), which reads the '
-        'inputs first', EXIT_USAGE)
+        'inputs first',
+        EXIT_USAGE)
 
 
 def _format_existing_output_error(prefix, existing):
@@ -6433,8 +6770,8 @@ def _format_existing_output_error(prefix, existing):
 
 def _is_owned_by_prefix(path: str, prefix: str) -> bool:
   """True if `path` is `prefix` itself or a Beam shard of `prefix` (`-NNNNN-of-NNNNN`)."""
-  if not prefix or prefix.endswith(('/', os.sep)) or any(
-      ch in prefix for ch in '*?['):
+  if not prefix or prefix.endswith(
+      ('/', os.sep)) or any(ch in prefix for ch in '*?['):
     return True
   norm_path = path.replace('\\', '/')
   norm_pref = prefix.replace('\\', '/')
@@ -6536,9 +6873,8 @@ def _summarize(error, max_lines=10):
   has_tb = _PYTHON_TRACEBACK in message
   lines = [
       line.strip() if not has_tb else line.rstrip()
-      for line in message.splitlines()
-      if line.strip() and (
-          not line[0].isspace() if has_tb else not line.startswith('  '))
+      for line in message.splitlines() if line.strip() and
+      (not line[0].isspace() if has_tb else not line.startswith('  '))
   ]
   if has_tb and any(_PYTHON_TRACEBACK in line for line in lines):
     context = lines[0].split(_PYTHON_TRACEBACK)[0].rstrip()

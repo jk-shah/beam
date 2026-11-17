@@ -27,14 +27,17 @@ JARs and `~/.beam/maven-wrapper/` are shared between `beam-sql.sh` and
 """
 
 import contextlib
+import errno
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -68,6 +71,26 @@ _RUNNER_ARTIFACTS = {
 }
 
 _VALID_ARTIFACT_PART = re.compile(r'^[a-z0-9][a-z0-9._-]*$')
+_ANSI_SEQ_RE = re.compile(
+    r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[@-_]')
+_CTRL_CHARS_RE = re.compile(r'[\x00-\x1f\x7f-\x9f]')
+
+_SQL_LOCKS_GUARD = threading.Lock()
+_SQL_INPROC_LOCKS: dict[str, threading.RLock] = {}
+_SQL_LOCK_DEPTH: dict[tuple[str, int], int] = {}
+
+
+def _sanitize_log_token(text: str) -> str:
+  return _CTRL_CHARS_RE.sub('', _ANSI_SEQ_RE.sub('', str(text)))
+
+
+def _get_sql_inproc_lock(abs_key: str) -> threading.RLock:
+  with _SQL_LOCKS_GUARD:
+    lk = _SQL_INPROC_LOCKS.get(abs_key)
+    if lk is None:
+      lk = threading.RLock()
+      _SQL_INPROC_LOCKS[abs_key] = lk
+    return lk
 
 
 def _is_valid_jar(jar_path: str) -> bool:
@@ -78,41 +101,80 @@ def _is_valid_jar(jar_path: str) -> bool:
 
 @contextlib.contextmanager
 def _file_lock(lock_path: str):
-  lock_dir = os.path.dirname(os.path.abspath(lock_path)) or '.'
-  os.makedirs(lock_dir, mode=0o700, exist_ok=True)
-  fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-  try:
-    if os.name == 'nt':
-      import msvcrt
-      os.lseek(fd, 0, os.SEEK_SET)
+  abs_key = os.path.abspath(str(lock_path))
+  lock_dir = os.path.dirname(abs_key) or '.'
+  inproc_lk = _get_sql_inproc_lock(abs_key)
+  with inproc_lk:
+    depth_key = (abs_key, threading.get_ident())
+    depth = _SQL_LOCK_DEPTH.get(depth_key, 0)
+    if depth > 0:
+      _SQL_LOCK_DEPTH[depth_key] = depth + 1
       try:
-        if os.fstat(fd).st_size == 0:
-          os.write(fd, b'\0')
-          os.lseek(fd, 0, os.SEEK_SET)
-      except OSError:
-        pass
-      while True:
-        try:
-          msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
-          break
-        except OSError:
-          time.sleep(0.05)
-    else:
-      import fcntl
-      fcntl.flock(fd, fcntl.LOCK_EX)
-    yield
-  finally:
+        yield
+      finally:
+        _SQL_LOCK_DEPTH[depth_key] = depth
+      return
+
+    if os.path.islink(lock_dir) or os.path.islink(lock_path) or os.path.islink(
+        abs_key):
+      raise SqlError(f'refusing symlinked lock path {lock_path!r}', _EXIT_USAGE)
+    os.makedirs(lock_dir, mode=0o700, exist_ok=True)
+    if os.path.islink(lock_dir) or os.path.islink(lock_path) or os.path.islink(
+        abs_key):
+      raise SqlError(f'refusing symlinked lock path {lock_path!r}', _EXIT_USAGE)
+    open_flags = os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0)
+    try:
+      fd = os.open(abs_key, open_flags, 0o600)
+    except OSError as exc:
+      if exc.errno == getattr(errno, 'ELOOP', -1):
+        raise SqlError(
+            f'refusing symlinked lock path {lock_path!r}',
+            _EXIT_USAGE) from None
+      raise
+    try:
+      st_mode = os.fstat(fd).st_mode
+    except OSError:
+      os.close(fd)
+      raise
+    if not stat.S_ISREG(st_mode):
+      os.close(fd)
+      raise SqlError(
+          f'lock path {lock_path!r} must be a regular file', _EXIT_USAGE)
+
     try:
       if os.name == 'nt':
         import msvcrt
         os.lseek(fd, 0, os.SEEK_SET)
-        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        try:
+          if os.fstat(fd).st_size == 0:
+            os.write(fd, b'\0')
+            os.lseek(fd, 0, os.SEEK_SET)
+        except OSError:
+          pass
+        while True:
+          try:
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            break
+          except OSError:
+            time.sleep(0.05)
       else:
         import fcntl
-        fcntl.flock(fd, fcntl.LOCK_UN)
-    except OSError:
-      pass
-    os.close(fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+      _SQL_LOCK_DEPTH[depth_key] = 1
+      yield
+    finally:
+      _SQL_LOCK_DEPTH.pop(depth_key, None)
+      try:
+        if os.name == 'nt':
+          import msvcrt
+          os.lseek(fd, 0, os.SEEK_SET)
+          msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+          import fcntl
+          fcntl.flock(fd, fcntl.LOCK_UN)
+      except OSError:
+        pass
+      os.close(fd)
 
 
 def _installed_beam_version() -> str:
@@ -157,6 +219,9 @@ def run(
   java_bin, java_home = _find_java()
 
   home = beam_home or os.path.expanduser(os.environ.get('BEAM_HOME', '~/.beam'))
+  if os.path.islink(home):
+    raise SqlError(
+        f'refusing symlinked BEAM_HOME directory {home!r}', _EXIT_USAGE)
   cache_dir = os.path.join(home, 'cache')
   os.makedirs(cache_dir, mode=0o700, exist_ok=True)
   if os.path.islink(cache_dir):
@@ -165,9 +230,17 @@ def run(
         _EXIT_USAGE)
   jar_path = os.path.join(
       cache_dir, _cache_filename(resolved_version, runner_key, clean_ios))
+  if os.path.islink(jar_path):
+    raise SqlError(
+        f'refusing symlinked Beam SQL cached JAR {jar_path!r}', _EXIT_USAGE)
 
-  if _is_valid_jar(jar_path):
-    print(f'Using cached Beam SQL JAR: {jar_path}', file=sys.stderr)
+  with _file_lock(f'{jar_path}.lock'):
+    cached_ready = _is_valid_jar(jar_path)
+
+  if cached_ready:
+    print(
+        f'Using cached Beam SQL JAR: {_sanitize_log_token(jar_path)}',
+        file=sys.stderr)
   else:
     wrapper_jar = _ensure_maven_wrapper(home)
     _build_shaded_jar(
@@ -182,7 +255,7 @@ def run(
 
   cmd = [java_bin, '-cp', jar_path, _MAIN_CLASS, *sqlline_args]
   if debug:
-    print('+ ' + ' '.join(cmd), file=sys.stderr)
+    print('+ ' + ' '.join(_sanitize_log_token(c) for c in cmd), file=sys.stderr)
   proc = subprocess.run(cmd, check=False)
   return proc.returncode
 
@@ -190,13 +263,13 @@ def run(
 def _resolve_version(version):
   """Returns the Maven release version to use for Beam SQL artifacts."""
   if version:
-    if not _VALID_ARTIFACT_PART.match(version.lower()):
+    if '..' in version or not _VALID_ARTIFACT_PART.match(version.lower()):
       raise SqlError(f'invalid Beam version {version!r}', _EXIT_USAGE)
     return version
   installed = _installed_beam_version()
-  if '.dev' not in installed and not re.search(r'rc\d+$',
-                                               installed,
-                                               re.IGNORECASE):
+  if ('.dev' not in installed and
+      not re.search(r'rc\d+$', installed, re.IGNORECASE) and
+      '..' not in installed and _VALID_ARTIFACT_PART.match(installed.lower())):
     return installed
   # A development checkout (`2.XX.0.dev`) has no published Maven JARs; fall
   # back to the latest release on Maven Central, just as `beam-sql.sh` uses a
@@ -209,8 +282,9 @@ def _resolve_version(version):
         _EXIT_FAILED)
   latest = versions[0]
   print(
-      f'Installed Beam is {installed}; using latest released Beam SQL '
-      f'{latest} (override with --version).',
+      f'Installed Beam is {_sanitize_log_token(installed)}; using latest '
+      f'released Beam SQL {_sanitize_log_token(latest)} '
+      '(override with --version).',
       file=sys.stderr)
   return latest
 
@@ -234,7 +308,7 @@ def _normalize_ios(ios):
   seen = set()
   for raw in ios:
     name = raw.strip().lower()
-    if not name or not _VALID_ARTIFACT_PART.match(name):
+    if not name or '..' in name or not _VALID_ARTIFACT_PART.match(name):
       raise SqlError(
           f'invalid --io connector {raw!r}; run `beam sql --list-ios` to see '
           'available connectors',
@@ -342,6 +416,27 @@ _MAVEN_DISTRIBUTION_URL = (
     f'{_MAVEN_VERSION}/apache-maven-{_MAVEN_VERSION}-bin.zip')
 
 
+def _replace_with_nt_retry(
+    tmp_path: str,
+    dest_path: str,
+    *,
+    accept_existing_valid_jar: bool = False,
+) -> None:
+  for attempt in range(6):
+    try:
+      os.replace(tmp_path, dest_path)
+      return
+    except PermissionError:
+      if os.name != 'nt':
+        raise
+      if attempt < 5:
+        time.sleep(0.01)
+        continue
+      if accept_existing_valid_jar and _is_valid_jar(dest_path):
+        return
+      raise
+
+
 def _atomic_write_props(props_path: str, content: str) -> None:
   props_dir = os.path.dirname(os.path.abspath(props_path)) or '.'
   os.makedirs(props_dir, mode=0o700, exist_ok=True)
@@ -350,7 +445,7 @@ def _atomic_write_props(props_path: str, content: str) -> None:
   try:
     with os.fdopen(fd, 'w', encoding='utf-8') as f:
       f.write(content)
-    os.replace(tmp_path, props_path)
+    _replace_with_nt_retry(tmp_path, props_path)
   finally:
     if os.path.exists(tmp_path):
       try:
@@ -377,7 +472,9 @@ def _ensure_maven_wrapper(beam_home):
         not os.path.islink(wrapper_props)):
       return wrapper_jar
 
-    print(f'Downloading Maven Wrapper into {wrapper_dir}...', file=sys.stderr)
+    print(
+        f'Downloading Maven Wrapper into {_sanitize_log_token(wrapper_dir)}...',
+        file=sys.stderr)
     os.makedirs(os.path.dirname(wrapper_jar), mode=0o700, exist_ok=True)
     _atomic_write_props(
         wrapper_props, f'distributionUrl={_MAVEN_DISTRIBUTION_URL}\n')
@@ -427,7 +524,10 @@ def _download_https(url, dest_path, max_bytes: int = 32 * 1024 * 1024):
           _EXIT_FAILED)
     with os.fdopen(fd, 'wb') as f:
       f.write(data)
-    os.replace(tmp_path, dest_path)
+    _replace_with_nt_retry(
+        tmp_path,
+        dest_path,
+        accept_existing_valid_jar=str(dest_path).lower().endswith('.jar'))
   except (urllib.error.URLError, OSError) as e:
     if os.path.exists(tmp_path):
       try:
@@ -446,7 +546,7 @@ def _download_https(url, dest_path, max_bytes: int = 32 * 1024 * 1024):
 
 def _validated_dep_version(env_var: str, default: str) -> str:
   val = (os.environ.get(env_var) or default).strip()
-  if not _VALID_ARTIFACT_PART.match(val.lower()):
+  if '..' in val or not _VALID_ARTIFACT_PART.match(val.lower()):
     raise SqlError(f'invalid {env_var}={val!r}', _EXIT_USAGE)
   return val
 
@@ -475,43 +575,38 @@ def _render_pom(version, runner_key, ios):
   for io_name in ios:
     deps.append(
         _dep_xml(
-            'org.apache.beam', f'beam-sdks-java-io-{io_name}',
+            'org.apache.beam',
+            f'beam-sdks-java-io-{io_name}',
             '${beam.version}'))
     if io_name == 'delta':
       deps.append(
           _dep_xml(
-              'org.apache.beam', 'beam-sdks-java-extensions-sql-delta',
+              'org.apache.beam',
+              'beam-sdks-java-extensions-sql-delta',
               '${beam.version}'))
       for gcs_art in ('gcs-connector', 'util-hadoop', 'gcsio', 'util'):
         deps.append(_dep_xml('com.google.cloud.bigdataoss', gcs_art, gcs_ver))
     elif io_name == 'iceberg':
       deps.append(
           _dep_xml(
-              'org.apache.beam', 'beam-sdks-java-extensions-sql-iceberg',
+              'org.apache.beam',
+              'beam-sdks-java-extensions-sql-iceberg',
               '${beam.version}'))
       for ice_art in ('iceberg-aws', 'iceberg-aws-bundle', 'iceberg-gcp'):
         deps.append(_dep_xml('org.apache.iceberg', ice_art, iceberg_ver))
 
   deps.append(
       _dep_xml(
-          'org.apache.beam', 'beam-sdks-java-extensions-sql-jdbc',
+          'org.apache.beam',
+          'beam-sdks-java-extensions-sql-jdbc',
           '${beam.version}'))
   runner_artifact = _RUNNER_ARTIFACTS[runner_key]
   if runner_artifact:
-    deps.append(
-        _dep_xml('org.apache.beam', runner_artifact, '${beam.version}'))
+    deps.append(_dep_xml('org.apache.beam', runner_artifact, '${beam.version}'))
   deps_block = '\n'.join(deps)
-  return f"""\
-<project xmlns="http://maven.apache.org/POM/4.0.0"
-         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
-    <modelVersion>4.0.0</modelVersion>
-    <groupId>org.apache.beam</groupId>
-    <artifactId>beam-sql-shell-runner</artifactId>
-    <version>1.0</version>
-    <dependencies>
-{deps_block}
-    </dependencies>
+  repos_block = ''
+  if 'snapshot' in str(version).lower():
+    repos_block = f"""
     <repositories>
         <repository>
             <id>apache.snapshots</id>
@@ -524,7 +619,18 @@ def _render_pom(version, runner_key, ios):
                 <updatePolicy>always</updatePolicy>
             </snapshots>
         </repository>
-    </repositories>
+    </repositories>"""
+  return f"""\
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>org.apache.beam</groupId>
+    <artifactId>beam-sql-shell-runner</artifactId>
+    <version>1.0</version>
+    <dependencies>
+{deps_block}
+    </dependencies>{repos_block}
     <properties>
         <beam.version>{xml_escape(version)}</beam.version>
     </properties>
@@ -583,12 +689,16 @@ def _build_shaded_jar(
   lock_path = f'{jar_path}.lock'
   with _file_lock(lock_path):
     if _is_valid_jar(jar_path):
-      print(f'Using cached Beam SQL JAR: {jar_path}', file=sys.stderr)
+      print(
+          f'Using cached Beam SQL JAR: {_sanitize_log_token(jar_path)}',
+          file=sys.stderr)
       return
 
-    io_desc = f', ios: {", ".join(ios)}' if ios else ''
+    safe_ios = [_sanitize_log_token(x) for x in ios]
+    io_desc = f', ios: {", ".join(safe_ios)}' if safe_ios else ''
     print(
-        f'Building Beam SQL v{version} JAR (runner: {runner_key}{io_desc}); '
+        f'Building Beam SQL v{_sanitize_log_token(version)} JAR '
+        f'(runner: {_sanitize_log_token(runner_key)}{io_desc}); '
         'this takes a moment on first run...',
         file=sys.stderr)
     env = os.environ.copy()
@@ -618,7 +728,9 @@ def _build_shaded_jar(
         cmd.append('-q')
       cmd.extend(['--batch-mode', 'package'])
       if debug:
-        print('+ ' + ' '.join(cmd), file=sys.stderr)
+        print(
+            '+ ' + ' '.join(_sanitize_log_token(c) for c in cmd),
+            file=sys.stderr)
         proc = subprocess.run(cmd, env=env, check=False)
         details = ''
       else:
@@ -630,13 +742,16 @@ def _build_shaded_jar(
           work_dir, 'target', 'beam-sql-shell-runner-1.0.jar')
       if proc.returncode != 0 or not _is_valid_jar(built_jar):
         if 'Could not find artifact org.apache.beam:' in details:
+          last_ln = _sanitize_log_token(details.splitlines()[-1])
           raise SqlError(
-              f'Maven could not resolve a Beam {version} artifact:\n'
-              f'  {details.splitlines()[-1]}\n'
+              f'Maven could not resolve a Beam {_sanitize_log_token(version)} '
+              f'artifact:\n  {last_ln}\n'
               '  check --version (`beam sql --list-versions`) and --io '
               '(`beam sql --list-ios`)',
               _EXIT_USAGE)
-        suffix = f':\n{details}' if details else ''
+        clean_details = '\n'.join(
+            _sanitize_log_token(ln) for ln in details.splitlines())
+        suffix = f':\n{clean_details}' if clean_details else ''
         raise SqlError(
             f'Maven build for Beam SQL JAR failed{suffix}', _EXIT_FAILED)
 
@@ -649,7 +764,8 @@ def _build_shaded_jar(
       os.close(fd)
       try:
         shutil.copyfile(built_jar, tmp_jar)
-        os.replace(tmp_jar, jar_path)
+        _replace_with_nt_retry(
+            tmp_jar, jar_path, accept_existing_valid_jar=True)
       finally:
         if os.path.exists(tmp_jar):
           try:
@@ -657,7 +773,9 @@ def _build_shaded_jar(
           except OSError:
             pass
 
-    print(f'Cached Beam SQL JAR at {jar_path}', file=sys.stderr)
+    print(
+        f'Cached Beam SQL JAR at {_sanitize_log_token(jar_path)}',
+        file=sys.stderr)
 
 
 _METADATA_URL = (
@@ -701,10 +819,15 @@ def _fetch_maven_versions():
     root = ET.fromstring(xml_text)
   except ET.ParseError:
     return []
-  versions = [
-      el.text.strip() for el in root.findall('.//versions/version')
-      if el.text and 'SNAPSHOT' not in el.text
-  ]
+  versions = []
+  for el in root.findall('.//versions/version'):
+    if not el.text:
+      continue
+    raw_v = _sanitize_log_token(el.text).strip()
+    if (not raw_v or raw_v != el.text.strip() or 'SNAPSHOT' in raw_v.upper() or
+        '..' in raw_v or not _VALID_ARTIFACT_PART.match(raw_v.lower())):
+      continue
+    versions.append(raw_v)
   return sorted(
       versions,
       key=lambda v: [(0, int(p)) if p.isdigit() else (1, p)
@@ -722,11 +845,19 @@ def _query_maven_artifacts(prefix, excluded_re):
     return []
   try:
     docs = json.loads(body).get('response', {}).get('docs', [])
-    return sorted({
-        doc['a'][len(prefix):]
-        for doc in docs if doc.get('a', '').startswith(prefix) and
-        not excluded_re.search(doc['a'][len(prefix):])
-    })
+    results = set()
+    for doc in docs:
+      art = str(doc.get('a', ''))
+      if not art.startswith(prefix):
+        continue
+      raw_suf = art[len(prefix):]
+      clean_suf = _sanitize_log_token(raw_suf)
+      if (not clean_suf or clean_suf != raw_suf or '..' in clean_suf or
+          not _VALID_ARTIFACT_PART.match(clean_suf.lower()) or
+          excluded_re.search(clean_suf)):
+        continue
+      results.add(clean_suf)
+    return sorted(results)
   except (ValueError, KeyError, TypeError):
     return []
 
@@ -740,7 +871,7 @@ def _list_versions():
         _EXIT_FAILED)
   print('10 latest Apache Beam releases:')
   for ver in versions[:10]:
-    print(f'  {ver}')
+    print(f'  {_sanitize_log_token(ver)}')
   return 0
 
 
@@ -761,7 +892,10 @@ def _list_ios():
   print('Available Apache Beam SQL IO connectors:')
   print(
       textwrap.fill(
-          ' '.join(ios), width=78, initial_indent='  ', subsequent_indent='  '))
+          ' '.join(_sanitize_log_token(x) for x in ios),
+          width=78,
+          initial_indent='  ',
+          subsequent_indent='  '))
   return 0
 
 
@@ -769,25 +903,27 @@ def _list_runners(version):
   # Maven Central's artifact index only matches `v:` against `latestVersion`,
   # so query `beam-runners-*` directly rather than failing whenever `--version`
   # is not the newest release.
+  safe_ver = _sanitize_log_token(version)
   runners = _query_maven_artifacts('beam-runners-', _EXCLUDED_RUNNER_RE)
   if not runners:
     print(
-        f'warning: could not fetch runners for Beam {version} from Maven '
+        f'warning: could not fetch runners for Beam {safe_ver} from Maven '
         'Central; supported by `beam sql`:',
         file=sys.stderr)
     print('  direct    - DirectRunner (runs locally, default)')
     print('  dataflow  - DataflowRunner (runs on Google Cloud Dataflow)')
     return _EXIT_FAILED
 
-  print(f'Available runners in Maven Central (Beam {version}):')
+  print(f'Available runners in Maven Central (Beam {safe_ver}):')
   for raw in runners:
-    if raw == 'direct-java':
+    safe_raw = _sanitize_log_token(raw)
+    if safe_raw == 'direct-java':
       print('  direct    - DirectRunner (supported by beam sql, default)')
-    elif raw == 'google-cloud-dataflow-java':
+    elif safe_raw == 'google-cloud-dataflow-java':
       print('  dataflow  - DataflowRunner (supported by beam sql)')
     else:
-      clean = re.sub(r'(-java$|^gcp-|^local-)', '', raw)
-      print(f'  {clean:<9} - {raw}')
+      clean = re.sub(r'(-java$|^gcp-|^local-)', '', safe_raw)
+      print(f'  {clean:<9} - {safe_raw}')
   print(
       "\nNote: `beam sql --runner` currently supports 'direct' and 'dataflow'.")
   return 0

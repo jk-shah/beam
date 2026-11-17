@@ -521,6 +521,12 @@ def _expand_comma_grouped_opts(
           m.group(1).strip().lower().replace('-', '_') in all_known_keys or
           uris._SECRET_KEY_RE.search(m.group(1).strip().lower())):
         sub_k = m.group(1).strip()
+        sub_norm = sub_k.lower().replace('-', '_')
+        if not sub_norm.endswith('_env') and uris._SECRET_KEY_RE.search(sub_k):
+          raise ValueError(
+              f'refusing inline secret option {sub_k!r} in --enrich; '
+              'use environment variables (e.g. BEAM_REDIS_PASSWORD), ADC, or '
+              'a 0600 --enrich-opt-file')
         sub_v = _strip_matching_quotes(m.group(2))
         grouped.append((sub_k, sub_v))
       else:
@@ -536,7 +542,7 @@ def _expand_comma_grouped_opts(
 def parse_enrich_spec_str(
     spec_str: str,
     *,
-    extra_opts: Mapping[str, Any] | None = None,
+    extra_opts: Mapping[str, Any] | Iterable[str] | None = None,
     default_project: str | None = None,
     single_stage: bool = True,
 ) -> dict[str, Any]:
@@ -632,7 +638,7 @@ def parse_enrich_spec_str(
       k, v = tok.split('=', 1)
       key = k.strip().lower().replace('-', '_')
       val = _strip_matching_quotes(v)
-      if uris._SECRET_KEY_RE.search(key):
+      if not key.endswith('_env') and uris._SECRET_KEY_RE.search(key):
         raise ValueError(
             f'refusing inline secret option {key!r} in --enrich; '
             'use environment variables (e.g. BEAM_REDIS_PASSWORD) or ADC')
@@ -640,6 +646,12 @@ def parse_enrich_spec_str(
       last_list_key = key if key in _LIST_KEYS else None
 
   if extra_opts:
+    if not isinstance(extra_opts, Mapping):
+      try:
+        extra_opts = uris.parse_kv_options(
+            list(extra_opts), None, '--enrich-opt')
+      except uris.UriError as e:
+        raise ValueError(str(e)) from None
     allowed_for_handler = _COMMON_ENRICH_KEYS | _HANDLER_SPECIFIC_KEYS[handler]
     for ek, ev in _expand_comma_grouped_opts(extra_opts):
       norm_k = str(ek).strip().lower().replace('-', '_')
@@ -1861,6 +1873,38 @@ class _VertexFSCaller:
     return results
 
 
+_SAFE_FEAST_TOP_KEYS = frozenset([
+    'project',
+    'provider',
+    'online_store',
+    'registry',
+    'entity_key_serialization_version',
+    'flags',
+])
+_SAFE_FEAST_REGISTRY_TYPES = frozenset(['file', 'sql', 'gcs', 's3'])
+
+
+def _validate_feast_safe_path(raw_path: str, label: str) -> None:
+  if any(c in raw_path for c in ('\r', '\n', '\x00')):
+    raise ValueError(f'control characters are not allowed in Feast {label}')
+  norm_segs = raw_path.replace('\\', '/').split('/')
+  if '..' in norm_segs:
+    raise ValueError(
+        f"path traversal ('..') is not allowed in Feast {label}: {raw_path!r}")
+  if '://' in raw_path:
+    parsed_u = urllib.parse.urlsplit(raw_path)
+    if '..' in (parsed_u.path or '').replace('\\', '/').split('/'):
+      raise ValueError(
+          f"path traversal ('..') is not allowed in Feast {label}: {raw_path!r}"
+      )
+  try:
+    uris.reject_inline_credentials(raw_path)
+  except uris.UriError as e:
+    raise ValueError(str(e)) from None
+  if uris._string_has_inline_secret(raw_path, check_kv_pairs=True):
+    raise ValueError(f'inline credentials are not allowed in Feast {label}')
+
+
 def validate_feast_yaml_content(
     yaml_text: str, *, trust_providers: bool = False) -> dict[str, Any]:
   """Validates Feast `feature_store.yaml` safely before `FeatureStore()` load."""
@@ -1871,8 +1915,15 @@ def validate_feast_yaml_content(
   if not isinstance(doc, dict):
     raise ValueError('Feast feature_store.yaml must be a YAML mapping')
   if not trust_providers:
+    disallowed_top = sorted(
+        str(k) for k in doc.keys() if str(k) not in _SAFE_FEAST_TOP_KEYS)
+    if disallowed_top:
+      raise ValueError(
+          f'untrusted top-level key(s) {disallowed_top} in Feast '
+          f'feature_store.yaml (allowed: {sorted(_SAFE_FEAST_TOP_KEYS)}; '
+          'pass --trust-providers to allow custom Feast components)')
     provider = str(doc.get('provider') or '').strip()
-    if not provider or provider not in _SAFE_FEAST_PROVIDERS:
+    if not provider or '.' in provider or provider not in _SAFE_FEAST_PROVIDERS:
       raise ValueError(
           f'untrusted Feast provider {provider!r} in feature_store.yaml '
           f'(allowed: {sorted(_SAFE_FEAST_PROVIDERS)}; pass --trust-providers '
@@ -1883,11 +1934,40 @@ def validate_feast_yaml_content(
       os_type = online_store.strip()
     elif isinstance(online_store, Mapping):
       os_type = str(online_store.get('type') or 'sqlite').strip()
-    if os_type is not None and os_type not in _SAFE_FEAST_ONLINE_STORES:
+      for ok, ov in online_store.items():
+        oks = str(ok).strip()
+        if not oks.lower().endswith('_env') and uris._SECRET_KEY_RE.search(oks):
+          raise ValueError(
+              f'inline secret key {oks!r} is not allowed in Feast online_store')
+        if isinstance(ov, str) and oks.lower() in ('path', 'uri', 'url'):
+          _validate_feast_safe_path(ov.strip(), f'online_store.{oks}')
+    elif online_store is not None:
+      raise ValueError('Feast online_store must be a string or mapping')
+    if os_type is not None and ('.' in os_type or
+                                os_type not in _SAFE_FEAST_ONLINE_STORES):
       raise ValueError(
           f'untrusted Feast online_store.type {os_type!r} in feature_store.yaml '
           f'(allowed: {sorted(_SAFE_FEAST_ONLINE_STORES)}; pass '
           '--trust-providers to allow custom Feast online store classes)')
+    registry = doc.get('registry')
+    if isinstance(registry, str):
+      _validate_feast_safe_path(registry.strip(), 'registry')
+    elif isinstance(registry, Mapping):
+      reg_type = str(registry.get('registry_type') or 'file').strip()
+      if '.' in reg_type or reg_type not in _SAFE_FEAST_REGISTRY_TYPES:
+        raise ValueError(
+            f'untrusted Feast registry.registry_type {reg_type!r} in '
+            f'feature_store.yaml (allowed: {sorted(_SAFE_FEAST_REGISTRY_TYPES)}; '
+            'pass --trust-providers to allow custom Feast registry classes)')
+      for rk, rv in registry.items():
+        rks = str(rk).strip()
+        if not rks.lower().endswith('_env') and uris._SECRET_KEY_RE.search(rks):
+          raise ValueError(
+              f'inline secret key {rks!r} is not allowed in Feast registry')
+        if isinstance(rv, str) and rks.lower() != 'registry_type':
+          _validate_feast_safe_path(rv.strip(), f'registry.{rks}')
+    elif registry is not None:
+      raise ValueError('Feast registry must be a string or mapping')
   return doc
 
 

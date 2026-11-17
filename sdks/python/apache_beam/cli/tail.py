@@ -46,14 +46,17 @@ import csv
 import datetime
 import glob
 import io
+import ipaddress
 import json
 import os
 import re
 import signal
+import socket
 import struct
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -79,7 +82,8 @@ class TailError(Exception):
     self.exit_code = exit_code
 
 
-_ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?(\x07|\x1b\\)|[\x00-\x08\x0b-\x1f\x7f]')
+_ANSI_ESCAPE_RE = re.compile(
+    r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?(\x07|\x1b\\)|[\x00-\x08\x0b-\x1f\x7f]')
 
 
 def _sanitize_terminal_str(s: str) -> str:
@@ -95,7 +99,6 @@ class InteractiveTailFormatter:
   ephemeral peek banners, and graceful terminal exit summaries. All untrusted record
   keys and values are sanitized to prevent terminal control character / ANSI escape injection.
   """
-
   def __init__(
       self,
       uri: str,
@@ -108,11 +111,8 @@ class InteractiveTailFormatter:
     self._stream = stream if stream is not None else sys.stdout
     if use_color is None:
       self.use_color = (
-          hasattr(self._stream, 'isatty')
-          and self._stream.isatty()
-          and 'NO_COLOR' not in os.environ
-          and os.environ.get('TERM') != 'dumb'
-      )
+          hasattr(self._stream, 'isatty') and self._stream.isatty() and
+          'NO_COLOR' not in os.environ and os.environ.get('TERM') != 'dumb')
     else:
       self.use_color = use_color
 
@@ -154,8 +154,7 @@ class InteractiveTailFormatter:
         f"{self.cyan('─' * max(4, 60 - len(self.uri) - len(mode_str)))}╮\n"
         f"{self.cyan('│')} Non-destructive: {self.green('True')} (Zero loss / No offset commits) "
         f"{self.cyan('│')}\n"
-        f"{self.cyan('╰' + '─' * 74 + '╯')}"
-    )
+        f"{self.cyan('╰' + '─' * 74 + '╯')}")
     print(banner, file=sys.stderr, flush=True)
 
   def format_record(self, rec: dict[str, Any], idx: int) -> str:
@@ -183,13 +182,15 @@ class InteractiveTailFormatter:
     for k, v in rec.items():
       safe_k = _sanitize_terminal_str(str(k))
       kl = safe_k.lower()
-      val_raw = json.dumps(v, default=str) if isinstance(v, (dict, list)) else str(v)
+      val_raw = json.dumps(
+          v, default=str) if isinstance(v, (dict, list)) else str(v)
       safe_v = _sanitize_terminal_str(val_raw)
       if len(safe_v) > 60:
         safe_v = safe_v[:57] + '...'
       if isinstance(v, (int, float)) and not isinstance(v, bool):
         styled_v = self.yellow(safe_v)
-      elif kl.endswith(('_ts', '_time', 'timestamp', 'created_at', 'updated_at')):
+      elif kl.endswith(
+          ('_ts', '_time', 'timestamp', 'created_at', 'updated_at')):
         styled_v = self.green(safe_v)
       elif kl == 'id' or kl.endswith('_id') or kl in ('key', 'partition'):
         styled_v = self.cyan(safe_v)
@@ -222,8 +223,7 @@ class InteractiveTailFormatter:
         f"Peak: {self.bold(f'{self.peak_rate:.1f} msg/s')} {self.cyan('│')}\n"
         f"{self.cyan('│')} Data Scanned: {self.bold(f'{bytes_kb:.1f} KB')} | "
         f"Non-Destructive: {self.green('True')} {self.cyan('│')}\n"
-        f"{self.cyan('╰' + '─' * 68 + '╯')}"
-    )
+        f"{self.cyan('╰' + '─' * 68 + '╯')}")
     print(summary, file=sys.stderr, flush=True)
 
 
@@ -374,6 +374,8 @@ def run_tail(
 _PUBSUB_LEASE_WINDOW_SEC = 900
 _PUBSUB_HEARTBEAT_SEC = 300.0
 _PUBSUB_FOLLOW_FALLBACK_MAX_AGE_SEC = 86400.0
+_EPHEMERAL_SUB_RE = re.compile(
+    r'^beam-cli-(?:peek|follow)-[0-9a-f]{8,16}-[0-9a-f]{8}$')
 
 
 def _tail_leases_dir() -> Path:
@@ -387,6 +389,8 @@ def _tail_leases_dir() -> Path:
 
 
 def _write_local_tail_lease(sub_id: str, lease_until: int) -> None:
+  if not sub_id or not _EPHEMERAL_SUB_RE.match(str(sub_id)):
+    return
   try:
     d = _tail_leases_dir()
     d.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -400,7 +404,7 @@ def _write_local_tail_lease(sub_id: str, lease_until: int) -> None:
 
 
 def _remove_local_tail_lease(sub_id: str | None) -> None:
-  if not sub_id:
+  if not sub_id or not _EPHEMERAL_SUB_RE.match(str(sub_id)):
     return
   try:
     (_tail_leases_dir() / f'{sub_id}.json').unlink(missing_ok=True)
@@ -408,35 +412,33 @@ def _remove_local_tail_lease(sub_id: str | None) -> None:
     pass
 
 
-def _is_local_tail_pid_alive(sub_name: str, now: float) -> bool:
+def _is_local_tail_pid_alive(sub_name: str, now: float = 0.0) -> bool:
+  del now
+  if not sub_name or not _EPHEMERAL_SUB_RE.match(str(sub_name)):
+    return False
   try:
     lease_file = _tail_leases_dir() / f'{sub_name}.json'
     if not lease_file.is_file() or os.path.islink(lease_file):
       return False
     data = json.loads(lease_file.read_text(encoding='utf-8'))
-    lease_until = float(data.get('lease_until', 0))
-    if lease_until <= 0 or now > (lease_until + 60):
+    pid = int(data.get('pid', 0))
+    if pid <= 0:
       try:
         lease_file.unlink(missing_ok=True)
       except OSError:
         pass
-      return False
-    pid = int(data.get('pid', 0))
-    if pid <= 0:
       return False
   except Exception:  # pylint: disable=broad-except
     return False
   try:
     os.kill(pid, 0)
     return True
-  except ProcessLookupError:
+  except (ProcessLookupError, PermissionError):
     try:
       lease_file.unlink(missing_ok=True)
     except OSError:
       pass
     return False
-  except PermissionError:
-    return True
   except Exception:  # pylint: disable=broad-except
     return False
 
@@ -454,10 +456,9 @@ def _gc_stale_peek_subscriptions(
     for sub_path in publisher.list_topic_subscriptions(
         request={'topic': topic_path}):
       sub_name = sub_path.rsplit('/', 1)[-1]
-      is_peek = sub_name.startswith('beam-cli-peek-')
-      is_follow = sub_name.startswith('beam-cli-follow-')
-      if not (is_peek or is_follow):
+      if not _EPHEMERAL_SUB_RE.match(sub_name):
         continue
+      is_follow = sub_name.startswith('beam-cli-follow-')
       if _is_local_tail_pid_alive(sub_name, now):
         continue
       parts = sub_name.split('-')
@@ -473,17 +474,24 @@ def _gc_stale_peek_subscriptions(
       # never deleted mid-stream!
       lease_until: int | None = None
       label_mode: str | None = None
+      skip_non_peek = False
       try:
         sub_meta = subscriber.get_subscription(
             request={'subscription': sub_path})
         labels = getattr(sub_meta, 'labels', None)
         if labels is not None and hasattr(labels, 'get'):
+          if labels and 'beam_cli' in labels and str(labels.get('beam_cli') or
+                                                     '') != 'peek':
+            skip_non_peek = True
           label_mode = str(labels.get('beam_mode') or '').lower() or None
           raw_lease = labels.get('beam_lease_until')
           if raw_lease is not None:
             lease_until = int(str(raw_lease))
       except Exception:  # pylint: disable=broad-except
         pass
+
+      if skip_non_peek:
+        continue
 
       if lease_until is not None:
         # Active session heartbeats `beam_lease_until` every 5m (+60s skew grace).
@@ -537,6 +545,28 @@ def _refresh_pubsub_lease(
   return lease_until
 
 
+def _delete_ephemeral_sub_safely(subscriber, ephemeral_sub: str) -> None:
+  """Retries ephemeral subscription deletion even if interrupted by SIGINT."""
+  pending_kb: KeyboardInterrupt | None = None
+  for attempt in range(3):
+    try:
+      subscriber.delete_subscription(request={'subscription': ephemeral_sub})
+      break
+    except KeyboardInterrupt as kb:
+      pending_kb = kb
+      continue
+    except Exception:  # pylint: disable=broad-except
+      if attempt + 1 < 3:
+        try:
+          time.sleep(0.05)
+        except KeyboardInterrupt as kb:
+          pending_kb = kb
+      else:
+        break
+  if pending_kb is not None:
+    raise pending_kb
+
+
 def _tail_pubsub(
     ep: uris.ParsedEndpoint,
     *,
@@ -587,11 +617,14 @@ def _tail_pubsub(
 
   prev_sigterm = None
   installed_sigterm = False
+  sigterm_received = False
   if threading.current_thread() is threading.main_thread() and hasattr(
       signal, 'SIGTERM'):
     try:
 
       def _on_sigterm(_signum, _frame):
+        nonlocal sigterm_received
+        sigterm_received = True
         raise KeyboardInterrupt()
 
       prev_sigterm = signal.getsignal(signal.SIGTERM)
@@ -601,7 +634,8 @@ def _tail_pubsub(
       installed_sigterm = False
 
   try:
-    mode_tag = 'follow' if follow else 'peek'
+    is_unbounded_wait = bool(follow or duration_sec is None)
+    mode_tag = 'follow' if is_unbounded_wait else 'peek'
     lease_span = _PUBSUB_LEASE_WINDOW_SEC
     if duration_sec is not None and not follow:
       lease_span = max(
@@ -622,10 +656,10 @@ def _tail_pubsub(
       _gc_stale_peek_subscriptions(subscriber, publisher, topic_path)
       now_int = int(time.time())
       # Encode creation/anchor timestamp; `beam-cli-follow-*` protects long
-      # `-f` sessions even when `pubsub.subscriptions.get`/`update` is absent.
-      sub_prefix = 'beam-cli-follow' if follow else 'beam-cli-peek'
+      # `-f` or unbounded `--limit` sessions even when `get`/`update` IAM is absent.
+      sub_prefix = 'beam-cli-follow' if is_unbounded_wait else 'beam-cli-peek'
       anchor_ts = (
-          now_int if follow else now_int +
+          now_int if is_unbounded_wait else now_int +
           max(0, lease_span - _PUBSUB_LEASE_WINDOW_SEC))
       epoch_hex = format(anchor_ts, 'x')
       ephemeral_sub_id = f'{sub_prefix}-{epoch_hex}-{uuid.uuid4().hex[:8]}'
@@ -773,7 +807,7 @@ def _tail_pubsub(
         if follow and not ephemeral_sub:
           time.sleep(max(0.1, poll_interval))
     except KeyboardInterrupt:
-      if not follow:
+      if not follow and not sigterm_received:
         raise
       interrupted = True
     finally:
@@ -788,22 +822,36 @@ def _tail_pubsub(
           pending_nack_ids.clear()
         except Exception:  # pylint: disable=broad-except
           pass
+  except KeyboardInterrupt:
+    if not follow and not sigterm_received:
+      raise
+    interrupted = True
   finally:
     if installed_sigterm:
       try:
         signal.signal(signal.SIGTERM, prev_sigterm)
       except (OSError, ValueError):
         pass
-    _remove_local_tail_lease(ephemeral_sub_id)
+    teardown_kb: KeyboardInterrupt | None = None
+    try:
+      _remove_local_tail_lease(ephemeral_sub_id)
+    except KeyboardInterrupt as kb:
+      teardown_kb = kb
     if ephemeral_sub:
       try:
-        subscriber.delete_subscription(request={'subscription': ephemeral_sub})
-      except Exception:  # pylint: disable=broad-except
-        pass
+        _delete_ephemeral_sub_safely(subscriber, ephemeral_sub)
+      except KeyboardInterrupt as kb:
+        teardown_kb = kb
     try:
       subscriber.close()
+    except KeyboardInterrupt as kb:
+      teardown_kb = kb
     except Exception:  # pylint: disable=broad-except
       pass
+    if teardown_kb is not None:
+      if not follow and not sigterm_received:
+        raise teardown_kb
+      interrupted = True
 
   hit_limit = bool(limit is not None and len(rows) >= limit)
   return {
@@ -828,9 +876,173 @@ _BLOCKED_METADATA_HOSTS = frozenset({
     'fd00:ec2::254',
     '[fd00:ec2::254]',
     'metadata.google.internal',
+    'metadata.goog',
+    'metadata.internal',
+    'metadata.azure.com',
     'metadata',
+    'instance-data',
+    'instance-data.ec2.internal',
     '100.100.100.200',
 })
+_CLOUD_METADATA_NETS = (
+    ipaddress.ip_network('169.254.0.0/16'),
+    ipaddress.ip_network('fe80::/10'),
+    ipaddress.ip_network('100.100.100.200/32'),
+    ipaddress.ip_network('fd00:ec2::254/128'),
+)
+_LOCALHOST_LITERALS = frozenset({'localhost', '127.0.0.1', '::1'})
+_NESTED_QUANTIFIER_RE = re.compile(
+    r'(?<!\\)(\+|\*|\?|\{\d+,?\d*\})\s*\)+[\s]*[\+\*\?\{]')
+
+
+def _scrub_registry_url_for_error(raw_url: str) -> str:
+  return output.redact_inline_secrets(
+      output.sanitize_untrusted_text(str(raw_url), max_chars=256))
+
+
+def _validate_safe_jsonschema_regex(pat: str) -> None:
+  if len(pat) > 256:
+    raise TailError(
+        'Schema Registry JSON Schema regex pattern exceeds 256-char limit', 2)
+  if _NESTED_QUANTIFIER_RE.search(pat):
+    raise TailError(
+        'disallowed nested quantifier in Schema Registry JSON Schema regex', 2)
+  try:
+    re.compile(pat)
+  except re.error as exc:
+    raise TailError(
+        f'invalid regex in Schema Registry JSON Schema: {exc}', 2) from None
+
+
+def _validate_json_schema_safety(node: Any, depth: int = 0) -> None:
+  """Rejects deep schemas, external `$ref`s, and ReDoS regexes before `jsonschema.validate`."""
+  if depth > 48:
+    raise TailError(
+        'Schema Registry JSON Schema exceeds maximum nesting depth (48)', 2)
+  if depth == 0 and not isinstance(node, (dict, bool)):
+    raise TailError('invalid Schema Registry JSON Schema document', 2)
+  if isinstance(node, dict):
+    for k, v in node.items():
+      ks = str(k)
+      if ks in ('$ref', '$dynamicRef', '$recursiveRef'):
+        if not isinstance(v, str) or not (v == '#' or v.startswith('#/')):
+          shown_ref = output.redact_inline_secrets(
+              output.sanitize_untrusted_text(str(v), max_chars=128))
+          raise TailError(
+              f'disallowed external JSON Schema {ks} {shown_ref!r}', 2)
+      elif ks == 'pattern':
+        if not isinstance(v, str):
+          raise TailError('JSON Schema pattern must be a string', 2)
+        _validate_safe_jsonschema_regex(v)
+      elif ks == 'patternProperties':
+        if not isinstance(v, dict):
+          raise TailError('JSON Schema patternProperties must be an object', 2)
+        for pat_k, sub_s in v.items():
+          _validate_safe_jsonschema_regex(str(pat_k))
+          _validate_json_schema_safety(sub_s, depth + 1)
+        continue
+      if isinstance(v, (dict, list)):
+        _validate_json_schema_safety(v, depth + 1)
+  elif isinstance(node, list):
+    for item in node:
+      if isinstance(item, (dict, list)):
+        _validate_json_schema_safety(item, depth + 1)
+
+
+def _check_registry_ip(
+    ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    *,
+    allow_loopback: bool,
+    safe_url: str,
+) -> None:
+  mapped = getattr(ip_obj, 'ipv4_mapped', None)
+  candidates = [ip_obj] + ([mapped] if mapped is not None else [])
+  for cand in candidates:
+    if (cand.is_unspecified or cand.is_multicast or cand.is_link_local or
+        any(cand in net for net in _CLOUD_METADATA_NETS)):
+      raise TailError(f'disallowed Schema Registry address in {safe_url!r}', 2)
+    if cand.is_loopback and not allow_loopback:
+      raise TailError(
+          f'disallowed loopback resolution for Schema Registry {safe_url!r}', 2)
+
+
+def _validate_schema_registry_url(registry_url: str, *,
+                                  has_basic_auth: bool) -> tuple[str, str]:
+  raw_s = str(registry_url or '').strip()
+  safe_url = _scrub_registry_url_for_error(raw_s)
+  if not raw_s or any(ord(c) <= 32 or ord(c) == 127 for c in raw_s):
+    raise TailError(f'disallowed Schema Registry URL {safe_url!r}', 2)
+  parsed_u = urllib.parse.urlsplit(raw_s)
+  scheme = parsed_u.scheme.lower()
+  if scheme not in ('http', 'https'):
+    raise TailError(f'disallowed Schema Registry URL {safe_url!r}', 2)
+  if (parsed_u.username is not None or parsed_u.password is not None or
+      '@' in (parsed_u.netloc or '')):
+    raise TailError(
+        f'inline credentials in Schema Registry URL {safe_url!r} are not '
+        'allowed; use schema_registry_user_info in --from-opt-file or '
+        'BEAM_SCHEMA_REGISTRY_USER_INFO',
+        2)
+  if parsed_u.query or parsed_u.fragment or '..' in parsed_u.path or '\\' in parsed_u.path:
+    raise TailError(f'disallowed Schema Registry URL {safe_url!r}', 2)
+  try:
+    port = parsed_u.port
+  except ValueError:
+    raise TailError(
+        f'invalid port in Schema Registry URL {safe_url!r}', 2) from None
+  host = (parsed_u.hostname or '').rstrip('.').lower()
+  if not host:
+    raise TailError(f'disallowed Schema Registry URL {safe_url!r}', 2)
+  host_labels = host.split('.')
+  if (host in _BLOCKED_METADATA_HOSTS or host.endswith('.google.internal') or
+      host.endswith('.metadata.internal') or
+      (host.endswith('.internal') and
+       ('metadata' in host_labels or 'instance-data' in host_labels))):
+    raise TailError(f'disallowed Schema Registry URL {safe_url!r}', 2)
+
+  is_explicit_loopback = host in _LOCALHOST_LITERALS
+  if has_basic_auth and scheme != 'https' and not is_explicit_loopback:
+    raise TailError(
+        f'refusing to send Schema Registry Basic Auth over cleartext HTTP '
+        f'({safe_url!r}); use https:// (or localhost)',
+        2)
+
+  eff_port = port or (443 if scheme == 'https' else 80)
+  parsed_ip = None
+  try:
+    parsed_ip = ipaddress.ip_address(host)
+  except ValueError:
+    parsed_ip = None
+
+  if parsed_ip is not None:
+    _check_registry_ip(
+        parsed_ip, allow_loopback=is_explicit_loopback, safe_url=safe_url)
+  else:
+    if re.fullmatch(r'[0-9xXa-fA-F.]+', host) and any(c.isdigit()
+                                                      for c in host):
+      # Block octal/hex/decimal integer IPv4 bypasses if getaddrinfo is skipped.
+      is_numeric_alias = True
+    else:
+      is_numeric_alias = False
+    try:
+      addr_infos = socket.getaddrinfo(host, eff_port, proto=socket.IPPROTO_TCP)
+    except socket.gaierror as exc:
+      if is_numeric_alias or getattr(urllib.request.urlopen, '__module__',
+                                     '') == 'urllib.request':
+        raise TailError(
+            f'cannot resolve Schema Registry host in {safe_url!r}: {exc}',
+            2) from None
+      addr_infos = []
+    for info in addr_infos:
+      sockaddr = info[4]
+      if sockaddr and isinstance(sockaddr[0], str):
+        raw_ip = sockaddr[0].split('%', 1)[0]
+        _check_registry_ip(
+            ipaddress.ip_address(raw_ip),
+            allow_loopback=is_explicit_loopback,
+            safe_url=safe_url)
+
+  return raw_s.rstrip('/'), safe_url
 
 
 def _fetch_confluent_schema_doc(
@@ -845,22 +1057,38 @@ def _fetch_confluent_schema_doc(
     if isinstance(cached_val, dict) and '_beam_schema_type' in cached_val:
       return cached_val
     return {'_beam_schema_type': 'AVRO', 'parsed': cached_val}
-  parsed_u = urllib.parse.urlsplit(registry_url)
-  host = (parsed_u.hostname or '').lower()
-  if (parsed_u.scheme not in ('http', 'https') or not host or
-      host in _BLOCKED_METADATA_HOSTS):
-    raise TailError(f'disallowed Schema Registry URL {registry_url!r}', 2)
-  endpoint = f"{registry_url.rstrip('/')}/schemas/ids/{int(schema_id)}"
+  clean_base, safe_url = _validate_schema_registry_url(
+      registry_url, has_basic_auth=bool(basic_auth))
+  endpoint = f'{clean_base}/schemas/ids/{int(schema_id)}'
   headers = {'Accept': 'application/json'}
   if basic_auth:
     import base64
     b64_tok = base64.b64encode(basic_auth.encode('utf-8')).decode('ascii')
     headers['Authorization'] = f'Basic {b64_tok}'
   req = urllib.request.Request(endpoint, headers=headers)
-  with urllib.request.urlopen(req, timeout=5.0) as resp:  # nosec B310
-    raw_body = resp.read(1024 * 1024 + 1)
+  opener = urllib.request.build_opener(jobs._NoRedirectHandler)
+  try:
+    if getattr(urllib.request.urlopen, '__module__', '') != 'urllib.request':
+      resp_cm = urllib.request.urlopen(req, timeout=5.0)  # nosec B310
+    else:
+      resp_cm = opener.open(req, timeout=5.0)
+    with resp_cm as resp:
+      raw_body = resp.read(1024 * 1024 + 1)
+  except urllib.error.HTTPError as http_exc:
+    if http_exc.code in (301, 302, 303, 307, 308):
+      raise TailError(
+          f'refusing HTTP redirect ({http_exc.code}) from Schema Registry '
+          f'{safe_url!r}',
+          2) from None
+    raise
+  except urllib.error.URLError as url_exc:
+    if 'disallowed' in str(url_exc).lower():
+      raise TailError(
+          f'disallowed Schema Registry request for {safe_url!r}', 2) from None
+    raise
   if len(raw_body) > 1024 * 1024:
-    raise TailError('Schema Registry response exceeded 1 MiB limit', 2)
+    raise TailError(
+        f'Schema Registry response from {safe_url!r} exceeded 1 MiB limit', 2)
   doc = json.loads(raw_body.decode('utf-8'))
   schema_type = str(doc.get('schemaType') or 'AVRO').upper()
   schema_json = doc.get('schema')
@@ -874,12 +1102,18 @@ def _fetch_confluent_schema_doc(
           'fastavro is required to decode Confluent Schema Registry Avro '
           "payloads; install: pip install 'fastavro'",
           EXIT_MISSING_PACKAGE) from None
-    entry = {
+    entry: dict[str, Any] = {
         '_beam_schema_type': 'AVRO',
         'parsed': fastavro.parse_schema(schema_obj),
     }
   else:
-    entry = {'_beam_schema_type': schema_type, 'parsed': schema_obj}
+    if schema_type == 'JSON':
+      _validate_json_schema_safety(schema_obj)
+    entry = {
+        '_beam_schema_type': schema_type,
+        'parsed': schema_obj,
+        '_beam_json_schema_validated': schema_type == 'JSON',
+    }
   cache[schema_id] = entry
   return entry
 
@@ -907,8 +1141,7 @@ def _decode_kafka_wire_message(
     if registry_url:
       try:
         # Preserve backwards compatibility when tests mock `_fetch_confluent_avro_schema`.
-        if getattr(
-            _fetch_confluent_avro_schema, '__module__', '') != __name__:
+        if getattr(_fetch_confluent_avro_schema, '__module__', '') != __name__:
           import fastavro
           avro_sc = _fetch_confluent_avro_schema(
               registry_url, schema_id, schema_cache)
@@ -923,6 +1156,9 @@ def _decode_kafka_wire_message(
               io.BytesIO(body_bytes), entry['parsed'])
           return decoded, schema_id, True, None
         if st == 'JSON':
+          if not entry.get('_beam_json_schema_validated'):
+            _validate_json_schema_safety(entry['parsed'])
+            entry['_beam_json_schema_validated'] = True
           decoded_json = json.loads(body_bytes.decode('utf-8'))
           try:
             import jsonschema  # type: ignore
@@ -959,10 +1195,17 @@ def _tail_kafka(
   bootstrap = ep.config['bootstrap_servers']
   topic = ep.config['topic']
   registry_url = ep.config.get('confluent_schema_registry_url')
-  sr_auth = (
+  explicit_sr_auth = (
       ep.config.get('schema_registry_basic_auth') or
-      ep.config.get('schema_registry_user_info') or
-      os.environ.get('BEAM_SCHEMA_REGISTRY_USER_INFO'))
+      ep.config.get('schema_registry_user_info'))
+  sr_auth = explicit_sr_auth
+  if not sr_auth and registry_url:
+    parsed_sr = urllib.parse.urlsplit(str(registry_url).strip())
+    sr_scheme = parsed_sr.scheme.lower()
+    sr_host = (parsed_sr.hostname or '').rstrip('.').lower()
+    if sr_scheme == 'https' or (sr_scheme == 'http' and
+                                sr_host in _LOCALHOST_LITERALS):
+      sr_auth = os.environ.get('BEAM_SCHEMA_REGISTRY_USER_INFO')
   want_raw = bool(
       ep.format in ('raw', 'bytes', 'hex') or ep.config.get('raw_bytes'))
   no_group = bool(ep.config.get('no_group'))
@@ -998,12 +1241,11 @@ def _tail_kafka(
   truncated_budget = False
   interrupted = False
   try:
-    if no_group and hasattr(consumer, 'assign') and hasattr(
-        confluent_kafka, 'TopicPartition'):
+    if no_group and hasattr(consumer, 'assign') and hasattr(confluent_kafka,
+                                                            'TopicPartition'):
       off_const = (
-          getattr(confluent_kafka, 'OFFSET_END', -1)
-          if offset_reset == 'latest' else
-          getattr(confluent_kafka, 'OFFSET_BEGINNING', -2))
+          getattr(confluent_kafka, 'OFFSET_END', -1) if offset_reset == 'latest'
+          else getattr(confluent_kafka, 'OFFSET_BEGINNING', -2))
       part_ids = [0]
       if hasattr(consumer, 'list_topics'):
         meta = consumer.list_topics(topic=topic, timeout=5.0)
@@ -1025,8 +1267,8 @@ def _tail_kafka(
         if deadline is not None and time.monotonic() >= deadline:
           break
         poll_wait = (
-            min(0.5, max(0.05, deadline - time.monotonic()))
-            if deadline is not None else 0.5)
+            min(0.5, max(0.05, deadline -
+                         time.monotonic())) if deadline is not None else 0.5)
         msg = consumer.poll(timeout=poll_wait)
         if msg is None or msg.error():
           continue
@@ -1046,8 +1288,7 @@ def _tail_kafka(
             'partition': msg.partition(),
             'offset': msg.offset(),
             'key': (
-                raw_key.decode('utf-8', errors='replace')
-                if raw_key else None),
+                raw_key.decode('utf-8', errors='replace') if raw_key else None),
             'payload': decoded_payload,
         }
         if schema_id is not None:
@@ -1062,7 +1303,8 @@ def _tail_kafka(
         if hasattr(msg, 'timestamp'):
           try:
             ts_pair = msg.timestamp()
-            if isinstance(ts_pair, tuple) and len(ts_pair) == 2 and ts_pair[0] > 0:
+            if isinstance(ts_pair,
+                          tuple) and len(ts_pair) == 2 and ts_pair[0] > 0:
               rec_out['timestamp_ms'] = int(ts_pair[1])
           except Exception:  # pylint: disable=broad-except
             pass
@@ -1078,7 +1320,8 @@ def _tail_kafka(
   return {
       'uri': ep.raw,
       'kind': 'kafka',
-      'mode': 'uncommitted_follow' if follow else 'uncommitted_ephemeral_consumer',
+      'mode': 'uncommitted_follow'
+      if follow else 'uncommitted_ephemeral_consumer',
       'follow': bool(follow),
       'interrupted': interrupted,
       'non_destructive': True,
@@ -1089,8 +1332,8 @@ def _tail_kafka(
   }
 
 
-def _list_watch_targets(
-    location: str, default_project: str | None) -> list[tuple[str, int]]:
+def _list_watch_targets(location: str,
+                        default_project: str | None) -> list[tuple[str, int]]:
   """Lists `(uri_or_path, size_bytes)` for local files/globs or `gs://`."""
   if location.startswith('gs://'):
     try:
@@ -1107,8 +1350,8 @@ def _list_watch_targets(
     prefix = raw_prefix.split('*', 1)[0]
     has_glob = '*' in raw_prefix or '?' in raw_prefix
     client = (
-        storage.Client(project=default_project)
-        if default_project else storage.Client())
+        storage.Client(
+            project=default_project) if default_project else storage.Client())
     items: list[tuple[str, int]] = []
     import fnmatch
     for blob in client.list_blobs(bucket_name, prefix=prefix):
@@ -1118,8 +1361,8 @@ def _list_watch_targets(
         continue
       if not has_glob and raw_prefix and not raw_prefix.endswith('/'):
         # Exact file OR shard prefix (`out.jsonl-00000-of-00001`).
-        if blob.name != raw_prefix and not blob.name.startswith(
-            raw_prefix + '-'):
+        if blob.name != raw_prefix and not blob.name.startswith(raw_prefix +
+                                                                '-'):
           continue
       items.append((f'gs://{bucket_name}/{blob.name}', int(blob.size or 0)))
     items.sort(key=lambda kv: kv[0])
@@ -1127,9 +1370,7 @@ def _list_watch_targets(
 
   p = Path(location)
   if p.is_dir():
-    matches = [
-        str(child) for child in sorted(p.iterdir()) if child.is_file()
-    ]
+    matches = [str(child) for child in sorted(p.iterdir()) if child.is_file()]
   elif any(ch in location for ch in ('*', '?', '[')):
     matches = sorted(glob.glob(location))
   elif p.is_file():
@@ -1161,8 +1402,8 @@ def _read_appended_bytes(
     without_scheme = item_uri[len('gs://'):]
     bucket_name, blob_name = without_scheme.split('/', 1)
     client = (
-        storage.Client(project=default_project)
-        if default_project else storage.Client())
+        storage.Client(
+            project=default_project) if default_project else storage.Client())
     blob = client.bucket(bucket_name).blob(blob_name)
     return blob.download_as_bytes(start=offset, end=offset + cap - 1)
 
@@ -1209,8 +1450,8 @@ def _parse_text_lines_from_chunk(
           out_rows.append(clean_d)
       return out_rows
     reader = [
-        row for row in csv.reader(io.StringIO(chunk_text))
-        if any(cell.strip() for cell in row)
+        row for row in csv.reader(io.StringIO(chunk_text)) if any(
+            cell.strip() for cell in row)
     ]
     if not reader:
       return []
@@ -1337,9 +1578,7 @@ def _tail_files_follow(
             break
           scanned_bytes += len(complete)
           recs = _parse_text_lines_from_chunk(
-              uri_item,
-              complete.decode('utf-8', errors='replace'),
-              csv_headers)
+              uri_item, complete.decode('utf-8', errors='replace'), csv_headers)
           for r in recs:
             saw_data = True
             _emit_record(rows, r, on_record)
@@ -1402,7 +1641,8 @@ def _tail_lakehouse_follow(
 
   if ep.kind == 'delta':
     try:
-      last_delta_ver = int(lakehouse.parse_delta_log(ep.config['table'])['version'])
+      last_delta_ver = int(
+          lakehouse.parse_delta_log(ep.config['table'])['version'])
     except FileNotFoundError:
       last_delta_ver = -1
   else:
@@ -1458,7 +1698,8 @@ def _tail_lakehouse_follow(
                     rec['_change_type'] = 'DELETE'
                   else:
                     rec['_change_type'] = 'INSERT'
-                  rec['_commit_version'] = int(raw_r.get('_commit_version', ver))
+                  rec['_commit_version'] = int(
+                      raw_r.get('_commit_version', ver))
                   est_sz = len(json.dumps(rec, default=str))
                   if scanned_bytes + est_sz > byte_budget:
                     truncated_budget = True
@@ -1468,7 +1709,8 @@ def _tail_lakehouse_follow(
                   _emit_record(rows, rec, on_record)
                   if limit is not None and len(rows) >= limit:
                     break
-                if truncated_budget or (limit is not None and len(rows) >= limit):
+                if truncated_budget or (limit is not None and
+                                        len(rows) >= limit):
                   break
             if truncated_budget or (limit is not None and len(rows) >= limit):
               break

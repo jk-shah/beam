@@ -146,8 +146,7 @@ class SqlShellTest(unittest.TestCase):
   def test_corrupt_cached_jar_is_rebuilt_not_trusted(self):
     cache_dir = os.path.join(self.beam_home, 'cache')
     os.makedirs(cache_dir)
-    corrupt_jar = os.path.join(
-        cache_dir, 'beam-2.75.0_runner-direct_ios-.jar')
+    corrupt_jar = os.path.join(cache_dir, 'beam-2.75.0_runner-direct_ios-.jar')
     with open(corrupt_jar, 'wb') as f:
       f.write(b'corrupt-truncated-not-a-zip')
 
@@ -192,9 +191,8 @@ class SqlShellTest(unittest.TestCase):
     with (
         mock.patch.dict(os.environ, {'JAVA_HOME': fake_jdk}, clear=True),
         mock.patch.object(sql.os, 'name', 'nt'),
-        mock.patch(
-            'subprocess.run',
-            return_value=_proc(0, stderr='openjdk version "21.0.2"')),
+        mock.patch('subprocess.run',
+                   return_value=_proc(0, stderr='openjdk version "21.0.2"')),
     ):
       found_bin, found_home = sql._find_java()
     self.assertTrue(found_bin.endswith('java.exe'))
@@ -311,15 +309,22 @@ class SqlShellTest(unittest.TestCase):
     ET.fromstring(pom_xml)
     self.assertIn('beam-sdks-java-extensions-sql-delta', pom_xml)
     self.assertIn('beam-sdks-java-extensions-sql-iceberg', pom_xml)
-    self.assertIn('<artifactId>gcs-connector</artifactId><version>4.0.4</version>', pom_xml)
-    self.assertIn('<artifactId>iceberg-gcp</artifactId><version>1.12.0</version>', pom_xml)
+    self.assertIn(
+        '<artifactId>gcs-connector</artifactId><version>4.0.4</version>',
+        pom_xml)
+    self.assertIn(
+        '<artifactId>iceberg-gcp</artifactId><version>1.12.0</version>',
+        pom_xml)
     self.assertIn('<Multi-Release>true</Multi-Release>', pom_xml)
-    self.assertIn('<id>apache.snapshots</id>', pom_xml)
+    self.assertNotIn('<id>apache.snapshots</id>', pom_xml)
+    snap_pom = sql._render_pom('2.79.0-SNAPSHOT', 'direct', ['delta'])
+    self.assertIn('<id>apache.snapshots</id>', snap_pom)
     self.assertLess(
         pom_xml.index('beam-sdks-java-extensions-sql-delta'),
         pom_xml.index('beam-sdks-java-extensions-sql-jdbc'))
 
-    with mock.patch.dict(os.environ, {'ICEBERG_VERSION': '../bad'}, clear=False):
+    with mock.patch.dict(os.environ, {'ICEBERG_VERSION': '../bad'},
+                         clear=False):
       with self.assertRaisesRegex(SqlError, 'invalid ICEBERG_VERSION') as ctx:
         sql._render_pom('2.79.0', 'direct', ['iceberg'])
       self.assertEqual(ctx.exception.exit_code, 2)
@@ -327,26 +332,35 @@ class SqlShellTest(unittest.TestCase):
   def test_list_versions_and_list_runners_online_and_offline(self):
     out_v = io.StringIO()
     with (
-        mock.patch.object(
-            sql, '_fetch_maven_versions', return_value=['2.79.0', '2.78.0']
-        ),
+        mock.patch.object(sql,
+                          '_fetch_maven_versions',
+                          return_value=['2.79.0', '2.78.0']),
         contextlib.redirect_stdout(out_v),
     ):
       self.assertEqual(sql.run(list_versions=True), 0)
     self.assertIn('2.79.0', out_v.getvalue())
 
     with mock.patch.object(sql, '_fetch_maven_versions', return_value=[]):
-      with self.assertRaisesRegex(SqlError, 'could not retrieve Beam versions') as c_v:
+      with self.assertRaisesRegex(SqlError,
+                                  'could not retrieve Beam versions') as c_v:
         sql.run(list_versions=True)
       self.assertEqual(c_v.exception.exit_code, 1)
 
     solr_runners = json.dumps({
         'response': {
             'docs': [
-                {'a': 'beam-runners-direct-java'},
-                {'a': 'beam-runners-google-cloud-dataflow-java'},
-                {'a': 'beam-runners-flink-1.18'},
-                {'a': 'beam-runners-core-java'},
+                {
+                    'a': 'beam-runners-direct-java'
+                },
+                {
+                    'a': 'beam-runners-google-cloud-dataflow-java'
+                },
+                {
+                    'a': 'beam-runners-flink-1.18'
+                },
+                {
+                    'a': 'beam-runners-core-java'
+                },
             ]
         }
     })
@@ -372,39 +386,46 @@ class SqlShellTest(unittest.TestCase):
   def test_download_https_symlink_and_maven_failure_guards(self):
     # Non-https rejected
     with self.assertRaises(ValueError):
-      sql._download_https('http://example.com/a.jar', os.path.join(self.tmp, 'a.jar'))
+      sql._download_https(
+          'http://example.com/a.jar', os.path.join(self.tmp, 'a.jar'))
     with self.assertRaises(ValueError):
       sql._fetch_text('http://example.com/meta.xml')
 
     # Redirect downgrade to http:// rejected
     handler = sql._HttpsOnlyRedirectHandler()
     with self.assertRaises(sql.urllib.error.URLError):
-      handler.redirect_request(None, None, 302, 'Found', {}, 'http://evil.test/x')
+      handler.redirect_request(
+          None, None, 302, 'Found', {}, 'http://evil.test/x')
 
     # Atomic download success & max_bytes overflow
     dest = os.path.join(self.tmp, 'dl', 'ok.jar')
     with mock.patch.object(
         sql,
         '_https_urlopen',
-        side_effect=lambda u, timeout: contextlib.nullcontext(io.BytesIO(b'hello')),
+        side_effect=lambda u, timeout: contextlib.nullcontext(io.BytesIO(
+            b'hello')),
     ):
-      sql._download_https('https://repo.maven.apache.org/ok.jar', dest, max_bytes=16)
+      sql._download_https(
+          'https://repo.maven.apache.org/ok.jar', dest, max_bytes=16)
     with open(dest, 'rb') as f:
       self.assertEqual(f.read(), b'hello')
 
     with mock.patch.object(
         sql,
         '_https_urlopen',
-        side_effect=lambda u, timeout: contextlib.nullcontext(io.BytesIO(b'x' * 32)),
+        side_effect=lambda u, timeout: contextlib.nullcontext(io.BytesIO(b'x' *
+                                                                         32)),
     ):
       with self.assertRaisesRegex(SqlError, 'exceeded maximum size'):
-        sql._download_https('https://repo.maven.apache.org/big.jar', dest, max_bytes=8)
+        sql._download_https(
+            'https://repo.maven.apache.org/big.jar', dest, max_bytes=8)
 
     # _fetch_text bounded read + XXE guard in _fetch_maven_versions
     with mock.patch.object(
         sql,
         '_https_urlopen',
-        side_effect=lambda u, timeout: contextlib.nullcontext(io.BytesIO(b'<!DOCTYPE foo>')),
+        side_effect=lambda u, timeout: contextlib.nullcontext(io.BytesIO(
+            b'<!DOCTYPE foo>')),
     ):
       self.assertEqual(sql._fetch_maven_versions(), [])
 
@@ -437,8 +458,7 @@ class SqlShellTest(unittest.TestCase):
 
     # Maven missing-artifact (exit 2) and generic build failure (exit 1)
     wrapper_jar = os.path.join(
-        self.beam_home, 'maven-wrapper', '.mvn', 'wrapper', 'maven-wrapper.jar'
-    )
+        self.beam_home, 'maven-wrapper', '.mvn', 'wrapper', 'maven-wrapper.jar')
     _write_dummy_jar(wrapper_jar)
     with mock.patch(
         'subprocess.run',

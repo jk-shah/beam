@@ -124,10 +124,11 @@ def _looks_like_utf8_text(sample: bytes) -> bool:
 
 _SHARD_SUFFIX_RE = re.compile(r'-\d+-of-\d+$')
 _SECRET_KEY_RE = re.compile(
-    r'(password|passwd|passphrase|secret|token|private_key|signing_key|'
-    r'encryption_key|client_secret|access_key|api[-_]?key|authorization|'
-    r'bearer|jaas|credential|connection_string|user[._-]?info|'
-    r'(?:^|[_.-])(?:auth|pwd|cookie)(?:$|[_.-]))',
+    r'(password|passwd|passphrase|secret|token|auth[-_.]?token|'
+    r'private[-_.]?key|signing[-_.]?key|encryption[-_.]?key|'
+    r'account[-_.]?key|client[-_.]?secret|access[-_.]?key|api[-_.]?key|'
+    r'authorization|bearer|jaas|credential|connection[-_.]?string|'
+    r'user[-_.]?info|(?:^|[_.-])(?:auth|pwd|cookie)(?:$|[_.-]))',
     re.IGNORECASE)
 _BQ_TABLE_ID_RE = re.compile(
     r'^(?:(?P<project>[A-Za-z0-9_.:-]+)[:.])?'
@@ -185,8 +186,8 @@ def sniff_file_format(path: str) -> str | None:
     if '://' not in path:
       import glob as _glob
       candidates = sorted(
-          p for p in _glob.glob(path) if os.path.isfile(p) and
-          os.path.getsize(p) > 0)
+          p for p in _glob.glob(path)
+          if os.path.isfile(p) and os.path.getsize(p) > 0)
       if not candidates and not any(c in path for c in '*?['):
         candidates = [
             p for p in sorted(_glob.glob(_glob.escape(path) + '*'))
@@ -252,20 +253,66 @@ def reject_inline_credentials(uri: str) -> None:
           'environment variables or --from-opt-file / --to-opt-file')
 
 
+_INLINE_URI_USERINFO_RE = re.compile(
+    r'\b([A-Za-z][A-Za-z0-9+.-]*)://[^/\s:@\'"]+(?::[^@\s/\'"]*)?@')
+
+
+def _string_has_inline_secret(
+    text: str, *, check_kv_pairs: bool = False) -> str | None:
+  cand = text.strip()
+  if cand.lower().startswith('jdbc:'):
+    cand = cand[5:]
+  if re.match(r'^[A-Za-z][A-Za-z0-9+.-]*://', cand):
+    parsed = urllib.parse.urlsplit(cand)
+    if (parsed.username is not None or parsed.password is not None or
+        '@' in (parsed.netloc or '')):
+      return f'{parsed.scheme}://***@...'
+    for qk, _ in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True):
+      if _SECRET_KEY_RE.search(qk):
+        return qk
+  m_uri = _INLINE_URI_USERINFO_RE.search(text)
+  if m_uri:
+    return f'{m_uri.group(1)}://***@...'
+  if check_kv_pairs:
+    for seg in re.split(r'[;&,\n]', text):
+      seg = seg.strip()
+      if '=' in seg:
+        lhs = urllib.parse.unquote(seg.split('=', 1)[0]).strip()
+        if (lhs and re.fullmatch(r'[A-Za-z0-9_.-]+', lhs) and
+            _SECRET_KEY_RE.search(lhs)):
+          return lhs
+  return None
+
+
 def _mapping_has_secret_key(obj: Any) -> str | None:
-  """Returns the first key name matching `_SECRET_KEY_RE` in `obj`, or None."""
+  """Returns the first secret key or inline secret indicator in `obj`, or None."""
   if isinstance(obj, dict):
     for k, v in obj.items():
-      if _SECRET_KEY_RE.search(str(k)):
-        return str(k)
+      ks = str(k)
+      if _SECRET_KEY_RE.search(ks):
+        return ks
+      if isinstance(v, str) and ks.strip().lower() in (
+          'connection_properties',
+          'connectionproperties',
+      ):
+        hit = _string_has_inline_secret(v, check_kv_pairs=True)
+        if hit:
+          return hit
       nested = _mapping_has_secret_key(v)
       if nested:
         return nested
-  elif isinstance(obj, list):
+  elif isinstance(obj, (list, tuple)):
     for item in obj:
-      nested = _mapping_has_secret_key(item)
-      if nested:
-        return nested
+      if isinstance(item, str):
+        hit = _string_has_inline_secret(item, check_kv_pairs=True)
+        if hit:
+          return hit
+      else:
+        nested = _mapping_has_secret_key(item)
+        if nested:
+          return nested
+  elif isinstance(obj, str):
+    return _string_has_inline_secret(obj, check_kv_pairs=False)
   return None
 
 
@@ -281,7 +328,8 @@ def _load_checked_opt_file(opt_file: str) -> dict[str, Any]:
     raise UriError(
         f'options file {opt_file!r} cannot be a symbolic link; '
         'pass a regular 0600 file')
-  flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0)
+  flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(
+      os, 'O_BINARY', 0)
   try:
     fd = os.open(opt_file, flags)
   except OSError as exc:
@@ -295,6 +343,12 @@ def _load_checked_opt_file(opt_file: str) -> dict[str, Any]:
     fstat = os.fstat(fd)
     if not stat.S_ISREG(fstat.st_mode):
       raise UriError(f'options file {opt_file!r} must be a regular file')
+    if os.name == 'posix' and (fstat.st_mode & 0o002):
+      mode = fstat.st_mode & 0o777
+      raise UriError(
+          f'refusing world-writable options file {opt_file!r} '
+          f'with overly permissive mode {oct(mode)}; restrict permissions '
+          f'first with: chmod 0600 {opt_file}')
     with os.fdopen(fd, 'rb') as fh:
       fd = -1
       raw_text = out_mod.read_bounded_text(fh, label=opt_file)
@@ -312,8 +366,7 @@ def _load_checked_opt_file(opt_file: str) -> dict[str, Any]:
 
   if isinstance(loaded, str):
     kv_lines = [
-        ln.strip()
-        for ln in raw_text.splitlines()
+        ln.strip() for ln in raw_text.splitlines()
         if ln.strip() and not ln.lstrip().startswith('#')
     ]
     if kv_lines and all('=' in ln for ln in kv_lines):
@@ -359,11 +412,12 @@ def parse_kv_options(
     return merged
 
   for raw in opt_items or ():
-    if isinstance(raw, str) and raw.startswith('@') and len(raw) > 1 and '=' not in raw:
+    if isinstance(raw, str) and raw.startswith('@') and len(raw) > 1:
       merged.update(_load_checked_opt_file(raw[1:]))
       continue
     if '=' not in raw:
-      shown = raw if re.fullmatch(r'[A-Za-z0-9_.-]{1,32}', raw) else '<redacted>'
+      shown = raw if re.fullmatch(
+          r'[A-Za-z0-9_.-]{1,32}', raw) else '<redacted>'
       raise UriError(
           f'expected KEY=VALUE (or @file.yaml) for {flag_name}, got {shown!r}')
     key, val = raw.split('=', 1)
@@ -376,7 +430,7 @@ def parse_kv_options(
           f'place secrets in {flag_name} @file.yaml (chmod 0600) or environment '
           'variables')
     coerced = _coerce_opt_value(val)
-    nested_secret = _mapping_has_secret_key(coerced)
+    nested_secret = _mapping_has_secret_key({key: coerced})
     if nested_secret:
       raise UriError(
           f'refusing nested secret key {nested_secret!r} in {flag_name} '
@@ -394,7 +448,11 @@ _BQ_DISALLOWED_ROW_RESTRICTION_KW_RE = re.compile(
 
 def validate_bq_row_restriction(raw: str) -> str:
   """Validates that a BigQuery `row_restriction` is a single filter predicate."""
-  expr = str(raw or '').strip()
+  raw_s = str(raw or '')
+  if any(c in raw_s for c in ('\r', '\n', '\x00')):
+    raise UriError(
+        'newlines and NUL bytes are not allowed in BigQuery row_restriction')
+  expr = raw_s.strip()
   if not expr:
     return ''
   if len(expr) > 4096:
@@ -416,24 +474,36 @@ def validate_bq_row_restriction(raw: str) -> str:
         quote = None
       i += 1
       continue
-    if ch in ("'", '"', '`'):
+    if ch in ("'", '"'):
+      if expr[i:i + 3] in ("'''", '"""'):
+        raise UriError(
+            'triple-quoted strings are not allowed in BigQuery row_restriction')
+      j = i
+      while j > 0 and (expr[j - 1].isalpha() or expr[j - 1] == '_'):
+        j -= 1
+      if j < i and expr[j:i].lower() in ('r', 'b', 'rb', 'br'):
+        raise UriError(
+            'raw or bytes string literals are not allowed in BigQuery '
+            'row_restriction')
       quote = ch
       unquoted_chars.append(' ')
       i += 1
       continue
-    if expr[i:i + 2] in ('--', '/*', '*/'):
-      raise UriError(
-          'SQL comments are not allowed in BigQuery row_restriction')
+    if ch == '`':
+      quote = ch
+      unquoted_chars.append(' ')
+      i += 1
+      continue
+    if ch == '#' or expr[i:i + 2] in ('--', '/*', '*/'):
+      raise UriError('SQL comments are not allowed in BigQuery row_restriction')
     if ch == ';':
-      raise UriError(
-          'semicolons are not allowed in BigQuery row_restriction')
+      raise UriError('semicolons are not allowed in BigQuery row_restriction')
     if ch == '(':
       paren_depth += 1
     elif ch == ')':
       paren_depth -= 1
       if paren_depth < 0:
-        raise UriError(
-            'unbalanced parentheses in BigQuery row_restriction')
+        raise UriError('unbalanced parentheses in BigQuery row_restriction')
     unquoted_chars.append(ch)
     i += 1
   if quote is not None or paren_depth != 0:
@@ -481,8 +551,20 @@ _JINJA_FORMAT_TOKENS: dict[str, str] = {
 
 
 def _has_jinja_syntax(text: str) -> bool:
-  return ('{{' in text or '}}' in text or '{%' in text or '%}' in text or
-          '{#' in text or '#}' in text)
+  return (
+      '{{' in text or '}}' in text or '{%' in text or '%}' in text or
+      '{#' in text or '#}' in text)
+
+
+_BLOCKED_JINJA_URI_NAMES = frozenset([
+    'cycler',
+    'dict',
+    'joiner',
+    'lipsum',
+    'namespace',
+    'range',
+    'self',
+])
 
 
 def _validate_jinja_uri(uri: str) -> None:
@@ -500,21 +582,59 @@ def _validate_jinja_uri(uri: str) -> None:
     import jinja2
     from jinja2 import nodes as jnodes
   except ImportError:
-    return
+    raise UriError(
+        'jinja2 is required to validate parameterized Jinja2 URIs; '
+        "install: pip install 'apache-beam[yaml]'") from None
   try:
     parsed_j = jinja2.Environment().parse(uri)
   except jinja2.TemplateSyntaxError as e:
     raise UriError(
         f'invalid Jinja2 syntax in URI {uri!r}: {e.message}') from None
-  for jnode in parsed_j.find_all((jnodes.Getattr, jnodes.Getitem, jnodes.Call)):
-    raise UriError(
-        f'disallowed Jinja2 expression {type(jnode).__name__} in URI {uri!r}; '
-        'only simple {{ param }} or {{ param | default(...) }} placeholders '
-        'are permitted')
-  for nnode in parsed_j.find_all(jnodes.Name):
-    if str(nnode.name).startswith('_'):
+
+  def _check_var_name(nnode: Any) -> None:
+    name_s = str(nnode.name)
+    if name_s.startswith('_'):
       raise UriError(
-          f'underscore-prefixed Jinja2 variable {nnode.name!r} is not allowed')
+          f'underscore-prefixed Jinja2 variable {name_s!r} is not allowed')
+    if name_s in _BLOCKED_JINJA_URI_NAMES:
+      raise UriError(
+          f'disallowed Jinja2 builtin identifier {name_s!r} in URI {uri!r}')
+
+  def _is_scalar_const(cnode: Any) -> bool:
+    if isinstance(cnode, jnodes.Const):
+      return cnode.value is None or isinstance(
+          cnode.value, (str, int, float, bool))
+    if isinstance(cnode, (jnodes.Neg, jnodes.Pos)) and isinstance(cnode.node,
+                                                                  jnodes.Const):
+      return isinstance(
+          cnode.node.value,
+          (int, float)) and not isinstance(cnode.node.value, bool)
+    return False
+
+  for stmt in parsed_j.body:
+    if not isinstance(stmt, jnodes.Output):
+      raise UriError(
+          f'disallowed Jinja2 statement {type(stmt).__name__} in URI {uri!r}')
+    for expr_node in stmt.nodes:
+      if isinstance(expr_node, jnodes.TemplateData):
+        continue
+      if isinstance(expr_node, jnodes.Name):
+        _check_var_name(expr_node)
+        continue
+      if isinstance(expr_node, jnodes.Filter):
+        if (str(expr_node.name) == 'default' and
+            isinstance(expr_node.node, jnodes.Name) and
+            not expr_node.dyn_args and not expr_node.dyn_kwargs and 1 <=
+            (len(expr_node.args) + len(expr_node.kwargs)) <= 2 and
+            all(_is_scalar_const(a) for a in expr_node.args) and
+            all(isinstance(kw, jnodes.Keyword) and _is_scalar_const(kw.value)
+                for kw in expr_node.kwargs)):
+          _check_var_name(expr_node.node)
+          continue
+      raise UriError(
+          f'disallowed Jinja2 expression {type(expr_node).__name__} in URI '
+          f'{uri!r}; only simple {{{{ param }}}} or '
+          '{{ param | default(...) }} placeholders are permitted')
 
 
 def _infer_jinja_file_format(location: str) -> str:
@@ -539,7 +659,10 @@ def _infer_jinja_file_format(location: str) -> str:
   if not m_var:
     return ''
   tokens = [t for t in m_var.group(1).lower().split('_') if t]
-  matched = {_JINJA_FORMAT_TOKENS[t] for t in tokens if t in _JINJA_FORMAT_TOKENS}
+  matched = {
+      _JINJA_FORMAT_TOKENS[t]
+      for t in tokens if t in _JINJA_FORMAT_TOKENS
+  }
   if len(matched) == 1:
     return next(iter(matched))
   return ''
@@ -565,7 +688,8 @@ def normalize_bq_table_spec(
     allow_jinja: bool = False,
 ) -> tuple[str, str | None, str, str]:
   """Normalizes `bigquery://P.D.T` or `P:D.T` -> `('P:D.T', P, D, T)`."""
-  if default_project and not (allow_jinja and _has_jinja_syntax(default_project)):
+  if default_project and not (allow_jinja and
+                              _has_jinja_syntax(default_project)):
     validate_bq_project_id(default_project)
   body = raw_uri_or_spec
   if body.lower().startswith('bigquery://'):
@@ -622,35 +746,69 @@ _BLOCKED_JDBC_PROPS = frozenset([
     'exceptioninterceptors',
     'loggerfile',
     'loggerlevel',
+    'passfile',
     'propertiestransform',
     'queryinterceptors',
+    'servicefile',
     'socketfactory',
     'socketfactoryarg',
     'socksproxyhost',
+    'sslcert',
     'sslfactory',
     'sslfactoryarg',
+    'sslkey',
     'sslpasswordcallback',
+    'sslrootcert',
     'statementinterceptors',
     'trustcertificatekeystoreurl',
 ])
 _BLOCKED_KAFKA_CLIENT_PROPS = frozenset([
+    'config.providers',
     'interceptor.classes',
+    'key.deserializer',
+    'key.serializer',
     'metric.reporters',
+    'partitioner.class',
+    'plugin.library.paths',
     'sasl.client.callback.handler.class',
+    'sasl.kerberos.kinit.cmd',
     'sasl.login.callback.handler.class',
     'sasl.login.class',
+    'sasl.oauthbearer.jwks.endpoint.url',
+    'sasl.oauthbearer.token.endpoint.url',
     'security.providers',
     'ssl.engine.factory.class',
+    'value.deserializer',
+    'value.serializer',
+])
+_ALLOWED_KAFKA_JAAS_MODULES = frozenset([
+    'org.apache.kafka.common.security.plain.PlainLoginModule',
+    'org.apache.kafka.common.security.scram.ScramLoginModule',
+    'org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule',
 ])
 
 
-def _validate_resource_seg(seg: str, label: str, allow_jinja: bool = False) -> str:
+def _validate_resource_seg(
+    seg: str, label: str, allow_jinja: bool = False) -> str:
   if allow_jinja and _has_jinja_syntax(seg):
     _validate_jinja_uri(seg)
     return seg
-  if not seg or seg in ('.', '..') or '..' in seg or not _SAFE_GCP_RESOURCE_SEG_RE.match(seg):
+  if not seg or seg in (
+      '.', '..') or '..' in seg or not _SAFE_GCP_RESOURCE_SEG_RE.match(seg):
     raise UriError(f'invalid {label} identifier {seg!r}')
   return seg
+
+
+def _validate_jdbc_prop_tokens(prop_str: str) -> None:
+  unq_full = urllib.parse.unquote(prop_str)
+  if any(ord(c) < 32 for c in prop_str) or any(ord(c) < 32 for c in unq_full):
+    raise UriError('control character in connection_properties is not allowed')
+  for seg in re.split(r'[;&]', prop_str):
+    if not seg.strip():
+      continue
+    pk = urllib.parse.unquote(seg.split('=', 1)[0]).strip().lower()
+    if pk in _BLOCKED_JDBC_PROPS:
+      raise UriError(f'disallowed JDBC connection property {pk!r}')
 
 
 def _validate_jdbc_properties(
@@ -658,37 +816,112 @@ def _validate_jdbc_properties(
     conn_props: Iterable[Any],
     extra_opts: dict[str, Any],
 ) -> None:
-  for k in qparams:
-    norm = str(k).strip().lower()
-    if norm in _BLOCKED_JDBC_PROPS or any(ord(c) < 32 for c in str(k)):
+  for k, qv in qparams.items():
+    raw_k = str(k)
+    unq_k = urllib.parse.unquote(raw_k)
+    norm = unq_k.strip().lower()
+    if (norm in _BLOCKED_JDBC_PROPS or any(ord(c) < 32 for c in raw_k) or
+        any(ord(c) < 32 for c in unq_k) or any(ord(c) < 32 for c in str(qv))):
       raise UriError(f'disallowed JDBC driver property {k!r}')
   for prop in conn_props:
-    prop_s = str(prop)
-    if any(ord(c) < 32 for c in prop_s):
-      raise UriError('control character in connection_properties is not allowed')
-    pk = prop_s.split('=', 1)[0].strip().lower()
-    if pk in _BLOCKED_JDBC_PROPS:
-      raise UriError(f'disallowed JDBC connection property {pk!r}')
+    if not isinstance(prop, str):
+      raise UriError(
+          'JDBC connection_properties entries must be strings, '
+          f'got {type(prop).__name__}')
+    _validate_jdbc_prop_tokens(prop)
   for k, v in extra_opts.items():
-    norm = str(k).strip().lower()
+    norm = urllib.parse.unquote(str(k)).strip().lower()
+    if norm.replace('-', '_') in ('url', 'jdbc_url'):
+      raise UriError(
+          f'overriding JDBC {k!r} via options is not allowed; '
+          'specify host and database in the URI')
     if norm in _BLOCKED_JDBC_PROPS:
       raise UriError(f'disallowed JDBC option {k!r}')
     if isinstance(v, dict):
       for sub_k in v:
-        if str(sub_k).strip().lower() in _BLOCKED_JDBC_PROPS:
+        if urllib.parse.unquote(
+            str(sub_k)).strip().lower() in _BLOCKED_JDBC_PROPS:
           raise UriError(f'disallowed JDBC property {sub_k!r}')
+    elif isinstance(v, str) and norm.replace('-',
+                                             '_') == 'connection_properties':
+      _validate_jdbc_prop_tokens(v)
+
+
+def _validate_kafka_jaas_config(raw_val: Any) -> None:
+  if not isinstance(raw_val, str) or not raw_val.strip():
+    raise UriError('Kafka sasl.jaas.config must be a non-empty string')
+  if '\x00' in raw_val:
+    raise UriError('NUL byte in Kafka sasl.jaas.config is not allowed')
+  quote: str | None = None
+  escaped = False
+  semi_indices: list[int] = []
+  unquoted_buf: list[str] = []
+  for idx, ch in enumerate(raw_val):
+    if quote is not None:
+      if escaped:
+        escaped = False
+      elif ch == '\\':
+        escaped = True
+      elif ch == quote:
+        quote = None
+      continue
+    if ch in ("'", '"'):
+      quote = ch
+      unquoted_buf.append(' ')
+      continue
+    if ch == ';':
+      semi_indices.append(idx)
+    unquoted_buf.append(ch)
+  if quote is not None:
+    raise UriError('unterminated quote in Kafka sasl.jaas.config')
+  unquoted_text = ''.join(unquoted_buf)
+  if '/*' in unquoted_text or '//' in unquoted_text or '#' in unquoted_text:
+    raise UriError('comments are not allowed in Kafka sasl.jaas.config')
+  if len(semi_indices) > 1:
+    raise UriError(
+        'multiple login modules in Kafka sasl.jaas.config are not allowed')
+  if semi_indices:
+    stmt = raw_val[:semi_indices[0]]
+    trailing = raw_val[semi_indices[0] + 1:]
+    if trailing.strip():
+      raise UriError(
+          'chained statements after ";" in Kafka sasl.jaas.config are not '
+          'allowed')
+  else:
+    stmt = raw_val
+  m = re.match(
+      r'^\s*([A-Za-z0-9_.]+)\s+(required|requisite|sufficient|optional)\b',
+      stmt,
+      re.IGNORECASE)
+  if not m or m.group(1) not in _ALLOWED_KAFKA_JAAS_MODULES:
+    mod_shown = m.group(1) if m else '<invalid>'
+    raise UriError(
+        f'disallowed login module {mod_shown!r} in Kafka sasl.jaas.config; '
+        'allowed modules: ' + ', '.join(sorted(_ALLOWED_KAFKA_JAAS_MODULES)))
+
+
+def _check_kafka_kv(k: Any, v: Any) -> None:
+  nk = str(k).strip().lower().replace('_', '.')
+  if nk in _BLOCKED_KAFKA_CLIENT_PROPS or nk.startswith('config.providers.'):
+    raise UriError(f'disallowed Kafka client option {k!r}')
+  if nk == 'sasl.jaas.config':
+    _validate_kafka_jaas_config(v)
 
 
 def _validate_kafka_options(opts: dict[str, Any]) -> None:
   for cfg_key in ('consumer_config', 'producer_config'):
-    sub = opts.get(cfg_key)
-    if isinstance(sub, dict):
+    if cfg_key in opts:
+      sub = opts[cfg_key]
+      if not isinstance(sub, dict):
+        raise UriError(
+            f'Kafka {cfg_key} must be a dict mapping, '
+            f'got {type(sub).__name__}')
       for k, v in sub.items():
-        nk = str(k).strip().lower()
-        if nk in _BLOCKED_KAFKA_CLIENT_PROPS:
-          raise UriError(f'disallowed Kafka client class option {k!r}')
-        if nk == 'sasl.jaas.config' and 'ldaploginmodule' in str(v).lower():
-          raise UriError('disallowed JNDI LdapLoginModule in sasl.jaas.config')
+        _check_kafka_kv(k, v)
+  for k, v in opts.items():
+    if k in ('consumer_config', 'producer_config'):
+      continue
+    _check_kafka_kv(k, v)
 
 
 def parse_pubsub_uri(uri: str, *, allow_jinja: bool = False) -> tuple[str, str]:
@@ -704,7 +937,8 @@ def parse_pubsub_uri(uri: str, *, allow_jinja: bool = False) -> tuple[str, str]:
   if (len(parts) == 4 and parts[0] == 'projects' and
       parts[2] in ('topics', 'subscriptions') and parts[1] and parts[3]):
     _validate_resource_seg(parts[1], 'Pub/Sub project', allow_jinja=allow_jinja)
-    _validate_resource_seg(parts[3], f'Pub/Sub {parts[2][:-1]}', allow_jinja=allow_jinja)
+    _validate_resource_seg(
+        parts[3], f'Pub/Sub {parts[2][:-1]}', allow_jinja=allow_jinja)
     kind = 'topic' if parts[2] == 'topics' else 'subscription'
     return kind, body
   raise UriError(
@@ -714,24 +948,31 @@ def parse_pubsub_uri(uri: str, *, allow_jinja: bool = False) -> tuple[str, str]:
 
 
 def parse_spanner_uri(
-    uri: str, *, allow_jinja: bool = False
-) -> tuple[str, str, str, dict[str, str]]:
+    uri: str,
+    *,
+    allow_jinja: bool = False) -> tuple[str, str, str, dict[str, str]]:
   """Parses `spanner://projects/P/instances/I/databases/D?...` or `spanner://P/I/D?...`."""
   reject_inline_credentials(uri)
   parsed = urllib.parse.urlsplit(uri)
   raw_path = (parsed.netloc + parsed.path).strip('/')
   parts = [p for p in raw_path.split('/') if p]
   qparams = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=False))
-  if (len(parts) == 6 and parts[0] == 'projects' and
-      parts[2] == 'instances' and parts[4] == 'databases'):
-    proj = _validate_resource_seg(parts[1], 'Spanner project', allow_jinja=allow_jinja)
-    inst = _validate_resource_seg(parts[3], 'Spanner instance', allow_jinja=allow_jinja)
-    db = _validate_resource_seg(parts[5], 'Spanner database', allow_jinja=allow_jinja)
+  if (len(parts) == 6 and parts[0] == 'projects' and parts[2] == 'instances' and
+      parts[4] == 'databases'):
+    proj = _validate_resource_seg(
+        parts[1], 'Spanner project', allow_jinja=allow_jinja)
+    inst = _validate_resource_seg(
+        parts[3], 'Spanner instance', allow_jinja=allow_jinja)
+    db = _validate_resource_seg(
+        parts[5], 'Spanner database', allow_jinja=allow_jinja)
     return proj, inst, db, qparams
   if len(parts) == 3 and parts[0] != 'projects':
-    proj = _validate_resource_seg(parts[0], 'Spanner project', allow_jinja=allow_jinja)
-    inst = _validate_resource_seg(parts[1], 'Spanner instance', allow_jinja=allow_jinja)
-    db = _validate_resource_seg(parts[2], 'Spanner database', allow_jinja=allow_jinja)
+    proj = _validate_resource_seg(
+        parts[0], 'Spanner project', allow_jinja=allow_jinja)
+    inst = _validate_resource_seg(
+        parts[1], 'Spanner instance', allow_jinja=allow_jinja)
+    db = _validate_resource_seg(
+        parts[2], 'Spanner database', allow_jinja=allow_jinja)
     return proj, inst, db, qparams
   raise UriError(
       f'invalid Spanner URI {uri!r}; expected '
@@ -805,17 +1046,19 @@ def parse_endpoint(
     if raw_fmt not in FILE_FORMATS:
       valid = ', '.join(k for k in ('csv', 'json', 'parquet', 'avro', 'text'))
       raise UriError(
-          f'unsupported format {raw_fmt!r} for {location!r}; use one of: {valid}')
+          f'unsupported format {raw_fmt!r} for {location!r}; use one of: {valid}'
+      )
     norm_fmt = {
         'jsonl': 'json',
         'ndjson': 'json',
         'pq': 'parquet',
         'tsv': 'csv',
     }.get(raw_fmt, raw_fmt)
-    is_tsv = ext_low == '.tsv' or (explicit_format or '').strip().lower() == 'tsv'
+    is_tsv = ext_low == '.tsv' or (explicit_format or
+                                   '').strip().lower() == 'tsv'
     read_path = location
-    if is_read and not (allow_jinja and has_jinja) and not any(
-        c in location for c in '*?['):
+    if is_read and not (allow_jinja and has_jinja) and not any(c in location
+                                                               for c in '*?['):
       if not scheme and not os.path.exists(location):
         import glob as _glob
         shard_pat = _glob.escape(location) + '-*-of-*'
@@ -852,8 +1095,8 @@ def parse_endpoint(
       table_spec, _, _, _ = normalize_bq_table_spec(
           location, default_project=default_project, allow_jinja=allow_jinja)
       cfg = {'table': table_spec, **opts}
-    if cfg.get('row_restriction') and not (
-        allow_jinja and _has_jinja_syntax(str(cfg['row_restriction']))):
+    if cfg.get('row_restriction') and not (allow_jinja and _has_jinja_syntax(
+        str(cfg['row_restriction']))):
       cfg['row_restriction'] = validate_bq_row_restriction(
           str(cfg['row_restriction']))
     if not is_read:
@@ -864,9 +1107,7 @@ def parse_endpoint(
       }
       cfg.setdefault('create_disposition', 'CREATE_IF_NEEDED')
       cfg.setdefault(
-          'write_disposition',
-          'WRITE_APPEND' if (cdc and if_exists == 'fail') else
-          disp_map.get(if_exists, 'WRITE_EMPTY'))
+          'write_disposition', disp_map.get(if_exists, 'WRITE_EMPTY'))
     bq_yaml_type = (
         'WriteToBigQueryCDC' if (not is_read and cdc) else verb + 'BigQuery')
     return ParsedEndpoint(
@@ -886,6 +1127,12 @@ def parse_endpoint(
     norm_kind = 'postgres' if is_pg else 'mysql'
     default_port = 5432 if is_pg else 3306
     label_db = 'Postgres' if is_pg else 'MySql'
+    for k_opt in list(opts):
+      if urllib.parse.unquote(str(k_opt)).strip().lower().replace(
+          '-', '_') in ('url', 'jdbc_url'):
+        raise UriError(
+            f'overriding {label_db} {k_opt!r} via options is not allowed; '
+            f'specify the host, port, and database in the {norm_kind}:// URI')
     parsed = urllib.parse.urlsplit(location)
     if not parsed.hostname or not parsed.path.strip('/'):
       raise UriError(
@@ -897,26 +1144,43 @@ def parse_endpoint(
     query_sql = opts.pop('query', None)
     if not table_name and not (is_read and query_sql and not cdc):
       raise UriError(
-          f'{label_db} URI {location!r} requires ?table=TABLE'
-          + ('' if cdc else ' (or --from-opt query="SELECT ...")'))
+          f'{label_db} URI {location!r} requires ?table=TABLE' +
+          ('' if cdc else ' (or --from-opt query="SELECT ...")'))
     port_num = parsed.port or default_port
     db_name = parsed.path.lstrip('/')
     if not (allow_jinja and _has_jinja_syntax(db_name)):
       if any(ch in db_name for ch in (';', '?', '&', '#', '/', '\\')) or any(
           ord(c) <= 32 for c in db_name) or '..' in db_name:
         raise UriError(f'invalid {label_db} database name {db_name!r}')
-    conn_props_in = list(opts.get('connection_properties') or [])
+    conn_raw = opts.get('connection_properties')
+    if conn_raw is None:
+      conn_props_in: list[str] = []
+    elif isinstance(conn_raw, str):
+      conn_props_in = [conn_raw]
+    elif isinstance(conn_raw, (list, tuple)):
+      if not all(isinstance(item, str) for item in conn_raw):
+        raise UriError(
+            'JDBC connection_properties list entries must be strings')
+      conn_props_in = list(conn_raw)
+    else:
+      raise UriError(
+          'JDBC connection_properties must be a string or list of strings, '
+          f'got {type(conn_raw).__name__}')
     _validate_jdbc_properties(qparams, conn_props_in, opts)
     env_prefix = 'BEAM_POSTGRES' if is_pg else 'BEAM_MYSQL'
     user = opts.pop('username', None) or os.environ.get(f'{env_prefix}_USER')
     pwd = opts.pop('password', None) or os.environ.get(f'{env_prefix}_PASSWORD')
 
     if is_read and cdc:
-      conn_props = list(opts.pop('connection_properties', None) or [])
+      opts.pop('connection_properties', None)
+      conn_props = [
+          seg.strip() for p in conn_props_in for seg in re.split(r'[;&]', p)
+          if seg.strip()
+      ]
       if not any(str(p).startswith('database.dbname=') for p in conn_props):
         conn_props.append(f'database.dbname={db_name}')
-      if is_pg and not any(
-          str(p).startswith('plugin.name=') for p in conn_props):
+      if is_pg and not any(str(p).startswith('plugin.name=')
+                           for p in conn_props):
         conn_props.append('plugin.name=pgoutput')
       for qk, qv in qparams.items():
         conn_props.append(f'{qk}={qv}')
@@ -985,8 +1249,8 @@ def parse_endpoint(
       sp_cfg[qk] = _coerce_opt_value(qv)
     sp_cfg.update(opts)
     is_sp_cdc = bool(is_read and (cdc or 'change_stream' in sp_cfg))
-    if not is_sp_cdc and not sp_cfg.get('table') and not (
-        is_read and sp_cfg.get('query')):
+    if not is_sp_cdc and not sp_cfg.get('table') and not (is_read and
+                                                          sp_cfg.get('query')):
       raise UriError(
           f'Spanner URI {location!r} requires ?table=TABLE '
           '(or ?change_stream=STREAM for CDC)')
@@ -1071,7 +1335,8 @@ def parse_endpoint(
     if not bootstrap:
       raise UriError(
           f'invalid Kafka URI {location!r}; expected '
-          'kafka://BOOTSTRAP_SERVERS/TOPIC (or set BEAM_KAFKA_BOOTSTRAP_SERVERS)')
+          'kafka://BOOTSTRAP_SERVERS/TOPIC (or set BEAM_KAFKA_BOOTSTRAP_SERVERS)'
+      )
     if not (allow_jinja and _has_jinja_syntax(bootstrap)) and not re.fullmatch(
         r'[A-Za-z0-9._:,\[\]-]+', bootstrap):
       raise UriError(f'invalid Kafka bootstrap_servers {bootstrap!r}')
@@ -1086,9 +1351,11 @@ def parse_endpoint(
         opts.pop('confluent_schema_registry_url', None))
     if schema_reg:
       schema_reg_s = str(schema_reg).strip()
-      if not (schema_reg_s.startswith('http://') or schema_reg_s.startswith('https://')):
+      if not (schema_reg_s.startswith('http://') or
+              schema_reg_s.startswith('https://')):
         raise UriError(
-            f'invalid schema_registry URL {schema_reg!r}; expected http:// or https://')
+            f'invalid schema_registry URL {schema_reg!r}; expected http:// or https://'
+        )
       opts['confluent_schema_registry_url'] = schema_reg_s
 
     schema_subj = (
@@ -1098,9 +1365,16 @@ def parse_endpoint(
       opts['confluent_schema_registry_subject'] = str(schema_subj).strip()
 
     # Consumer group & SASL / SSL client security configuration
+    for _k_cfg in ('consumer_config', 'producer_config'):
+      if _k_cfg in opts and not isinstance(opts[_k_cfg], dict):
+        raise UriError(
+            f'Kafka {_k_cfg} must be a dict mapping, '
+            f'got {type(opts[_k_cfg]).__name__}')
     c_cfg_raw = opts.get('consumer_config')
-    c_cfg: dict[str, Any] = dict(c_cfg_raw) if isinstance(c_cfg_raw, dict) else {}
-    consumer_grp = opts.pop('consumer_group', None) or opts.pop('group_id', None)
+    c_cfg: dict[str,
+                Any] = dict(c_cfg_raw) if isinstance(c_cfg_raw, dict) else {}
+    consumer_grp = opts.pop('consumer_group', None) or opts.pop(
+        'group_id', None)
     if consumer_grp:
       c_cfg['group.id'] = str(consumer_grp).strip()
 
@@ -1112,24 +1386,20 @@ def parse_endpoint(
       c_cfg.setdefault('security.protocol', str(sec_proto).strip())
 
     sasl_mech = (
-        opts.pop('sasl_mechanism', None) or
-        opts.pop('sasl_mechanisms', None) or
-        opts.pop('sasl.mechanism', None) or
-        opts.pop('sasl.mechanisms', None) or
+        opts.pop('sasl_mechanism', None) or opts.pop('sasl_mechanisms', None) or
+        opts.pop('sasl.mechanism', None) or opts.pop('sasl.mechanisms', None) or
         os.environ.get('BEAM_KAFKA_SASL_MECHANISM'))
     if sasl_mech:
       c_cfg.setdefault('sasl.mechanism', str(sasl_mech).strip())
 
     sasl_user = (
-        opts.pop('sasl_username', None) or
-        opts.pop('sasl.username', None) or
+        opts.pop('sasl_username', None) or opts.pop('sasl.username', None) or
         os.environ.get('BEAM_KAFKA_SASL_USERNAME'))
     if sasl_user:
       c_cfg.setdefault('sasl.username', str(sasl_user).strip())
 
     sasl_pwd = (
-        opts.pop('sasl_password', None) or
-        opts.pop('sasl.password', None) or
+        opts.pop('sasl_password', None) or opts.pop('sasl.password', None) or
         os.environ.get('BEAM_KAFKA_SASL_PASSWORD'))
     if sasl_pwd:
       c_cfg.setdefault('sasl.password', str(sasl_pwd))
@@ -1151,8 +1421,7 @@ def parse_endpoint(
 
     # Offset reset configuration
     offset_reset = (
-        opts.pop('auto_offset_reset', None) or
-        opts.pop('offset_reset', None) or
+        opts.pop('auto_offset_reset', None) or opts.pop('offset_reset', None) or
         opts.pop('auto_offset_reset_config', None))
     if offset_reset:
       opts['auto_offset_reset_config'] = str(offset_reset).strip().lower()
@@ -1254,7 +1523,9 @@ def parse_endpoint(
     cat_props.setdefault('type', 'rest')
     cat_props.setdefault(
         'uri',
-        str(rest_uri or 'https://biglake.googleapis.com/iceberg/v1/restcatalog'))
+        str(
+            rest_uri or
+            'https://biglake.googleapis.com/iceberg/v1/restcatalog'))
     cat_props.setdefault('rest.auth.type', 'google')
     if warehouse_val:
       cat_props.setdefault('warehouse', str(warehouse_val))

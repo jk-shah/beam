@@ -35,6 +35,24 @@ from . import output
 from . import uris
 
 
+def _redact_config_preview(obj: Any) -> Any:
+  """Recursively redacts nested secret keys and inline credentials in config."""
+  if isinstance(obj, dict):
+    out_d: dict[Any, Any] = {}
+    for k, v in obj.items():
+      ks = str(k)
+      if not ks.lower().endswith('_env') and uris._SECRET_KEY_RE.search(ks):
+        out_d[k] = '<redacted>'
+      else:
+        out_d[k] = _redact_config_preview(v)
+    return out_d
+  if isinstance(obj, (list, tuple)):
+    return [_redact_config_preview(item) for item in obj]
+  if isinstance(obj, str):
+    return output.redact_inline_secrets(obj, placeholder='<redacted>')
+  return obj
+
+
 def run_inspect(
     location: str,
     *,
@@ -83,14 +101,11 @@ def run_inspect(
         search_term=search_term,
         scan_budget=scan_budget)
   return {
-      'uri': location,
+      'uri': output.redact_inline_secrets(location, placeholder='<redacted>'),
       'kind': ep.kind,
       'format': ep.format,
       'yaml_transform': ep.yaml_type,
-      'config_preview': {
-          k: ('<redacted>' if uris._SECRET_KEY_RE.search(str(k)) else v)
-          for k, v in ep.config.items()
-      },
+      'config_preview': _redact_config_preview(ep.config),
       'schema': [],
       'estimated_bytes': None,
       'row_count': None,
@@ -133,8 +148,8 @@ def _match_files(path: str) -> list[tuple[str, int]]:
         m for m in FileSystems.match([path + '*'])[0].metadata_list
         if cost_guard.is_owned_by_prefix(m.path, path)
     ]
-  return [(m.path, int(m.size_in_bytes or 0)) for m in sorted(
-      metas, key=lambda x: x.path)]
+  return [(m.path, int(m.size_in_bytes or 0))
+          for m in sorted(metas, key=lambda x: x.path)]
 
 
 def _row_matches_search(row: dict[str, Any], needle_lower: str) -> bool:
@@ -194,12 +209,16 @@ def _inspect_files(
         total_rows += pf.metadata.num_rows
         if len(rows) < sample_count and sample_count > 0:
           for batch in pf.iter_batches(batch_size=max(sample_count * 4, 64)):
+            scanned += max(int(batch.nbytes), 1)
             for rec in batch.to_pylist():
               if needle is None or _row_matches_search(rec, needle):
                 rows.append(rec)
                 if len(rows) >= sample_count:
                   break
             if len(rows) >= sample_count:
+              break
+            if scanned >= scan_budget:
+              truncated_scan = True
               break
       scanned += min(max(fsize, 1), 16384)
     exact_row_count = total_rows if scanned_all_footers else None
@@ -208,14 +227,16 @@ def _inspect_files(
     import fastavro
     scanned = 0
     for fpath, _ in matched:
-      if scanned >= scan_budget or (len(rows) >= sample_count and schema_fields):
+      if scanned >= scan_budget or (len(rows) >= sample_count and
+                                    schema_fields):
         if scanned >= scan_budget:
           truncated_scan = True
         break
       with _open_file_bytes(fpath) as fobj:
         reader = fastavro.reader(fobj)
         w_schema = reader.writer_schema
-        if not schema_fields and isinstance(w_schema, dict) and 'fields' in w_schema:
+        if not schema_fields and isinstance(w_schema,
+                                            dict) and 'fields' in w_schema:
           schema_fields = [{
               'name': output.sanitize_untrusted_text(
                   str(f.get('name')), max_chars=256),
@@ -294,8 +315,8 @@ def _inspect_files(
                 col_samples[c].append(cell)
             idx += 1
             rec = dict(zip(header, cells))
-            if (needle is None or _row_matches_search(rec, needle)) and len(
-                rows) < sample_count:
+            if (needle is None or
+                _row_matches_search(rec, needle)) and len(rows) < sample_count:
               rows.append(rec)
             if idx >= 100 and len(rows) >= sample_count:
               break
@@ -314,7 +335,8 @@ def _inspect_files(
           shown_c = (
               safe_c if output.SAFE_IDENTIFIER_RE.match(safe_c) else
               '<unsafe-column-name>')
-          dirty_cols.append(f'{shown_c} ({dirty_t} with non-{dirty_t} outlier cells)')
+          dirty_cols.append(
+              f'{shown_c} ({dirty_t} with non-{dirty_t} outlier cells)')
         schema_fields.append({
             'name': safe_c,
             'type': dirty_t,
@@ -355,8 +377,8 @@ def _inspect_files(
             inferred_types[k] = val_t
           elif {prev_t, val_t} == {'int', 'float'}:
             inferred_types[k] = 'float'
-      if (needle is None or _row_matches_search(rec_obj, needle)) and len(
-          rows) < sample_count:
+      if (needle is None or
+          _row_matches_search(rec_obj, needle)) and len(rows) < sample_count:
         rows.append(rec_obj)
 
     for fpath, fsize in matched:
@@ -397,8 +419,8 @@ def _inspect_files(
             except ValueError:
               malformed_in_sample += 1
               continue
-            if isinstance(parsed, list) and all(
-                isinstance(el, dict) for el in parsed):
+            if isinstance(parsed, list) and all(isinstance(el, dict)
+                                                for el in parsed):
               for el in parsed:
                 _observe_record(el)
             else:
@@ -442,8 +464,8 @@ def _inspect_files(
       'schema': schema_fields,
       'stats': stats,
       'warnings': inspect_warnings,
-      'untrusted_data': output.wrap_untrusted_rows(rows, truncated=truncated_scan)
-      if sample_count > 0 else None,
+      'untrusted_data': output.wrap_untrusted_rows(
+          rows, truncated=truncated_scan) if sample_count > 0 else None,
   }
 
 

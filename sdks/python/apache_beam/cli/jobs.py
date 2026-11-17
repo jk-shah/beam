@@ -32,12 +32,17 @@ Security & reliability invariants:
 """
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
+import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -51,7 +56,8 @@ _DURATION_RE = re.compile(
     r'^\s*(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>ms|s|sec|secs|m|min|mins|h|hr|hrs)?\s*$',
     re.IGNORECASE)
 
-_TERMINAL_SUCCESS_STATES = frozenset(['DONE', 'JOB_STATE_DONE', 'DRAINED', 'JOB_STATE_DRAINED'])
+_TERMINAL_SUCCESS_STATES = frozenset(
+    ['DONE', 'JOB_STATE_DONE', 'DRAINED', 'JOB_STATE_DRAINED'])
 _TERMINAL_FAILURE_STATES = frozenset([
     'FAILED',
     'JOB_STATE_FAILED',
@@ -109,13 +115,11 @@ def _jobs_dir() -> Path:
         EXIT_USAGE)
   d = beam_home / 'jobs'
   if os.path.islink(d):
-    raise JobError(
-        f'refusing symlinked jobs directory {str(d)!r}', EXIT_USAGE)
+    raise JobError(f'refusing symlinked jobs directory {str(d)!r}', EXIT_USAGE)
   beam_home.mkdir(mode=0o700, parents=True, exist_ok=True)
   d.mkdir(mode=0o700, parents=True, exist_ok=True)
   if os.path.islink(beam_home) or os.path.islink(d):
-    raise JobError(
-        f'refusing symlinked jobs directory {str(d)!r}', EXIT_USAGE)
+    raise JobError(f'refusing symlinked jobs directory {str(d)!r}', EXIT_USAGE)
   try:
     os.chmod(beam_home, 0o700)
     os.chmod(d, 0o700)
@@ -124,16 +128,12 @@ def _jobs_dir() -> Path:
   return d
 
 
-_INPROC_LOCKS_GUARD = None
-_INPROC_LOCKS: dict[str, Any] = {}
-_INPROC_LOCK_DEPTH: dict[str, int] = {}
+_INPROC_LOCKS_GUARD = threading.Lock()
+_INPROC_LOCKS: dict[str, threading.RLock] = {}
+_INPROC_LOCK_DEPTH: dict[tuple[str, int], int] = {}
 
 
-def _get_inproc_lock(key: str):
-  import threading
-  global _INPROC_LOCKS_GUARD
-  if _INPROC_LOCKS_GUARD is None:
-    _INPROC_LOCKS_GUARD = threading.Lock()
+def _get_inproc_lock(key: str) -> threading.RLock:
   with _INPROC_LOCKS_GUARD:
     lk = _INPROC_LOCKS.get(key)
     if lk is None:
@@ -144,20 +144,46 @@ def _get_inproc_lock(key: str):
 
 @contextlib.contextmanager
 def _file_lock(lock_path: Path):
-  abs_key = os.path.abspath(str(lock_path))
+  lock_p = Path(lock_path)
+  abs_key = os.path.abspath(str(lock_p))
   inproc_lk = _get_inproc_lock(abs_key)
   with inproc_lk:
-    depth = _INPROC_LOCK_DEPTH.get(abs_key, 0)
+    depth_key = (abs_key, threading.get_ident())
+    depth = _INPROC_LOCK_DEPTH.get(depth_key, 0)
     if depth > 0:
-      _INPROC_LOCK_DEPTH[abs_key] = depth + 1
+      _INPROC_LOCK_DEPTH[depth_key] = depth + 1
       try:
         yield
       finally:
-        _INPROC_LOCK_DEPTH[abs_key] = depth
+        _INPROC_LOCK_DEPTH[depth_key] = depth
       return
 
-    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    if os.path.islink(lock_p) or os.path.islink(lock_p.parent):
+      raise JobError(
+          f'refusing symbolic link lock path {str(lock_p)!r}', EXIT_USAGE)
+    lock_p.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if os.path.islink(lock_p) or os.path.islink(lock_p.parent):
+      raise JobError(
+          f'refusing symbolic link lock path {str(lock_p)!r}', EXIT_USAGE)
+    open_flags = os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0)
+    try:
+      fd = os.open(str(lock_p), open_flags, 0o600)
+    except OSError as exc:
+      if exc.errno == getattr(errno, 'ELOOP', -1):
+        raise JobError(
+            f'refusing symbolic link lock path {str(lock_p)!r}',
+            EXIT_USAGE) from None
+      raise
+    try:
+      st_mode = os.fstat(fd).st_mode
+    except OSError:
+      os.close(fd)
+      raise
+    if not stat.S_ISREG(st_mode):
+      os.close(fd)
+      raise JobError(
+          f'lock path {str(lock_p)!r} must be a regular file', EXIT_USAGE)
+
     try:
       if os.name == 'nt':
         import msvcrt
@@ -177,10 +203,10 @@ def _file_lock(lock_path: Path):
       else:
         import fcntl
         fcntl.flock(fd, fcntl.LOCK_EX)
-      _INPROC_LOCK_DEPTH[abs_key] = 1
+      _INPROC_LOCK_DEPTH[depth_key] = 1
       yield
     finally:
-      _INPROC_LOCK_DEPTH.pop(abs_key, None)
+      _INPROC_LOCK_DEPTH.pop(depth_key, None)
       try:
         if os.name == 'nt':
           import msvcrt
@@ -258,7 +284,14 @@ def _atomic_write_json(target: Path, payload: dict[str, Any]) -> None:
         os.fsync(f.fileno())
       except OSError:
         pass
-    os.replace(tmp_path, target)
+    for attempt in range(6):
+      try:
+        os.replace(tmp_path, target)
+        break
+      except PermissionError:
+        if os.name != 'nt' or attempt >= 5:
+          raise
+        time.sleep(0.01)
   finally:
     if os.path.exists(tmp_path):
       try:
@@ -268,12 +301,26 @@ def _atomic_write_json(target: Path, payload: dict[str, Any]) -> None:
 
 
 def compute_idempotency_key(argv: list[str], plan_hash: str) -> str:
-  canonical = json.dumps({'argv': list(argv), 'plan_hash': plan_hash}, sort_keys=True)
+  canonical = json.dumps({
+      'argv': list(argv), 'plan_hash': plan_hash
+  },
+                         sort_keys=True)
   return 'idem:' + hashlib.sha256(canonical.encode('utf-8')).hexdigest()[:32]
 
 
-def lookup_recent_submission(
-    idem_key: str, ttl_seconds: int = 1800) -> dict[str, Any] | None:
+@contextlib.contextmanager
+def idem_submission_lock(idem_key: str | None):
+  """Serializes check-then-submit for identical remote idempotency keys."""
+  if not idem_key:
+    yield
+    return
+  digest = hashlib.sha256(str(idem_key).encode('utf-8')).hexdigest()[:24]
+  with _file_lock(_jobs_dir() / f'.idem-{digest}.lock'):
+    yield
+
+
+def lookup_recent_submission(idem_key: str,
+                             ttl_seconds: int = 1800) -> dict[str, Any] | None:
   """Returns an active/recent remote job record if submitted within `ttl_seconds`."""
   from . import output as out_mod
   jobs_d = _jobs_dir()
@@ -576,20 +623,27 @@ def dataflow_console_url(
       f'?project={project}')
 
 
-class _NoRedirectHandler(object):
-  """Lazy factory wrapper around `urllib.request.HTTPRedirectHandler`."""
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+  """Blocks HTTP 30x redirects and local `file://` / `ftp://` schemes."""
+  def redirect_request(self, req, fp, code, msg, headers, newurl):
+    raise urllib.error.HTTPError(
+        req.full_url,
+        code,
+        'redirects disallowed for auth requests',
+        headers,
+        fp)
+
+  def file_open(self, req):
+    raise urllib.error.URLError(
+        f'disallowed file:// URL {getattr(req, "full_url", "")!r}')
+
+  def ftp_open(self, req):
+    raise urllib.error.URLError(
+        f'disallowed ftp:// URL {getattr(req, "full_url", "")!r}')
 
   @staticmethod
   def build_opener():
-    import urllib.request
-
-    class _BlockRedirect(urllib.request.HTTPRedirectHandler):
-      def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise urllib.error.HTTPError(
-            req.full_url, code, 'redirects disallowed for auth requests',
-            headers, fp)
-
-    return urllib.request.build_opener(_BlockRedirect())
+    return urllib.request.build_opener(_NoRedirectHandler())
 
 
 def _extract_raw_counters_from_metrics_list(
@@ -602,9 +656,10 @@ def _extract_raw_counters_from_metrics_list(
       origin = str(m_name.get('origin') or '')
       name_str = str(m_name.get('name') or '')
       ctx_raw = m_name.get('context') or {}
-      context_entries = (
-          {str(k): str(v) for k, v in ctx_raw.items()}
-          if isinstance(ctx_raw, dict) else {})
+      context_entries = ({
+          str(k): str(v)
+          for k, v in ctx_raw.items()
+      } if isinstance(ctx_raw, dict) else {})
       scalar = m.get('scalar')
       if isinstance(scalar, dict):
         val = scalar.get(
@@ -625,7 +680,8 @@ def _extract_raw_counters_from_metrics_list(
         context_entries = {str(k): str(v) for k, v in ctx_obj.items()}
       elif ctx_obj and hasattr(ctx_obj, 'additionalProperties'):
         context_entries = {
-            str(kv.key): str(kv.value) for kv in ctx_obj.additionalProperties
+            str(kv.key): str(kv.value)
+            for kv in ctx_obj.additionalProperties
         }
       else:
         context_entries = {}
@@ -699,20 +755,21 @@ class _DataflowPoller:
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme != 'https' or parsed.hostname != 'dataflow.googleapis.com':
       raise JobError(f'refusing Dataflow API request to {url!r}', EXIT_USAGE)
-    payload = (
-        json.dumps(body).encode('utf-8') if body is not None else None)
+    payload = (json.dumps(body).encode('utf-8') if body is not None else None)
     headers = {
         'Authorization': f'Bearer {token}',
         'Accept': 'application/json',
     }
     if payload is not None:
       headers['Content-Type'] = 'application/json'
-    req = urllib.request.Request(url, data=payload, headers=headers, method=method)
+    req = urllib.request.Request(
+        url, data=payload, headers=headers, method=method)
     with self._opener.open(req, timeout=20) as resp:
       raw = resp.read(16 * 1024 * 1024)
     return json.loads(raw.decode('utf-8')) if raw else {}
 
-  def query(self, job_id: str, project: str, region: str) -> tuple[str, dict[str, int]]:
+  def query(self, job_id: str, project: str,
+            region: str) -> tuple[str, dict[str, int]]:
     import urllib.parse
     token = self._ensure_rest_creds()
     if token is not None:
@@ -777,9 +834,8 @@ class _DataflowPoller:
       os.environ.setdefault('GRPC_ENABLE_FORK_SUPPORT', '0')
       from apache_beam.options.pipeline_options import PipelineOptions
       from apache_beam.runners.dataflow.internal import apiclient
-      opts = PipelineOptions([
-          f'--project={self._project}', f'--region={self._region}'
-      ])
+      opts = PipelineOptions(
+          [f'--project={self._project}', f'--region={self._region}'])
       self._apiclient = apiclient.DataflowApplicationClient(opts)
     return bool(self._apiclient.modify_job_state(job_id, target_state))
 
@@ -840,36 +896,42 @@ def wait_for_job(
   while True:
     state_str, counters = fetch(safe_id, proj, reg)
     upper = state_str.upper()
-    try:
-      latest_disk = load_job_record(safe_id)
-      if isinstance(latest_disk, dict):
-        disk_state = str(latest_disk.get('state') or '').upper()
-        record.update(latest_disk)
-        if console_url:
-          merged_out = dict(record.get('outputs') or {})
-          merged_out.setdefault('console_url', console_url)
-          record['outputs'] = merged_out
-        if (disk_state in ('JOB_STATE_CANCELLED', 'CANCELLED', 'CANCELED',
-                           'JOB_STATE_DRAINING', 'DRAINING') and
-            upper not in (_TERMINAL_SUCCESS_STATES | _TERMINAL_FAILURE_STATES)):
-          record['state'] = latest_disk['state']
+    jobs_d = _jobs_dir()
+    job_lock = jobs_d / f'.{safe_id}.job.lock'
+    with _file_lock(job_lock):
+      try:
+        latest_disk = load_job_record(safe_id)
+        if isinstance(latest_disk, dict):
+          disk_state = str(latest_disk.get('state') or '').upper()
+          record.update(latest_disk)
+          if console_url:
+            merged_out = dict(record.get('outputs') or {})
+            merged_out.setdefault('console_url', console_url)
+            record['outputs'] = merged_out
+          if (disk_state in ('JOB_STATE_CANCELLED',
+                             'CANCELLED',
+                             'CANCELED',
+                             'JOB_STATE_DRAINING',
+                             'DRAINING') and upper
+              not in (_TERMINAL_SUCCESS_STATES | _TERMINAL_FAILURE_STATES)):
+            record['state'] = latest_disk['state']
+          else:
+            record['state'] = state_str
         else:
           record['state'] = state_str
-      else:
+      except JobError:
         record['state'] = state_str
-    except JobError:
-      record['state'] = state_str
 
-    record['updated_at'] = time.time()
-    eff_counters = counters if counters else dict(record.get('metrics') or {})
-    if eff_counters:
-      record['metrics'] = eff_counters
-    _atomic_write_json(_jobs_dir() / f'{safe_id}.json', record)
+      record['updated_at'] = time.time()
+      eff_counters = counters if counters else dict(record.get('metrics') or {})
+      if eff_counters:
+        record['metrics'] = eff_counters
+      _atomic_write_json(jobs_d / f'{safe_id}.json', record)
 
     now_m = time.monotonic()
     elapsed_s = int(now_m - t_start)
-    if show_progress and (
-        state_str != last_logged_state or (now_m - last_logged_at) >= 10.0):
+    if show_progress and (state_str != last_logged_state or
+                          (now_m - last_logged_at) >= 10.0):
       print(
           f'[beam] Waiting for job {safe_id} '
           f'(state={state_str}, elapsed={elapsed_s}s)...',
@@ -909,11 +971,25 @@ def wait_for_job(
       if post.get('assert_counts'):
         err_msg = check_assert_counts(eff_counters)
         if err_msg:
-          record['validation_state'] = 'FAILED'
-          record['validation_exit_code'] = EXIT_PIPELINE_FAILED
-          record['post_check_error'] = err_msg
-          _atomic_write_json(_jobs_dir() / f'{safe_id}.json', record)
+          with _file_lock(job_lock):
+            try:
+              latest_disk = load_job_record(safe_id)
+              if isinstance(latest_disk, dict):
+                record.update(latest_disk)
+            except JobError:
+              pass
+            record['outputs'] = {
+                **dict(record.get('outputs') or {}), **outputs_obj
+            }
+            if eff_counters:
+              record['metrics'] = eff_counters
+            record['updated_at'] = time.time()
+            record['validation_state'] = 'FAILED'
+            record['validation_exit_code'] = EXIT_PIPELINE_FAILED
+            record['post_check_error'] = err_msg
+            _atomic_write_json(jobs_d / f'{safe_id}.json', record)
           return EXIT_PIPELINE_FAILED, dict(record)
+      diff_report: dict[str, Any] | None = None
       if post.get('verify_diff'):
         from . import diff
         v_cfg = post['verify_diff']
@@ -934,15 +1010,42 @@ def wait_for_job(
           v_err = (
               f'--verify detected mismatch between '
               f'{v_cfg["left"]} and {v_cfg["right"]}')
-          record['validation_state'] = 'FAILED'
-          record['validation_exit_code'] = diff_code
-          record['post_check_error'] = v_err
-          _atomic_write_json(_jobs_dir() / f'{safe_id}.json', record)
+          with _file_lock(job_lock):
+            try:
+              latest_disk = load_job_record(safe_id)
+              if isinstance(latest_disk, dict):
+                record.update(latest_disk)
+            except JobError:
+              pass
+            record['outputs'] = {
+                **dict(record.get('outputs') or {}), **outputs_obj
+            }
+            record['verify_diff'] = diff_report
+            if eff_counters:
+              record['metrics'] = eff_counters
+            record['updated_at'] = time.time()
+            record['validation_state'] = 'FAILED'
+            record['validation_exit_code'] = diff_code
+            record['post_check_error'] = v_err
+            _atomic_write_json(jobs_d / f'{safe_id}.json', record)
           return diff_code, dict(record)
-      record['validation_state'] = 'PASSED' if post else 'NONE'
-      record['validation_exit_code'] = EXIT_OK
-      record.pop('post_check_error', None)
-      _atomic_write_json(_jobs_dir() / f'{safe_id}.json', record)
+      with _file_lock(job_lock):
+        try:
+          latest_disk = load_job_record(safe_id)
+          if isinstance(latest_disk, dict):
+            record.update(latest_disk)
+        except JobError:
+          pass
+        record['outputs'] = {**dict(record.get('outputs') or {}), **outputs_obj}
+        if diff_report is not None:
+          record['verify_diff'] = diff_report
+        if eff_counters:
+          record['metrics'] = eff_counters
+        record['updated_at'] = time.time()
+        record['validation_state'] = 'PASSED' if post else 'NONE'
+        record['validation_exit_code'] = EXIT_OK
+        record.pop('post_check_error', None)
+        _atomic_write_json(jobs_d / f'{safe_id}.json', record)
       return EXIT_OK, record
 
     if upper in _TERMINAL_FAILURE_STATES:
@@ -1012,10 +1115,10 @@ def cancel_job(
     ok = poller.modify_state(safe_id, target_state)
     if not ok:
       try:
-        q_state, _ = poller.query(safe_id)
+        q_state, _ = poller.query(safe_id, proj, reg)
         current_state = str(q_state or '').upper()
-        if current_state in (_TERMINAL_SUCCESS_STATES |
-                             _TERMINAL_FAILURE_STATES):
+        if current_state in (_TERMINAL_SUCCESS_STATES
+                             | _TERMINAL_FAILURE_STATES):
           ok = True
           already_terminal = True
       except Exception:  # pylint: disable=broad-except
@@ -1027,10 +1130,18 @@ def cancel_job(
         f'runner rejected state transition to {target_state} for job {safe_id!r}{hint}',
         EXIT_PIPELINE_FAILED)
 
-  if record:
-    record['state'] = current_state if already_terminal else target_state
-    record['updated_at'] = time.time()
-    _atomic_write_json(_jobs_dir() / f'{safe_id}.json', record)
+  jobs_d = _jobs_dir()
+  with _file_lock(jobs_d / f'.{safe_id}.job.lock'):
+    try:
+      latest_rec = load_job_record(safe_id)
+    except JobError:
+      latest_rec = dict(record) if record else {}
+    if latest_rec:
+      latest_rec['state'] = (
+          current_state if
+          (already_terminal and current_state) else target_state)
+      latest_rec['updated_at'] = time.time()
+      _atomic_write_json(jobs_d / f'{safe_id}.json', latest_rec)
 
   out_res: dict[str, Any] = {
       'job_id': safe_id,

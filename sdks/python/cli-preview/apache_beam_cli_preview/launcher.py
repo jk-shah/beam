@@ -25,8 +25,10 @@ import importlib.machinery
 import importlib.util
 import os
 import re
+import stat
 import sys
 import tempfile
+import threading
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -35,6 +37,7 @@ from . import __version__
 
 _FAST_PKG = '_apache_beam_cli_pkg'
 _CANON_PKG = 'apache_beam.cli'
+_HOOKS_LOCK = threading.Lock()
 _PTH_CONTENT = (
     'import apache_beam_cli_preview.launcher as _bcp; '
     '_bcp.install_runtime_hooks(strict=False)\n')
@@ -57,11 +60,12 @@ def _locate_cli_dir() -> Path:
   bundled = (Path(__file__).resolve().parent / '_bundled_cli').resolve()
   if (bundled / 'main.py').is_file():
     return bundled
-  repo_cli = (
-      Path(__file__).resolve().parents[2] / 'apache_beam' / 'cli').resolve()
+  repo_cli = (Path(__file__).resolve().parents[2] / 'apache_beam' /
+              'cli').resolve()
   if (repo_cli / 'main.py').is_file():
     return repo_cli
-  raise RuntimeError(f'could not locate apache_beam/cli sources from {__file__}')
+  raise RuntimeError(
+      f'could not locate apache_beam/cli sources from {__file__}')
 
 
 def _is_truthy_env(var_name: str) -> bool:
@@ -81,8 +85,8 @@ def _core_beam_cli_dir() -> Path | None:
     except Exception:  # pylint: disable=broad-except
       ab_spec = None
     search_locs = (
-        list(ab_spec.submodule_search_locations or ())
-        if ab_spec is not None else [])
+        list(ab_spec.submodule_search_locations or
+             ()) if ab_spec is not None else [])
   for loc in search_locs:
     cand = Path(loc) / 'cli'
     if (cand / '__init__.py').is_file():
@@ -140,15 +144,15 @@ def _make_arbitrary_field_row_tuple(type_name: str, subfields) -> type:
       '__annotations__': dict(subfields),
       '__new__': _new,
       '_asdict': lambda self: dict(zip(field_names, self)),
-      '_replace': lambda self, **kw: type(self)(
-          *(kw.get(f, v) for f, v in zip(field_names, self))),
+      '_replace': lambda self, **kw: type(self)
+      (*(kw.get(f, v) for f, v in zip(field_names, self))),
       '__repr__': lambda self: (
-          f'{type_name}(' +
-          ', '.join(f'{f}={v!r}' for f, v in zip(field_names, self)) + ')'),
+          f'{type_name}(' + ', '.join(
+              f'{f}={v!r}' for f, v in zip(field_names, self)) + ')'),
   }
   cls = type(type_name, (tuple, ), ns)
   for idx, name in enumerate(field_names):
-    if name not in ('count', 'index') and not name.startswith('__'):
+    if name not in ('count', 'index') and not name.startswith('_'):
       setattr(cls, name, property(operator.itemgetter(idx)))
   return cls
 
@@ -160,13 +164,23 @@ def _patch_schemas_module(module) -> None:
     return
   orig_nt = st_cls.named_tuple_from_schema
 
+  reserved_tuple_attrs = frozenset(
+      ('_asdict', '_fields', '_replace', '_field_defaults', 'count', 'index'))
+
   def _safe_named_tuple_from_schema(self_st, schema):
     try:
+      seen_f: set[str] = set()
+      for f in schema.fields:
+        fn = f.name
+        if (fn.startswith('__') or fn in reserved_tuple_attrs or fn in seen_f):
+          raise ValueError('reserved or duplicate tuple field name')
+        seen_f.add(fn)
       return orig_nt(self_st, schema)
     except (ValueError, TypeError, SyntaxError):
       from apache_beam import coders
       from apache_beam.typehints import row_type
-      type_name = 'BeamSchema_{}'.format(schema.id.replace('-', '_'))
+      safe_schema_id = re.sub(r'[^A-Za-z0-9_]', '_', str(schema.id or ''))
+      type_name = f'BeamSchema_{safe_schema_id}'
       if schema.id in self_st.schema_registry.by_id:
         return self_st.schema_registry.by_id[schema.id][0]
       subfields = []
@@ -274,8 +288,9 @@ def _patch_opcodes_module(module) -> None:
         return row_type.RowTypeConstraint.from_user_type(t)
       return None
 
-    if isinstance(o, row_type.RowTypeConstraint) or (
-        inspect.isclass(o) and ntc.match_is_named_tuple(o)):
+    if isinstance(o,
+                  row_type.RowTypeConstraint) or (inspect.isclass(o) and
+                                                  ntc.match_is_named_tuple(o)):
       row = _row_type_of(o)
       nullable = False
     else:
@@ -303,11 +318,11 @@ def _rewrite_module_member_origins(module: Any, canon_name: str) -> None:
     return
   for obj in list(mod_dict.values()):
     orig_mod = getattr(obj, '__module__', None)
-    if isinstance(orig_mod, str) and (
-        orig_mod == _FAST_PKG or orig_mod.startswith(f'{_FAST_PKG}.')):
+    if isinstance(orig_mod, str) and (orig_mod == _FAST_PKG or
+                                      orig_mod.startswith(f'{_FAST_PKG}.')):
       target_mod = (
-          _CANON_PKG + orig_mod[len(_FAST_PKG):]
-          if orig_mod != _FAST_PKG else canon_name)
+          _CANON_PKG +
+          orig_mod[len(_FAST_PKG):] if orig_mod != _FAST_PKG else canon_name)
       try:
         obj.__module__ = target_mod
       except (AttributeError, TypeError):
@@ -409,12 +424,7 @@ class _PreviewCliFinder(importlib.abc.MetaPathFinder):
         if mod_py.is_file():
           if existing is not None:
             return self._alias_spec(
-                fullname,
-                canon_name,
-                fast_name,
-                existing,
-                mod_py,
-                is_pkg=False)
+                fullname, canon_name, fast_name, existing, mod_py, is_pkg=False)
           return self._cli_file_spec(
               fullname, canon_name, fast_name, mod_py, is_pkg=False)
 
@@ -563,46 +573,130 @@ class _PreviewCliFinder(importlib.abc.MetaPathFinder):
 
 
 def install_runtime_hooks(*, strict: bool = True) -> Path | None:
-  force_preview = (
-      bool(os.environ.get('BEAM_CLI_DIR')) or
-      _is_truthy_env('BEAM_CLI_FORCE_PREVIEW'))
-  if not force_preview:
-    core_cli = _core_beam_cli_dir()
-    if core_cli is not None:
+  with _HOOKS_LOCK:
+    force_preview = (
+        bool(os.environ.get('BEAM_CLI_DIR')) or
+        _is_truthy_env('BEAM_CLI_FORCE_PREVIEW'))
+    if not force_preview:
+      core_cli = _core_beam_cli_dir()
+      if core_cli is not None:
+        if any(type(f).__name__ == '_PreviewCliFinder' for f in sys.meta_path):
+          sys.meta_path[:] = [
+              f for f in sys.meta_path
+              if type(f).__name__ != '_PreviewCliFinder'
+          ]
+        canonicalize_cli_module_aliases()
+        return core_cli
+
+    try:
+      cli_dir = _locate_cli_dir()
+    except (RuntimeError, OSError):
+      if strict:
+        raise
+      return None
+
+    already_installed = (
+        bool(sys.meta_path) and
+        type(sys.meta_path[0]).__name__ == '_PreviewCliFinder' and
+        getattr(sys.meta_path[0], '_cli_dir', None) == cli_dir and not any(
+            type(f).__name__ == '_PreviewCliFinder' for f in sys.meta_path[1:]))
+    if not already_installed:
       sys.meta_path[:] = [
-          f for f in sys.meta_path
-          if type(f).__name__ != '_PreviewCliFinder'
+          f for f in sys.meta_path if type(f).__name__ != '_PreviewCliFinder'
       ]
-      canonicalize_cli_module_aliases()
-      return core_cli
+      sys.meta_path.insert(0, _PreviewCliFinder(cli_dir))
+    # Also patch if any target module was already imported before hooks ran.
+    arrow_mod = sys.modules.get(
+        'apache_beam.typehints.arrow_type_compatibility')
+    if arrow_mod is not None:
+      _patch_arrow_module(arrow_mod)
+    schemas_mod = sys.modules.get('apache_beam.typehints.schemas')
+    if schemas_mod is not None:
+      _patch_schemas_module(schemas_mod)
+    yaml_mod = sys.modules.get('apache_beam.yaml.yaml_mapping')
+    if yaml_mod is not None:
+      _patch_yaml_mapping_module(yaml_mod)
+    opcodes_mod = sys.modules.get('apache_beam.typehints.opcodes')
+    if opcodes_mod is not None:
+      _patch_opcodes_module(opcodes_mod)
+    canonicalize_cli_module_aliases()
+    return cli_dir
 
+
+def _check_owned_dir_lstat(dir_path: Path) -> None:
+  st = os.lstat(dir_path)
+  if stat.S_ISLNK(st.st_mode):
+    raise RuntimeError(f'refusing symlinked cache directory {str(dir_path)!r}')
+  if not stat.S_ISDIR(st.st_mode):
+    raise NotADirectoryError(
+        f'cache path is not a directory: {str(dir_path)!r}')
+  if hasattr(os, 'getuid') and st.st_uid != os.getuid():
+    raise RuntimeError(
+        f'refusing foreign-owned cache directory {str(dir_path)!r}')
   try:
-    cli_dir = _locate_cli_dir()
-  except (RuntimeError, OSError):
-    if strict:
-      raise
-    return None
+    os.chmod(dir_path, 0o700)
+  except OSError:
+    pass
 
-  sys.meta_path[:] = [
-      f for f in sys.meta_path
-      if type(f).__name__ != '_PreviewCliFinder'
-  ]
-  sys.meta_path.insert(0, _PreviewCliFinder(cli_dir))
-  # Also patch if any target module was already imported before hooks ran.
-  arrow_mod = sys.modules.get('apache_beam.typehints.arrow_type_compatibility')
-  if arrow_mod is not None:
-    _patch_arrow_module(arrow_mod)
-  schemas_mod = sys.modules.get('apache_beam.typehints.schemas')
-  if schemas_mod is not None:
-    _patch_schemas_module(schemas_mod)
-  yaml_mod = sys.modules.get('apache_beam.yaml.yaml_mapping')
-  if yaml_mod is not None:
-    _patch_yaml_mapping_module(yaml_mod)
-  opcodes_mod = sys.modules.get('apache_beam.typehints.opcodes')
-  if opcodes_mod is not None:
-    _patch_opcodes_module(opcodes_mod)
-  canonicalize_cli_module_aliases()
-  return cli_dir
+
+def _ensure_owned_private_dir(path: Path, *, root: Path | None = None) -> Path:
+  """Creates missing cache dirs with `0o700` and verifies ownership/no symlinks."""
+  target = Path(os.path.abspath(os.fspath(path)))
+  root_abs = (
+      Path(os.path.abspath(os.fspath(root))) if root is not None else None)
+  chain: list[Path] = []
+  cur = target
+  while True:
+    chain.append(cur)
+    if root_abs is not None and cur == root_abs:
+      break
+    parent = cur.parent
+    if parent == cur:
+      break
+    if root_abs is None:
+      try:
+        parent_st = os.lstat(parent)
+        parent_exists = True
+      except FileNotFoundError:
+        parent_exists = False
+        parent_st = None
+      if parent_exists:
+        p_name = parent.name
+        if not (p_name.startswith('beam-cli-cache') or p_name == '.beam' or
+                (parent_st is not None and stat.S_ISLNK(parent_st.st_mode) and
+                 parent not in
+                 (Path('/tmp'), Path('/var'), Path(tempfile.gettempdir())))):
+          break
+    cur = parent
+
+  chain.reverse()
+  base_parent = chain[0].parent
+  if base_parent != chain[0] and not base_parent.exists():
+    base_parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+  for comp in chain:
+    try:
+      os.lstat(comp)
+    except FileNotFoundError:
+      try:
+        os.mkdir(comp, 0o700)
+      except FileExistsError:
+        pass
+    _check_owned_dir_lstat(comp)
+  return target
+
+
+def _is_valid_owned_wheel(wheel_path: Path) -> bool:
+  try:
+    st = os.lstat(wheel_path)
+  except FileNotFoundError:
+    return False
+  if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+    raise RuntimeError(
+        f'refusing symlinked or non-regular cached wheel {str(wheel_path)!r}')
+  if hasattr(os, 'getuid') and st.st_uid != os.getuid():
+    raise RuntimeError(
+        f'refusing foreign-owned cached wheel {str(wheel_path)!r}')
+  return zipfile.is_zipfile(wheel_path)
 
 
 def ensure_preview_wheel() -> str:
@@ -636,43 +730,28 @@ def ensure_preview_wheel() -> str:
   beam_home_env = os.environ.get('BEAM_HOME')
   if explicit_cache:
     cache_root = Path(explicit_cache)
+    check_root = cache_root
   elif beam_home_env:
-    cache_root = Path(os.path.expanduser(beam_home_env)) / 'cache'
+    check_root = Path(os.path.expanduser(beam_home_env))
+    cache_root = check_root / 'cache'
   else:
-    cache_root = Path.home() / '.beam' / 'cache'
-  if os.path.islink(cache_root):
-    raise RuntimeError(
-        f'refusing symlinked cache directory {str(cache_root)!r}')
-  wheel_dir = cache_root / 'wheels' / digest
+    check_root = Path.home() / '.beam'
+    cache_root = check_root / 'cache'
   wheel_name = f'apache_beam_cli_preview-{__version__}-py3-none-any.whl'
-  wheel_path = wheel_dir / wheel_name
-  if wheel_path.is_file() and not os.path.islink(wheel_path):
-    return str(wheel_path)
+  wheel_dir = cache_root / 'wheels' / digest
   try:
-    wheel_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    wheel_dir = _ensure_owned_private_dir(wheel_dir, root=check_root)
   except OSError:
     if explicit_cache:
       raise
     uid_suffix = f'-{os.getuid()}' if hasattr(os, 'getuid') else ''
     user_tmp_root = Path(tempfile.gettempdir()) / f'beam-cli-cache{uid_suffix}'
-    user_tmp_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if os.path.islink(user_tmp_root):
-      raise RuntimeError(
-          f'refusing symlinked cache directory {str(user_tmp_root)!r}')
-    if hasattr(os, 'getuid'):
-      st = os.lstat(user_tmp_root)
-      if st.st_uid != os.getuid():
-        raise RuntimeError(
-            f'refusing foreign-owned cache directory {str(user_tmp_root)!r}')
-      try:
-        os.chmod(user_tmp_root, 0o700)
-      except OSError:
-        pass
-    wheel_dir = user_tmp_root / 'wheels' / digest
-    wheel_path = wheel_dir / wheel_name
-    if wheel_path.is_file() and not os.path.islink(wheel_path):
-      return str(wheel_path)
-    wheel_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    wheel_dir = _ensure_owned_private_dir(
+        user_tmp_root / 'wheels' / digest, root=user_tmp_root)
+
+  wheel_path = wheel_dir / wheel_name
+  if _is_valid_owned_wheel(wheel_path):
+    return str(wheel_path)
 
   dist_info = f'apache_beam_cli_preview-{__version__}.dist-info'
   metadata_bytes = (
@@ -685,15 +764,13 @@ def ensure_preview_wheel() -> str:
       'Wheel-Version: 1.0\n'
       'Generator: apache-beam-cli-preview\n'
       'Root-Is-Purelib: true\n'
-      'Tag: py3-none-any\n'
-  ).encode('utf-8')
+      'Tag: py3-none-any\n').encode('utf-8')
   top_level_bytes = b'apache_beam_cli_preview\n'
   entry_points_bytes = (
       b'[console_scripts]\n'
       b'beam = apache_beam_cli_preview.launcher:main\n'
       b'apache-beam = apache_beam_cli_preview.launcher:main\n'
-      b'beam-demo = apache_beam_cli_preview.demo:main\n'
-  )
+      b'beam-demo = apache_beam_cli_preview.demo:main\n')
 
   all_files = entries + [
       (f'{dist_info}/METADATA', metadata_bytes),
@@ -704,8 +781,8 @@ def ensure_preview_wheel() -> str:
 
   record_lines: list[str] = []
   for arcname, data in all_files:
-    b64 = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(
-        b'=').decode('ascii')
+    b64 = base64.urlsafe_b64encode(
+        hashlib.sha256(data).digest()).rstrip(b'=').decode('ascii')
     record_lines.append(f'{arcname},sha256={b64},{len(data)}')
   record_path = f'{dist_info}/RECORD'
   record_lines.append(f'{record_path},,')
@@ -719,7 +796,13 @@ def ensure_preview_wheel() -> str:
       for arcname, data in all_files:
         zf.writestr(arcname, data)
       zf.writestr(record_path, record_bytes)
-    os.replace(tmp_whl, wheel_path)
+    try:
+      os.replace(tmp_whl, wheel_path)
+    except PermissionError:
+      if (wheel_path.is_file() and not wheel_path.is_symlink() and
+          _is_valid_owned_wheel(wheel_path)):
+        return str(wheel_path)
+      raise
   finally:
     if os.path.exists(tmp_whl):
       try:
@@ -761,14 +844,13 @@ def _extract_flag_from_argv(
   return found
 
 
-def _is_non_in_process_runner(
-    runner: str | None, env_type: str | None) -> bool:
+def _is_non_in_process_runner(runner: str | None, env_type: str | None) -> bool:
   norm_runner = _normalize_runner_name(runner)
   if norm_runner in _REMOTE_RUNNERS:
     return True
   norm_env = str(env_type or '').strip().upper()
-  if norm_runner in ('prism', 'direct', 'switchingdirect', '') and (
-      norm_env in _EXTERNAL_ENV_TYPES):
+  if norm_runner in ('prism', 'direct', 'switchingdirect',
+                     '') and (norm_env in _EXTERNAL_ENV_TYPES):
     return True
   return False
 
@@ -781,8 +863,8 @@ def _has_custom_worker_container(args: list[str]) -> bool:
       '--worker-harness-container-image',
   )
   for a in args:
-    if a in custom_prefixes or any(
-        a.startswith(p + '=') for p in custom_prefixes):
+    if a in custom_prefixes or any(a.startswith(p + '=')
+                                   for p in custom_prefixes):
       return True
   return False
 
@@ -805,8 +887,8 @@ def maybe_inject_dataflow_worker_args(pipeline_args: list[str]) -> list[str]:
   return out
 
 
-def maybe_inject_remote_worker_args(
-    argv: list[str], runner: str | None = None) -> list[str]:
+def maybe_inject_remote_worker_args(argv: list[str],
+                                    runner: str | None = None) -> list[str]:
   """Stages the preview `.whl` + plugin for any non-in-process runner."""
   skip_flags = {'--no-stage-cli-wheel', '--no_stage_cli_wheel'}
   explicit_skip = any(a in skip_flags for a in argv)
@@ -835,13 +917,15 @@ def stage_preview_wheel_into_options(options: Any) -> None:
     if not _is_non_in_process_runner(runner_val, env_val):
       return
     whl = ensure_preview_wheel()
-    pkgs = list(options.get('extra_packages') or options.get('extra_package') or [])
+    pkgs = list(
+        options.get('extra_packages') or options.get('extra_package') or [])
     if isinstance(pkgs, str):
       pkgs = [pkgs]
     if not any('apache_beam_cli_preview' in str(p) for p in pkgs):
       pkgs.append(whl)
       options['extra_packages'] = pkgs
-    plugins = list(options.get('beam_plugins') or options.get('beam_plugin') or [])
+    plugins = list(
+        options.get('beam_plugins') or options.get('beam_plugin') or [])
     if isinstance(plugins, str):
       plugins = [plugins]
     if plugin_mod not in plugins:
@@ -899,8 +983,7 @@ def main(argv=None) -> int:
       spec.loader.exec_module(pkg)
       sys.modules.setdefault(_CANON_PKG, pkg)
   target = (
-      f'{_FAST_PKG}.main'
-      if _FAST_PKG in sys.modules else f'{_CANON_PKG}.main')
+      f'{_FAST_PKG}.main' if _FAST_PKG in sys.modules else f'{_CANON_PKG}.main')
   return importlib.import_module(target).main(argv)
 
 

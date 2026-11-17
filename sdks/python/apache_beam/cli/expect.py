@@ -122,7 +122,6 @@ _DISALLOWED_AST_NODES = (
 
 _ACTION_CHOICES = frozenset(['dlq', 'drop', 'fail'])
 
-
 _ALLOWED_EXPECT_AST_NODES = (
     ast.Expression,
     ast.BoolOp,
@@ -161,11 +160,18 @@ _ALLOWED_EXPECT_AST_NODES = (
     ast.Tuple,
 )
 
+MAX_EXPR_STR_BYTES = 1_048_576
+
+
+class _ExpressionSafetyLimitError(ValueError):
+  """Raised when string replacement or concatenation exceeds the 1 MiB limit."""
+
 
 def _validate_expectation_ast(expr: str) -> ast.Expression:
   """Validates an expectation expression AST using a strict allowlist."""
-  if not isinstance(expr, str) or not expr.strip():
-    raise ValueError('Empty expectation rule specification')
+  if (not isinstance(expr, str) or '\r' in expr or '\x00' in expr or
+      not expr.strip()):
+    raise ValueError('Empty or invalid expectation rule specification')
   if len(expr) > 4096:
     raise ValueError('Expectation expression exceeds 4096-character safety cap')
   try:
@@ -192,6 +198,7 @@ def _validate_expectation_ast(expr: str) -> ast.Expression:
         node.func.id == '_cli_exp_col' and not node.keywords and
         len(node.args) == 1 and isinstance(node.args[0], ast.Constant) and
         isinstance(node.args[0].value, str) and node.args[0].value and
+        len(node.args[0].value) <= 256 and
         not node.args[0].value.startswith('_')):
       valid_col_calls.add(id(node.func))
 
@@ -209,11 +216,9 @@ def _validate_expectation_ast(expr: str) -> ast.Expression:
         raise ValueError(
             f'Disallowed attribute {node.attr!r} in expectation {expr!r}')
     if isinstance(node, ast.Subscript):
-      if not isinstance(node.slice, ast.Constant) or (
-          isinstance(node.slice.value, str) and
-          node.slice.value.startswith('_')):
-        raise ValueError(
-            f'Disallowed subscript key in expectation {expr!r}')
+      if not isinstance(node.slice, ast.Constant) or (isinstance(
+          node.slice.value, str) and node.slice.value.startswith('_')):
+        raise ValueError(f'Disallowed subscript key in expectation {expr!r}')
     if isinstance(node, ast.Call):
       if node.keywords:
         raise ValueError(
@@ -259,7 +264,8 @@ def _is_temporal_value(val: Any) -> bool:
   return isinstance(micros, int) and not isinstance(micros, bool)
 
 
-def _coerce_temporal_epoch_us(val: Any, *, allow_str: bool = False) -> int | None:
+def _coerce_temporal_epoch_us(
+    val: Any, *, allow_str: bool = False) -> int | None:
   """Converts a `datetime`, `date`, Beam `Timestamp`, or ISO `str` to UTC us."""
   micros = getattr(val, 'micros', None)
   if isinstance(micros, int) and not isinstance(micros, bool):
@@ -291,7 +297,8 @@ def _coerce_temporal_epoch_us(val: Any, *, allow_str: bool = False) -> int | Non
   return None
 
 
-def _sql_like_core(val: Any, pattern: Any, *, case_insensitive: bool = False) -> bool | None:
+def _sql_like_core(
+    val: Any, pattern: Any, *, case_insensitive: bool = False) -> bool | None:
   """Bounded NFA SQL LIKE / ILIKE matcher (zero regex ReDoS)."""
   if val is None or pattern is None:
     return None
@@ -530,15 +537,16 @@ class _Expect3VLTransformer(ast.NodeTransformer):
     left = self.visit(node.left)
     right = self.visit(node.right)
     if isinstance(node.op, ast.Mult):
-      return self._null_safe(
-          [left, right],
-          lambda a, b: ast.Call(
-              func=ast.Name(id='_cli_exp_mul', ctx=ast.Load()),
-              args=[a, b],
-              keywords=[]))
+      return self._null_safe([left, right], lambda a, b: ast.Call(
+          func=ast.Name(id='_cli_exp_mul', ctx=ast.Load()), args=[a, b],
+          keywords=[]))
+    if isinstance(node.op, ast.Add):
+      return self._null_safe([left, right], lambda a, b: ast.Call(
+          func=ast.Name(id='_cli_exp_add', ctx=ast.Load()), args=[a, b],
+          keywords=[]))
     op = node.op
-    return self._null_safe(
-        [left, right], lambda a, b: ast.BinOp(left=a, op=op, right=b))
+    return self._null_safe([left, right],
+                           lambda a, b: ast.BinOp(left=a, op=op, right=b))
 
   def visit_UnaryOp(self, node: ast.UnaryOp) -> ast.AST:
     operand = self.visit(node.operand)
@@ -552,6 +560,19 @@ class _Expect3VLTransformer(ast.NodeTransformer):
     op = node.op
     return self._null_safe([operand], lambda v: ast.UnaryOp(op=op, operand=v))
 
+  def visit_Name(self, node: ast.Name) -> ast.AST:
+    if (not isinstance(node.ctx, ast.Load) or
+        node.id in ('True', 'False', 'None', '__row_dict__') or
+        node.id.startswith('_cli_exp_') or node.id == '_cli_str_replace'):
+      return node
+    return ast.Call(
+        func=ast.Name(id='_cli_exp_col', ctx=ast.Load()),
+        args=[
+            ast.Name(id='__row_dict__', ctx=ast.Load()),
+            ast.Constant(value=node.id),
+        ],
+        keywords=[])
+
   def visit_Attribute(self, node: ast.Attribute) -> ast.AST:
     val = self.visit(node.value)
     attr = node.attr
@@ -563,23 +584,35 @@ class _Expect3VLTransformer(ast.NodeTransformer):
       recv = self.visit(node.func.value)
       args = [self.visit(a) for a in node.args]
       method = node.func.attr
-      return self._null_safe(
-          [recv],
-          lambda v: ast.Call(
-              func=ast.Attribute(value=v, attr=method, ctx=ast.Load()),
-              args=args,
-              keywords=[]))
+      if method == 'replace':
+        if not 2 <= len(args) <= 3:
+          raise ValueError('str.replace() expects 2 or 3 arguments')
+        return self._null_safe([recv], lambda v: ast.Call(
+            func=ast.Name(id='_cli_str_replace', ctx=ast.Load()), args=
+            [v, *args], keywords=[]))
+      return self._null_safe([recv], lambda v: ast.Call(
+          func=ast.Attribute(value=v, attr=method, ctx=ast.Load()), args=args,
+          keywords=[]))
     if isinstance(node.func, ast.Name):
       fn = node.func.id
+      if fn == '_cli_exp_col':
+        if len(node.args) == 1:
+          return ast.Call(
+              func=ast.Name(id='_cli_exp_col', ctx=ast.Load()),
+              args=[
+                  ast.Name(id='__row_dict__', ctx=ast.Load()),
+                  node.args[0],
+              ],
+              keywords=[])
+        return ast.Call(
+            func=ast.Name(id='_cli_exp_col', ctx=ast.Load()),
+            args=list(node.args),
+            keywords=[])
       args = [self.visit(a) for a in node.args]
       if fn in ('int', 'float', 'abs', 'round', 'str') and args:
         rest = args[1:]
-        return self._null_safe(
-            [args[0]],
-            lambda v: ast.Call(
-                func=ast.Name(id=fn, ctx=ast.Load()),
-                args=[v, *rest],
-                keywords=[]))
+        return self._null_safe([args[0]], lambda v: ast.Call(
+            func=ast.Name(id=fn, ctx=ast.Load()), args=[v, *rest], keywords=[]))
       return ast.Call(
           func=ast.Name(id=fn, ctx=ast.Load()), args=args, keywords=[])
     return self.generic_visit(node)
@@ -601,8 +634,8 @@ class _Expect3VLTransformer(ast.NodeTransformer):
       if op_str in ('eq', 'ne') and (is_none_const(cur_left) or
                                      is_none_const(comp)):
         op_str = 'is' if op_str == 'eq' else 'is_not'
-      if op_str in ('in', 'not_in') and isinstance(comp, ast.Constant) and not (
-          comp.value is None):
+      if op_str in ('in', 'not_in') and isinstance(
+          comp, ast.Constant) and not (comp.value is None):
         comp = ast.Tuple(elts=[comp], ctx=ast.Load())
       parts.append(
           ast.Call(
@@ -615,7 +648,68 @@ class _Expect3VLTransformer(ast.NodeTransformer):
     return self._lazy_bool3(True, parts)
 
 
-def _mask_val_fn(v: Any, keep_last: int = 4, mask_char: str = '*') -> str | None:
+_ExpectAstRewriter = _Expect3VLTransformer
+
+
+def _exp_col(ctx: Any, key: str) -> Any:
+  if isinstance(ctx, tuple):
+    row_dict, row_obj = ctx
+    if key in row_dict:
+      return row_dict[key]
+    if key in ('row', 'element', 'record'):
+      return row_obj
+    return None
+  if isinstance(ctx, dict):
+    return ctx.get(key)
+  return getattr(ctx, key, None)
+
+
+def _exp_add(a: Any, b: Any) -> Any:
+  if a is None or b is None:
+    return None
+  if isinstance(a, (str, bytes)) and isinstance(b, (str, bytes)):
+    if len(a) + len(b) > MAX_EXPR_STR_BYTES:
+      raise _ExpressionSafetyLimitError(
+          'string concatenation exceeded 1 MiB safety limit')
+  elif isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+    if len(a) + len(b) > MAX_EXPR_STR_BYTES:
+      raise _ExpressionSafetyLimitError(
+          'sequence concatenation exceeded safety limit')
+  return a + b
+
+
+def _cli_str_replace(obj: Any, old: Any, new: Any, *rest: Any) -> str:
+  if not isinstance(obj, str) or not isinstance(old, str) or not isinstance(
+      new, str):
+    raise TypeError('replace() arguments must be strings')
+  if len(rest) > 1:
+    raise TypeError('replace() takes at most 3 arguments')
+  if len(obj) > MAX_EXPR_STR_BYTES:
+    raise _ExpressionSafetyLimitError(
+        'string replacement exceeded 1 MiB safety limit')
+  max_c: int | None = None
+  if rest:
+    c_arg = int(rest[0])
+    if c_arg == 0:
+      return obj
+    if c_arg > 0:
+      max_c = c_arg
+  if old == '':
+    reps = (len(obj) + 1) if max_c is None else min(len(obj) + 1, max_c)
+    if len(obj) + reps * len(new) > MAX_EXPR_STR_BYTES:
+      raise _ExpressionSafetyLimitError(
+          'string replacement exceeded 1 MiB safety limit')
+  elif len(new) > len(old):
+    occ = obj.count(old)
+    reps = occ if max_c is None else min(occ, max_c)
+    if len(obj) + reps * (len(new) - len(old)) > MAX_EXPR_STR_BYTES:
+      raise _ExpressionSafetyLimitError(
+          'string replacement exceeded 1 MiB safety limit')
+  return obj.replace(old, new, *rest)
+
+
+def _mask_val_fn(
+    v: Any, keep_last: int = 4, mask_char: str = '*') -> str | None:
   if v is None:
     return None
   s = str(v)
@@ -658,8 +752,14 @@ def _substr_fn(v: Any, start: int, length: int | None = None) -> str | None:
 
 
 def _concat_fn(*vals: Any) -> str | None:
-  if any(v is None for v in vals):
-    return None
+  tot = 0
+  for v in vals:
+    if v is None:
+      return None
+    tot += len(str(v))
+    if tot > MAX_EXPR_STR_BYTES:
+      raise _ExpressionSafetyLimitError(
+          'string concatenation exceeded 1 MiB safety limit')
   return ''.join(str(v) for v in vals)
 
 
@@ -681,11 +781,14 @@ _SAFE_BUILTINS.update({
     'concat': _concat_fn,
     'sql_like': _sql_like_fn,
     'sql_ilike': _sql_ilike_fn,
+    '_cli_exp_col': _exp_col,
+    '_cli_exp_add': _exp_add,
     '_cli_exp_mul': _exp_mul,
     '_cli_exp_not': _exp_not,
     '_cli_exp_and': _exp_and,
     '_cli_exp_or': _exp_or,
     '_cli_exp_cmp': _exp_cmp,
+    '_cli_str_replace': _cli_str_replace,
 })
 _SAFE_CALL_NAMES = _SAFE_CALL_NAMES | frozenset([
     'ifnull',
@@ -732,8 +835,8 @@ def _join_expect_pieces(pieces: list[str]) -> str:
   for idx, piece in enumerate(pieces):
     if idx > 0:
       prev = pieces[idx - 1]
-      if prev != '.' and piece not in ('.', ',', ')', ']') and prev not in (
-          '(', '['):
+      if prev != '.' and piece not in ('.', ',', ')',
+                                       ']') and prev not in ('(', '['):
         joined.append(' ')
     joined.append(piece)
   return ''.join(joined)
@@ -839,7 +942,8 @@ def _replace_backticks_outside_strings(raw: str) -> str:
         raise ValueError(
             f'Unterminated backtick identifier in expectation {raw!r}')
       col_name = raw[i + 1:end]
-      if not col_name or col_name.startswith('_'):
+      if (not col_name or len(col_name) > 256 or col_name.startswith('_') or
+          any(ord(c) < 32 for c in col_name)):
         raise ValueError(
             f'Invalid or underscore-prefixed backtick identifier {col_name!r}')
       if col_name.isidentifier() and not keyword.iskeyword(col_name):
@@ -866,7 +970,8 @@ def normalize_expectation_expression(expr: str) -> str:
         (t.type, t.string)
         for t in tokenize.generate_tokens(io.StringIO(cleaned_bt).readline)
         if t.type not in (
-            tokenize.ENCODING, tokenize.ENDMARKER, tokenize.NL, tokenize.NEWLINE)
+            tokenize.ENCODING, tokenize.ENDMARKER, tokenize.NL,
+            tokenize.NEWLINE)
     ]
   except tokenize.TokenError as exc:
     raise ValueError(f'Invalid expectation syntax in {expr!r}: {exc}') from None
@@ -891,8 +996,9 @@ def normalize_expectation_expression(expr: str) -> str:
       # `IS NOT NULL` / `IS NULL`
       if tt == tokenize.NAME and tu == 'IS':
         if (i + 2 < n and toks[i + 1][0] == tokenize.NAME and
-            toks[i + 1][1].upper() == 'NOT' and toks[i + 2][0] == tokenize.NAME
-            and toks[i + 2][1].upper() == 'NULL'):
+            toks[i + 1][1].upper() == 'NOT' and
+            toks[i + 2][0] == tokenize.NAME and
+            toks[i + 2][1].upper() == 'NULL'):
           out.extend(['is', 'not', 'None'])
           i += 3
           continue
@@ -930,8 +1036,8 @@ def normalize_expectation_expression(expr: str) -> str:
           continue
       # `[NOT] IN ( ... )` -> rewrite parenthesized SQL value list to `[...]`
       if (tt == tokenize.NAME and tu == 'NOT' and i + 2 < n and
-          toks[i + 1][0] == tokenize.NAME and toks[i + 1][1].upper() == 'IN'
-          and toks[i + 2] == (tokenize.OP, '(')):
+          toks[i + 1][0] == tokenize.NAME and toks[i + 1][1].upper() == 'IN' and
+          toks[i + 2] == (tokenize.OP, '(')):
         depth = 1
         j = i + 3
         while j < n and depth > 0:
@@ -1036,9 +1142,19 @@ def normalize_expectation_expression(expr: str) -> str:
       elif tt == tokenize.NAME and tu == 'NULL':
         out.append('None')
       elif (tt == tokenize.NAME and keyword.iskeyword(tv) and
-            tv not in ('and', 'or', 'not', 'in', 'is', 'if', 'else', 'True',
-                       'False', 'None', 'lambda', 'await', 'async') and
-            not (out and out[-1] == '.')):
+            tv not in ('and',
+                       'or',
+                       'not',
+                       'in',
+                       'is',
+                       'if',
+                       'else',
+                       'True',
+                       'False',
+                       'None',
+                       'lambda',
+                       'await',
+                       'async') and not (out and out[-1] == '.')):
         out.append(f'_cli_exp_col({tv!r})')
       else:
         out.append(tv)
@@ -1126,9 +1242,9 @@ def evaluate_record(
   if isinstance(compiled_code, str):
     compiled_code = compile_expectation_expression(compiled_code)
   elif hasattr(compiled_code, 'co_names'):
-    if any(
-        str(n).startswith('_') and not str(n).startswith('_cli_exp_')
-        for n in compiled_code.co_names):
+    if any(str(n).startswith('_') and not str(n).startswith('_cli_exp_') and
+           n not in ('__row_dict__', '_cli_str_replace')
+           for n in compiled_code.co_names):
       raise ValueError('Underscore attribute/name access is disallowed')
   if hasattr(row, '_asdict'):
     row_dict = row._asdict()
@@ -1137,15 +1253,24 @@ def evaluate_record(
   else:
     row_dict = {k: getattr(row, k) for k in dir(row) if not k.startswith('_')}
 
-  scope = dict(row_dict)
-  scope.setdefault('row', row)
-  scope.setdefault('element', row)
-  scope.setdefault('record', row)
-  eval_builtins = {**_SAFE_BUILTINS, '_cli_exp_col': row_dict.get}
+  if getattr(compiled_code, 'co_filename', '') == '<expectation>':
+    scope: dict[str, Any] = {'__row_dict__': (row_dict, row)}
+  else:
+    scope = {
+        k: v
+        for k, v in row_dict.items()
+        if not str(k).startswith('_') and k not in _SAFE_BUILTINS
+    }
+    scope.setdefault('row', row)
+    scope.setdefault('element', row)
+    scope.setdefault('record', row)
+    scope['__row_dict__'] = (row_dict, row)
 
   try:
-    result = eval(compiled_code, {'__builtins__': eval_builtins}, scope)  # pylint: disable=eval-used
+    result = eval(compiled_code, {'__builtins__': _SAFE_BUILTINS}, scope)  # pylint: disable=eval-used
     return result is True or (result is not None and bool(result))
+  except _ExpressionSafetyLimitError:
+    raise
   except Exception:  # pylint: disable=broad-except
     return False
 
@@ -1205,7 +1330,8 @@ def cli_expect(
       self._ctr_quarantined_rows = metrics.Metrics.counter(
           'beam_cli', 'expectation_quarantined_rows')
       self._passed_ctrs = {
-          r.name: metrics.Metrics.counter('beam_cli', f'expectation_passed_{r.name}')
+          r.name: metrics.Metrics.counter(
+              'beam_cli', f'expectation_passed_{r.name}')
           for r in self.rules
       }
       self._quarantined_ctrs = {
@@ -1219,7 +1345,8 @@ def cli_expect(
           for r in self.rules
       }
       self._failed_ctrs = {
-          r.name: metrics.Metrics.counter('beam_cli', f'expectation_failed_{r.name}')
+          r.name: metrics.Metrics.counter(
+              'beam_cli', f'expectation_failed_{r.name}')
           for r in self.rules
       }
 
@@ -1275,9 +1402,8 @@ def cli_expect(
       outputs = (
           pcoll
           | 'EvaluateExpectations' >> beam.ParDo(
-              _ExpectDoFn(parsed_rules, err_tag, route_errors)
-          ).with_outputs(err_tag, main='good')
-      )
+              _ExpectDoFn(parsed_rules, err_tag, route_errors)).with_outputs(
+                  err_tag, main='good'))
       good = outputs['good']
       bad = outputs[err_tag]
       if getattr(pcoll, 'element_type', None) is not None:

@@ -39,6 +39,7 @@ import json
 import math
 import os
 import re
+import threading
 from typing import Any
 from typing import Iterable
 from typing import Optional
@@ -160,9 +161,18 @@ def transform_dlq_row_type():
 
 
 _RAW_EMAIL_PII_RE = (
-    r'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}')
+    r'(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,255}\.[A-Za-z]{2,24}'
+)
 _RAW_PAN_PII_RE = r'(?<!\d)(?:\d[ -]?){12,18}\d(?!\d)'
 _RAW_SSN_PII_RE = r'\b\d{3}-\d{2}-\d{4}\b'
+_UNPARSEABLE_VAL_PAT = (
+    r'(?:"(?:\\.|[^"\\])*(?:"|$)|\'(?:\\.|[^\'\\])*(?:\'|$)|[^,\s)\]}]+)')
+_INLINE_KV_SECRET_PAT = (
+    r'(\b(?:password|passwd|pwd|passphrase|secret|token|api[-_]?key|'
+    r'x-api-key|access_key|private_key|signing_key|encryption_key|'
+    r'client_secret|auth|aws_secret_access_key|sasl\.jaas\.config)\b\s*[:=]\s*)'
+    r'(?![\'"]?<(?:redacted|REDACTED))'
+    r'(?:"(?:\\.|[^"\\])*(?:"|$)|\'(?:\\.|[^\'\\])*(?:\'|$)|[^\s,\'";)\]}]+)')
 
 
 def scrub_unparseable_dlq_text(
@@ -170,18 +180,26 @@ def scrub_unparseable_dlq_text(
     redact_fields: Iterable[str] = (),
 ) -> str:
   """Scrubs PII from unparseable/corrupt CSV or JSON strings when `redact_fields` is set."""
-  import re
-  rk = tuple(str(f) for f in (redact_fields or ()) if str(f).strip())
-  if not rk or not raw_text:
+  from . import output as out_mod
+  if not raw_text:
     return raw_text
-  out_s = str(raw_text)
+  out_s = out_mod.redact_inline_secrets(
+      str(raw_text), placeholder='<REDACTED_SECRET>')
+  rk = tuple(str(f) for f in (redact_fields or ()) if str(f).strip())
+  if not rk:
+    return out_s
   for col in rk:
+    esc_col = re.escape(col)
     out_s = re.sub(
-        r'([\'"]?' + re.escape(col) +
-        r'[\'"]?\s*[:=]\s*)(?:"(?:\\.|[^"])*"|\'(?:\\.|[^\'])*\'|[^,\s)\]}]+)',
+        r'([\'"]?' + esc_col + r'[\'"]?\s*[:=]\s*)' + _UNPARSEABLE_VAL_PAT,
         r'\1"<REDACTED>"',
         out_s)
-  out_s = re.sub(_RAW_EMAIL_PII_RE, '<REDACTED>', out_s)
+    out_s = re.sub(
+        r'(\bcolumn\s+[\'"]?' + esc_col + r'[\'"]?\s*:\s*).*',
+        r'\1<REDACTED>',
+        out_s)
+  if '@' in out_s:
+    out_s = re.sub(_RAW_EMAIL_PII_RE, '<REDACTED>', out_s)
   out_s = re.sub(_RAW_SSN_PII_RE, '<REDACTED>', out_s)
   out_s = re.sub(_RAW_PAN_PII_RE, '<REDACTED>', out_s)
   return out_s
@@ -200,12 +218,35 @@ def redact_nested_fields(
   if hasattr(value, '_asdict'):
     value = dict(value._asdict())
   if isinstance(value, dict):
-    return {
-        k: (
-            '<REDACTED>' if str(k) in rk else redact_nested_fields(
-                v, rk, max_depth=max_depth - 1))
-        for k, v in value.items()
-    }
+    out_dict: dict[Any, Any] = {}
+    for k, v in value.items():
+      ks = str(k)
+      if ks in rk:
+        out_dict[k] = '<REDACTED>'
+      elif ks == 'cells' and isinstance(v, (list, tuple)):
+        out_dict[k] = ['<REDACTED>' for _ in v]
+      elif ks == 'raw_line' and isinstance(v, str):
+        if 'file' in value:
+          out_dict[k] = '<REDACTED>'
+        else:
+          try:
+            parsed_rl = json.loads(v)
+            if isinstance(parsed_rl, (dict, list)):
+              dumped_rl = json.dumps(
+                  redact_nested_fields(parsed_rl, rk, max_depth=max_depth - 1),
+                  allow_nan=False,
+                  sort_keys=True)
+              out_dict[k] = scrub_unparseable_dlq_text(dumped_rl, rk)
+            elif isinstance(parsed_rl, str):
+              out_dict[k] = json.dumps(
+                  scrub_unparseable_dlq_text(parsed_rl, rk), allow_nan=False)
+            else:
+              out_dict[k] = scrub_unparseable_dlq_text(v, rk)
+          except Exception:  # pylint: disable=broad-except
+            out_dict[k] = scrub_unparseable_dlq_text(v, rk)
+      else:
+        out_dict[k] = redact_nested_fields(v, rk, max_depth=max_depth - 1)
+    return out_dict
   if isinstance(value, (list, tuple)):
     return [
         redact_nested_fields(item, rk, max_depth=max_depth - 1)
@@ -225,7 +266,6 @@ def make_transform_dlq_row(
     redact_fields: Iterable[str] = (),
 ):
   """Constructs a sanitized, PII-scrubbed 5-column `beam.Row` for transform DLQs."""
-  import re
   import apache_beam as beam
   from . import output as out_mod
   rk = tuple(str(f) for f in (redact_fields or ()) if str(f).strip())
@@ -237,9 +277,13 @@ def make_transform_dlq_row(
   if rk:
     clean_err = scrub_unparseable_dlq_text(clean_err, rk)
   for col in rk:
+    esc_col = re.escape(col)
     clean_err = re.sub(
-        r'([\'"]?' + re.escape(col) +
-        r'[\'"]?\s*[:=]\s*)(?:([\'"]).*?\2|[^,\s)\]}]+)',
+        r'([\'"]?' + esc_col + r'[\'"]?\s*[:=]\s*)' + _UNPARSEABLE_VAL_PAT,
+        r'\1<REDACTED>',
+        clean_err)
+    clean_err = re.sub(
+        r'(\bcolumn\s+[\'"]?' + esc_col + r'[\'"]?\s*:\s*).*',
         r'\1<REDACTED>',
         clean_err)
   return beam.Row(
@@ -259,11 +303,26 @@ def build_dlq_normalizer_transform(
     redact_fields: Iterable[str] = (),
 ) -> dict[str, Any]:
   """Builds a Beam YAML `MapToFields` stage normalizing error rows for Flatten."""
+  from . import output as out_mod
   step_lit = repr(step_label)
   redact_tuple = tuple(str(f) for f in (redact_fields or ()) if str(f).strip())
+  ansi_pat = repr(out_mod._ANSI_RE.pattern)
+  ctrl_pat = repr(out_mod._CONTROL_AND_INJECTION_RE.pattern)
+  uri_sec_pat = repr(out_mod._URI_USERINFO_SECRET_RE.pattern)
+  auth_sec_pat = repr(out_mod._AUTH_HEADER_SECRET_RE.pattern)
+  kv_sec_pat = repr(_INLINE_KV_SECRET_PAT)
+  tok_sec_pat = repr(out_mod._KNOWN_TOKEN_RE.pattern)
+  val_pat_lit = repr(_UNPARSEABLE_VAL_PAT)
+  inline_secret_snip = (
+      f'  _m = re.sub({ansi_pat}, "", _m)\n'
+      f'  _m = re.sub({ctrl_pat}, "", _m)\n'
+      f'  _m = re.sub({uri_sec_pat}, r"\\1<REDACTED_SECRET>\\2", _m)\n'
+      f'  _m = re.sub({auth_sec_pat}, r"\\1 <REDACTED_SECRET>", _m, flags=re.I)\n'
+      f'  _m = re.sub({kv_sec_pat}, r"\\1<REDACTED_SECRET>", _m, flags=re.I)\n'
+      f'  _m = re.sub({tok_sec_pat}, "<REDACTED_SECRET>", _m)\n')
   err_type_src = (
       'def normalize_dlq(err_row):\n'
-      f"  t = getattr(err_row, 'error_type', None)\n"
+      "  t = getattr(err_row, 'error_type', None)\n"
       '  if t:\n'
       '    return str(t)\n'
       "  msg = str(getattr(err_row, 'msg', None) or "
@@ -278,28 +337,32 @@ def build_dlq_normalizer_transform(
         'def normalize_dlq(err_row):\n'
         '  import re\n'
         f'  _rk = {redact_lit}\n'
-        "  msg = str(getattr(err_row, 'error', None) or "
+        "  _m = str(getattr(err_row, 'error', None) or "
         "getattr(err_row, 'msg', None) or "
-        "getattr(err_row, 'error_message', None) or str(err_row))[:4096]\n"
-        '  for _col in _rk:\n'
-        '    msg = re.sub(\n'
-        '        r\'([\\\'"]?\' + re.escape(_col) + r\'[\\\'"]?\\s*[:=]\\s*)(?:([\\\'"]).*?\\2|[^,\\s)\\]}]+)\',\n'
-        "        r'\\1<REDACTED>',\n"
-        '        msg)\n'
-        f'  msg = re.sub({_RAW_EMAIL_PII_RE!r}, "<REDACTED>", msg)\n'
-        f'  msg = re.sub({_RAW_SSN_PII_RE!r}, "<REDACTED>", msg)\n'
-        f'  msg = re.sub({_RAW_PAN_PII_RE!r}, "<REDACTED>", msg)\n'
-        '  return msg[:4096]\n')
+        "getattr(err_row, 'error_message', None) or str(err_row))[:4096]\n" +
+        inline_secret_snip + '  for _col in _rk:\n'
+        '    _ec = re.escape(_col)\n'
+        f'    _m = re.sub(r\'([\\\'"]?\' + _ec + r\'[\\\'"]?\\s*[:=]\\s*)\' + {val_pat_lit}, r\'\\1<REDACTED>\', _m)\n'
+        '    _m = re.sub(r\'(\\bcolumn\\s+[\\\'"]?\' + _ec + r\'[\\\'"]?\\s*:\\s*).*\', r\'\\1<REDACTED>\', _m)\n'
+        '  if "@" in _m:\n'
+        f'    _m = re.sub({_RAW_EMAIL_PII_RE!r}, "<REDACTED>", _m)\n'
+        f'  _m = re.sub({_RAW_SSN_PII_RE!r}, "<REDACTED>", _m)\n'
+        f'  _m = re.sub({_RAW_PAN_PII_RE!r}, "<REDACTED>", _m)\n'
+        '  return _m[:4096]\n')
     redact_tail = (
         '  import re\n'
         f'  _rk = {redact_lit}\n'
         '  def _scrub_str(s):\n'
+        f'    s = re.sub({uri_sec_pat}, r"\\1<REDACTED_SECRET>\\2", s)\n'
+        f'    s = re.sub({auth_sec_pat}, r"\\1 <REDACTED_SECRET>", s, flags=re.I)\n'
+        f'    s = re.sub({kv_sec_pat}, r"\\1<REDACTED_SECRET>", s, flags=re.I)\n'
+        f'    s = re.sub({tok_sec_pat}, "<REDACTED_SECRET>", s)\n'
         '    for _col in _rk:\n'
-        '      s = re.sub(\n'
-        '          r\'([\\\'"]?\' + re.escape(_col) + r\'[\\\'"]?\\s*[:=]\\s*)(?:"(?:\\\\.|[^"])*"|\\\'(?:\\\\.|[^\\\'])*\\\'|[^,\\s)\\]}]+)\',\n'
-        '          r\'\\1"<REDACTED>"\',\n'
-        '          s)\n'
-        f'    s = re.sub({_RAW_EMAIL_PII_RE!r}, "<REDACTED>", s)\n'
+        '      _ec = re.escape(_col)\n'
+        f'      s = re.sub(r\'([\\\'"]?\' + _ec + r\'[\\\'"]?\\s*[:=]\\s*)\' + {val_pat_lit}, r\'\\1"<REDACTED>"\', s)\n'
+        '      s = re.sub(r\'(\\bcolumn\\s+[\\\'"]?\' + _ec + r\'[\\\'"]?\\s*:\\s*).*\', r\'\\1<REDACTED>\', s)\n'
+        '    if "@" in s:\n'
+        f'      s = re.sub({_RAW_EMAIL_PII_RE!r}, "<REDACTED>", s)\n'
         f'    s = re.sub({_RAW_SSN_PII_RE!r}, "<REDACTED>", s)\n'
         f'    s = re.sub({_RAW_PAN_PII_RE!r}, "<REDACTED>", s)\n'
         '    return s\n'
@@ -307,7 +370,30 @@ def build_dlq_normalizer_transform(
         '    if d <= 0:\n'
         '      return v\n'
         '    if isinstance(v, dict):\n'
-        "      return {k: ('<REDACTED>' if k in _rk else _scrub(val, d - 1)) for k, val in v.items()}\n"
+        '      _res = {}\n'
+        '      for k, val in v.items():\n'
+        '        _ks = str(k)\n'
+        '        if _ks in _rk:\n'
+        "          _res[k] = '<REDACTED>'\n"
+        "        elif _ks == 'cells' and isinstance(val, list):\n"
+        "          _res[k] = ['<REDACTED>' for _ in val]\n"
+        "        elif _ks == 'raw_line' and isinstance(val, str):\n"
+        "          if 'file' in v:\n"
+        "            _res[k] = '<REDACTED>'\n"
+        '          else:\n'
+        '            try:\n'
+        '              _rl = json.loads(val)\n'
+        '              if isinstance(_rl, (dict, list)):\n'
+        '                _res[k] = _scrub_str(json.dumps(_scrub(_rl, d - 1), allow_nan=False, sort_keys=True))\n'
+        '              elif isinstance(_rl, str):\n'
+        '                _res[k] = json.dumps(_scrub_str(_rl), allow_nan=False)\n'
+        '              else:\n'
+        '                _res[k] = _scrub_str(val)\n'
+        '            except Exception:\n'
+        '              _res[k] = _scrub_str(val)\n'
+        '        else:\n'
+        '          _res[k] = _scrub(val, d - 1)\n'
+        '      return _res\n'
         '    if isinstance(v, list):\n'
         '      return [_scrub(x, d - 1) for x in v]\n'
         '    if isinstance(v, str):\n'
@@ -338,10 +424,11 @@ def build_dlq_normalizer_transform(
   else:
     err_msg_src = (
         'def normalize_dlq(err_row):\n'
-        "  msg = (getattr(err_row, 'error', None) or "
+        '  import re\n'
+        "  _m = str(getattr(err_row, 'error', None) or "
         "getattr(err_row, 'msg', None) or "
-        "getattr(err_row, 'error_message', None) or str(err_row))\n"
-        '  return str(msg)[:4096]\n')
+        "getattr(err_row, 'error_message', None) or str(err_row))[:4096]\n" +
+        inline_secret_snip + '  return _m[:4096]\n')
     payload_src = (
         'def normalize_dlq(err_row):\n' + _SAFE_JSON_HELPERS_SRC +
         "  raw = getattr(err_row, 'raw_payload', None)\n"
@@ -511,8 +598,8 @@ def iter_csv_rows_recovering(
 # Compressions Beam's CompressionTypes.AUTO handles that we open natively;
 # anything else on a local path still goes through FileSystems.
 _LOCAL_COMPRESSION_SUFFIXES = ('.gz', '.bz2')
-_OTHER_COMPRESSION_SUFFIXES = ('.zst', '.zstd', '.deflate', '.lzma', '.xz',
-                               '.snappy')
+_OTHER_COMPRESSION_SUFFIXES = (
+    '.zst', '.zstd', '.deflate', '.lzma', '.xz', '.snappy')
 
 
 def _match_paths(path) -> list[str]:
@@ -534,20 +621,71 @@ def _match_paths(path) -> list[str]:
   return sorted(m.path for m in FileSystems.match([path])[0].metadata_list)
 
 
-def _open_auto(path: str):
+MAX_SCHEMA_DECOMPRESSED_BYTES = 64 * 1024 * 1024
+
+
+class _BoundedDecompressedRawReader(io.RawIOBase):
+  """Caps decompressed bytes read from `.gz`/`.bz2` streams against zip bombs."""
+  def __init__(self, inner, max_bytes: int, path: str):
+    self._inner = inner
+    self._max_bytes = int(max_bytes)
+    self._path = path
+    self._read_bytes = 0
+
+  def readable(self) -> bool:
+    return True
+
+  def readinto(self, b) -> int:
+    chunk = self._inner.read(len(b))
+    if not chunk:
+      return 0
+    n = len(chunk)
+    self._read_bytes += n
+    if self._read_bytes > self._max_bytes:
+      raise ValueError(
+          f'decompressed stream for {self._path!r} exceeds maximum scan size '
+          f'({self._max_bytes:,} bytes)')
+    b[:n] = chunk
+    return n
+
+  def close(self) -> None:
+    try:
+      self._inner.close()
+    finally:
+      super().close()
+
+
+def _open_auto(
+    path: str,
+    *,
+    max_decompressed_bytes: Optional[int] = MAX_SCHEMA_DECOMPRESSED_BYTES,
+    streaming_rows: bool = False,
+):
   """Opens `path` for binary reading, decompressing like Beam's AUTO mode."""
   low = path.lower()
+  is_compressed = low.endswith(
+      _LOCAL_COMPRESSION_SUFFIXES + _OTHER_COMPRESSION_SUFFIXES)
+  eff_cap = None if streaming_rows else max_decompressed_bytes
   if '://' not in path and not low.endswith(_OTHER_COMPRESSION_SUFFIXES):
     if low.endswith('.gz'):
       import gzip
-      return gzip.open(path, 'rb')
-    if low.endswith('.bz2'):
+      raw_s: Any = gzip.open(path, 'rb')
+    elif low.endswith('.bz2'):
       import bz2
-      return bz2.open(path, 'rb')
-    return open(path, 'rb')
+      raw_s = bz2.open(path, 'rb')
+    else:
+      return open(path, 'rb')
+    if eff_cap is not None:
+      return io.BufferedReader(
+          _BoundedDecompressedRawReader(raw_s, eff_cap, path))
+    return raw_s
   from apache_beam.io.filesystem import CompressionTypes
   from apache_beam.io.filesystems import FileSystems
-  return FileSystems.open(path, compression_type=CompressionTypes.AUTO)
+  raw_fs = FileSystems.open(path, compression_type=CompressionTypes.AUTO)
+  if is_compressed and eff_cap is not None:
+    return io.BufferedReader(
+        _BoundedDecompressedRawReader(raw_fs, eff_cap, path))
+  return raw_fs
 
 
 def _has_leading_zero(v: str) -> bool:
@@ -608,8 +746,8 @@ def _infer_scalar_kind(
   n_float = sum(1 for v in non_empty if _is_float_cell(v))
   if n_bool == n or (allow_dirty and n >= 3 and n_bool / n >= 0.7):
     return 'bool'
-  if n_int == n or (
-      allow_dirty and n >= 3 and n_int / n >= 0.7 and n_float == n_int):
+  if n_int == n or (allow_dirty and n >= 3 and n_int / n >= 0.7 and
+                    n_float == n_int):
     return 'int'
   if n_float == n or (allow_dirty and n >= 3 and n_float / n >= 0.7):
     return 'float'
@@ -619,8 +757,8 @@ def _infer_scalar_kind(
 def _parse_cell(
     raw: str, kind: str, null_values=DEFAULT_CSV_NULL_VALUES) -> Any:
   if kind == 'str':
-    if raw == '' or raw in null_values or (
-        raw.strip() and raw.strip() in null_values):
+    if raw == '' or raw in null_values or (raw.strip() and
+                                           raw.strip() in null_values):
       return None
     return raw
   if _is_null_cell(raw, null_values):
@@ -733,8 +871,7 @@ def _preflight_csv_schema(
   if scan_all_for_leading_zeros:
     numeric = [c for c in header if kinds[c] in ('int', 'float')]
     if numeric:
-      for c in _columns_with_leading_zeros(
-          matches, header, numeric, delimiter):
+      for c in _columns_with_leading_zeros(matches, header, numeric, delimiter):
         kinds[c] = 'str'
   return header, kinds
 
@@ -824,6 +961,9 @@ def apply_type_overrides(
   return out
 
 
+_ROW_HOOKS_LOCK = threading.RLock()
+
+
 def install_keyword_safe_row_hooks() -> None:
   """Idempotently enables keyword/special column names in Beam Row schemas."""
   import keyword
@@ -831,134 +971,162 @@ def install_keyword_safe_row_hooks() -> None:
   from apache_beam.typehints import schemas as schemas_mod
   from apache_beam.yaml import yaml_mapping as yaml_map_mod
 
-  st_cls = getattr(schemas_mod, 'SchemaTranslation', None)
-  if st_cls is not None and not getattr(st_cls, '_cli_preview_patched', False):
-    orig_nt = st_cls.named_tuple_from_schema
+  with _ROW_HOOKS_LOCK:
+    st_cls = getattr(schemas_mod, 'SchemaTranslation', None)
+    if st_cls is not None and not getattr(st_cls, '_cli_row_hooks_v2', False):
+      orig_nt = st_cls.named_tuple_from_schema
+      reserved_tuple_attrs = frozenset((
+          '_asdict', '_fields', '_replace', '_field_defaults', 'count',
+          'index'))
 
-    def _make_kw_tuple(type_name: str, subfields) -> type:
-      fnames = tuple(name for name, _ in subfields)
-      fidx = {name: i for i, name in enumerate(fnames)}
-      nfields = len(fnames)
+      def _make_kw_tuple(type_name: str, subfields) -> type:
+        fnames = tuple(name for name, _ in subfields)
+        fidx = {name: i for i, name in enumerate(fnames)}
+        nfields = len(fnames)
 
-      def _new(cls, *args, **kwargs):
-        if args and kwargs:
-          if len(args) + len(kwargs) != nfields:
+        def _new(cls, *args, **kwargs):
+          if args and kwargs:
+            if len(args) + len(kwargs) != nfields:
+              raise TypeError(f'{type_name}() expected {nfields} args')
+            vals = list(args) + [None] * (nfields - len(args))
+            for k, v in kwargs.items():
+              idx = fidx.get(k)
+              if idx is None or idx < len(args):
+                raise TypeError(f'{type_name}() unexpected keyword {k!r}')
+              vals[idx] = v
+            return tuple.__new__(cls, vals)
+          if kwargs:
+            if len(kwargs) != nfields or set(kwargs) != set(fnames):
+              raise TypeError(f'{type_name}() keyword mismatch')
+            return tuple.__new__(cls, (kwargs[n] for n in fnames))
+          if len(args) != nfields:
             raise TypeError(f'{type_name}() expected {nfields} args')
-          vals = list(args) + [None] * (nfields - len(args))
-          for k, v in kwargs.items():
-            idx = fidx.get(k)
-            if idx is None or idx < len(args):
-              raise TypeError(f'{type_name}() unexpected keyword {k!r}')
-            vals[idx] = v
-          return tuple.__new__(cls, vals)
-        if kwargs:
-          if len(kwargs) != nfields or set(kwargs) != set(fnames):
-            raise TypeError(f'{type_name}() keyword mismatch')
-          return tuple.__new__(cls, (kwargs[n] for n in fnames))
-        if len(args) != nfields:
-          raise TypeError(f'{type_name}() expected {nfields} args')
-        return tuple.__new__(cls, args)
+          return tuple.__new__(cls, args)
 
-      cls = type(
-          type_name,
-          (tuple, ),
-          {
-              '__slots__': (),
-              '_fields': fnames,
-              '__annotations__': dict(subfields),
-              '__new__': _new,
-              '_asdict': lambda self: dict(zip(fnames, self)),
-              '_replace': lambda self, **kw: type(self)(
-                  *(kw.get(f, v) for f, v in zip(fnames, self))),
-              '__repr__': lambda self: (
-                  f'{type_name}(' +
-                  ', '.join(f'{f}={v!r}' for f, v in zip(fnames, self)) + ')'),
-          })
-      for idx, fname in enumerate(fnames):
-        if fname not in ('count', 'index') and not fname.startswith('__'):
-          setattr(cls, fname, property(operator.itemgetter(idx)))
-      return cls
+        cls = type(
+            type_name, (tuple, ),
+            {
+                '__slots__': (),
+                '_fields': fnames,
+                '__annotations__': dict(subfields),
+                '__new__': _new,
+                '_asdict': lambda self: dict(zip(fnames, self)),
+                '_replace': lambda self, **kw: type(self)
+                (*(kw.get(f, v) for f, v in zip(fnames, self))),
+                '__repr__': lambda self: (
+                    f'{type_name}(' + ', '.join(
+                        f'{f}={v!r}' for f, v in zip(fnames, self)) + ')'),
+            })
+        for idx, fname in enumerate(fnames):
+          if fname not in ('count', 'index') and not fname.startswith('_'):
+            setattr(cls, fname, property(operator.itemgetter(idx)))
+        return cls
 
-    def _safe_nt(self_st, schema):
-      try:
-        return orig_nt(self_st, schema)
-      except (ValueError, TypeError, SyntaxError):
-        # Workaround for apache/beam#40698 (keyword / non-identifier Row cols).
-        from apache_beam import coders
-        from apache_beam.typehints import row_type
-        type_name = 'BeamSchema_{}'.format(schema.id.replace('-', '_'))
-        if schema.id in self_st.schema_registry.by_id:
-          return self_st.schema_registry.by_id[schema.id][0]
-        subfields = []
-        descriptions = {}
-        for field in schema.fields:
-          f_py = self_st.typing_from_runner_api(field.type)
-          if isinstance(f_py, row_type.RowTypeConstraint):
-            f_py = f_py.user_type
-          descriptions[field.name] = field.description
-          subfields.append((field.name, f_py))
-        ut = _make_kw_tuple(type_name, subfields)
-        setattr(
-            ut,
-            '__reduce__',
-            schemas_mod._named_tuple_reduce_method(schema.SerializeToString()))
-        setattr(ut, '_field_descriptions', descriptions)
-        setattr(ut, row_type._BEAM_SCHEMA_ID, schema.id)
-        self_st.schema_registry.add(ut, schema)
-        coders.registry.register_coder(ut, coders.RowCoder)
-        return ut
+      def _needs_kw_tuple(schema) -> bool:
+        seen_names: set[str] = set()
+        for f in schema.fields:
+          fn = f.name
+          if (not fn.isidentifier() or keyword.iskeyword(fn) or
+              fn.startswith('__') or fn in reserved_tuple_attrs or
+              fn in seen_names):
+            return True
+          seen_names.add(fn)
+        return False
 
-    st_cls.named_tuple_from_schema = _safe_nt
-    st_cls._cli_preview_patched = True
+      def _safe_nt(self_st, schema):
+        try:
+          if _needs_kw_tuple(schema):
+            raise ValueError('keyword or reserved tuple field name')
+          with _ROW_HOOKS_LOCK:
+            return orig_nt(self_st, schema)
+        except (ValueError, TypeError, SyntaxError):
+          # Workaround for apache/beam#40698 (keyword / non-identifier Row cols).
+          from apache_beam import coders
+          from apache_beam.typehints import row_type
+          type_name = 'BeamSchema_{}'.format(schema.id.replace('-', '_'))
+          with _ROW_HOOKS_LOCK:
+            if schema.id in self_st.schema_registry.by_id:
+              return self_st.schema_registry.by_id[schema.id][0]
+          subfields = []
+          descriptions = {}
+          for field in schema.fields:
+            f_py = self_st.typing_from_runner_api(field.type)
+            if isinstance(f_py, row_type.RowTypeConstraint):
+              f_py = f_py.user_type
+            descriptions[field.name] = field.description
+            subfields.append((field.name, f_py))
+          with _ROW_HOOKS_LOCK:
+            if schema.id in self_st.schema_registry.by_id:
+              return self_st.schema_registry.by_id[schema.id][0]
+            ut = _make_kw_tuple(type_name, subfields)
+            setattr(
+                ut,
+                '__reduce__',
+                schemas_mod._named_tuple_reduce_method(
+                    schema.SerializeToString()))
+            setattr(ut, '_field_descriptions', descriptions)
+            setattr(ut, row_type._BEAM_SCHEMA_ID, schema.id)
+            self_st.schema_registry.add(ut, schema)
+            coders.registry.register_coder(ut, coders.RowCoder)
+            return ut
 
-  # Workaround for apache/beam#41077 (keyword column names in yaml_mapping).
-  orig_exp = getattr(yaml_map_mod, '_expand_python_mapping_func', None)
-  py_call = getattr(yaml_map_mod, 'python_callable', None)
-  if (orig_exp is not None and py_call is not None and
-      not getattr(orig_exp, '_cli_preview_patched', False)):
+      st_cls.named_tuple_from_schema = _safe_nt
+      st_cls._cli_preview_patched = True
+      st_cls._cli_row_hooks_v2 = True
 
-    def _safe_exp(
-        original_fields, expression=None, callable=None, path=None, name=None):
-      if expression and not (path and name):
-        if expression in original_fields:
-          return py_call.PythonCallableWithSource(
-              f'def fn(__row__):\n  return getattr(__row__, {expression!r})')
-        safe_f = [
-            f for f in original_fields
-            if f.isidentifier() and not keyword.iskeyword(f)
-        ]
+    # Workaround for apache/beam#41077 (keyword column names in yaml_mapping).
+    orig_exp = getattr(yaml_map_mod, '_expand_python_mapping_func', None)
+    py_call = getattr(yaml_map_mod, 'python_callable', None)
+    if (orig_exp is not None and py_call is not None and
+        not getattr(orig_exp, '_cli_preview_patched', False)):
+
+      def _safe_exp(
+          original_fields,
+          expression=None,
+          callable=None,
+          path=None,
+          name=None):
+        if expression and not (path and name):
+          if expression in original_fields:
+            return py_call.PythonCallableWithSource(
+                f'def fn(__row__):\n  return getattr(__row__, {expression!r})')
+          safe_f = [
+              f for f in original_fields
+              if f.isidentifier() and not keyword.iskeyword(f)
+          ]
+          return orig_exp(
+              safe_f,
+              expression=expression,
+              callable=callable,
+              path=path,
+              name=name)
         return orig_exp(
-            safe_f,
+            original_fields,
             expression=expression,
             callable=callable,
             path=path,
             name=name)
-      return orig_exp(
-          original_fields,
-          expression=expression,
-          callable=callable,
-          path=path,
-          name=name)
 
-    _safe_exp._cli_preview_patched = True
-    yaml_map_mod._expand_python_mapping_func = _safe_exp
+      _safe_exp._cli_preview_patched = True
+      yaml_map_mod._expand_python_mapping_func = _safe_exp
 
-  # Workaround for apache/beam#41373 (_validator rejects None on output_type).
-  orig_val = getattr(yaml_map_mod, '_validator', None)
-  if orig_val is not None and not getattr(orig_val, '_cli_preview_patched', False):
+    # Workaround for apache/beam#41373 (_validator rejects None on output_type).
+    orig_val = getattr(yaml_map_mod, '_validator', None)
+    if orig_val is not None and not getattr(
+        orig_val, '_cli_preview_patched', False):
 
-    def _nullable_validator(beam_type):
-      inner_v = orig_val(beam_type)
-      try:
-        beam_type.nullable = True
-      except Exception:  # pylint: disable=broad-except
-        pass
-      return lambda x: x is None or inner_v(x)
+      def _nullable_validator(beam_type):
+        inner_v = orig_val(beam_type)
+        try:
+          beam_type.nullable = True
+        except Exception:  # pylint: disable=broad-except
+          pass
+        return lambda x: x is None or inner_v(x)
 
-    _nullable_validator._cli_preview_patched = True
-    yaml_map_mod._validator = _nullable_validator
+      _nullable_validator._cli_preview_patched = True
+      yaml_map_mod._validator = _nullable_validator
 
-  _install_nested_row_attr_inference()
+    _install_nested_row_attr_inference()
 
 
 def _nested_row_plan(fields) -> dict[str, Any]:
@@ -974,8 +1142,8 @@ def _nested_row_plan(fields) -> dict[str, Any]:
   for name, typ in fields:
     args = [a for a in typing.get_args(typ) if a is not type(None)]
     inner = args[0] if len(args) == 1 else typ
-    is_row = isinstance(inner, RowTypeConstraint) or ntc.match_is_named_tuple(
-        inner)
+    is_row = isinstance(inner,
+                        RowTypeConstraint) or ntc.match_is_named_tuple(inner)
     plan[name] = (
         _nested_row_plan(schemas.named_fields_from_element_type(inner))
         if is_row else None)
@@ -987,8 +1155,8 @@ def _rowify_value(value: Any, plan: dict[str, Any] | None) -> Any:
   import apache_beam as beam
   if value is None or plan is None:
     return value
-  get = value.get if isinstance(value, dict) else (
-      lambda n: getattr(value, n, None))
+  get = value.get if isinstance(value,
+                                dict) else (lambda n: getattr(value, n, None))
   return beam.Row(**{n: _rowify_value(get(n), sub) for n, sub in plan.items()})
 
 
@@ -1014,8 +1182,8 @@ def cli_rowify_nested():
       plan = _nested_row_plan(fields)
       if not any(sub is not None for sub in plan.values()):
         return pcoll
-      return pcoll | 'RowifyNested' >> beam.Map(_rowify_value, plan).with_output_types(
-          pcoll.element_type)
+      return pcoll | 'RowifyNested' >> beam.Map(
+          _rowify_value, plan).with_output_types(pcoll.element_type)
 
   return _RowifyNested()
 
@@ -1059,8 +1227,9 @@ def _install_nested_row_attr_inference() -> None:
     if result is not typehints.Any:
       return result
     row = None
-    if isinstance(o, row_type.RowTypeConstraint) or (
-        inspect.isclass(o) and ntc.match_is_named_tuple(o)):
+    if isinstance(o,
+                  row_type.RowTypeConstraint) or (inspect.isclass(o) and
+                                                  ntc.match_is_named_tuple(o)):
       row = _row_type_of(o)
       nullable = False
     else:
@@ -1084,12 +1253,21 @@ def should_scan_local_csv_leading_zeros(path_or_files) -> bool:
   return should_scan_all_local_json(path_or_files)
 
 
+def _normalize_redact_tuple(raw: Any) -> tuple[str, ...]:
+  if not raw:
+    return ()
+  if isinstance(raw, str):
+    return tuple(p.strip() for p in raw.split(',') if p.strip())
+  return tuple(str(p).strip() for p in raw if str(p).strip())
+
+
 def read_csv_with_dlq(
     path: str,
     *,
     delimiter: str = ',',
     null_values: Optional[list[str]] = None,
     types: Optional[dict[str, str]] = None,
+    dlq_redact_fields: Any = None,
     error_handling: Optional[dict[str, Any]] = None,
 ):
   """RFC-4180 multi-shard CSV Beam YAML source with structured DLQ output.
@@ -1103,6 +1281,9 @@ def read_csv_with_dlq(
 
   install_keyword_safe_row_hooks()
   nulls = DEFAULT_CSV_NULL_VALUES | frozenset(null_values or ())
+  redact_cols = _normalize_redact_tuple(
+      dlq_redact_fields if dlq_redact_fields is not None else (
+          error_handling or {}).get('redact_fields'))
   header, kinds = _preflight_csv_schema(
       path,
       delimiter=delimiter,
@@ -1115,9 +1296,8 @@ def read_csv_with_dlq(
       'bool': Optional[bool],
       'str': Optional[str],
   }
-  good_row_type = RowTypeConstraint.from_fields([
-      (col, py_type_map[kinds[col]]) for col in header
-  ])
+  good_row_type = RowTypeConstraint.from_fields([(col, py_type_map[kinds[col]])
+                                                 for col in header])
   dlq_row_type = RowTypeConstraint.from_fields([
       ('step', str),
       ('error_type', str),
@@ -1140,7 +1320,13 @@ def read_csv_with_dlq(
       file_path = readable_file.metadata.path
       with readable_file.open() as raw_f:
         for parsed, err in iter_csv_records(
-            file_path, raw_f, header, kinds, delimiter, nulls):
+            file_path,
+            raw_f,
+            header,
+            kinds,
+            delimiter,
+            nulls,
+            redact_fields=redact_cols):
           self._rows_read.inc()
           if err is None:
             yield beam.Row(**parsed)
@@ -1176,7 +1362,9 @@ def iter_csv_records(
     header,
     kinds,
     delimiter=',',
-    null_values=DEFAULT_CSV_NULL_VALUES):
+    null_values=DEFAULT_CSV_NULL_VALUES,
+    *,
+    redact_fields: Iterable[str] = ()):
   """Parses one CSV file into `(row_dict, None)` or `(None, dlq_record)`.
 
   Shared by the `ReadCsvWithDlq` DoFn and the fast local path so both apply
@@ -1184,6 +1372,7 @@ def iter_csv_records(
   one record read; a header row matching `header` and blank lines are skipped.
   """
   ensure_csv_field_size_limit()
+  rk = _normalize_redact_tuple(redact_fields)
   wrapper = io.TextIOWrapper(
       raw_f, encoding='utf-8-sig', errors='replace', newline='')
   try:
@@ -1193,16 +1382,19 @@ def iter_csv_records(
         wrapper, delimiter=delimiter):
       if csv_err is not None:
         row_index += 1
+        raw_obj: dict[str, Any] = {
+            'file': file_path,
+            'row_index': row_index,
+            'raw_line': '<REDACTED>' if rk else (bad_line or '')[:4096],
+        }
+        err_s = f'file {file_path!r} row {row_index}: {csv_err}'
+        if rk:
+          err_s = scrub_unparseable_dlq_text(err_s, rk)
         yield None, {
             'step': 'ReadCsvWithDlq',
             'error_type': 'CsvSyntaxError',
-            'error': (
-                f'file {file_path!r} row {row_index}: {csv_err}'),
-            'raw_payload': safe_json_dumps({
-                'file': file_path,
-                'row_index': row_index,
-                'raw_line': (bad_line or '')[:4096],
-            }),
+            'error': err_s,
+            'raw_payload': safe_json_dumps(raw_obj),
         }
         continue
 
@@ -1226,7 +1418,7 @@ def iter_csv_records(
             'raw_payload': safe_json_dumps({
                 'file': file_path,
                 'row_index': row_index,
-                'cells': cells,
+                'cells': ['<REDACTED>' for _ in cells] if rk else cells,
             }),
         }
         continue
@@ -1245,13 +1437,18 @@ def iter_csv_records(
           bad_col = col_name
           break
       if conv_err is not None:
+        row_map = dict(zip(header, cells))
+        err_s = (
+            f'file {file_path!r} row {row_index} '
+            f'column {bad_col!r}: {conv_err}')
+        if rk:
+          row_map = redact_nested_fields(row_map, rk)
+          err_s = scrub_unparseable_dlq_text(err_s, rk)
         yield None, {
             'step': 'ReadCsvWithDlq',
             'error_type': type(conv_err).__name__,
-            'error': (
-                f'file {file_path!r} row {row_index} '
-                f'column {bad_col!r}: {conv_err}'),
-            'raw_payload': safe_json_dumps(dict(zip(header, cells))),
+            'error': err_s,
+            'raw_payload': safe_json_dumps(row_map),
         }
         continue
       yield parsed_vals, None
@@ -1296,14 +1493,15 @@ def _infer_json_kind(values: list[Any], depth: int = 0) -> Any:
     if not keys:
       return 'json'
     return {
-        k: _infer_json_kind(
-            [o[k] for o in objects if o.get(k) is not None], depth + 1)
+        k: _infer_json_kind([o[k] for o in objects if o.get(k) is not None],
+                            depth + 1)
         for k in keys
     }
   if objects or any(isinstance(v, list) for v in values):
     return 'json'
   n_bool = sum(1 for v in values if isinstance(v, bool))
-  n_int = sum(1 for v in values if isinstance(v, int) and not isinstance(v, bool))
+  n_int = sum(
+      1 for v in values if isinstance(v, int) and not isinstance(v, bool))
   n_num = n_int + sum(1 for v in values if isinstance(v, float))
   dirty_ok = n >= 3
   if n_bool == n or (dirty_ok and n_bool / n >= 0.7):
@@ -1331,7 +1529,6 @@ def _json_kind_type(kind: Any) -> Any:
 
 class SchemaDriftError(ValueError):
   """A JSON record contains field(s) absent from the sampled schema."""
-
   def __init__(self, message: str, extra_fields: Iterable[str] = ()):
     super().__init__(message)
     self.extra_fields = [str(f) for f in extra_fields]
@@ -1383,8 +1580,8 @@ def should_scan_all_local_json(path_or_files) -> bool:
     return False
 
 
-def resolve_json_sample_rows(
-    path_or_files, raw_sample_rows: Any = None) -> Optional[int]:
+def resolve_json_sample_rows(path_or_files,
+                             raw_sample_rows: Any = None) -> Optional[int]:
   """Effective `sample_rows`: explicit user value, else full scan if local <=64MB."""
   if raw_sample_rows is not None and raw_sample_rows != '':
     return parse_sample_rows_opt(raw_sample_rows)
@@ -1407,8 +1604,9 @@ def parse_unknown_fields_opt(raw: Any) -> str:
 def schema_drift_warning(count: int, extra_fields: Iterable[str] = ()) -> str:
   """Warning emitted when `--dlq` quarantines records with new JSON fields."""
   safe_fields = [
-      f for f in sorted({str(x) for x in extra_fields if x})
-      if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.]*', f)
+      f for f in sorted({str(x)
+                         for x in extra_fields
+                         if x}) if re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.]*', f)
   ]
   detail = f" ({', '.join(safe_fields[:8])})" if safe_fields else ''
   return (
@@ -1490,6 +1688,7 @@ def read_json_with_dlq(
     types: Optional[dict[str, str]] = None,
     sample_rows: Any = None,
     on_unknown_fields: str = 'error',
+    dlq_redact_fields: Any = None,
     error_handling: Optional[dict[str, Any]] = None,
 ):
   """JSONL Beam YAML source with a sampled schema and an optional DLQ.
@@ -1509,6 +1708,9 @@ def read_json_with_dlq(
 
   eff_sample = resolve_json_sample_rows(path, sample_rows)
   allow_unknown = (parse_unknown_fields_opt(on_unknown_fields) == 'ignore')
+  redact_cols = _normalize_redact_tuple(
+      dlq_redact_fields if dlq_redact_fields is not None else (
+          error_handling or {}).get('redact_fields'))
   kinds = apply_type_overrides(
       infer_json_kinds(path, sample_rows=eff_sample),
       types,
@@ -1552,7 +1754,9 @@ def read_json_with_dlq(
         if isinstance(exc, SchemaDriftError):
           self._drift_rows.inc()
         yield beam.pvalue.TaggedOutput(
-            'errors', beam.Row(**json_dlq_record(stripped, exc)))
+            'errors',
+            beam.Row(
+                **json_dlq_record(stripped, exc, redact_fields=redact_cols)))
         return
       yield row
 
@@ -1575,8 +1779,9 @@ def read_json_with_dlq(
 
 
 def infer_json_kinds(
-    path: str | list[str], *, sample_rows: Optional[int] = 100
-) -> dict[str, Any]:
+    path: str | list[str],
+    *,
+    sample_rows: Optional[int] = 100) -> dict[str, Any]:
   """Infers field kinds from up to `sample_rows` valid JSON objects (`None` = all)."""
   matches = _match_paths(path)
   if not matches:
@@ -1648,13 +1853,26 @@ def parse_json_record(
       })
 
 
-def json_dlq_record(stripped: str, exc: Exception) -> dict[str, Any]:
+def json_dlq_record(
+    stripped: str,
+    exc: Exception,
+    *,
+    redact_fields: Iterable[str] = (),
+) -> dict[str, Any]:
   """The DLQ record for a JSONL line that failed `parse_json_record`."""
+  from . import output as out_mod
+  rk = _normalize_redact_tuple(redact_fields)
+  err_s = out_mod.sanitize_untrusted_text(str(exc), max_chars=4096)
+  err_s = out_mod.redact_inline_secrets(err_s, placeholder='<REDACTED_SECRET>')
+  payload_obj: dict[str, Any] = {'raw_line': stripped[:4096]}
+  if rk:
+    err_s = scrub_unparseable_dlq_text(err_s, rk)
+    payload_obj = redact_nested_fields(payload_obj, rk)
   return {
       'step': 'ReadJsonWithDlq',
       'error_type': type(exc).__name__,
-      'error': str(exc),
-      'raw_payload': safe_json_dumps({'raw_line': stripped[:4096]}),
+      'error': err_s[:4096],
+      'raw_payload': safe_json_dumps(payload_obj),
   }
 
 
@@ -1793,8 +2011,8 @@ def cli_limit_rows(limit: int):
           | 'TagTs' >> beam.ParDo(_TagTsDoFn())
           | 'CombineLimit' >> beam.CombineGlobally(
               _LimitCombineFn()).without_defaults()
-          | 'UnpackLimit' >>
-          beam.ParDo(_UnpackLimitDoFn()).with_output_types(elem_type))
+          | 'UnpackLimit' >> beam.ParDo(
+              _UnpackLimitDoFn()).with_output_types(elem_type))
 
   return _CliLimitRowsTransform()
 
@@ -1845,11 +2063,20 @@ def _beam_row_type_to_bq_schema_dict(element_type) -> dict[str, Any]:
   return {'fields': fields}
 
 
+def _bq_table_has_streaming_buffer(tbl: Any) -> bool:
+  if hasattr(tbl, '_mock_children') and (
+      'streaming_buffer' not in getattr(tbl, '__dict__', {}) and
+      'streaming_buffer' not in (getattr(tbl, '_mock_children', None) or {})):
+    return False
+  return getattr(tbl, 'streaming_buffer', None) is not None
+
+
 def cli_write_to_bigquery(
     table: str,
     *,
     create_disposition: str = 'CREATE_IF_NEEDED',
     write_disposition: str = 'WRITE_EMPTY',
+    dlq_redact_fields: Any = None,
     error_handling: Optional[dict[str, Any]] = None,
 ):
   """Pure-Python BigQuery sink (zero Java boot; supports STREAMING & FILE_LOADS)."""
@@ -1861,6 +2088,9 @@ def cli_write_to_bigquery(
   from . import output as out_mod
 
   err_tag = (error_handling or {}).get('output', 'errors')
+  redact_cols = _normalize_redact_tuple(
+      dlq_redact_fields if dlq_redact_fields is not None else (
+          error_handling or {}).get('redact_fields'))
   dlq_row_type = RowTypeConstraint.from_fields([
       ('step', str),
       ('error_type', str),
@@ -1900,23 +2130,29 @@ def cli_write_to_bigquery(
       clean_err = out_mod.sanitize_untrusted_text(err_str, max_chars=4096)
       clean_err = out_mod.redact_inline_secrets(
           clean_err, placeholder='<REDACTED_SECRET>')
+      clean_row = redact_nested_fields(
+          row_dict, redact_cols) if redact_cols else row_dict
+      if redact_cols:
+        clean_err = scrub_unparseable_dlq_text(clean_err, redact_cols)
       yield beam.Row(
           step='WriteToBigQuery',
           error_type='BigQueryWriteError',
           error=clean_err[:4096],
-          raw_payload=safe_json_dumps(row_dict))
+          raw_payload=safe_json_dumps(clean_row))
 
   class _CliWriteBqTransform(beam.PTransform):
     def expand(self, pcoll):
       bq_schema = _beam_row_type_to_bq_schema_dict(pcoll.element_type)
-      temp_loc = pcoll.pipeline.options.view_as(GoogleCloudOptions).temp_location
+      temp_loc = pcoll.pipeline.options.view_as(
+          GoogleCloudOptions).temp_location
 
       if write_disposition == 'WRITE_TRUNCATE' and not temp_loc:
         raise ValueError(
             'BigQuery --if-exists=replace (WRITE_TRUNCATE) requires '
             '--temp_location=gs://<bucket>/tmp for atomic file loads')
 
-      if write_disposition == 'WRITE_EMPTY' and (not temp_loc or error_handling):
+      use_streaming = bool(error_handling) or not temp_loc
+      if write_disposition == 'WRITE_EMPTY' and use_streaming:
         from google.api_core import exceptions as gcp_exceptions
         from google.cloud import bigquery as gcp_bq
         from . import uris
@@ -1925,25 +2161,43 @@ def cli_write_to_bigquery(
             default_project=pcoll.pipeline.options.view_as(
                 GoogleCloudOptions).project)
         client = gcp_bq.Client(project=proj)
-        fq = f'{proj or client.project}.{ds}.{tbl_name}'
+        eff_proj = uris.validate_bq_project_id(proj or client.project)
+        fq = f'{eff_proj}.{ds}.{tbl_name}'
         try:
           existing_tbl = client.get_table(fq)
-          if (existing_tbl.num_rows or 0) > 0:
+          has_rows = (existing_tbl.num_rows or 0) > 0
+          has_sbuf = _bq_table_has_streaming_buffer(existing_tbl)
+          if has_rows or has_sbuf:
+            detail = (
+                f'has {existing_tbl.num_rows} rows'
+                if has_rows else 'has active streaming buffer rows')
             raise ValueError(
-                f'BigQuery table {fq!r} already exists and has '
-                f'{existing_tbl.num_rows} rows; pass --if-exists=append to add '
-                'rows or choose a new destination table')
+                f'BigQuery table {fq!r} already exists and {detail}; pass '
+                '--if-exists=append to add rows or choose a new destination '
+                'table')
         except gcp_exceptions.NotFound:
-          pass
+          if create_disposition != 'CREATE_NEVER':
+            bq_fields = [
+                gcp_bq.SchemaField(
+                    f['name'], f['type'], mode=f.get('mode', 'NULLABLE'))
+                for f in bq_schema.get('fields', [])
+            ]
+            try:
+              client.create_table(
+                  gcp_bq.Table(fq, schema=bq_fields), exists_ok=False)
+            except gcp_exceptions.Conflict:
+              raise ValueError(
+                  f'BigQuery table {fq!r} was concurrently created by another '
+                  'writer (--if-exists=fail); pass --if-exists=append to add '
+                  'rows or choose a new destination table') from None
 
-      use_streaming = bool(error_handling) or not temp_loc
       method = (
           WriteToBigQuery.Method.STREAMING_INSERTS
           if use_streaming else WriteToBigQuery.Method.FILE_LOADS)
       effective_disp = (
-          'WRITE_APPEND'
-          if (use_streaming and write_disposition == 'WRITE_EMPTY') else
-          write_disposition)
+          'WRITE_APPEND' if
+          (use_streaming and
+           write_disposition == 'WRITE_EMPTY') else write_disposition)
 
       bq_write_kwargs: dict[str, Any] = {
           'schema': bq_schema,
@@ -1960,8 +2214,8 @@ def cli_write_to_bigquery(
       if error_handling and 'output' in error_handling and use_streaming:
         errs = (
             write_res.failed_rows_with_errors
-            | 'FormatBqErrors' >>
-            beam.ParDo(_FormatBqErrorDoFn()).with_output_types(dlq_row_type))
+            | 'FormatBqErrors' >> beam.ParDo(
+                _FormatBqErrorDoFn()).with_output_types(dlq_row_type))
         return {
             'post_write': errs | beam.FlatMap(lambda _: ()),
             err_tag: errs,

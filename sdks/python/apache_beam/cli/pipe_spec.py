@@ -78,8 +78,55 @@ def _materialize_cdc_config(pks, seq_col):
   return cfg
 
 
+_ALLOWED_WINDOW_AGG_FNS = frozenset({
+    'sum',
+    'count',
+    'min',
+    'max',
+    'avg',
+    'mean',
+    'any',
+    'all',
+})
+
+_ALLOWED_INTERNAL_COMBINE_FN_TYPES = frozenset({
+    'apache_beam.cli.windowing.CountDistinctCombineFn',
+    'apache_beam.cli.windowing.VarPopCombineFn',
+    'apache_beam.cli.windowing.StddevPopCombineFn',
+})
+
+_ALLOWED_WINDOW_DICT_KEYS = frozenset({
+    'type',
+    'window_type',
+    'size',
+    'period',
+    'offset',
+    'gap',
+    'allowed_lateness',
+    'trigger',
+    'accumulation',
+    'accumulation_mode',
+    'late_action',
+    'late_data',
+    'late_shards',
+    'watermark_lag',
+    'group_by',
+    'aggregations',
+})
+
+_B23_WINDOW_EXTRA_KEYS = frozenset({
+    'allowed_lateness',
+    'trigger',
+    'accumulation',
+    'accumulation_mode',
+    'late_action',
+    'late_data',
+    'late_shards',
+    'watermark_lag',
+})
+
 _AGG_CALL_RE = re.compile(
-    r'^(?:(?P<alias>[A-Za-z0-9_]+)\s*=\s*)?(?P<fn>[A-Za-z0-9_]+)\s*\(\s*(?P<val>[A-Za-z0-9_*]*)\s*\)$'
+    r'^(?:(?P<alias>[^=()]+?)\s*=\s*)?(?P<fn>[A-Za-z_][A-Za-z0-9_]*)\s*\((?P<val>[^()]*)\)$'
 )
 
 
@@ -102,9 +149,15 @@ def _split_window_tokens(s: str) -> list[str]:
   return ij_mod.split_bracket_tokens(s)
 
 
+def _validate_window_ident(name: Any, label: str) -> str:
+  from . import output
+  if not isinstance(name, str) or not output.SAFE_IDENTIFIER_RE.match(name):
+    raise PipeSpecError(f'invalid {label} {name!r} in --window')
+  return name
+
+
 def _parse_inline_aggregations(
-    tokens: list[str]
-) -> tuple[dict[str, Any], list[str], list[str]]:
+    tokens: list[str]) -> tuple[dict[str, Any], list[str], list[str]]:
   """Extracts inline group_by and aggregation expressions from window tokens.
 
   Rationale:
@@ -127,22 +180,45 @@ def _parse_inline_aggregations(
     if t.startswith(('group_by=', 'by=', 'key=', 'keys=')):
       val = t.split('=', 1)[1]
       cols = [c.strip("[] '\"") for c in val.split(',') if c.strip("[] '\"")]
+      for col in cols:
+        _validate_window_ident(col, 'group_by column')
       group_by.extend(cols)
       continue
 
     # 2. Parse aggregation call: [alias=]fn(col)
     m = _AGG_CALL_RE.match(t)
     if m:
-      fn = m.group('fn').lower()
+      raw_fn = m.group('fn')
+      fn = raw_fn.lower()
+      if fn not in _ALLOWED_WINDOW_AGG_FNS:
+        raise PipeSpecError(
+            f'unsupported window aggregation function {raw_fn!r}; '
+            f'allowed: {sorted(_ALLOWED_WINDOW_AGG_FNS)}')
       # Beam YAML Combine uses 'mean' for averages.
       fn_clean = 'mean' if fn == 'avg' else fn
       val = m.group('val').strip()
-      alias = m.group('alias')
+      raw_alias = m.group('alias')
+      alias = raw_alias.strip() if raw_alias is not None else None
       # Infer output alias if not explicitly provided
       if not alias:
-        alias = val if val and val != '*' else (fn if fn != 'mean' else 'avg')
+        alias = (
+            val if (val and val not in ('*', '1')) else
+            (fn if fn != 'mean' else 'avg'))
+      _validate_window_ident(alias, 'aggregation output alias')
       if not val or val == '*':
-        val = alias if alias != fn_clean else '1'
+        if fn_clean == 'count':
+          val = alias if alias != fn_clean else '1'
+        elif alias != fn_clean and raw_alias is None:
+          val = alias
+        else:
+          raise PipeSpecError(
+              f'aggregation {raw_fn}(...) in --window requires an input column')
+      if val == '1':
+        if fn_clean != 'count':
+          raise PipeSpecError(
+              f'literal 1 input is only supported for count(...), got {t!r}')
+      else:
+        _validate_window_ident(val, 'aggregation input column')
       combines[alias] = {'value': val, 'fn': fn_clean}
       continue
 
@@ -205,24 +281,197 @@ def _extract_sql_select_window_aggs(
   return {'group_by': group_by, 'combine': combines}
 
 
+def _is_safe_internal_combine_callable(val_spec: Mapping[str, Any]) -> bool:
+  """Verifies a `Combine` `value` callable dict matches CLI's internal AST templates."""
+  import ast as _ast
+  if not set(val_spec.keys()) <= {'callable', 'output_type'}:
+    return False
+  out_t = val_spec.get('output_type')
+  if out_t is not None and out_t not in (
+      'integer', 'number', 'string', 'boolean'):
+    return False
+  src = val_spec.get('callable')
+  if not isinstance(src, str) or not src.strip() or '\x00' in src:
+    return False
+  try:
+    mod = _ast.parse(src, mode='exec')
+  except SyntaxError:
+    return False
+  if len(mod.body) != 1:
+    return False
+  stmt = mod.body[0]
+  if isinstance(stmt, _ast.Expr) and isinstance(stmt.value, _ast.Lambda):
+    args = stmt.value.args
+    if len(args.args) != 1 or args.vararg or args.kwarg or args.defaults:
+      return False
+    param = args.args[0].arg
+    expr = stmt.value.body
+  elif (isinstance(stmt, _ast.FunctionDef) and stmt.name == '_cli_fn' and
+        not stmt.decorator_list and len(stmt.body) == 1 and
+        isinstance(stmt.body[0], _ast.Return) and
+        stmt.body[0].value is not None):
+    args = stmt.args
+    if len(args.args) != 1 or args.vararg or args.kwarg or args.defaults:
+      return False
+    param = args.args[0].arg
+    expr = stmt.body[0].value
+  else:
+    return False
+
+  def _is_getattr_call(node: Any, allow_default_none: bool) -> bool:
+    if not isinstance(node, _ast.Call) or node.keywords:
+      return False
+    if not (isinstance(node.func, _ast.Name) and node.func.id == 'getattr'):
+      return False
+    if len(node.args) == 2:
+      a0, a1 = node.args
+      return (
+          isinstance(a0, _ast.Name) and a0.id == param and
+          isinstance(a1, _ast.Constant) and isinstance(a1.value, str) and
+          not a1.value.startswith('__') and
+          not any(c in a1.value for c in ('\r', '\n', '\x00')))
+    if allow_default_none and len(node.args) == 3:
+      a0, a1, a2 = node.args
+      return (
+          isinstance(a0, _ast.Name) and a0.id == param and
+          isinstance(a1, _ast.Constant) and isinstance(a1.value, str) and
+          not a1.value.startswith('__') and
+          not any(c in a1.value for c in ('\r', '\n', '\x00')) and
+          isinstance(a2, _ast.Constant) and a2.value is None)
+    return False
+
+  if (isinstance(expr, _ast.Constant) and type(expr.value) is int and
+      expr.value == 1):
+    return True
+  if _is_getattr_call(expr, allow_default_none=False):
+    return True
+  if (isinstance(expr, _ast.IfExp) and isinstance(expr.body, _ast.Constant) and
+      type(expr.body.value) is int and expr.body.value == 0 and
+      isinstance(expr.orelse, _ast.Constant) and
+      type(expr.orelse.value) is int and expr.orelse.value == 1 and
+      isinstance(expr.test, _ast.Compare) and len(expr.test.ops) == 1 and
+      isinstance(expr.test.ops[0], _ast.Is) and
+      len(expr.test.comparators) == 1 and
+      isinstance(expr.test.comparators[0], _ast.Constant) and
+      expr.test.comparators[0].value is None and
+      _is_getattr_call(expr.test.left, allow_default_none=True)):
+    return True
+  return False
+
+
 def _build_combine_config(
     window_aggs: dict[str, Any],
     *,
+    group_by: Iterable[str] | str | None = None,
     force_python: bool = False,
 ) -> dict[str, Any]:
-  raw_comb = window_aggs.get('combine') or {}
+  import keyword
+  from . import output
+
+  if not isinstance(window_aggs, Mapping):
+    raise PipeSpecError('window aggregations must be a mapping')
+  if 'combine' not in window_aggs and group_by is not None:
+    raw_gb: Any = group_by
+    raw_comb: Any = window_aggs
+  else:
+    unknown_agg_top = sorted(set(window_aggs.keys()) - {'group_by', 'combine'})
+    if unknown_agg_top:
+      raise PipeSpecError(
+          f'unknown key(s) {unknown_agg_top} in window aggregations')
+    raw_gb = group_by if group_by is not None else window_aggs.get(
+        'group_by', [])
+    raw_comb = window_aggs.get('combine')
+
+  if raw_gb is None:
+    gb_list: list[str] = []
+  elif isinstance(raw_gb, str):
+    gb_list = [raw_gb] if raw_gb else []
+  elif isinstance(raw_gb, Iterable):
+    gb_list = list(raw_gb)
+  else:
+    raise PipeSpecError('window group_by must be a list of column identifiers')
+  for gb_col in gb_list:
+    _validate_window_ident(gb_col, 'group_by column')
+
+  if not isinstance(raw_comb, Mapping) or not raw_comb:
+    raise PipeSpecError(
+        'window aggregations combine must be a non-empty mapping')
+
   needs_py = force_python
   clean_comb: dict[str, Any] = {}
   for k, v in raw_comb.items():
-    if isinstance(v, dict):
+    alias = _validate_window_ident(k, 'aggregation output alias')
+    if isinstance(v, str):
+      vc: dict[str, Any] = {'value': alias, 'fn': v}
+    elif isinstance(v, Mapping):
       vc = dict(v)
-      if vc.pop('_needs_python', False) or vc.get('value') == '1':
-        needs_py = True
-      clean_comb[k] = vc
     else:
-      clean_comb[k] = v
+      raise PipeSpecError(f'invalid aggregation spec for {alias!r}: {v!r}')
+
+    if vc.pop('_needs_python', False):
+      needs_py = True
+    extra_keys = sorted(set(vc.keys()) - {'value', 'fn'})
+    if extra_keys:
+      raise PipeSpecError(
+          f'unexpected key(s) {extra_keys} in window aggregation {alias!r}')
+
+    fn_spec = vc.get('fn')
+    if isinstance(fn_spec, str):
+      fn_low = fn_spec.strip().lower()
+      if fn_low not in _ALLOWED_WINDOW_AGG_FNS:
+        raise PipeSpecError(
+            f'unsupported window aggregation function {fn_spec!r}; '
+            f'allowed: {sorted(_ALLOWED_WINDOW_AGG_FNS)}')
+      vc['fn'] = 'mean' if fn_low == 'avg' else fn_low
+    elif isinstance(fn_spec, Mapping):
+      fn_type = fn_spec.get('type')
+      fn_cfg = fn_spec.get('config')
+      if (not set(fn_spec.keys()) <= {'type', 'config'} or
+          fn_type not in _ALLOWED_INTERNAL_COMBINE_FN_TYPES or
+          fn_cfg not in (None, {})):
+        raise PipeSpecError(
+            f'unsupported CombineFn specification for {alias!r}: {fn_spec!r}')
+      vc['fn'] = {'type': fn_type, 'config': {}}
+      needs_py = True
+    else:
+      raise PipeSpecError(
+          f'invalid aggregation function for {alias!r}: {fn_spec!r}')
+
+    val_spec = vc.get('value', alias)
+    if isinstance(val_spec, str):
+      if val_spec == '1':
+        if vc['fn'] not in ('count', 'sum'):
+          raise PipeSpecError(
+              f'literal "1" input is only valid for count, got {vc["fn"]!r}')
+        needs_py = True
+        vc['value'] = '1'
+      elif output.SAFE_IDENTIFIER_RE.match(val_spec):
+        if keyword.iskeyword(val_spec):
+          needs_py = True
+          vc['value'] = {
+              'callable': (
+                  f'def _cli_fn(__row__):\n'
+                  f'  return getattr(__row__, {val_spec!r})\n'),
+          }
+        else:
+          vc['value'] = val_spec
+      else:
+        raise PipeSpecError(
+            f'invalid aggregation input column {val_spec!r} for {alias!r}')
+    elif isinstance(val_spec, Mapping):
+      if not _is_safe_internal_combine_callable(val_spec):
+        raise PipeSpecError(
+            f'disallowed callable/expression in window aggregation {alias!r}')
+      needs_py = True
+      vc['value'] = dict(val_spec)
+    else:
+      raise PipeSpecError(
+          f'invalid aggregation value {val_spec!r} for {alias!r}')
+
+    clean_comb[alias] = vc
+
   out: dict[str, Any] = {
-      'group_by': window_aggs.get('group_by', []),
+      'group_by': gb_list,
       'combine': clean_comb,
   }
   if needs_py:
@@ -230,14 +479,127 @@ def _build_combine_config(
   return out
 
 
+def _validate_parsed_window_dict(raw_dict: Mapping[str, Any]) -> dict[str, Any]:
+  """Validates keys, durations, triggers, lateness, and aggregations of a `--window` dict."""
+  from . import interval_join as ij_mod
+  from . import windowing as windowing_mod
+
+  norm_res: dict[str, Any] = {}
+  for rk, rv in raw_dict.items():
+    nk = str(rk).strip().lower().replace('-', '_')
+    if nk not in _ALLOWED_WINDOW_DICT_KEYS:
+      raise PipeSpecError(f'unknown option {rk!r} in --window specification')
+    norm_res[nk] = rv
+
+  raw_wtype = str(
+      norm_res.pop('window_type', None) or norm_res.get('type') or
+      '').strip().lower()
+  if raw_wtype == 'session':
+    raw_wtype = 'sessions'
+  if raw_wtype:
+    norm_res['type'] = raw_wtype
+
+  raw_gb = norm_res.pop('group_by', None)
+  gb_cols: list[str] = []
+  if raw_gb is not None:
+    if isinstance(raw_gb, (str, list, tuple)):
+      gb_cols = list(ij_mod.parse_column_list(raw_gb))
+    else:
+      raise PipeSpecError('--window group_by must be a column name or list')
+    for c in gb_cols:
+      _validate_window_ident(c, 'group_by column')
+
+  raw_aggs = norm_res.pop('aggregations', None)
+  clean_aggs: dict[str, Any] | None = None
+  if raw_aggs is not None:
+    if not isinstance(raw_aggs, Mapping):
+      raise PipeSpecError('--window aggregations must be a JSON/YAML object')
+    bad_ak = sorted(set(raw_aggs.keys()) - {'group_by', 'combine'})
+    if bad_ak:
+      raise PipeSpecError(f'unknown key(s) {bad_ak} in --window aggregations')
+    agg_gb_raw = raw_aggs.get('group_by')
+    agg_gb: list[str] = []
+    if agg_gb_raw is not None:
+      if not isinstance(agg_gb_raw, (str, list, tuple)):
+        raise PipeSpecError('--window aggregations.group_by must be a list')
+      agg_gb = list(ij_mod.parse_column_list(agg_gb_raw))
+      for c in agg_gb:
+        _validate_window_ident(c, 'group_by column')
+    agg_comb_raw = raw_aggs.get('combine')
+    if not isinstance(agg_comb_raw, Mapping) or not agg_comb_raw:
+      raise PipeSpecError(
+          '--window aggregations.combine must be a non-empty object')
+    validated_comb: dict[str, Any] = {}
+    for out_alias, spec_v in agg_comb_raw.items():
+      alias_s = _validate_window_ident(out_alias, 'aggregation output alias')
+      if isinstance(spec_v, str):
+        fn_raw = spec_v.strip().lower()
+        val_raw: Any = alias_s
+      elif isinstance(spec_v, Mapping):
+        extra_sk = sorted(set(spec_v.keys()) - {'value', 'fn'})
+        if extra_sk:
+          raise PipeSpecError(
+              f'unexpected key(s) {extra_sk} in --window aggregation {alias_s!r}'
+          )
+        if not isinstance(spec_v.get('fn'), str):
+          raise PipeSpecError(
+              f'--window aggregation {alias_s!r} fn must be one of '
+              f'{sorted(_ALLOWED_WINDOW_AGG_FNS)}')
+        fn_raw = spec_v['fn'].strip().lower()
+        val_raw = spec_v.get('value', alias_s)
+      else:
+        raise PipeSpecError(
+            f'invalid --window aggregation {alias_s!r}: {spec_v!r}')
+      if fn_raw not in _ALLOWED_WINDOW_AGG_FNS:
+        raise PipeSpecError(
+            f'unsupported --window aggregation function {fn_raw!r}; '
+            f'allowed: {sorted(_ALLOWED_WINDOW_AGG_FNS)}')
+      fn_norm = 'mean' if fn_raw == 'avg' else fn_raw
+      if not isinstance(val_raw, str):
+        raise PipeSpecError(
+            f'--window aggregation {alias_s!r} value must be a column identifier'
+        )
+      val_s = val_raw.strip()
+      if val_s in ('*', '') and fn_norm == 'count':
+        val_s = '1'
+      if val_s == '1':
+        if fn_norm != 'count':
+          raise PipeSpecError(
+              f'literal "1" value in --window is only valid for count, got {fn_raw!r}'
+          )
+      else:
+        _validate_window_ident(val_s, 'aggregation input column')
+      validated_comb[alias_s] = {'value': val_s, 'fn': fn_norm}
+    clean_aggs = {'group_by': agg_gb, 'combine': validated_comb}
+
+  try:
+    w_parsed = windowing_mod.parse_windowing_config(norm_res)
+  except ValueError as e:
+    raise PipeSpecError(str(e)) from None
+
+  norm_res['type'] = w_parsed.window_type
+  if w_parsed.window_type == 'sliding' and 'period' not in norm_res and w_parsed.period:
+    norm_res['size'] = w_parsed.size
+    norm_res['period'] = w_parsed.period
+  if w_parsed.offset and 'offset' not in norm_res:
+    norm_res['offset'] = w_parsed.offset
+  if clean_aggs is not None:
+    if gb_cols:
+      merged = list(gb_cols)
+      for c in clean_aggs['group_by']:
+        if c not in merged:
+          merged.append(c)
+      clean_aggs['group_by'] = merged
+    norm_res['aggregations'] = clean_aggs
+  elif gb_cols:
+    norm_res['group_by'] = gb_cols
+  return norm_res
+
+
 def parse_window_spec(spec: str | dict[str, Any]) -> dict[str, Any]:
   """Parses a `--window` string into a Beam YAML windowing dict."""
-  if isinstance(spec, dict):
-    res = dict(spec)
-    w_type = str(res.get('type') or '').lower()
-    if w_type == 'session':
-      res['type'] = 'sessions'
-    return res
+  if isinstance(spec, Mapping):
+    return _validate_parsed_window_dict(spec)
 
   s = str(spec or '').strip()
   if not s:
@@ -247,15 +609,21 @@ def parse_window_spec(spec: str | dict[str, Any]) -> dict[str, Any]:
     import json
     try:
       d = json.loads(s)
-      return parse_window_spec(d)
     except Exception as e:
       raise PipeSpecError(f'malformed JSON in --window: {e}') from None
+    if not isinstance(d, Mapping):
+      raise PipeSpecError('--window JSON must be an object')
+    return _validate_parsed_window_dict(d)
 
   prefix = ''
   rest = s
   if ':' in s and '=' not in s.split(':', 1)[0]:
     cand_prefix, cand_rest = s.split(':', 1)
-    if cand_prefix.lower() in ('fixed', 'sliding', 'session', 'sessions', 'global'):
+    if cand_prefix.lower() in ('fixed',
+                               'sliding',
+                               'session',
+                               'sessions',
+                               'global'):
       prefix = cand_prefix.lower()
       rest = cand_rest.strip()
 
@@ -277,41 +645,59 @@ def parse_window_spec(spec: str | dict[str, Any]) -> dict[str, Any]:
     kv_tokens.pop('type', None)
 
   if prefix == 'fixed':
+    if len(pos_tokens) > 2:
+      raise PipeSpecError(
+          f'unexpected token {pos_tokens[2]!r} in fixed --window {s!r}')
     size_val = kv_tokens.pop('size',
                              None) or (pos_tokens[0] if pos_tokens else None)
     if not size_val:
       raise PipeSpecError(
-          f"invalid fixed window specification {s!r}; expected fixed:DURATION (e.g. 'fixed:60s')")
+          f"invalid fixed window specification {s!r}; expected fixed:DURATION (e.g. 'fixed:60s')"
+      )
     out: dict[str, Any] = {'type': 'fixed', 'size': size_val}
     off_val = kv_tokens.pop(
         'offset', None) or (pos_tokens[1] if len(pos_tokens) > 1 else None)
     if off_val is not None:
       out['offset'] = off_val
   elif prefix == 'sliding':
+    if len(pos_tokens) > 3:
+      raise PipeSpecError(
+          f'unexpected token {pos_tokens[3]!r} in sliding --window {s!r}')
     size_val = kv_tokens.pop('size',
                              None) or (pos_tokens[0] if pos_tokens else None)
     period_val = kv_tokens.pop(
         'period', None) or (pos_tokens[1] if len(pos_tokens) > 1 else None)
     if not period_val and size_val and ':' in size_val:
-      s_parts = [p.strip() for p in size_val.split(':', 1)]
-      if len(s_parts) == 2 and s_parts[0] and s_parts[1]:
+      s_parts = [p.strip() for p in size_val.split(':') if p.strip()]
+      if len(s_parts) >= 2:
         size_val, period_val = s_parts[0], s_parts[1]
+        if len(s_parts) >= 3 and 'offset' not in kv_tokens and len(
+            pos_tokens) <= 1:
+          kv_tokens['offset'] = s_parts[2]
     if not size_val or not period_val:
       raise PipeSpecError(
-          f"invalid sliding window specification {s!r}; expected sliding:SIZE,PERIOD (e.g. 'sliding:5m,1m')")
+          f"invalid sliding window specification {s!r}; expected sliding:SIZE,PERIOD (e.g. 'sliding:5m,1m')"
+      )
     out = {'type': 'sliding', 'size': size_val, 'period': period_val}
     off_val = kv_tokens.pop(
         'offset', None) or (pos_tokens[2] if len(pos_tokens) > 2 else None)
     if off_val is not None:
       out['offset'] = off_val
   elif prefix in ('session', 'sessions'):
+    if len(pos_tokens) > 1:
+      raise PipeSpecError(
+          f'unexpected token {pos_tokens[1]!r} in session --window {s!r}')
     gap_val = kv_tokens.pop('gap',
                             None) or (pos_tokens[0] if pos_tokens else None)
     if not gap_val:
       raise PipeSpecError(
-          f"invalid session window specification {s!r}; expected session:GAP (e.g. 'session:30m')")
+          f"invalid session window specification {s!r}; expected session:GAP (e.g. 'session:30m')"
+      )
     out = {'type': 'sessions', 'gap': gap_val}
   elif prefix == 'global':
+    if pos_tokens:
+      raise PipeSpecError(
+          f'unexpected token {pos_tokens[0]!r} in global --window {s!r}')
     out = {'type': 'global'}
   else:
     raise PipeSpecError(
@@ -323,7 +709,7 @@ def parse_window_spec(spec: str | dict[str, Any]) -> dict[str, Any]:
     out['aggregations'] = {'group_by': group_by, 'combine': combines}
   elif group_by:
     out['group_by'] = group_by
-  return out
+  return _validate_parsed_window_dict(out)
 
 
 def _split_source_alias_prefix(raw: str) -> tuple[str | None, str]:
@@ -455,15 +841,15 @@ def build_pipe_spec(
     parsed_from_opts = uris.parse_kv_options(
         from_opts, from_opt_file, '--from-opt')
     parsed_join_opts = (
-        uris.parse_kv_options(join_opts, join_opt_file, '--join-opt')
-        if (join_opts or join_opt_file) else {})
+        uris.parse_kv_options(join_opts, join_opt_file, '--join-opt') if
+        (join_opts or join_opt_file) else {})
     parsed_to_opts = uris.parse_kv_options(to_opts, to_opt_file, '--to-opt')
     raw_cdc_fields = parsed_from_opts.pop('fields', None) if cdc else None
     if (',' in source and '://' not in source and not allow_jinja and
         not dlq._match_paths(source)):
       parts = [p.strip() for p in source.split(',') if p.strip()]
-      if len(parts) >= 2 and any(
-          uris.extension_of(p) or dlq._match_paths(p) for p in parts):
+      if len(parts) >= 2 and any(uris.extension_of(p) or dlq._match_paths(p)
+                                 for p in parts):
         raise PipeSpecError(
             'comma-separated paths in --from are not supported; pass '
             '--from a=FIRST --join b=SECOND with --sql and UNION ALL '
@@ -482,7 +868,9 @@ def build_pipe_spec(
             clean_join_source,
             is_read=True,
             explicit_format=from_format,
-            options={**parsed_from_opts, **parsed_join_opts},
+            options={
+                **parsed_from_opts, **parsed_join_opts
+            },
             default_project=default_project,
             allow_sniff=not allow_jinja,
             allow_jinja=allow_jinja) if clean_join_source else None)
@@ -498,12 +886,12 @@ def build_pipe_spec(
         allow_jinja=allow_jinja)
     dlq_default_fmt = None
     if dlq_sink and not dlq_format:
-      if not (uris.extension_of(dlq_sink) or (
-          '://' in dlq_sink and
-          dlq_sink.split('://', 1)[0].lower() not in uris.FILE_SCHEMES)):
-        dlq_default_fmt = (
-            (uris._infer_jinja_file_format(dlq_sink) or 'json')
-            if allow_jinja and uris._has_jinja_syntax(dlq_sink) else 'json')
+      if not (uris.extension_of(dlq_sink) or
+              ('://' in dlq_sink and
+               dlq_sink.split('://', 1)[0].lower() not in uris.FILE_SCHEMES)):
+        dlq_default_fmt = ((uris._infer_jinja_file_format(dlq_sink) or 'json')
+                           if allow_jinja and uris._has_jinja_syntax(dlq_sink)
+                           else 'json')
     dlq_ep = (
         uris.parse_endpoint(
             dlq_sink,
@@ -539,23 +927,25 @@ def build_pipe_spec(
     from . import expect as expect_mod
     for item in expect:
       try:
-        r = expect_mod.parse_expectation_rule(item, default_on_violation=on_violation)
+        r = expect_mod.parse_expectation_rule(
+            item, default_on_violation=on_violation)
         parsed_expect_rules.append(r)
       except (ValueError, TypeError) as e:
         raise PipeSpecError(f'invalid --expect rule {item!r}: {e}') from None
-    if any(r.on_violation == 'dlq' for r in parsed_expect_rules) and dlq_ep is None:
+    if any(r.on_violation == 'dlq'
+           for r in parsed_expect_rules) and dlq_ep is None:
       raise PipeSpecError(
           "cannot route expectation violations to DLQ without a DLQ sink; "
           "specify --dlq <PATH> or use --on-violation {fail|drop}")
 
-  has_b23_window_opts = bool(
-      (
-          allowed_lateness is not None and
-          (window is not None or
-           (asof_join is None and interval_join is None and pattern is None)))
-      or trigger is not None or accumulation is not None or
-      late_action is not None or late_dlq_ep is not None or emit_pane_info or
-      watermark_lag is not None)
+  has_b23_window_opts = bool((
+      allowed_lateness is not None and (
+          window is not None or
+          (asof_join is None and interval_join is None and pattern is None))) or
+                             trigger is not None or accumulation is not None or
+                             late_action is not None or
+                             late_dlq_ep is not None or emit_pane_info or
+                             watermark_lag is not None)
 
   if zero_copy:
     if limit is not None:
@@ -573,8 +963,9 @@ def build_pipe_spec(
     if dst_ep.kind != 'iceberg':
       raise PipeSpecError(
           f'--zero-copy requires an iceberg:// destination, got {dst_ep.raw!r}')
-    if src_ep.kind not in ('delta', 'iceberg') and not (
-        src_ep.kind == 'file' and src_ep.format == 'parquet'):
+    if src_ep.kind not in ('delta',
+                           'iceberg') and not (src_ep.kind == 'file' and
+                                               src_ep.format == 'parquet'):
       raise PipeSpecError(
           '--zero-copy requires a delta://, iceberg://, or Parquet file/glob '
           f'source, got {src_ep.raw!r}')
@@ -601,18 +992,26 @@ def build_pipe_spec(
           fallback_pat = src_tdir.rstrip('/') + '/data/*.parquet'
           src_st = lakehouse.load_iceberg_state(
               src_tdir, snapshot_id=src_ep.config.get('snapshot_id'))
-          active_paths = [
-              {'path': f['path']} for f in src_st.get('data_files', [])
-          ]
+          active_paths = [{
+              'path': f['path']
+          } for f in src_st.get('data_files', [])]
       except Exception:  # pylint: disable=broad-except
         active_paths = []
       if active_paths:
-        zc_steps.append({'type': 'Create', 'config': {'elements': active_paths}})
+        zc_steps.append({
+            'type': 'Create', 'config': {
+                'elements': active_paths
+            }
+        })
       else:
         pat = fallback_pat or (
             str(src_ep.config.get('table', '')).rstrip('/') + '/*.parquet')
         zc_steps.extend([
-            {'type': 'ReadMatchFiles', 'config': {'file_pattern': pat}},
+            {
+                'type': 'ReadMatchFiles', 'config': {
+                    'file_pattern': pat
+                }
+            },
             {
                 'type': 'MapToFields',
                 'config': {
@@ -629,13 +1028,17 @@ def build_pipe_spec(
         zc_providers.append({
             'type': 'python',
             'config': {},
-            'transforms': {'ReadMatchFiles': 'apache_beam.io.fileio.MatchFiles'},
+            'transforms': {
+                'ReadMatchFiles': 'apache_beam.io.fileio.MatchFiles'
+            },
         })
     else:
       zc_steps.extend([
           {
               'type': 'ReadMatchFiles',
-              'config': {'file_pattern': src_ep.config['path']},
+              'config': {
+                  'file_pattern': src_ep.config['path']
+              },
           },
           {
               'type': 'MapToFields',
@@ -653,11 +1056,15 @@ def build_pipe_spec(
       zc_providers.append({
           'type': 'python',
           'config': {},
-          'transforms': {'ReadMatchFiles': 'apache_beam.io.fileio.MatchFiles'},
+          'transforms': {
+              'ReadMatchFiles': 'apache_beam.io.fileio.MatchFiles'
+          },
       })
     zc_steps.append({'type': 'IcebergAddFiles', 'config': dict(dst_ep.config)})
     zc_spec: dict[str, Any] = {
-        'pipeline': {'type': 'chain', 'transforms': zc_steps}
+        'pipeline': {
+            'type': 'chain', 'transforms': zc_steps
+        }
     }
     if zc_providers:
       zc_spec['providers'] = zc_providers
@@ -683,6 +1090,13 @@ def build_pipe_spec(
   window_spec = parse_window_spec(window) if window else None
   window_group_by = window_spec.pop('group_by', None) if window_spec else None
   window_aggs = window_spec.pop('aggregations', None) if window_spec else None
+  inline_b23_opts: dict[str, Any] = {}
+  if window_spec is not None:
+    for bk in list(window_spec.keys()):
+      if bk in _B23_WINDOW_EXTRA_KEYS:
+        inline_b23_opts[bk] = window_spec.pop(bk)
+    if inline_b23_opts:
+      has_b23_window_opts = True
   if window_spec is not None and window_aggs is None and select:
     inferred_aggs = _extract_sql_select_window_aggs(select)
     if inferred_aggs is not None:
@@ -834,6 +1248,8 @@ def build_pipe_spec(
       raw_dcfg['dedupe_dlq'] = True
     if isinstance(dedupe_by, dict) and dedupe_by.get('force_stateful'):
       raw_dcfg['force_stateful'] = True
+    if isinstance(dedupe_by, dict) and dedupe_by.get('dlq_redact_fields'):
+      raw_dcfg['dlq_redact_fields'] = dedupe_by['dlq_redact_fields']
     try:
       parsed_dedup = dedup_mod.parse_deduplicate_config(raw_dcfg)
     except ValueError as e:
@@ -872,6 +1288,9 @@ def build_pipe_spec(
       dedupe_yaml_cfg['dedupe_dlq'] = True
     if parsed_dedup.force_stateful:
       dedupe_yaml_cfg['force_stateful'] = True
+    if parsed_dedup.dlq_redact_fields:
+      dedupe_yaml_cfg['dlq_redact_fields'] = list(
+          parsed_dedup.dlq_redact_fields)
 
   parsed_dlq_redact: tuple[str, ...] = ()
   if dlq_redact_fields:
@@ -885,6 +1304,9 @@ def build_pipe_spec(
         raise PipeSpecError(
             f'invalid column identifier {rf!r} in --dlq-redact-fields')
     parsed_dlq_redact = raw_rf
+
+  if dedupe_yaml_cfg is not None and parsed_dlq_redact:
+    dedupe_yaml_cfg.setdefault('dlq_redact_fields', list(parsed_dlq_redact))
 
   raw_enrich_items: list[str | dict[str, Any]]
   if enrich is None:
@@ -929,7 +1351,7 @@ def build_pipe_spec(
         extra_pairs: list[tuple[str, str]] = []
         for idx_s, seg in enumerate(segs):
           m_kv = (
-              re.match(r'^([A-Za-z_][A-Za-z0-9_]*)=(.*)$', seg)
+              re.match(r'^([A-Za-z_][A-Za-z0-9_-]*)=(.*)$', seg)
               if idx_s > 0 else None)
           if m_kv:
             extra_pairs.append((m_kv.group(1), m_kv.group(2).strip()))
@@ -941,6 +1363,11 @@ def build_pipe_spec(
         if extra_pairs:
           _assign_stage_kv(target_stage, sub_k, ','.join(lead_parts))
           for ek, ev in extra_pairs:
+            if uris._SECRET_KEY_RE.search(ek):
+              raise PipeSpecError(
+                  f'refusing secret option {ek!r} on the command line '
+                  f'({opt_flag}); place secrets in {opt_flag} @file.yaml '
+                  '(chmod 0600) or environment variables')
             _assign_stage_kv(target_stage, ek, ev)
           continue
       _assign_stage_kv(target_stage, sub_k, rv)
@@ -1084,9 +1511,15 @@ def build_pipe_spec(
           '--late-data-dlq / --emit-pane-info requires --window <SPEC>')
     from . import windowing as windowing_mod
     eff_late_act = late_action
+    if eff_late_act is None:
+      eff_late_act = inline_b23_opts.get(
+          'late_action', inline_b23_opts.get('late_data'))
     if eff_late_act is None and late_dlq_ep is not None:
       eff_late_act = 'dlq'
-    raw_w_cfg: dict[str, Any] = {'windowing': dict(window_spec)}
+    raw_w_cfg: dict[str, Any] = {
+        **inline_b23_opts,
+        'windowing': dict(window_spec),
+    }
     if allowed_lateness is not None:
       raw_w_cfg['allowed_lateness'] = allowed_lateness
     if trigger is not None:
@@ -1118,6 +1551,8 @@ def build_pipe_spec(
     cli_window_yaml_cfg = windowing_mod.windowing_config_to_yaml_dict(
         cli_window_parsed)
 
+  if interval_join_cfg is not None and parsed_dlq_redact:
+    interval_join_cfg.setdefault('dlq_redact_fields', list(parsed_dlq_redact))
   if asof_join_cfg is not None and parsed_dlq_redact:
     asof_join_cfg['dlq_redact_fields'] = list(parsed_dlq_redact)
   two_stream_cfg = (
@@ -1256,7 +1691,8 @@ def build_pipe_spec(
     for exp_rule in parsed_expect_rules:
       tree = _ast.parse(exp_rule.expression, mode='eval')
       call_fn_ids = {
-          id(n.func) for n in _ast.walk(tree) if isinstance(n, _ast.Call)
+          id(n.func)
+          for n in _ast.walk(tree) if isinstance(n, _ast.Call)
       }
       exp_refs: list[str] = []
       for n in _ast.walk(tree):
@@ -1269,8 +1705,9 @@ def build_pipe_spec(
               n.id not in ignore_names):
           exp_refs.append(n.id)
       for eref in exp_refs:
-        if (not is_sel_append and eref not in sel_out_cols) or (
-            is_sel_append and eref in sel_dropped):
+        if (not is_sel_append and
+            eref not in sel_out_cols) or (is_sel_append and
+                                          eref in sel_dropped):
           shown_sel = ', '.join(sel_fields_map) or '<none>'
           raise PipeSpecError(
               f'--expect rule {exp_rule.name!r} references column {eref!r}, '
@@ -1340,7 +1777,9 @@ def build_pipe_spec(
     # pandas equivalents of the explicit column types.
     src_cfg['dtype'] = {
         c: {
-            'int': 'Int64', 'float': 'float64', 'bool': 'boolean',
+            'int': 'Int64',
+            'float': 'float64',
+            'bool': 'boolean',
             'str': 'string'
         }[t]
         for c, t in src_cfg.pop('types').items()
@@ -1407,9 +1846,8 @@ def build_pipe_spec(
       if cdc_seq_col:
         cdc_norm_cfg['seq_col'] = cdc_seq_col
       if resolved_cdc_fields:
-        cdc_norm_cfg['fields_spec'] = [
-            [cname, ckind] for cname, ckind in resolved_cdc_fields
-        ]
+        cdc_norm_cfg['fields_spec'] = [[cname, ckind]
+                                       for cname, ckind in resolved_cdc_fields]
       if cdc_fields_inferred_from_jsonl:
         cdc_norm_cfg['strict_inferred_fields'] = True
         if 'on_unknown_fields' in src_ep.config:
@@ -1449,7 +1887,8 @@ def build_pipe_spec(
       src_type = 'ReadCsvWithDlq'
       src_cfg = {
           k: v
-          for k, v in src_ep.config.items() if k in ('path', 'delimiter', 'null_values', 'types')
+          for k, v in src_ep.config.items()
+          if k in ('path', 'delimiter', 'null_values', 'types')
       }
       src_java = False
       needs_cli_provider = True
@@ -1464,7 +1903,8 @@ def build_pipe_spec(
     if dst_ep.kind == 'iceberg':
       sink_type = 'CliWriteToIceberg'
       sink_cfg = dict(dst_ep.config)
-      sink_cfg['if_exists'] = 'append' if (cdc and if_exists == 'fail') else if_exists
+      sink_cfg['if_exists'] = 'append' if (
+          cdc and if_exists == 'fail') else if_exists
       if is_unbounded:
         freq = None
         if 'triggering_frequency_seconds' in dst_ep.config:
@@ -1525,11 +1965,12 @@ def build_pipe_spec(
         sink_cfg.setdefault('equality_columns', pks)
         sink_cfg.setdefault(
             'change_type_column',
-            cdc_op_col or (
-                '_change_type' if src_ep.kind in ('delta', 'iceberg') else 'op'))
+            cdc_op_col or
+            ('_change_type' if src_ep.kind in ('delta', 'iceberg') else 'op'))
         if src_ep.kind == 'delta' and not cdc_op_col:
           sink_cfg.setdefault(
-              'change_type_map', {
+              'change_type_map',
+              {
                   'insert': 'INSERT',
                   'update_preimage': 'UPDATE_BEFORE',
                   'update_postimage': 'UPDATE_AFTER',
@@ -1661,8 +2102,7 @@ def build_pipe_spec(
           'config': {
               'language': 'python',
               'keep': {
-                  'callable':
-                  "lambda row: bool(getattr(row, 'line', str(row)).strip())"
+                  'callable': "lambda row: bool(getattr(row, 'line', str(row)).strip())"
               },
           },
       })
@@ -1682,11 +2122,12 @@ def build_pipe_spec(
     if clean_timestamp_col:
       if (cli_window_yaml_cfg is not None or pattern_yaml_cfg is not None or
           bool(window_aggs) or dedupe_yaml_cfg is not None):
+        ts_chain_cfg: dict[str, Any] = {'timestamp_col': clean_timestamp_col}
+        if parsed_dlq_redact:
+          ts_chain_cfg['dlq_redact_fields'] = list(parsed_dlq_redact)
         chain_steps.append({
             'type': 'CliAssignTimestamps',
-            'config': {
-                'timestamp_col': clean_timestamp_col
-            },
+            'config': ts_chain_cfg,
         })
       else:
         chain_steps.append({
@@ -1788,10 +2229,11 @@ def build_pipe_spec(
       chain_steps.append({
           'type': 'CliExpect',
           'config': {
-              'rules': [
-                  {'name': r.name, 'expression': r.expression, 'on_violation': r.on_violation}
-                  for r in parsed_expect_rules
-              ],
+              'rules': [{
+                  'name': r.name,
+                  'expression': r.expression,
+                  'on_violation': r.on_violation
+              } for r in parsed_expect_rules],
           },
       })
     if limit is not None:
@@ -1961,6 +2403,8 @@ def build_pipe_spec(
 
     if l_ts_col:
       ts_l_cfg: dict[str, Any] = {'timestamp_col': l_ts_col}
+      if parsed_dlq_redact:
+        ts_l_cfg['dlq_redact_fields'] = list(parsed_dlq_redact)
       if has_dlq:
         ts_l_cfg['error_handling'] = {'output': 'errors'}
       dag_transforms.append({
@@ -1984,6 +2428,8 @@ def build_pipe_spec(
 
     if r_ts_col:
       ts_r_cfg: dict[str, Any] = {'timestamp_col': r_ts_col}
+      if parsed_dlq_redact:
+        ts_r_cfg['dlq_redact_fields'] = list(parsed_dlq_redact)
       if has_dlq:
         ts_r_cfg['error_handling'] = {'output': 'errors'}
       dag_transforms.append({
@@ -2050,8 +2496,7 @@ def build_pipe_spec(
           'config': {
               'language': 'python',
               'keep': {
-                  'callable':
-                  "lambda row: bool(getattr(row, 'line', str(row)).strip())"
+                  'callable': "lambda row: bool(getattr(row, 'line', str(row)).strip())"
               },
           },
       })
@@ -2081,6 +2526,8 @@ def build_pipe_spec(
       if (cli_window_yaml_cfg is not None or pattern_yaml_cfg is not None or
           bool(window_aggs) or dedupe_yaml_cfg is not None):
         ts_dag_cfg: dict[str, Any] = {'timestamp_col': clean_timestamp_col}
+        if parsed_dlq_redact:
+          ts_dag_cfg['dlq_redact_fields'] = list(parsed_dlq_redact)
         if has_dlq:
           ts_dag_cfg['error_handling'] = {'output': 'errors'}
         dag_transforms.append({
@@ -2418,8 +2865,7 @@ def build_pipe_spec(
     })
     if has_dlq:
       dag_transforms.append(
-          _norm_dlq(
-              'NormalizeExpectDlq', 'ValidateExpect.errors', 'CliExpect'))
+          _norm_dlq('NormalizeExpectDlq', 'ValidateExpect.errors', 'CliExpect'))
       dlq_norm_refs.append('NormalizeExpectDlq')
       current_ref = 'ValidateExpect.good'
     else:
@@ -2465,8 +2911,8 @@ def build_pipe_spec(
         'config': dst_cfg,
     })
     sink_err_ref = 'WriteSink.errors'
-    if inject_counters and sink_type not in (
-        'CliWriteToBigQuery', 'CliWriteToBigQueryCDC'):
+    if inject_counters and sink_type not in ('CliWriteToBigQuery',
+                                             'CliWriteToBigQueryCDC'):
       dag_transforms.append({
           'name': 'CountSinkDlq',
           'type': 'CliCountRows',
@@ -2512,8 +2958,8 @@ def build_pipe_spec(
 
       dlq_sink_type = (
           'CliWriteToBigQuery' if
-          (prefer_python_bigquery_sink and dlq_ep.kind == 'bigquery') else
-          dlq_ep.yaml_type)
+          (prefer_python_bigquery_sink and
+           dlq_ep.kind == 'bigquery') else dlq_ep.yaml_type)
       dag_transforms.append({
           'name': 'WriteDlq',
           'type': dlq_sink_type,
@@ -2612,23 +3058,123 @@ def _redact_spec_secrets(
   return obj
 
 
+_KV_OPT_FLAGS = frozenset([
+    'from_opt',
+    'to_opt',
+    'left_opt',
+    'right_opt',
+    'join_opt',
+    'enrich_opt',
+    'infer_opt',
+    'pattern_opt',
+    'window_opt',
+    'dedupe_opt',
+    'cdc_opt',
+    'interval_join_opt',
+    'asof_join_opt',
+    'enrich',
+    'infer',
+    'pattern',
+    'join',
+    'interval_join',
+    'asof_join',
+])
+
+
+def _split_opt_commas(text: str) -> list[str]:
+  """Splits `text` on top-level commas outside quotes and brackets."""
+  parts: list[str] = []
+  buf: list[str] = []
+  depth = 0
+  quote: str | None = None
+  escape = False
+  for ch in text:
+    if escape:
+      buf.append(ch)
+      escape = False
+      continue
+    if quote is not None:
+      buf.append(ch)
+      if ch == '\\':
+        escape = True
+      elif ch == quote:
+        quote = None
+      continue
+    if ch in ('"', "'"):
+      quote = ch
+      buf.append(ch)
+    elif ch in '([{':
+      depth += 1
+      buf.append(ch)
+    elif ch in ')]}':
+      depth = max(0, depth - 1)
+      buf.append(ch)
+    elif ch == ',' and depth == 0:
+      parts.append(''.join(buf))
+      buf = []
+    else:
+      buf.append(ch)
+  parts.append(''.join(buf))
+  return parts
+
+
+def _redact_kv_option_arg(val: str) -> str:
+  """Redacts inline secret values inside `k=v` or comma-grouped CLI options."""
+  from . import output
+  stripped = val.strip()
+  if stripped.startswith('{') and stripped.endswith('}'):
+    import json
+    try:
+      parsed = json.loads(stripped)
+      if isinstance(parsed, dict):
+        return json.dumps(_redact_spec_secrets(parsed))
+    except Exception:  # pylint: disable=broad-except
+      pass
+  if '=' not in val:
+    return output.redact_inline_secrets(val, '<REDACTED_SECRET>')
+  out_parts: list[str] = []
+  for seg in _split_opt_commas(val):
+    lhs, eq, rhs = seg.partition('=')
+    if eq:
+      key_cand = lhs.rsplit(':', 1)[-1].strip()
+      norm_cand = key_cand.lower().replace('-', '_')
+      if not norm_cand.endswith('_env') and uris._SECRET_KEY_RE.search(
+          key_cand):
+        out_parts.append(f'{lhs}=<REDACTED_SECRET>')
+      else:
+        out_parts.append(
+            f'{lhs}={output.redact_inline_secrets(rhs, "<REDACTED_SECRET>")}')
+    else:
+      out_parts.append(output.redact_inline_secrets(seg, '<REDACTED_SECRET>'))
+  return ','.join(out_parts)
+
+
 def _redact_argv_tokens(argv: list[str]) -> list[str]:
   """Redacts credentials inside CLI argv tokens before emitting YAML headers."""
   from . import output
   redacted: list[str] = []
   redact_next = False
+  redact_kv_next = False
   for tok in argv:
     s = str(tok)
     if redact_next:
       redacted.append('<REDACTED_SECRET>')
       redact_next = False
       continue
+    if redact_kv_next:
+      redacted.append(_redact_kv_option_arg(s))
+      redact_kv_next = False
+      continue
     if s.startswith('-'):
       flag_part, sep, val_part = s.partition('=')
       flag_key = flag_part.lstrip('-')
+      norm_flag = flag_key.lower().replace('-', '_')
+      is_kv_opt = norm_flag in _KV_OPT_FLAGS or norm_flag.endswith('_opt')
       if sep:
         if uris._SECRET_KEY_RE.search(flag_key):
           redacted.append(f'{flag_part}=<REDACTED_SECRET>')
+        elif is_kv_opt:
+          redacted.append(f'{flag_part}={_redact_kv_option_arg(val_part)}')
         else:
           redacted.append(
               f'{flag_part}='
@@ -2636,6 +3182,8 @@ def _redact_argv_tokens(argv: list[str]) -> list[str]:
         continue
       if uris._SECRET_KEY_RE.search(flag_key):
         redact_next = True
+      elif is_kv_opt:
+        redact_kv_next = True
       redacted.append(s)
       continue
     redacted.append(output.redact_inline_secrets(s, '<REDACTED_SECRET>'))
@@ -2645,12 +3193,23 @@ def _redact_argv_tokens(argv: list[str]) -> list[str]:
 def redact_yaml_text(yaml_text: str) -> str:
   """Redacts secrets in serialized Beam YAML text before job display_data upload."""
   from . import output
+  header_lines: list[str] = []
+  for raw_ln in yaml_text.splitlines():
+    if raw_ln.lstrip().startswith('#'):
+      header_lines.append(
+          output.redact_inline_secrets(raw_ln, placeholder='<REDACTED_SECRET>'))
+    elif not raw_ln.strip():
+      if header_lines:
+        header_lines.append('')
+    else:
+      break
+  prefix = ('\n'.join(header_lines) + '\n') if header_lines else ''
   try:
     import yaml
     parsed = output.safe_yaml_load(yaml_text)
     if isinstance(parsed, dict):
       dumper = getattr(yaml, 'CSafeDumper', yaml.SafeDumper)
-      return yaml.dump(
+      return prefix + yaml.dump(
           _redact_spec_secrets(parsed),
           Dumper=dumper,
           sort_keys=False,

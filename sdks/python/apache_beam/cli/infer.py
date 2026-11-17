@@ -122,6 +122,7 @@ _COMMON_INFER_KEYS = frozenset([
     'dlq_redact_fields',
     'inference_args',
     'parameters',
+    'trust_providers',
 ])
 
 _PROVIDER_SPECIFIC_KEYS: dict[str, frozenset[str]] = {
@@ -167,13 +168,53 @@ _PROVIDER_SPECIFIC_KEYS: dict[str, frozenset[str]] = {
     ]),
 }
 
-_SAFE_GCP_TOKEN_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$')
+_SAFE_GCP_TOKEN_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$')
 _SAFE_LOCATION_RE = re.compile(r'^[a-z0-9][a-z0-9-]{1,63}$')
-_SAFE_ENDPOINT_ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$')
+_SAFE_ENDPOINT_ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$')
 _SAFE_VPC_NETWORK_RE = re.compile(
     r'^projects/[A-Za-z0-9._:-]+/global/networks/[A-Za-z0-9._-]+$')
 _SAFE_INVOKE_ROUTE_RE = re.compile(r'^/[A-Za-z0-9._/-]{1,255}$')
 _SAFE_HF_TASK_RE = re.compile(r'^[a-z0-9][a-z0-9-]{1,63}$')
+_SAFE_HF_NLP_TASKS = frozenset([
+    'text-classification',
+    'sentiment-analysis',
+    'token-classification',
+    'ner',
+    'question-answering',
+    'table-question-answering',
+    'fill-mask',
+    'summarization',
+    'translation',
+    'text-generation',
+    'text2text-generation',
+    'zero-shot-classification',
+    'feature-extraction',
+    'sentence-similarity',
+])
+_FORBIDDEN_HF_DICT_KEYS = frozenset([
+    'proxies',
+    'token',
+    'hf_token',
+    'use_auth_token',
+    'hub_kwargs',
+    'cache_dir',
+    'revision',
+    'code_revision',
+    'commit_hash',
+    'config',
+    'tokenizer',
+    'processor',
+    'feature_extractor',
+    'image_processor',
+    'model',
+    'model_id',
+    'pretrained_model_name_or_path',
+    'repo_id',
+    'custom_pipeline',
+    'pipeline_class',
+    'mirror',
+    'endpoint',
+])
 _SAFE_HF_REPO_RE = re.compile(
     r'^[A-Za-z0-9][A-Za-z0-9._-]*(?:/[A-Za-z0-9._-]+)?$')
 _SAFE_HF_REVISION_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$')
@@ -271,6 +312,7 @@ class InferConfig(NamedTuple):
   mock_response_json: str | None = None
   mock_fail_on: str | None = None
   mock_fail_batch_once: bool = False
+  trust_providers: bool = False
 
 
 class _InferErrorSentinel(NamedTuple):
@@ -424,20 +466,46 @@ def _validate_hf_security_dict(d: Any, label: str) -> None:
   for k, v in d.items():
     ks = str(k).strip()
     kl = ks.lower()
-    if kl == 'trust_remote_code' and _parse_bool(v,
-                                                 f'{label}.trust_remote_code'):
+    kl_norm = kl.replace('-', '_')
+    if kl_norm == 'trust_remote_code' and _parse_bool(
+        v, f'{label}.trust_remote_code'):
       raise ValueError(
           'trust_remote_code=True is blocked in CliInfer to prevent arbitrary '
           'remote Hub code execution; only trust_remote_code=False is allowed')
-    if kl == 'use_safetensors' and not _parse_bool(v,
-                                                   f'{label}.use_safetensors'):
+    if kl_norm == 'use_safetensors' and not _parse_bool(
+        v, f'{label}.use_safetensors'):
       raise ValueError(
           'use_safetensors=False is blocked in CliInfer to prevent unsafe '
           'pickle (.bin) weight deserialization')
-    if kl in _FORBIDDEN_CALLABLE_KEYS:
+    if (kl in _FORBIDDEN_CALLABLE_KEYS or kl_norm in _FORBIDDEN_CALLABLE_KEYS or
+        kl_norm in _FORBIDDEN_HF_DICT_KEYS or
+        (not kl_norm.endswith('_env') and uris._SECRET_KEY_RE.search(kl_norm))):
       raise ValueError(f'{ks!r} is disallowed inside {label} for security')
     if isinstance(v, Mapping):
       _validate_hf_security_dict(v, f'{label}.{ks}')
+
+
+def _reject_comma_grouped_infer_secrets(raw_map: Mapping[str, Any]) -> None:
+  for raw_k, raw_v in raw_map.items():
+    if not isinstance(raw_v, str) or ',' not in raw_v or '=' not in raw_v:
+      continue
+    norm_k = str(raw_k).strip().lower().replace('-', '_')
+    if norm_k in ('response_json',
+                  'load_pipeline_args',
+                  'model_kwargs',
+                  'inference_args',
+                  'parameters'):
+      continue
+    for tok in enrich_mod.split_bracket_tokens(raw_v.strip())[1:]:
+      if '=' not in tok:
+        continue
+      sub_k = tok.split('=', 1)[0].strip()
+      sub_norm = sub_k.lower().replace('-', '_')
+      if not sub_norm.endswith('_env') and uris._SECRET_KEY_RE.search(sub_k):
+        raise ValueError(
+            f'refusing inline secret option {sub_k!r} in --infer; '
+            'use environment variables (e.g. HF_TOKEN), ADC, or '
+            'a 0600 --infer-opt-file')
 
 
 def parse_infer_config(
@@ -448,6 +516,7 @@ def parse_infer_config(
   """Validates a `CliInfer` config mapping and returns `InferConfig`."""
   if not isinstance(raw_cfg, Mapping):
     raise ValueError('CliInfer config must be a mapping')
+  _reject_comma_grouped_infer_secrets(raw_cfg)
 
   norm: dict[str, Any] = {}
   for k, v in raw_cfg.items():
@@ -590,6 +659,8 @@ def parse_infer_config(
   if not isinstance(raw_inf_args, Mapping):
     raise ValueError('inference_args / parameters must be a mapping')
   inference_args = {str(k): v for k, v in raw_inf_args.items()}
+  trust_providers = _parse_bool(
+      norm.get('trust_providers', False), 'trust_providers')
 
   if provider == 'vertexai':
     endpoint_id = str(norm.get('endpoint_id') or norm.get('endpoint') or
@@ -609,7 +680,8 @@ def parse_infer_config(
       uris.reject_inline_credentials(endpoint_id)
     except uris.UriError as e:
       raise ValueError(str(e)) from None
-    if '://' in endpoint_id or not _SAFE_ENDPOINT_ID_RE.match(endpoint_id):
+    if ('://' in endpoint_id or '..' in endpoint_id or '/' in endpoint_id or
+        '\\' in endpoint_id or not _SAFE_ENDPOINT_ID_RE.match(endpoint_id)):
       raise ValueError(f'invalid Vertex AI endpoint_id {endpoint_id!r}')
 
     project = str(
@@ -617,7 +689,8 @@ def parse_infer_config(
     if not project:
       raise ValueError(
           '--infer vertexai:... requires project=<GCP_PROJECT> (or --project)')
-    if not _SAFE_GCP_TOKEN_RE.match(project):
+    if '..' in project or '/' in project or '\\' in project or (
+        not _SAFE_GCP_TOKEN_RE.match(project)):
       raise ValueError(f'invalid GCP project {project!r} in --infer vertexai')
 
     location = str(
@@ -637,7 +710,8 @@ def parse_infer_config(
       raise ValueError(
           '--infer vertexai private=true requires network=projects/<NUM>/global/networks/<VPC>'
       )
-    if network is not None and not _SAFE_VPC_NETWORK_RE.match(network):
+    if network is not None and ('..' in network or
+                                not _SAFE_VPC_NETWORK_RE.match(network)):
       raise ValueError(
           f'invalid Vertex AI VPC network {network!r}; expected '
           'projects/<PROJECT_NUMBER>/global/networks/<NETWORK>')
@@ -646,7 +720,9 @@ def parse_infer_config(
         str(norm['experiment']).strip()
         if norm.get('experiment') is not None and
         str(norm['experiment']).strip() else None)
-    if experiment is not None and not _SAFE_GCP_TOKEN_RE.match(experiment):
+    if experiment is not None and ('..' in experiment or '/' in experiment or
+                                   '\\' in experiment or
+                                   not _SAFE_GCP_TOKEN_RE.match(experiment)):
       raise ValueError(f'invalid Vertex AI experiment {experiment!r}')
 
     invoke_route = (
@@ -654,7 +730,8 @@ def parse_infer_config(
         if norm.get('invoke_route') is not None and
         str(norm['invoke_route']).strip() else None)
     if invoke_route is not None:
-      if '..' in invoke_route or not _SAFE_INVOKE_ROUTE_RE.match(invoke_route):
+      if '..' in invoke_route or '\\' in invoke_route or (
+          not _SAFE_INVOKE_ROUTE_RE.match(invoke_route)):
         raise ValueError(
             f'invalid Vertex AI invoke_route {invoke_route!r}; expected leading '
             'slash path such as /predict/v1 without ..')
@@ -685,6 +762,7 @@ def parse_infer_config(
         experiment=experiment,
         invoke_route=invoke_route,
         max_payload_bytes=max_payload_bytes,
+        trust_providers=trust_providers,
     )
 
   if provider == 'hf':
@@ -719,8 +797,16 @@ def parse_infer_config(
     task = (
         str(norm['task']).strip().lower()
         if norm.get('task') is not None and str(norm['task']).strip() else None)
-    if task is not None and not _SAFE_HF_TASK_RE.match(task):
-      raise ValueError(f'invalid HuggingFace task {task!r}')
+    if task is not None:
+      if not _SAFE_HF_TASK_RE.match(task):
+        raise ValueError(f'invalid HuggingFace task {task!r}')
+      if not trust_providers and not (task in _SAFE_HF_NLP_TASKS or
+                                      task.startswith('translation-')):
+        raise ValueError(
+            f'HuggingFace task {task!r} requires trust_providers=True / '
+            '--trust-providers (multimodal/vision/audio HF pipelines can fetch '
+            'remote URLs or open local worker paths from input strings; '
+            f'allowed safe text/tabular tasks: {sorted(_SAFE_HF_NLP_TASKS)})')
 
     raw_model = (
         str(norm['model']).strip() if norm.get('model') is not None and
@@ -773,7 +859,8 @@ def parse_infer_config(
           raise ValueError(f'invalid HuggingFace model identifier {model_id!r}')
         is_pinned = bool(revision and _PINNED_SHA_RE.match(revision))
 
-    if revision is not None and not _SAFE_HF_REVISION_RE.match(revision):
+    if revision is not None and ('..' in revision or '\\' in revision or
+                                 not _SAFE_HF_REVISION_RE.match(revision)):
       raise ValueError(f'invalid HuggingFace revision {revision!r}')
 
     device: str | None = None
@@ -824,6 +911,7 @@ def parse_infer_config(
         hf_token=hf_token,
         load_pipeline_args=clean_lpa,
         model_kwargs=clean_mk,
+        trust_providers=trust_providers,
     )
 
   # provider == 'mock'
@@ -886,6 +974,7 @@ def parse_infer_config(
       mock_response_json=mock_response_json,
       mock_fail_on=mock_fail_on,
       mock_fail_batch_once=mock_fail_batch_once,
+      trust_providers=trust_providers,
   )
 
 
@@ -918,6 +1007,8 @@ def infer_config_to_yaml_dict(cfg: InferConfig) -> dict[str, Any]:
     out['dlq_redact_fields'] = list(cfg.dlq_redact_fields)
   if cfg.inference_args:
     out['inference_args'] = dict(cfg.inference_args)
+  if cfg.trust_providers:
+    out['trust_providers'] = True
 
   if cfg.provider == 'vertexai':
     out['endpoint_id'] = cfg.endpoint_id
@@ -984,7 +1075,7 @@ def infer_config_to_yaml_dict(cfg: InferConfig) -> dict[str, Any]:
 def parse_infer_spec_str(
     spec_str: str,
     *,
-    extra_opts: Mapping[str, Any] | None = None,
+    extra_opts: Mapping[str, Any] | Iterable[str] | None = None,
     infer_fields: str | None = None,
     infer_tag: str | None = None,
     infer_flatten: bool = False,
@@ -1035,7 +1126,7 @@ def parse_infer_spec_str(
       val = v.strip()
       if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
         val = val[1:-1]
-      if uris._SECRET_KEY_RE.search(key):
+      if not key.endswith('_env') and uris._SECRET_KEY_RE.search(key):
         raise ValueError(
             f'refusing inline secret option {key!r} in --infer; '
             'use environment variables (e.g. HF_TOKEN), ADC, or '
@@ -1051,12 +1142,25 @@ def parse_infer_spec_str(
     kv['flatten'] = True
 
   if extra_opts:
+    if not isinstance(extra_opts, Mapping):
+      try:
+        extra_opts = uris.parse_kv_options(
+            list(extra_opts), None, '--infer-opt')
+      except uris.UriError as e:
+        raise ValueError(str(e)) from None
+    _reject_comma_grouped_infer_secrets(extra_opts)
     allowed_for_prov = _COMMON_INFER_KEYS | _PROVIDER_SPECIFIC_KEYS[provider]
     for ek, ev in extra_opts.items():
       norm_k = str(ek).strip().lower().replace('-', '_')
       if norm_k in _FORBIDDEN_CALLABLE_KEYS:
         raise ValueError(
             f'option {ek!r} is disallowed in CliInfer for security')
+      if norm_k not in ('hf_token', 'hf_token_env') and (
+          uris._SECRET_KEY_RE.search(norm_k)):
+        raise ValueError(
+            f'refusing inline secret option {norm_k!r} in --infer; '
+            'use environment variables (e.g. HF_TOKEN), ADC, or '
+            '--infer-opt @file.yaml (chmod 0600)')
       if norm_k not in allowed_for_prov:
         if single_stage:
           raise ValueError(
@@ -1107,6 +1211,22 @@ def _extract_field_path(
   return cur
 
 
+def _guard_hf_untrusted_input_str(val: Any, cfg: InferConfig) -> None:
+  if cfg.trust_providers:
+    return
+  if cfg.task is not None and (cfg.task in _SAFE_HF_NLP_TASKS or
+                               cfg.task.startswith('translation-')):
+    return
+  if isinstance(val, str):
+    s = val.strip()
+    if s.lower().startswith(
+        ('http://', 'https://', 'file://', 'ftp://')) or (s and
+                                                          os.path.exists(s)):
+      raise ValueError(
+          'URL and local file path inputs are blocked for HuggingFace '
+          'inference without --trust-providers')
+
+
 def _build_model_input(row_dict: Mapping[str, Any], cfg: InferConfig) -> Any:
   if cfg.provider == 'hf':
     if len(cfg.fields) == 1:
@@ -1115,7 +1235,9 @@ def _build_model_input(row_dict: Mapping[str, Any], cfg: InferConfig) -> Any:
         raise ValueError(
             f'null input in column {".".join(cfg.fields[0].source_path)!r} '
             'for HuggingFace text inference')
-      return val if isinstance(val, str) else str(val)
+      out_s = val if isinstance(val, str) else str(val)
+      _guard_hf_untrusted_input_str(out_s, cfg)
+      return out_s
     out_hf: dict[str, Any] = {}
     for fm in cfg.fields:
       val = _extract_field_path(row_dict, fm.source_path)
@@ -1123,7 +1245,9 @@ def _build_model_input(row_dict: Mapping[str, Any], cfg: InferConfig) -> Any:
         raise ValueError(
             f'null input in column {".".join(fm.source_path)!r} '
             'for HuggingFace inference')
-      out_hf[fm.target_key] = _to_json_compatible(val)
+      conv = _to_json_compatible(val)
+      _guard_hf_untrusted_input_str(conv, cfg)
+      out_hf[fm.target_key] = conv
     return out_hf
 
   if cfg.fields:
@@ -2146,6 +2270,7 @@ def cli_infer(
     fail_batch_once: Optional[bool] = None,
     # Beam YAML error handling
     error_handling: Optional[Mapping[str, Any]] = None,
+    trust_providers: Optional[bool] = None,
 ) -> CliInfer:
   """Beam YAML provider entrypoint for `type: CliInfer` / `type: Infer`."""
   raw: dict[str, Any] = {
@@ -2203,6 +2328,7 @@ def cli_infer(
       ('response_json', response_json),
       ('fail_on', fail_on),
       ('fail_batch_once', fail_batch_once),
+      ('trust_providers', trust_providers),
   )
   for k, v in optional_pairs:
     if v is not None:

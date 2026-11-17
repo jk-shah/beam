@@ -328,6 +328,42 @@ def _values_equal_safe(left_v: Any, right_v: Any) -> bool:
   return bool(norm_l == norm_r)
 
 
+MAX_EXPR_STR_BYTES = 1_048_576
+
+
+class _CepSafetyLimitError(ValueError):
+  """Raised when string replacement or concatenation exceeds the 1 MiB limit."""
+
+
+def _cli_str_replace(obj: Any, old: Any, new: Any, *rest: Any) -> str:
+  if not isinstance(obj, str) or not isinstance(old, str) or not isinstance(
+      new, str):
+    raise TypeError('replace() arguments must be strings')
+  if len(rest) > 1:
+    raise TypeError('replace() takes at most 3 arguments')
+  if len(obj) > MAX_EXPR_STR_BYTES:
+    raise _CepSafetyLimitError('string replacement exceeded 1 MiB safety limit')
+  max_c: int | None = None
+  if rest:
+    c_arg = int(rest[0])
+    if c_arg == 0:
+      return obj
+    if c_arg > 0:
+      max_c = c_arg
+  if old == '':
+    reps = (len(obj) + 1) if max_c is None else min(len(obj) + 1, max_c)
+    if len(obj) + reps * len(new) > MAX_EXPR_STR_BYTES:
+      raise _CepSafetyLimitError(
+          'string replacement exceeded 1 MiB safety limit')
+  elif len(new) > len(old):
+    occ = obj.count(old)
+    reps = occ if max_c is None else min(occ, max_c)
+    if len(obj) + reps * (len(new) - len(old)) > MAX_EXPR_STR_BYTES:
+      raise _CepSafetyLimitError(
+          'string replacement exceeded 1 MiB safety limit')
+  return obj.replace(old, new, *rest)
+
+
 class _CompiledPredicate:
   """Zero-`eval` recursive AST evaluator validated via `expressions.compile_where`."""
   def __init__(self, expr_str: str):
@@ -339,10 +375,15 @@ class _CompiledPredicate:
     self._tree = ast.parse(normalized, mode='eval').body
     self._colref_map = colref_map
 
+  def __call__(self, row_dict: Mapping[str, Any]) -> bool:
+    return self.matches(row_dict)
+
   def matches(self, row_dict: Mapping[str, Any]) -> bool:
     try:
       val = self._eval_node(self._tree, row_dict)
       return bool(val) if val is not None else False
+    except _CepSafetyLimitError:
+      raise
     except Exception:  # pylint: disable=broad-except
       return False
 
@@ -402,6 +443,14 @@ class _CompiledPredicate:
       if lv is None or rv is None:
         return None
       if isinstance(node.op, ast.Add):
+        if isinstance(lv, (str, bytes)) and isinstance(rv, (str, bytes)):
+          if len(lv) + len(rv) > MAX_EXPR_STR_BYTES:
+            raise _CepSafetyLimitError(
+                'string concatenation exceeded 1 MiB safety limit')
+        elif isinstance(lv, (list, tuple)) and isinstance(rv, (list, tuple)):
+          if len(lv) + len(rv) > MAX_EXPR_STR_BYTES:
+            raise _CepSafetyLimitError(
+                'sequence concatenation exceeded safety limit')
         return lv + rv
       if isinstance(node.op, ast.Sub):
         return lv - rv
@@ -488,6 +537,14 @@ class _CompiledPredicate:
           return None
         if any(a is None for a in args):
           return None
+        if fn == 'concat':
+          tot = 0
+          for a in args:
+            tot += len(str(a))
+            if tot > MAX_EXPR_STR_BYTES:
+              raise _CepSafetyLimitError(
+                  'string concatenation exceeded 1 MiB safety limit')
+          return ''.join(str(a) for a in args)
         if fn == 'lower':
           return str(args[0]).lower()
         if fn == 'upper':
@@ -530,10 +587,11 @@ class _CompiledPredicate:
           return s_t.lstrip(str(args[0])) if args else s_t.lstrip()
         if mname == 'rstrip':
           return s_t.rstrip(str(args[0])) if args else s_t.rstrip()
-        if mname == 'replace' and len(args) >= 2:
+        if mname == 'replace' and 2 <= len(args) <= 3:
           return (
-              s_t.replace(str(args[0]), str(args[1]), int(args[2]))
-              if len(args) >= 3 else s_t.replace(str(args[0]), str(args[1])))
+              _cli_str_replace(s_t, str(args[0]), str(args[1]), int(args[2]))
+              if len(args) == 3 else _cli_str_replace(
+                  s_t, str(args[0]), str(args[1])))
         if mname == 'startswith':
           return s_t.startswith(str(args[0]))
         if mname == 'endswith':

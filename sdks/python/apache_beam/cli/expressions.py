@@ -46,6 +46,9 @@ from typing import NamedTuple
 MAX_AST_NODES = 64
 MAX_AST_DEPTH = 12
 MAX_STRING_LITERAL_LEN = 4096
+MAX_EXPR_STR_BYTES = 1_048_576
+_BLOCKED_EXPR_JINJA_GLOBALS = frozenset(
+    ['cycler', 'joiner', 'namespace', 'lipsum', 'dict', 'range'])
 
 _IDENT_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_]*$')
 
@@ -214,6 +217,11 @@ def _extract_backtick_columns(raw: str, colref_map: dict[str, str]) -> str:
       col_name = raw[i + 1:end]
       if not col_name:
         raise ExpressionError('empty backtick identifier in expression')
+      if len(col_name) > 256 or any(c in ('\r', '\n', '\x00') or ord(c) < 32
+                                    for c in col_name):
+        raise ExpressionError(
+            'invalid control character or excessive length in backtick '
+            'column identifier')
       placeholder = f'beam_colref__{len(colref_map)}'
       colref_map[placeholder] = col_name
       out.append(placeholder)
@@ -225,7 +233,7 @@ def _extract_backtick_columns(raw: str, colref_map: dict[str, str]) -> str:
 
 
 def _validate_jinja_syntax(raw: str) -> None:
-  """Validates `{{ ... }}` Jinja2 syntax via AST without rendering/executing."""
+  """Validates `{{ ... }}` Jinja2 syntax via strict AST allowlist without rendering."""
   if '{%' in raw or '%}' in raw or '{#' in raw or '#}' in raw:
     raise ExpressionError(
         'Jinja control/comment blocks ({% ... %}, {# ... #}) are not allowed '
@@ -234,76 +242,185 @@ def _validate_jinja_syntax(raw: str) -> None:
     import jinja2
     from jinja2 import nodes as jnodes
   except ImportError:
-    return
+    raise ExpressionError(
+        'jinja2 is required to validate Jinja {{ ... }} placeholders in '
+        'expressions') from None
   try:
     parsed_j = jinja2.Environment().parse(raw)
   except jinja2.TemplateSyntaxError as e:
     raise ExpressionError(
         f'invalid Jinja2 placeholder syntax in expression: {e.message}'
     ) from None
-  for jnode in parsed_j.find_all((jnodes.Getattr, jnodes.Getitem, jnodes.Call)):
-    raise ExpressionError(
-        f'disallowed Jinja2 syntax {type(jnode).__name__} in expression; '
-        'only simple {{ param }} or {{ param | default(...) }} placeholders '
-        'are permitted')
-  for nnode in parsed_j.find_all(jnodes.Name):
-    if str(nnode.name).startswith('_'):
+
+  def _is_const_or_signed_const(n: Any) -> bool:
+    if isinstance(n, jnodes.Const):
+      return n.value is None or (
+          isinstance(n.value, (bool, int, float, str)) and (
+              not isinstance(n.value, str) or
+              len(n.value) <= MAX_STRING_LITERAL_LEN))
+    if isinstance(n, (jnodes.Neg, jnodes.Pos)):
+      return (
+          isinstance(n.node, jnodes.Const) and
+          isinstance(n.node.value,
+                     (int, float)) and not isinstance(n.node.value, bool))
+    return False
+
+  allowed_jnodes = (
+      jnodes.Template,
+      jnodes.Output,
+      jnodes.TemplateData,
+      jnodes.Name,
+      jnodes.Const,
+      jnodes.Neg,
+      jnodes.Pos,
+      jnodes.Filter,
+  )
+  for jnode in parsed_j.find_all(jnodes.Node):
+    if not isinstance(jnode, allowed_jnodes):
       raise ExpressionError(
-          f'underscore-prefixed Jinja2 variable {nnode.name!r} is not allowed')
+          f'disallowed Jinja2 syntax {type(jnode).__name__} in expression; '
+          'only simple {{ param }} or {{ param | default(...) }} placeholders '
+          'are permitted')
+    if isinstance(jnode, jnodes.Name):
+      name_s = str(jnode.name)
+      if jnode.ctx != 'load' or name_s.startswith('_') or (
+          name_s in _BLOCKED_EXPR_JINJA_GLOBALS):
+        raise ExpressionError(
+            f'disallowed Jinja2 variable {name_s!r} in expression')
+    elif isinstance(jnode, jnodes.Const):
+      if not _is_const_or_signed_const(jnode):
+        raise ExpressionError('disallowed Jinja2 constant in expression')
+    elif isinstance(jnode, (jnodes.Neg, jnodes.Pos)):
+      if not _is_const_or_signed_const(jnode):
+        raise ExpressionError(
+            'Jinja2 unary +/- in expression is only allowed on numeric '
+            'constants')
+    elif isinstance(jnode, jnodes.Filter):
+      if (jnode.name != 'default' or not isinstance(jnode.node, jnodes.Name) or
+          jnode.kwargs or jnode.dyn_args is not None or
+          jnode.dyn_kwargs is not None or not (1 <= len(jnode.args) <= 2) or
+          not all(_is_const_or_signed_const(a) for a in jnode.args)):
+        raise ExpressionError(
+            f'disallowed Jinja2 filter |{jnode.name} in expression; only '
+            '{{ param | default(<constant>) }} is permitted')
+
+
+def _scan_jinja_expr_end(text: str, start_after_open: int) -> int:
+  j = start_after_open
+  n = len(text)
+  in_q: str | None = None
+  in_esc = False
+  while j < n:
+    jc = text[j]
+    if in_q is not None:
+      if in_esc:
+        in_esc = False
+      elif jc == '\\':
+        in_esc = True
+      elif jc == in_q:
+        in_q = None
+      j += 1
+      continue
+    if jc in ("'", '"'):
+      in_q = jc
+      j += 1
+      continue
+    if text[j:j + 2] == '}}':
+      return j
+    j += 1
+  return -1
 
 
 def _extract_jinja_placeholders(raw: str, jinja_map: dict[str, str]) -> str:
-  """Replaces unquoted `{{ ... }}` blocks with safe AST identifier tokens."""
+  """Replaces `{{ ... }}` blocks with safe AST identifier tokens."""
   _validate_jinja_syntax(raw)
   out: list[str] = []
-  quote: str | None = None
-  escaped = False
   i = 0
   n = len(raw)
   while i < n:
     ch = raw[i]
-    if quote is not None:
-      out.append(ch)
-      if escaped:
-        escaped = False
-      elif ch == '\\':
-        escaped = True
-      elif ch == quote:
-        quote = None
-      i += 1
+    if ch == '`':
+      end = raw.find('`', i + 1)
+      if end == -1:
+        out.append(raw[i:])
+        break
+      seg = raw[i:end + 1]
+      if '{{' in seg or '{%' in seg or '{#' in seg:
+        raise ExpressionError(
+            'Jinja {{ ... }} placeholders are not allowed inside backtick '
+            'column identifiers')
+      out.append(seg)
+      i = end + 1
       continue
-    if ch in ("'", '"', '`'):
-      quote = ch
-      out.append(ch)
-      i += 1
+    if ch in ("'", '"'):
+      q_end = -1
+      k = i + 1
+      esc = False
+      while k < n:
+        kc = raw[k]
+        if esc:
+          esc = False
+        elif kc == '\\':
+          esc = True
+        elif kc == ch:
+          q_end = k
+          break
+        k += 1
+      if q_end == -1:
+        out.append(raw[i:])
+        break
+      lit_raw = raw[i:q_end + 1]
+      if '{{' not in lit_raw and '{%' not in lit_raw and '{#' not in lit_raw:
+        out.append(lit_raw)
+        i = q_end + 1
+        continue
+      try:
+        s_val = ast.literal_eval(lit_raw)
+      except (SyntaxError, ValueError) as e:
+        raise ExpressionError(
+            f'invalid quoted Jinja string literal in expression: {e}') from None
+      if not isinstance(s_val, str):
+        out.append(lit_raw)
+        i = q_end + 1
+        continue
+      _validate_jinja_syntax(s_val)
+      parts_s: list[str] = []
+      lit_buf: list[str] = []
+      p = 0
+      sn = len(s_val)
+      while p < sn:
+        if s_val[p:p + 2] == '{{':
+          if lit_buf:
+            parts_s.append(repr(''.join(lit_buf)))
+            lit_buf = []
+          j_end = _scan_jinja_expr_end(s_val, p + 2)
+          if j_end == -1:
+            raise ExpressionError(
+                'unclosed Jinja2 {{ ... }} placeholder in expression')
+          inner_q = s_val[p + 2:j_end].strip()
+          if not inner_q:
+            raise ExpressionError(
+                'empty Jinja2 {{ }} placeholder in expression')
+          placeholder_q = f'beam_jinjastr__{len(jinja_map)}'
+          jinja_map[placeholder_q] = inner_q
+          parts_s.append(placeholder_q)
+          p = j_end + 2
+          continue
+        lit_buf.append(s_val[p])
+        p += 1
+      if lit_buf:
+        parts_s.append(repr(''.join(lit_buf)))
+      if len(parts_s) == 1:
+        out.append(f' {parts_s[0]} ')
+      else:
+        out.append(f' CONCAT({", ".join(parts_s)}) ')
+      i = q_end + 1
       continue
     if ch == '#':
       out.append(raw[i:])
       break
     if raw[i:i + 2] == '{{':
-      j = i + 2
-      in_q: str | None = None
-      in_esc = False
-      end = -1
-      while j < n:
-        jc = raw[j]
-        if in_q is not None:
-          if in_esc:
-            in_esc = False
-          elif jc == '\\':
-            in_esc = True
-          elif jc == in_q:
-            in_q = None
-          j += 1
-          continue
-        if jc in ("'", '"'):
-          in_q = jc
-          j += 1
-          continue
-        if raw[j:j + 2] == '}}':
-          end = j
-          break
-        j += 1
+      end = _scan_jinja_expr_end(raw, i + 2)
       if end == -1:
         raise ExpressionError(
             'unclosed Jinja2 {{ ... }} placeholder in expression')
@@ -311,7 +428,7 @@ def _extract_jinja_placeholders(raw: str, jinja_map: dict[str, str]) -> str:
       if not inner:
         raise ExpressionError('empty Jinja2 {{ }} placeholder in expression')
       placeholder = f'beam_jinja__{len(jinja_map)}'
-      jinja_map[placeholder] = raw[i:end + 2]
+      jinja_map[placeholder] = inner
       out.append(f' {placeholder} ')
       i = end + 2
       continue
@@ -352,7 +469,8 @@ def _rewrite_sql_cast_tokens(
             'CAST(...) requires AS <TYPE>, e.g. CAST(order_id AS INT)')
       inner_tokens = tokens[i + 2:top_level_as_idx]
       type_tokens = tokens[top_level_as_idx + 1:j]
-      if not inner_tokens or not type_tokens or type_tokens[0][0] != tokenize.NAME:
+      if not inner_tokens or not type_tokens or type_tokens[0][
+          0] != tokenize.NAME:
         raise ExpressionError('invalid CAST(expr AS TYPE) syntax')
       sql_type_name = type_tokens[0][1].lower()
       # Allow optional precision/scale parens like `DECIMAL(10, 2)` or `VARCHAR(64)`.
@@ -379,8 +497,7 @@ def _rewrite_sql_cast_tokens(
   return out
 
 
-def _lex_and_normalize_with_colmap(
-    raw: str) -> tuple[str, dict[str, str]]:
+def _lex_and_normalize_with_colmap(raw: str) -> tuple[str, dict[str, str]]:
   """Normalizes SQL-like tokens (`=`, `<>`, `CAST`, `AND`/`OR`, `IS NULL`, keywords)."""
   if not raw or not raw.strip():
     raise ExpressionError('expression cannot be empty')
@@ -394,8 +511,8 @@ def _lex_and_normalize_with_colmap(
   try:
     raw_toks = list(tokenize.generate_tokens(io.StringIO(pre_raw).readline))
   except tokenize.TokenError as e:
-    raise ExpressionError(f'unterminated string or bracket in expression: {e}'
-                          ) from None
+    raise ExpressionError(
+        f'unterminated string or bracket in expression: {e}') from None
 
   k = 0
   while k < len(raw_toks):
@@ -458,8 +575,8 @@ def _lex_and_normalize_with_colmap(
     for idx, piece in enumerate(pieces):
       if idx > 0:
         prev = pieces[idx - 1]
-        if prev != '.' and piece not in ('.', ',', ')', ']') and prev not in (
-            '(', '['):
+        if prev != '.' and piece not in ('.', ',', ')',
+                                         ']') and prev not in ('(', '['):
           joined.append(' ')
       joined.append(piece)
     return ''.join(joined)
@@ -483,9 +600,8 @@ def _lex_and_normalize_with_colmap(
     picked.reverse()
     return _join_pieces(picked)
 
-  def _scan_operand(
-      tok_slice: list[tuple[int, str]], start: int
-  ) -> tuple[list[tuple[int, str]], int]:
+  def _scan_operand(tok_slice: list[tuple[int, str]],
+                    start: int) -> tuple[list[tuple[int, str]], int]:
     depth = 0
     j = start
     n_tok = len(tok_slice)
@@ -560,8 +676,7 @@ def _lex_and_normalize_with_colmap(
         is_not_like = (
             upper == 'NOT' and i + 1 < n_tok and
             tok_list[i + 1][0] == tokenize.NAME and
-            tok_list[i + 1][1].upper() in ('LIKE', 'ILIKE') and
-            bool(rewritten))
+            tok_list[i + 1][1].upper() in ('LIKE', 'ILIKE') and bool(rewritten))
         is_like = (
             upper in ('LIKE', 'ILIKE') and bool(rewritten) and
             rewritten[-1] != '.')
@@ -627,8 +742,8 @@ def _is_literal(node: ast.AST) -> bool:
   """True for constants, signed numbers, and tuples/lists/sets of them."""
   if isinstance(node, ast.Constant):
     return True
-  if (isinstance(node, ast.UnaryOp) and
-      isinstance(node.op, (ast.USub, ast.UAdd)) and
+  if (isinstance(node, ast.UnaryOp) and isinstance(node.op,
+                                                   (ast.USub, ast.UAdd)) and
       isinstance(node.operand, ast.Constant)):
     return True
   if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
@@ -649,8 +764,8 @@ def _normalize_comparison(node: ast.Compare):
   for i, op in enumerate(ops):
     right = comparators[i]
     is_none = lambda n: isinstance(n, ast.Constant) and n.value is None
-    if isinstance(op, (ast.Eq, ast.NotEq)) and (is_none(right) or
-                                                 is_none(left)):
+    if isinstance(op,
+                  (ast.Eq, ast.NotEq)) and (is_none(right) or is_none(left)):
       ops[i] = ast.Is() if isinstance(op, ast.Eq) else ast.IsNot()
     elif isinstance(op, (ast.In, ast.NotIn)) and (
         isinstance(right, ast.Constant) or
@@ -669,6 +784,8 @@ class _RowExprCompiler(ast.NodeTransformer):
   ) -> None:
     self.columns: set[str] = set()
     self.uses_safe_mul = False
+    self.uses_safe_add = False
+    self.uses_safe_str_replace = False
     self.uses_coalesce = False
     self.uses_datetime = False
     self.uses_json = False
@@ -716,7 +833,8 @@ class _RowExprCompiler(ast.NodeTransformer):
     body = build(*refs)
     if not tests:
       return body
-    test = tests[0] if len(tests) == 1 else ast.BoolOp(op=ast.Or(), values=tests)
+    test = tests[0] if len(tests) == 1 else ast.BoolOp(
+        op=ast.Or(), values=tests)
     return ast.IfExp(test=test, body=ast.Constant(value=None), orelse=body)
 
   def _bool3(self, op: ast.boolop, values: list[ast.AST]) -> ast.AST:
@@ -809,18 +927,24 @@ class _RowExprCompiler(ast.NodeTransformer):
     if isinstance(node.op, ast.Mult):
       # Static fast-fail on literal sequence repetition (`'a' * 100`).
       for side in (node.left, node.right):
-        if isinstance(side, (ast.List, ast.Tuple)) or (
-            isinstance(side, ast.Constant) and isinstance(side.value, str)):
+        if isinstance(
+            side, (ast.List, ast.Tuple)) or (isinstance(side, ast.Constant) and
+                                             isinstance(side.value, str)):
           raise ExpressionError(
               'string or sequence repetition (`*`) is not allowed')
       left = self.visit(node.left)
       right = self.visit(node.right)
       self.uses_safe_mul = True
-      return self._null_safe([left, right],
-                             lambda a, b: ast.Call(
-                                 func=ast.Name(id='_cli_mul', ctx=ast.Load()),
-                                 args=[a, b],
-                                 keywords=[]))
+      return self._null_safe([left, right], lambda a, b: ast.Call(
+          func=ast.Name(id='_cli_mul', ctx=ast.Load()), args=[a, b], keywords=[
+          ]))
+    if isinstance(node.op, ast.Add):
+      left = self.visit(node.left)
+      right = self.visit(node.right)
+      self.uses_safe_add = True
+      return self._null_safe([left, right], lambda a, b: ast.Call(
+          func=ast.Name(id='_cli_add', ctx=ast.Load()), args=[a, b], keywords=[
+          ]))
     left = self.visit(node.left)
     right = self.visit(node.right)
     op = node.op
@@ -835,8 +959,7 @@ class _RowExprCompiler(ast.NodeTransformer):
     if isinstance(operand, ast.Constant) and not isinstance(node.op, ast.Not):
       return ast.UnaryOp(op=node.op, operand=operand)
     op = node.op
-    return self._null_safe([operand],
-                           lambda v: ast.UnaryOp(op=op, operand=v))
+    return self._null_safe([operand], lambda v: ast.UnaryOp(op=op, operand=v))
 
   _CMP_OP_NAMES = {
       ast.Eq: 'eq',
@@ -852,8 +975,7 @@ class _RowExprCompiler(ast.NodeTransformer):
   def visit_Compare(self, node: ast.Compare) -> ast.AST:
     for op in node.ops:
       if not isinstance(op, _ALLOWED_CMPOPS):
-        raise ExpressionError(
-            f'comparison {type(op).__name__} is not allowed')
+        raise ExpressionError(f'comparison {type(op).__name__} is not allowed')
     ops, comparators = _normalize_comparison(node)
     operands = [self.visit(node.left)]
     operands.extend(self.visit(c) for c in comparators)
@@ -867,12 +989,9 @@ class _RowExprCompiler(ast.NodeTransformer):
         op_name = self._CMP_OP_NAMES[type(op)]
         self.uses_temporal_cmp = True
         parts.append(
-            self._null_safe(
-                [a, b],
-                lambda x, y, op_s=op_name: ast.Call(
-                    func=ast.Name(id='_cli_cmp', ctx=ast.Load()),
-                    args=[ast.Constant(value=op_s), x, y],
-                    keywords=[])))
+            self._null_safe([a, b], lambda x, y, op_s=op_name: ast.Call(
+                func=ast.Name(id='_cli_cmp', ctx=ast.Load()), args=
+                [ast.Constant(value=op_s), x, y], keywords=[])))
     return parts[0] if len(parts) == 1 else self._bool3(ast.And(), parts)
 
   def visit_Name(self, node: ast.Name) -> ast.AST:
@@ -899,9 +1018,8 @@ class _RowExprCompiler(ast.NodeTransformer):
       return self.generic_visit(node)
     value = self.visit(node.value)
     attr = node.attr
-    return self._null_safe([value],
-                           lambda v: ast.Attribute(
-                               value=v, attr=attr, ctx=ast.Load()))
+    return self._null_safe(
+        [value], lambda v: ast.Attribute(value=v, attr=attr, ctx=ast.Load()))
 
   def visit_Call(self, node: ast.Call) -> ast.AST:
     if node.keywords:
@@ -931,38 +1049,28 @@ class _RowExprCompiler(ast.NodeTransformer):
         ci_flag = lowered == 'sql_ilike'
         return ast.Call(
             func=ast.Name(id='_cli_like', ctx=ast.Load()),
-            args=[compiled_args[0], compiled_args[1], ast.Constant(value=ci_flag)],
+            args=[
+                compiled_args[0], compiled_args[1], ast.Constant(value=ci_flag)
+            ],
             keywords=[])
       if lowered in ('lower', 'upper', 'strip', 'trim'):
         if len(compiled_args) != 1:
           raise ExpressionError(f'{fn_name}() expects 1 argument')
         attr_name = 'strip' if lowered == 'trim' else lowered
-        return self._null_safe([compiled_args[0]],
-                               lambda v: ast.Call(
-                                   func=ast.Attribute(
-                                       value=ast.Call(
-                                           func=ast.Name(
-                                               id='str', ctx=ast.Load()),
-                                           args=[v],
-                                           keywords=[]),
-                                       attr=attr_name,
-                                       ctx=ast.Load()),
-                                   args=[],
-                                   keywords=[]))
+        return self._null_safe([compiled_args[0]], lambda v: ast.Call(
+            func=ast.Attribute(
+                value=ast.Call(
+                    func=ast.Name(id='str', ctx=ast.Load()), args=[v], keywords=
+                    []), attr=attr_name, ctx=ast.Load()), args=[], keywords=[]))
       if lowered == 'length':
         if len(compiled_args) != 1:
           raise ExpressionError(f'{fn_name}() expects 1 argument')
-        return self._null_safe([compiled_args[0]],
-                               lambda v: ast.Call(
-                                   func=ast.Name(id='len', ctx=ast.Load()),
-                                   args=[
-                                       ast.Call(
-                                           func=ast.Name(
-                                               id='str', ctx=ast.Load()),
-                                           args=[v],
-                                           keywords=[])
-                                   ],
-                                   keywords=[]))
+        return self._null_safe([compiled_args[0]], lambda v: ast.Call(
+            func=ast.Name(id='len', ctx=ast.Load()), args=[
+                ast.Call(
+                    func=ast.Name(id='str', ctx=ast.Load()), args=[v], keywords=
+                    [])
+            ], keywords=[]))
       if lowered in ('coalesce', 'ifnull'):
         if not compiled_args:
           raise ExpressionError(f'{fn_name}() requires at least 1 argument')
@@ -1024,7 +1132,8 @@ class _RowExprCompiler(ast.NodeTransformer):
           raise ExpressionError(f'{fn_name}() expects 1 argument (val)')
         if not 1 <= len(compiled_args) <= 3:
           raise ExpressionError(
-              f'{fn_name}() expects 1 to 3 arguments (val[, keep_last, mask_char])')
+              f'{fn_name}() expects 1 to 3 arguments (val[, keep_last, mask_char])'
+          )
         self.uses_mask = True
         return ast.Call(
             func=ast.Name(id='_cli_mask', ctx=ast.Load()),
@@ -1065,11 +1174,9 @@ class _RowExprCompiler(ast.NodeTransformer):
             keywords=[])
       if lowered in ('int', 'float', 'abs', 'round', 'str') and compiled_args:
         rest = compiled_args[1:]
-        return self._null_safe([compiled_args[0]],
-                               lambda v: ast.Call(
-                                   func=ast.Name(id=lowered, ctx=ast.Load()),
-                                   args=[v, *rest],
-                                   keywords=[]))
+        return self._null_safe([compiled_args[0]], lambda v: ast.Call(
+            func=ast.Name(id=lowered, ctx=ast.Load()), args=[v, *rest], keywords
+            =[]))
       return ast.Call(
           func=ast.Name(id=lowered, ctx=ast.Load()),
           args=compiled_args,
@@ -1083,12 +1190,16 @@ class _RowExprCompiler(ast.NodeTransformer):
             f'{", ".join(sorted(_SAFE_STR_METHODS))}')
       receiver = self.visit(node.func.value)
       compiled_args = [self.visit(a) for a in node.args]
-      return self._null_safe([receiver],
-                             lambda v: ast.Call(
-                                 func=ast.Attribute(
-                                     value=v, attr=method, ctx=ast.Load()),
-                                 args=compiled_args,
-                                 keywords=[]))
+      if method == 'replace':
+        if not 2 <= len(compiled_args) <= 3:
+          raise ExpressionError('str.replace() expects 2 or 3 arguments')
+        self.uses_safe_str_replace = True
+        return self._null_safe([receiver], lambda v: ast.Call(
+            func=ast.Name(id='_cli_str_replace', ctx=ast.Load()), args=
+            [v, *compiled_args], keywords=[]))
+      return self._null_safe([receiver], lambda v: ast.Call(
+          func=ast.Attribute(value=v, attr=method, ctx=ast.Load()), args=
+          compiled_args, keywords=[]))
 
     raise ExpressionError('indirect function calls are not allowed')
 
@@ -1099,7 +1210,8 @@ def _infer_json_schema_type(tree_body: ast.AST) -> str | None:
     return 'boolean'
   if isinstance(tree_body, ast.UnaryOp) and isinstance(tree_body.op, ast.Not):
     return 'boolean'
-  if isinstance(tree_body.value, bool) if isinstance(tree_body, ast.Constant) else False:
+  if isinstance(tree_body.value, bool) if isinstance(tree_body,
+                                                     ast.Constant) else False:
     return 'boolean'
   if isinstance(tree_body, ast.Constant):
     if isinstance(tree_body.value, int):
@@ -1113,15 +1225,40 @@ def _infer_json_schema_type(tree_body: ast.AST) -> str | None:
       fn = tree_body.func.id.lower()
       if fn in ('bool', 'sql_like', 'sql_ilike'):
         return 'boolean'
-      if fn in ('int', 'len', 'length', 'epoch_ms', 'to_epoch_ms', 'year',
-                'month', 'day', 'hour', 'minute', 'second', 'date_part'):
+      if fn in ('int',
+                'len',
+                'length',
+                'epoch_ms',
+                'to_epoch_ms',
+                'year',
+                'month',
+                'day',
+                'hour',
+                'minute',
+                'second',
+                'date_part'):
         return 'integer'
       if fn in ('float', 'round'):
         return 'number'
       if fn in (
-          'str', 'lower', 'upper', 'strip', 'trim', 'parse_timestamp', 'to_utc',
-          'json_get', 'json_extract_scalar', 'json_value', 'sha256', 'mask',
-          'mask_last4', 'mask_email', 'redact', 'substr', 'substring', 'concat',
+          'str',
+          'lower',
+          'upper',
+          'strip',
+          'trim',
+          'parse_timestamp',
+          'to_utc',
+          'json_get',
+          'json_extract_scalar',
+          'json_value',
+          'sha256',
+          'mask',
+          'mask_last4',
+          'mask_email',
+          'redact',
+          'substr',
+          'substring',
+          'concat',
       ):
         return 'string'
     if isinstance(tree_body.func, ast.Attribute):
@@ -1150,6 +1287,9 @@ def _build_callable_source(
     as_bool: bool,
     uses_safe_mul: bool,
     uses_coalesce: bool,
+    uses_safe_add: bool = False,
+    uses_safe_str_replace: bool = False,
+    uses_jinja_json: bool = False,
     uses_datetime: bool = False,
     uses_json: bool = False,
     uses_like: bool = False,
@@ -1168,6 +1308,44 @@ def _build_callable_source(
         '        b, (str, bytes, list, tuple)):',
         "      raise TypeError('sequence repetition is not allowed')",
         '    return a * b',
+    ])
+  if uses_safe_add:
+    lines.extend([
+        '  def _cli_add(a, b):',
+        '    if isinstance(a, (str, bytes)) and isinstance(b, (str, bytes)):',
+        f'      if len(a) + len(b) > {MAX_EXPR_STR_BYTES}:',
+        "        raise ValueError('string concatenation exceeded 1 MiB safety limit')",
+        '    elif isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):',
+        f'      if len(a) + len(b) > {MAX_EXPR_STR_BYTES}:',
+        "        raise ValueError('sequence concatenation exceeded safety limit')",
+        '    return a + b',
+    ])
+  if uses_safe_str_replace:
+    lines.extend([
+        '  def _cli_str_replace(obj, old, new, *rest):',
+        '    if not isinstance(obj, str) or not isinstance(old, str) or not isinstance(new, str):',
+        "      raise TypeError('replace() arguments must be strings')",
+        '    if len(rest) > 1:',
+        "      raise TypeError('replace() takes at most 3 arguments')",
+        f'    if len(obj) > {MAX_EXPR_STR_BYTES}:',
+        "      raise ValueError('string replacement exceeded 1 MiB safety limit')",
+        '    max_c = None',
+        '    if rest:',
+        '      c_arg = int(rest[0])',
+        '      if c_arg == 0:',
+        '        return obj',
+        '      if c_arg > 0:',
+        '        max_c = c_arg',
+        "    if old == '':",
+        '      reps = (len(obj) + 1) if max_c is None else min(len(obj) + 1, max_c)',
+        f'      if len(obj) + reps * len(new) > {MAX_EXPR_STR_BYTES}:',
+        "        raise ValueError('string replacement exceeded 1 MiB safety limit')",
+        '    elif len(new) > len(old):',
+        '      occ = obj.count(old)',
+        '      reps = occ if max_c is None else min(occ, max_c)',
+        f'      if len(obj) + reps * (len(new) - len(old)) > {MAX_EXPR_STR_BYTES}:',
+        "        raise ValueError('string replacement exceeded 1 MiB safety limit')",
+        '    return obj.replace(old, new, *rest)',
     ])
   if uses_coalesce:
     lines.extend([
@@ -1341,9 +1519,32 @@ def _build_callable_source(
         '      return (dt.weekday() + 1) % 7',
         "    raise ValueError('unsupported date_part: ' + p)",
     ])
+  if uses_json or uses_jinja_json:
+    lines.append('  import json as _json')
+  if uses_jinja_json:
+    lines.extend([
+        '  def _cli_j(u, as_str):',
+        "    parts = u.split('%')",
+        "    buf = list(parts[0].encode('utf-8'))",
+        '    for seg in parts[1:]:',
+        '      buf.append(int(seg[:2], 16))',
+        "      buf.extend(seg[2:].encode('utf-8'))",
+        "    s = bytes(buf).decode('utf-8')",
+        '    if as_str:',
+        '      return s',
+        "    if s in ('True', 'true'):",
+        '      return True',
+        "    if s in ('False', 'false'):",
+        '      return False',
+        "    if s in ('None', 'null'):",
+        '      return None',
+        '    try:',
+        '      return _json.loads(s)',
+        '    except ValueError:',
+        '      return s',
+    ])
   if uses_json:
     lines.extend([
-        '  import json as _json',
         '  def _cli_json_get(v, path):',
         '    if v is None or path is None:',
         '      return None',
@@ -1406,9 +1607,13 @@ def _build_callable_source(
         '    idx = max(0, len(s) + st) if st < 0 else max(0, st - 1)',
         '    return s[idx:] if length is None else s[idx:idx + max(0, int(length))]',
         '  def _cli_concat(*vals):',
+        '    tot = 0',
         '    for _cv in vals:',
         '      if _cv is None:',
         '        return None',
+        '      tot += len(str(_cv))',
+        f'      if tot > {MAX_EXPR_STR_BYTES}:',
+        "        raise ValueError('string concatenation exceeded 1 MiB safety limit')",
         '    return "".join(str(_cv) for _cv in vals)',
     ])
   ret = f'bool({compiled_expr})' if as_bool else compiled_expr
@@ -1417,10 +1622,8 @@ def _build_callable_source(
 
 
 def _safe_expr_import(name, globals=None, locals=None, fromlist=(), level=0):  # pylint: disable=redefined-builtin
-  if level != 0 or name not in (
-      'datetime', 'hashlib', 'json', '_strptime', 'time', 'calendar', 'locale'):
-    raise ImportError(f'import {name!r} is not allowed in expressions')
-  return __import__(name, globals, locals, fromlist, level)
+  from . import fast_local
+  return fast_local._safe_fast_import(name, globals, locals, fromlist, level)
 
 
 _SAFE_EXEC_BUILTINS: dict[str, Any] = {
@@ -1445,6 +1648,20 @@ _SAFE_EXEC_BUILTINS: dict[str, Any] = {
     'TypeError': TypeError,
     'ValueError': ValueError,
 }
+
+
+def _substitute_jinja_tokens(expr_code: str, jinja_map: dict[str, str]) -> str:
+  if not jinja_map:
+    return expr_code
+  for tok, inner_expr in sorted(
+      jinja_map.items(), key=lambda kv: len(kv[0]), reverse=True):
+    as_str = 'True' if tok.startswith('beam_jinjastr__') else 'False'
+    replacement = (
+        f"_cli_j('{{% filter urlencode %}}{{{{ {inner_expr} }}}}"
+        f"{{% endfilter %}}', {as_str})")
+    expr_code = re.sub(
+        rf'\b{re.escape(tok)}\b', lambda _m, r=replacement: r, expr_code)
+  return expr_code
 
 
 def compile_scalar_callable(
@@ -1474,6 +1691,8 @@ def compile_scalar_callable(
       expr_code,
       as_bool=as_bool,
       uses_safe_mul=compiler.uses_safe_mul,
+      uses_safe_add=compiler.uses_safe_add,
+      uses_safe_str_replace=compiler.uses_safe_str_replace,
       uses_coalesce=compiler.uses_coalesce,
       uses_datetime=compiler.uses_datetime,
       uses_json=compiler.uses_json,
@@ -1525,13 +1744,14 @@ def compile_where(
         frozenset(compiler.columns),
     )
 
-  expr_code = ast.unparse(rewritten.body)
-  for tok, raw_jinja in jinja_map.items():
-    expr_code = expr_code.replace(tok, raw_jinja)
+  expr_code = _substitute_jinja_tokens(ast.unparse(rewritten.body), jinja_map)
   callable_src = _build_callable_source(
       expr_code,
       as_bool=True,
       uses_safe_mul=compiler.uses_safe_mul,
+      uses_safe_add=compiler.uses_safe_add,
+      uses_safe_str_replace=compiler.uses_safe_str_replace,
+      uses_jinja_json=bool(jinja_map),
       uses_coalesce=compiler.uses_coalesce,
       uses_datetime=compiler.uses_datetime,
       uses_json=compiler.uses_json,
@@ -1551,6 +1771,15 @@ def compile_where(
 
 _NATIVE_BINOPS = (ast.Add, ast.Sub, ast.Div)
 _ISO_DATE_LIT_RE = re.compile(r'^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}|$)')
+
+
+def _is_numeric_const(node: ast.AST) -> bool:
+  if isinstance(node, ast.UnaryOp) and isinstance(node.op,
+                                                  (ast.USub, ast.UAdd)):
+    node = node.operand
+  return (
+      isinstance(node, ast.Constant) and
+      isinstance(node.value, (int, float)) and not isinstance(node.value, bool))
 
 
 def _native_expression(
@@ -1579,25 +1808,41 @@ def _native_expression(
   except SyntaxError:
     return None
   allowed = (
-      ast.BoolOp, ast.And, ast.Or, ast.Compare, *_ALLOWED_CMPOPS, ast.Name,
-      ast.Constant, ast.Tuple, ast.List, ast.Set, ast.Load, ast.BinOp,
-      *_NATIVE_BINOPS, ast.UnaryOp, ast.USub, ast.UAdd)
+      ast.BoolOp,
+      ast.And,
+      ast.Or,
+      ast.Compare,
+      *_ALLOWED_CMPOPS,
+      ast.Name,
+      ast.Constant,
+      ast.Tuple,
+      ast.List,
+      ast.Set,
+      ast.Load,
+      ast.BinOp,
+      *_NATIVE_BINOPS,
+      ast.UnaryOp,
+      ast.USub,
+      ast.UAdd)
   for node in ast.walk(tree):
     if not isinstance(node, allowed):
       return None
-    if isinstance(node, ast.UnaryOp) and not isinstance(node.operand,
-                                                        ast.Constant):
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+      if not (_is_numeric_const(node.left) or _is_numeric_const(node.right)):
+        return None
+    if isinstance(node,
+                  ast.UnaryOp) and not isinstance(node.operand, ast.Constant):
       return None
     if isinstance(node, ast.Constant):
-      if not (node.value is None or
-              isinstance(node.value, (bool, int, float, str))):
+      if not (node.value is None or isinstance(node.value,
+                                               (bool, int, float, str))):
         return None
       if isinstance(node.value, str) and _ISO_DATE_LIT_RE.match(
           node.value.strip()):
         return None
-    if isinstance(node, ast.Name) and (
-        node.id.startswith('_') or keyword.iskeyword(node.id) or
-        not _IDENT_RE.match(node.id)):
+    if isinstance(node, ast.Name) and (node.id.startswith('_') or
+                                       keyword.iskeyword(node.id) or
+                                       not _IDENT_RE.match(node.id)):
       return None
 
   def arith_names(node):
@@ -1616,8 +1861,7 @@ def _native_expression(
                  (ast.Is, ast.IsNot, ast.Eq, ast.In))
     if any(not isinstance(op, unguarded) for op in cmp.ops):
       names.extend(
-          o.id for o in [cmp.left, *cmp.comparators]
-          if isinstance(o, ast.Name))
+          o.id for o in [cmp.left, *cmp.comparators] if isinstance(o, ast.Name))
     return list(dict.fromkeys(names))
 
   for cmp in (n for n in ast.walk(tree) if isinstance(n, ast.Compare)):
@@ -1625,8 +1869,8 @@ def _native_expression(
     if norm_ops != list(cmp.ops):
       return None
     cmp.comparators = norm_comparators  # `IN ('CA')` -> `in ('CA',)`
-    if any(isinstance(op, (ast.Is, ast.IsNot)) for op in cmp.ops) and len(
-        cmp.ops) > 1:
+    if any(isinstance(op, (ast.Is, ast.IsNot))
+           for op in cmp.ops) and len(cmp.ops) > 1:
       return None
   if for_select and any(isinstance(n, ast.BoolOp) for n in ast.walk(tree)):
     return None
@@ -1647,8 +1891,9 @@ def _native_expression(
       test = ' or '.join(f'{g} is None' for g in guards)
       text = f'None if {test} else {text}'
   else:
-    if isinstance(tree, (ast.BinOp, ast.Constant, ast.Tuple, ast.List,
-                         ast.Set, ast.UnaryOp)):
+    if isinstance(
+        tree,
+        (ast.BinOp, ast.Constant, ast.Tuple, ast.List, ast.Set, ast.UnaryOp)):
       return None
 
     class _Guard(ast.NodeTransformer):
@@ -1715,14 +1960,31 @@ _UNALIASED_CAST_RE = re.compile(
 
 def _unwrap_plain_col(token_str: str) -> str | None:
   s = token_str.strip()
-  if len(s) >= 2 and s.startswith('`') and s.endswith('`') and '`' not in s[1:-1]:
+  if any(c in ('\r', '\n', '\x00') or ord(c) < 32 for c in s):
+    return None
+  if len(s) >= 2 and s.startswith('`') and s.endswith(
+      '`') and '`' not in s[1:-1]:
     inner = s[1:-1]
-    if not inner or inner.startswith('_'):
+    if not inner or len(inner) > 256 or inner.startswith('_'):
       return None
     return inner
-  if _IDENT_RE.match(s):
+  if len(s) <= 256 and _IDENT_RE.match(s):
     return s
   return None
+
+
+def _plain_col_field_spec(
+    col: str,
+    *,
+    from_backticks: bool,
+    known_columns: set[str] | None,
+) -> Any:
+  if (not col.isidentifier() or keyword.iskeyword(col) or
+      not _IDENT_RE.match(col) or (from_backticks and known_columns is None)):
+    return {
+        'callable': f'def _cli_fn(__row__):\n  return getattr(__row__, {col!r})\n'
+    }
+  return col
 
 
 def _is_nested_path(node: ast.AST) -> bool:
@@ -1784,7 +2046,7 @@ def compile_select(
 
     plain_col = _unwrap_plain_col(part)
     # Plain column name (`id`, `user_email`, `class`, `` `order-id` ``) preserves
-    # upstream Beam schema type!
+    # upstream Beam schema type when safe, or uses `getattr(__row__, col)`!
     if plain_col is not None and plain_col not in jinja_map:
       if plain_col in fields_cfg:
         raise ExpressionError(
@@ -1792,7 +2054,10 @@ def compile_select(
       all_cols.add(plain_col)
       if known_columns is not None:
         _check_known_columns({plain_col}, known_columns, flag_name)
-      fields_cfg[plain_col] = plain_col
+      fields_cfg[plain_col] = _plain_col_field_spec(
+          plain_col,
+          from_backticks=part.strip().startswith('`'),
+          known_columns=known_columns)
       continue
 
     m_as = _AS_ALIAS_RE.match(part)
@@ -1810,7 +2075,7 @@ def compile_select(
     else:
       shown_part = part
       for tok, raw_jinja in jinja_map.items():
-        shown_part = shown_part.replace(tok, raw_jinja)
+        shown_part = shown_part.replace(tok, f'{{{{ {raw_jinja} }}}}')
       raise ExpressionError(
           f'computed {flag_name} expression {shown_part!r} requires an alias, '
           'for example: "amount * 1.08 AS total"')
@@ -1828,7 +2093,10 @@ def compile_select(
       all_cols.add(plain_expr_col)
       if known_columns is not None:
         _check_known_columns({plain_expr_col}, known_columns, flag_name)
-      fields_cfg[alias] = plain_expr_col
+      fields_cfg[alias] = _plain_col_field_spec(
+          plain_expr_col,
+          from_backticks=expr_raw.strip().startswith('`'),
+          known_columns=known_columns)
       continue
 
     normalized, colref_map = _lex_and_normalize_with_colmap(expr_raw)
@@ -1860,13 +2128,14 @@ def compile_select(
       } if inferred_type is not None else native)
       continue
 
-    expr_code = ast.unparse(rewritten.body)
-    for tok, raw_jinja in jinja_map.items():
-      expr_code = expr_code.replace(tok, raw_jinja)
+    expr_code = _substitute_jinja_tokens(ast.unparse(rewritten.body), jinja_map)
     callable_src = _build_callable_source(
         expr_code,
         as_bool=False,
         uses_safe_mul=compiler.uses_safe_mul,
+        uses_safe_add=compiler.uses_safe_add,
+        uses_safe_str_replace=compiler.uses_safe_str_replace,
+        uses_jinja_json=bool(jinja_map),
         uses_coalesce=compiler.uses_coalesce,
         uses_datetime=compiler.uses_datetime,
         uses_json=compiler.uses_json,
@@ -1880,7 +2149,8 @@ def compile_select(
 
   if has_star and not fields_cfg and not except_cols:
     raise ExpressionError(
-        f'{flag_name} "*" must include at least one computed, renamed, or EXCEPT column')
+        f'{flag_name} "*" must include at least one computed, renamed, or EXCEPT column'
+    )
   out_cfg: dict[str, Any] = {
       'language': 'python',
       'fields': fields_cfg,

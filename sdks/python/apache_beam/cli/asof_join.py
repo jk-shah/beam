@@ -39,6 +39,7 @@ import datetime
 import decimal
 import json
 import math
+import uuid
 from collections.abc import Iterable
 from collections.abc import Mapping
 from typing import Any
@@ -801,6 +802,8 @@ class _BoundedAsofJoinDoFn(beam.DoFn):
 
 _LEFT_PENDING_CODER = TupleCoder((FloatCoder(), VarIntCoder(), StrUtf8Coder()))
 _RIGHT_ENTRY_CODER = TupleCoder((FloatCoder(), StrUtf8Coder(), StrUtf8Coder()))
+_WORKER_RIGHT_COLS_CACHE: dict[str, tuple[str, ...]] = {}
+_MAX_WORKER_SCHEMA_CACHES = 256
 
 
 class AsofJoinStatefulDoFn(beam.DoFn):
@@ -822,6 +825,8 @@ class AsofJoinStatefulDoFn(beam.DoFn):
     self.proj_cfg = _as_interval_projection_config(config)
     self.err_tag = err_tag
     self.route_errors = route_errors
+    self._worker_right_cols: tuple[str, ...] | None = None
+    self._schema_cache_id: str = uuid.uuid4().hex
     self.matched_ctr = beam.metrics.Metrics.counter('beam_cli', 'asof_matched')
     self.unmatched_ctr = beam.metrics.Metrics.counter(
         'beam_cli', 'asof_unmatched')
@@ -829,6 +834,25 @@ class AsofJoinStatefulDoFn(beam.DoFn):
         'beam_cli', 'skew_dropped')
     self.skew_warn_ctr = beam.metrics.Metrics.counter(
         'AsofJoin', 'watermark_skew_warn')
+
+  def _observe_right_cols(self, cols: Iterable[str]) -> None:
+    if self.config.right_fields:
+      return
+    cur = list(
+        self._worker_right_cols or
+        _WORKER_RIGHT_COLS_CACHE.get(self._schema_cache_id) or ())
+    changed = False
+    for rk in cols:
+      if rk not in cur:
+        cur.append(rk)
+        changed = True
+    if changed or (cur and self._worker_right_cols is None):
+      tup = tuple(cur)
+      self._worker_right_cols = tup
+      if (self._schema_cache_id not in _WORKER_RIGHT_COLS_CACHE and
+          len(_WORKER_RIGHT_COLS_CACHE) >= _MAX_WORKER_SCHEMA_CACHES):
+        _WORKER_RIGHT_COLS_CACHE.pop(next(iter(_WORKER_RIGHT_COLS_CACHE)), None)
+      _WORKER_RIGHT_COLS_CACHE[self._schema_cache_id] = tup
 
   def _handle_bad_or_skewed(
       self, err_type: str, msg: str, payload: Any, *, is_skew: bool = False):
@@ -937,16 +961,8 @@ class AsofJoinStatefulDoFn(beam.DoFn):
         next_eval.write(eval_ms)
         eval_timer.set(beam_timestamp.Timestamp(micros=eval_ms * 1000))
     else:
-      prev_r_cols = list(cur_wm.get('r_cols') or [])
       if isinstance(row_payload, Mapping):
-        changed_cols = False
-        for rk in row_payload:
-          if rk not in prev_r_cols:
-            prev_r_cols.append(rk)
-            changed_cols = True
-        if changed_cols:
-          cur_wm['r_cols'] = prev_r_cols
-          wm_state.write(json.dumps(cur_wm))
+        self._observe_right_cols(row_payload.keys())
       if any(row_payload.get(c) is None for c in self.config.right_key):
         return  # SQL semantics: NULL join keys never match NULL!
       right_buf.add((t, '', encoded_json))
@@ -982,6 +998,13 @@ class AsofJoinStatefulDoFn(beam.DoFn):
 
     sorted_right: list[tuple[float, tuple[int, Any], str, dict[str, Any]]] = []
     right_cols: list[str] = list(self.config.right_fields)
+    cached_r_cols = (
+        self._worker_right_cols or
+        _WORKER_RIGHT_COLS_CACHE.get(getattr(self, '_schema_cache_id', '')) or
+        ())
+    for rc in cached_r_cols:
+      if rc not in right_cols:
+        right_cols.append(rc)
     for rc in cur_wm.get('r_cols') or ():
       if rc not in right_cols:
         right_cols.append(rc)
@@ -992,6 +1015,8 @@ class AsofJoinStatefulDoFn(beam.DoFn):
           right_cols.append(rk)
       tie_k = _encode_tie_key(r_decoded, self.config.right_order)
       sorted_right.append((t_r, tie_k, r_json, r_decoded))
+    if right_cols and not self.config.right_fields:
+      self._observe_right_cols(right_cols)
     sorted_right.sort(key=lambda it: (it[0], it[1], it[2]))
     t_list = [it[0] for it in sorted_right]
 
@@ -1065,13 +1090,14 @@ class AsofJoinStatefulDoFn(beam.DoFn):
         if c_ms is not None:
           next_candidates.append(max(fired_ms + 1, c_ms))
 
+    cur_wm.pop('r_cols', None)
     if next_candidates:
       nxt = min(next_candidates)
       next_eval.write(nxt)
       eval_timer.set(beam_timestamp.Timestamp(micros=nxt * 1000))
       cur_wm['evicted_ms'] = fired_ms
       wm_state.write(json.dumps(cur_wm))
-    elif surviving_right or cur_wm.get('r_cols'):
+    elif surviving_right:
       next_eval.clear()
       cur_wm['evicted_ms'] = fired_ms
       wm_state.write(json.dumps(cur_wm))

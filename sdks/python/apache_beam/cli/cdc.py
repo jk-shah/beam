@@ -44,9 +44,73 @@ from typing import Iterable
 from typing import Optional
 
 from . import dlq
+from . import output
 
 _HEX_SEGMENTS_RE = re.compile(r'^[0-9A-Fa-f]{1,16}(?:/[0-9A-Fa-f]{1,16}){0,3}$')
 _SAFE_BQ_IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
+
+def _parse_redact_fields(raw: Any) -> tuple[str, ...]:
+  if not raw:
+    return ()
+  if isinstance(raw, str):
+    return tuple(p.strip() for p in raw.split(',') if p.strip())
+  return tuple(str(p).strip() for p in raw if str(p).strip())
+
+
+def _make_cdc_dlq_dict(
+    step: str,
+    error_type: str,
+    raw_err: Any,
+    raw_element: Any,
+    redact_fields: Iterable[str] = (),
+) -> dict[str, str]:
+  rk = tuple(str(f) for f in (redact_fields or ()) if str(f).strip())
+  clean_err = output.scrub_error_message(str(raw_err))
+  if rk:
+    clean_err = dlq.scrub_unparseable_dlq_text(clean_err, rk)
+    if isinstance(raw_element, (bytes, bytearray)):
+      decoded = bytes(raw_element).decode('utf-8', errors='replace')
+      try:
+        parsed_el = json.loads(decoded)
+        payload_obj: Any = (
+            dlq.redact_nested_fields(parsed_el, rk) if isinstance(
+                parsed_el,
+                (dict, list)) else dlq.scrub_unparseable_dlq_text(decoded, rk))
+      except Exception:  # pylint: disable=broad-except
+        payload_obj = dlq.scrub_unparseable_dlq_text(decoded, rk)
+      raw_json = dlq.safe_json_dumps(payload_obj)
+    elif isinstance(raw_element, str):
+      try:
+        parsed_el = json.loads(raw_element)
+        if isinstance(parsed_el, (dict, list)):
+          raw_json = dlq.safe_json_dumps(
+              dlq.redact_nested_fields(parsed_el, rk))
+        else:
+          raw_json = dlq.safe_json_dumps(
+              dlq.scrub_unparseable_dlq_text(raw_element, rk))
+      except Exception:  # pylint: disable=broad-except
+        raw_json = dlq.safe_json_dumps(
+            dlq.scrub_unparseable_dlq_text(raw_element, rk))
+    else:
+      raw_json = dlq.safe_json_dumps(dlq.redact_nested_fields(raw_element, rk))
+  else:
+    raw_json = dlq.safe_json_dumps(raw_element)
+  return {
+      'step': str(step),
+      'error_type': str(error_type),
+      'error': clean_err[:4096],
+      'raw_payload': raw_json,
+  }
+
+
+def _bq_table_has_streaming_buffer(tbl: Any) -> bool:
+  if hasattr(tbl, '_mock_children') and (
+      'streaming_buffer' not in getattr(tbl, '__dict__', {}) and
+      'streaming_buffer' not in (getattr(tbl, '_mock_children', None) or {})):
+    return False
+  return getattr(tbl, 'streaming_buffer', None) is not None
+
 
 _DEFAULT_OP_COLS = (
     'beam_cdc_op',
@@ -94,7 +158,6 @@ _UPSERT_OPS = frozenset([
 ])
 _DELETE_OPS = frozenset(['d', 'delete'])
 _SKIP_PREIMAGE_OPS = frozenset(['update_before', 'update_preimage'])
-
 
 _INT64_MIN = -(1 << 63)
 _INT64_MAX = (1 << 63) - 1
@@ -148,8 +211,8 @@ def to_bq_hex_sequence(raw_seq: Any, fallback_int: int = 0) -> tuple[int, str]:
   if s.isdigit():
     return to_bq_hex_sequence(int(s), fallback_int=fallback_int)
 
-  if s.lower().startswith('0x') and all(
-      c in '0123456789abcdefABCDEF' for c in s[2:]):
+  if s.lower().startswith('0x') and all(c in '0123456789abcdefABCDEF'
+                                        for c in s[2:]):
     return to_bq_hex_sequence(int(s[2:], 16), fallback_int=fallback_int)
 
   # Postgres WAL LSN (`0/16B3748`, `1/100000000`) or BigQuery hex (`AAA/2`).
@@ -213,7 +276,8 @@ def parse_cdc_event(
   elif isinstance(raw_element, str):
     d = json.loads(raw_element)
   else:
-    raise ValueError(f'unsupported CDC element type: {type(raw_element).__name__}')
+    raise ValueError(
+        f'unsupported CDC element type: {type(raw_element).__name__}')
 
   # Unwrap single-string wrapper rows from `ReadFromPubSub(format='STRING')` or
   # `ReadFromText` (`Row(payload='{"op": ...}')` or `Row(line='...')`).
@@ -241,13 +305,13 @@ def parse_cdc_event(
       canon_op = 'DELETE'
       img = d.get('before')
       if not isinstance(img, dict):
-        raise ValueError("Debezium delete ('d') event is missing 'before' object")
+        raise ValueError(
+            "Debezium delete ('d') event is missing 'before' object")
     elif raw_op in _UPSERT_OPS:
       canon_op = 'UPSERT'
       img = d.get('after')
       if not isinstance(img, dict):
-        raise ValueError(
-            f"Debezium {raw_op!r} event is missing 'after' object")
+        raise ValueError(f"Debezium {raw_op!r} event is missing 'after' object")
     else:
       raise ValueError(f'unrecognized Debezium op {raw_op!r}')
 
@@ -257,20 +321,15 @@ def parse_cdc_event(
     elif seq_col and seq_col in img:
       seq_raw = img[seq_col]
     else:
-      seq_raw = next(
-          (
-              v
-              for v in (
-                  src_meta.get('lsn'),
-                  src_meta.get('sequence'),
-                  src_meta.get('ts_us'),
-                  src_meta.get('ts_ms'),
-                  d.get('ts_us'),
-                  d.get('ts_ms'),
-              )
-              if v is not None and v != ''
-          ),
-          None)
+      seq_raw = next((
+          v for v in (
+              src_meta.get('lsn'),
+              src_meta.get('sequence'),
+              src_meta.get('ts_us'),
+              src_meta.get('ts_ms'),
+              d.get('ts_us'),
+              d.get('ts_ms'), ) if v is not None and v != ''),
+                     None)
     int_seq, hex_seq = to_bq_hex_sequence(seq_raw, fallback_int=fallback_seq)
     payload = dict(img)
   else:
@@ -295,7 +354,8 @@ def parse_cdc_event(
     seq_raw = d.get(eff_seq_col) if eff_seq_col else None
     int_seq, hex_seq = to_bq_hex_sequence(seq_raw, fallback_int=fallback_seq)
     drop_meta = {
-        c for c in (
+        c
+        for c in (
             eff_op_col,
             # A sequence column that is ordinary data (e.g. updated_at) stays
             # in the row; only CDC envelope sequence columns are dropped.
@@ -305,8 +365,7 @@ def parse_cdc_event(
             'beam_cdc_hex_seq',
             '_change_type',
             '_commit_version',
-            '_commit_snapshot_sequence_number',
-        ) if c and c not in primary_keys
+            '_commit_snapshot_sequence_number', ) if c and c not in primary_keys
     }
     payload = {k: v for k, v in d.items() if k not in drop_meta}
 
@@ -364,8 +423,10 @@ def infer_cdc_jsonl_fields(
   from . import lakehouse
 
   matched = lakehouse._fs_list_files(
-      path if any(c in path for c in '*?[') or '://' in path and lakehouse._fs_exists(path)
-      else (path if lakehouse._fs_exists(path) else path + '*'))
+      path if any(
+          c in path
+          for c in '*?[') or '://' in path and lakehouse._fs_exists(path) else (
+              path if lakehouse._fs_exists(path) else path + '*'))
   if not matched:
     return []
 
@@ -413,9 +474,9 @@ def infer_cdc_jsonl_fields(
   return [(c, col_types[c]) for c in col_order]
 
 
-def infer_target_table_fields(
-    sink_ep, default_project: Optional[str] = None
-) -> list[tuple[str, str]]:
+def infer_target_table_fields(sink_ep,
+                              default_project: Optional[str] = None
+                              ) -> list[tuple[str, str]]:
   """Fetches existing target schema from BigQuery (`$0`) or Iceberg if present."""
   if sink_ep.kind == 'bigquery':
     try:
@@ -512,6 +573,7 @@ def cli_normalize_cdc(
     fields_spec: Optional[list[list[str]]] = None,
     on_unknown_fields: str = 'error',
     strict_inferred_fields: bool = False,
+    dlq_redact_fields: Any = None,
     error_handling: Optional[dict[str, Any]] = None,
 ):
   """Beam PTransform normalizing CDC inputs into typed rows + `_beam_cdc_*`."""
@@ -527,6 +589,9 @@ def cli_normalize_cdc(
       strict_inferred_fields and
       dlq.parse_unknown_fields_opt(on_unknown_fields) != 'ignore')
   err_tag = (error_handling or {}).get('output')
+  redact_cols = _parse_redact_fields(
+      dlq_redact_fields if dlq_redact_fields is not None else (
+          error_handling or {}).get('redact_fields'))
   dlq_row_type = RowTypeConstraint.from_fields([
       ('step', str),
       ('error_type', str),
@@ -585,10 +650,8 @@ def cli_normalize_cdc(
         if isinstance(exc, dlq.SchemaDriftError):
           self._drift_ctr.inc()
         err_row = beam.Row(
-            step='NormalizeCdc',
-            error_type=type(exc).__name__,
-            error=str(exc)[:4096],
-            raw_payload=dlq.safe_json_dumps(element))
+            **_make_cdc_dlq_dict(
+                'NormalizeCdc', type(exc).__name__, exc, element, redact_cols))
         yield pvalue.TaggedOutput(err_tag, err_row)
 
   class _NormalizeCdcTransform(beam.PTransform):
@@ -622,22 +685,19 @@ def cli_normalize_cdc(
             'Unable to infer CDC payload columns; pass --from-opt '
             'fields="id:int,col:str,..." or target an existing table')
 
-      row_fields = [
-          (cname, Optional[_kind_to_py_type(ckind)])
-          for cname, ckind in resolved_cols
-      ] + [
-          ('beam_cdc_op', str),
-          ('beam_cdc_seq', int),
-          ('beam_cdc_hex_seq', str),
-      ]
+      row_fields = [(cname, Optional[_kind_to_py_type(ckind)])
+                    for cname, ckind in resolved_cols] + [
+                        ('beam_cdc_op', str),
+                        ('beam_cdc_seq', int),
+                        ('beam_cdc_hex_seq', str),
+                    ]
       out_row_type = RowTypeConstraint.from_fields(row_fields)
 
       if err_tag:
         res = (
             pcoll
-            | 'ParseCdcWithDlq' >> beam.ParDo(
-                _NormalizeCdcDoFn(resolved_cols)).with_outputs(
-                    err_tag, main='good'))
+            | 'ParseCdcWithDlq' >> beam.ParDo(_NormalizeCdcDoFn(
+                resolved_cols)).with_outputs(err_tag, main='good'))
         res['good'].element_type = out_row_type
         res[err_tag].element_type = dlq_row_type
         return {'good': res['good'], err_tag: res[err_tag]}
@@ -682,12 +742,12 @@ def cli_materialize_cdc(
     def process(self, keyed):
       key, rows = keyed
       rows = list(rows)
-      top = max(
-          (int(r.beam_cdc_seq), str(getattr(r, 'beam_cdc_hex_seq', '')))
-          for r in rows)
+      top = max((int(r.beam_cdc_seq), str(getattr(r, 'beam_cdc_hex_seq', '')))
+                for r in rows)
       tied = [
           r for r in rows
-          if (int(r.beam_cdc_seq), str(getattr(r, 'beam_cdc_hex_seq', ''))) == top
+          if (int(r.beam_cdc_seq),
+              str(getattr(r, 'beam_cdc_hex_seq', ''))) == top
       ]
       # Exact duplicates (same values and operation) are one change.
       distinct = {
@@ -724,11 +784,11 @@ def cli_materialize_cdc(
       names = [name for name, _ in fields]
       return (
           pcoll
-          | 'KeyByPrimaryKey' >> beam.Map(
-              lambda r: (tuple(getattr(r, k) for k in pks), r))
+          | 'KeyByPrimaryKey' >>
+          beam.Map(lambda r: (tuple(getattr(r, k) for k in pks), r))
           | 'GroupVersions' >> beam.GroupByKey()
-          | 'LatestLiveRow' >> beam.ParDo(_LatestLiveRowDoFn(names))
-          .with_output_types(RowTypeConstraint.from_fields(fields)))
+          | 'LatestLiveRow' >> beam.ParDo(_LatestLiveRowDoFn(
+              names)).with_output_types(RowTypeConstraint.from_fields(fields)))
 
   return _MaterializeCdcTransform()
 
@@ -745,10 +805,11 @@ def resolve_cdc_source_columns(
   col_names = [c for c, _ in source_cols]
   eff_op = op_col or next(
       (c for c in _DEFAULT_OP_COLS if c in col_names and c not in pks), None)
-  eff_seq = seq_col or next((c for c in _DEFAULT_SEQ_COLS if c in col_names),
-                            None)
+  eff_seq = seq_col or next(
+      (c for c in _DEFAULT_SEQ_COLS if c in col_names), None)
   meta_skip = {
-      c for c in (
+      c
+      for c in (
           eff_op,
           eff_seq if eff_seq in _ENVELOPE_SEQ_COLS else None,
           'beam_cdc_op',
@@ -756,8 +817,7 @@ def resolve_cdc_source_columns(
           'beam_cdc_hex_seq',
           '_change_type',
           '_commit_version',
-          '_commit_snapshot_sequence_number',
-      ) if c and c not in pks
+          '_commit_snapshot_sequence_number', ) if c and c not in pks
   }
   return [(c, k) for c, k in source_cols if c not in meta_skip]
 
@@ -775,6 +835,7 @@ def materialize_cdc_records(
     route_errors: bool = False,
     row_factory,
     dlq_list: list[dict[str, Any]],
+    dlq_redact_fields: Any = None,
 ) -> tuple[list[str], list[Any], int, int, int, set[str]]:
   """In-memory equivalent of `CliNormalizeCdc | CliMaterializeCdc` (zero Beam import).
 
@@ -784,11 +845,12 @@ def materialize_cdc_records(
   pks = [str(k) for k in primary_key]
   names = [c for c, _ in col_specs]
   known = set(names)
+  redact_cols = _parse_redact_fields(dlq_redact_fields)
   check_unknown = bool(
       strict_inferred_fields and
       dlq.parse_unknown_fields_opt(on_unknown_fields) != 'ignore')
-  grouped: dict[
-      tuple[Any, ...], list[tuple[str, tuple[int, str], dict[str, Any]]]] = {}
+  grouped: dict[tuple[Any, ...],
+                list[tuple[str, tuple[int, str], dict[str, Any]]]] = {}
   preimage_skipped = 0
   drift_rows = 0
   drift_fields: set[str] = set()
@@ -833,22 +895,17 @@ def materialize_cdc_records(
       if isinstance(exc, dlq.SchemaDriftError):
         drift_rows += 1
         drift_fields.update(exc.extra_fields)
-      dlq_list.append({
-          'step': 'NormalizeCdc',
-          'error_type': type(exc).__name__,
-          'error': str(exc)[:4096],
-          'raw_payload': dlq.safe_json_dumps(element),
-      })
+      dlq_list.append(
+          _make_cdc_dlq_dict(
+              'NormalizeCdc', type(exc).__name__, exc, element, redact_cols))
 
   superseded = 0
   live_rows: list[Any] = []
   for key, versions in grouped.items():
     top = max(v[1] for v in versions)
     tied = [v for v in versions if v[1] == top]
-    distinct = {
-        tuple(v[2][n] for n in names) + (v[0], )
-        for v in tied
-    }
+    distinct = {tuple(v[2][n] for n in names) + (v[0], )
+                for v in tied}
     if len(distinct) > 1:
       if seq_col:
         hint = (
@@ -905,11 +962,16 @@ def _ensure_bq_cdc_table(
   try:
     existing_tbl = client.get_table(fq)
     exists = True
-    if write_disposition == 'WRITE_EMPTY' and (existing_tbl.num_rows or 0) > 0:
-      raise ValueError(
-          f'BigQuery table {fq!r} already exists and has '
-          f'{existing_tbl.num_rows} rows; pass --if-exists=append or '
-          '--if-exists=replace')
+    if write_disposition == 'WRITE_EMPTY':
+      has_rows = (existing_tbl.num_rows or 0) > 0
+      has_sbuf = _bq_table_has_streaming_buffer(existing_tbl)
+      if has_rows or has_sbuf:
+        detail = (
+            f'has {existing_tbl.num_rows} rows'
+            if has_rows else 'has active streaming buffer rows')
+        raise ValueError(
+            f'BigQuery table {fq!r} already exists and {detail}; '
+            'pass --if-exists=append or --if-exists=replace')
   except gcp_exceptions.NotFound:
     exists = False
 
@@ -928,14 +990,31 @@ def _ensure_bq_cdc_table(
   pk_clause = ', '.join(f'`{k}`' for k in primary_keys)
 
   if write_disposition == 'WRITE_TRUNCATE' or not exists:
-    verb = (
-        'CREATE OR REPLACE TABLE'
-        if write_disposition == 'WRITE_TRUNCATE' else 'CREATE TABLE IF NOT EXISTS'
-    )
+    if write_disposition == 'WRITE_TRUNCATE':
+      verb = 'CREATE OR REPLACE TABLE'
+    elif write_disposition == 'WRITE_EMPTY':
+      verb = 'CREATE TABLE'
+    else:
+      verb = 'CREATE TABLE IF NOT EXISTS'
     ddl = (
         f'{verb} `{eff_proj}.{ds}.{tbl_name}` '
         f'({", ".join(col_defs)}, PRIMARY KEY ({pk_clause}) NOT ENFORCED)')
-    client.query(ddl).result()
+    try:
+      client.query(ddl).result()
+    except gcp_exceptions.Conflict:
+      if write_disposition == 'WRITE_EMPTY':
+        msg = (
+            f'BigQuery table {fq!r} was concurrently created by another '
+            'writer (409 AlreadyExists under --if-exists=fail); pass '
+            '--if-exists=append or --if-exists=replace')
+        base_exc = getattr(
+            gcp_exceptions, 'AlreadyExists', gcp_exceptions.Conflict)
+        if isinstance(base_exc, type) and issubclass(base_exc, Exception):
+          dual_cls = type(
+              '_BqCdcAlreadyExistsError', (base_exc, ValueError), {})
+          raise dual_cls(msg) from None
+        raise ValueError(msg) from None
+      raise
 
   return eff_proj, ds, tbl_name
 
@@ -969,7 +1048,8 @@ def _build_bq_cdc_proto_bundle(col_specs: list[tuple[str, str]]):
     f.name = cname
     f.number = idx
     f.label = descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL
-    f.type = proto_type_map.get(ckind, descriptor_pb2.FieldDescriptorProto.TYPE_STRING)
+    f.type = proto_type_map.get(
+        ckind, descriptor_pb2.FieldDescriptorProto.TYPE_STRING)
 
   pool = descriptor_pool.DescriptorPool()
   file_desc = pool.Add(file_proto)
@@ -986,6 +1066,7 @@ def cli_write_to_bigquery_cdc(
     primary_key: list[str],
     *,
     write_disposition: str = 'WRITE_APPEND',
+    dlq_redact_fields: Any = None,
     error_handling: Optional[dict[str, Any]] = None,
 ):
   """Pure-Python BigQuery Storage Write API CDC sink (`_default` stream)."""
@@ -1003,6 +1084,9 @@ def cli_write_to_bigquery_cdc(
   if not pks:
     raise ValueError('BigQuery CDC sink requires --primary-key')
   err_tag = (error_handling or {}).get('output')
+  redact_cols = _parse_redact_fields(
+      dlq_redact_fields if dlq_redact_fields is not None else (
+          error_handling or {}).get('redact_fields'))
   dlq_row_type = RowTypeConstraint.from_fields([
       ('step', str),
       ('error_type', str),
@@ -1075,10 +1159,12 @@ def cli_write_to_bigquery_cdc(
             yield pvalue.TaggedOutput(
                 err_tag,
                 beam.Row(
-                    step='WriteToBigQueryCDC',
-                    error_type=type(exc).__name__,
-                    error=str(exc)[:4096],
-                    raw_payload=dlq.safe_json_dumps(r)))
+                    **_make_cdc_dlq_dict(
+                        'WriteToBigQueryCDC',
+                        type(exc).__name__,
+                        exc,
+                        r,
+                        redact_cols)))
 
         if not serialized:
           continue
@@ -1113,21 +1199,24 @@ def cli_write_to_bigquery_cdc(
               bad_row = (
                   valid_rows[bad_idx] if 0 <= bad_idx < len(valid_rows) else {})
               if not err_tag:
+                clean_r_msg = output.scrub_error_message(str(r_err.message))
                 raise RuntimeError(
-                    f'BigQuery CDC row error at index {bad_idx}: {r_err.message}'
-                )
+                    f'BigQuery CDC row error at index {bad_idx}: {clean_r_msg}')
               self._sink_dlq.inc()
               yield pvalue.TaggedOutput(
                   err_tag,
                   beam.Row(
-                      step='WriteToBigQueryCDC',
-                      error_type='BigQueryRowError',
-                      error=str(r_err.message)[:4096],
-                      raw_payload=dlq.safe_json_dumps(bad_row)))
+                      **_make_cdc_dlq_dict(
+                          'WriteToBigQueryCDC',
+                          'BigQueryRowError',
+                          r_err.message,
+                          bad_row,
+                          redact_cols)))
           elif resp.error and resp.error.code != 0:
+            clean_s_msg = output.scrub_error_message(str(resp.error.message))
             raise RuntimeError(
                 f'BigQuery Storage Write API error ({resp.error.code}): '
-                f'{resp.error.message}')
+                f'{clean_s_msg}')
 
   class _CliWriteBqCdcTransform(beam.PTransform):
     def expand(self, pcoll):

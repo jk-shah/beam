@@ -41,6 +41,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -60,6 +61,18 @@ DEFAULT_PYTHON_LAUNCHER_BASE = (
     'gcr.io/dataflow-templates-base/python312-template-launcher-base:latest')
 _SAFE_PARAM_NAME_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 _JINJA_EXPR_RE = re.compile(r'\{\{.*?\}\}|\{%.*?%\}|\{#.*?#\}', re.DOTALL)
+_SECRET_VALUE_TOKEN_RE = re.compile(
+    r'(?:'
+    r'\bya29\.[A-Za-z0-9._-]{8,}|'
+    r'\bsk-[A-Za-z0-9_-]{12,}|'
+    r'\bAIza[0-9A-Za-z_-]{20,}|'
+    r'\bgh[pousr]_[A-Za-z0-9_]{12,}|'
+    r'\bgithub_pat_[A-Za-z0-9_]{12,}|'
+    r'\bhf_[A-Za-z0-9]{12,}|'
+    r'\bAKIA[0-9A-Z]{16}\b|'
+    r'\bxox[baprs]-[A-Za-z0-9-]{10,}|'
+    r'\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}'
+    r')')
 
 
 class PackageError(Exception):
@@ -67,6 +80,58 @@ class PackageError(Exception):
   def __init__(self, message: str, exit_code: int = EXIT_USAGE):
     super().__init__(message)
     self.exit_code = exit_code
+
+
+def _check_no_inline_secret_text(text: str, label: str) -> None:
+  """Raises `PackageError` if `text` contains inline URI credentials or tokens."""
+  from . import output as out_mod
+  from . import uris as uris_mod
+  if uris_mod._INLINE_URI_USERINFO_RE.search(text):
+    raise PackageError(
+        f'refusing to bake inline URI credentials (`user:pass@`) from {label} '
+        'into Flex Template; use environment variables, ADC, or Secret Manager.',
+        EXIT_USAGE)
+  if '://' in text:
+    for token in re.findall(r'[A-Za-z][A-Za-z0-9+.-]*://[^\s\'"<>]+', text):
+      try:
+        uris_mod.reject_inline_credentials(token)
+      except uris_mod.UriError as e:
+        raise PackageError(
+            f'refusing to bake inline credentials from {label}: {e}',
+            EXIT_USAGE) from None
+  if _SECRET_VALUE_TOKEN_RE.search(text) or (out_mod.redact_inline_secrets(text)
+                                             != text):
+    raise PackageError(
+        f'refusing to bake inline credentials or secret tokens from {label} '
+        'into Flex Template; use Google Cloud Secret Manager or runtime parameters.',
+        EXIT_USAGE)
+
+
+def _scan_python_source_for_secrets(py_source: str, label: str) -> None:
+  """Scans string literals in `py_source` via AST for inline credentials/tokens."""
+  try:
+    tree = ast.parse(py_source)
+  except SyntaxError as e:
+    raise PackageError(
+        f'invalid Python syntax in pipeline file (line {e.lineno}): {e.msg}',
+        EXIT_USAGE) from None
+  for node in ast.walk(tree):
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+      _check_no_inline_secret_text(node.value, label)
+
+
+def _scan_requirements_file_for_secrets(req_path: Path) -> None:
+  """Scans `requirements.txt` lines for inline credentials or secret tokens."""
+  from . import output as out_mod
+  try:
+    req_text = out_mod.read_bounded_text(req_path, label=str(req_path))
+  except ValueError as e:
+    raise PackageError(str(e), EXIT_USAGE) from None
+  for lineno, raw_line in enumerate(req_text.splitlines(), start=1):
+    stripped = raw_line.strip()
+    if not stripped or stripped.startswith('#'):
+      continue
+    _check_no_inline_secret_text(stripped, f'{req_path.name} (line {lineno})')
 
 
 def _humanize_label(param_name: str) -> str:
@@ -77,6 +142,7 @@ def _humanize_label(param_name: str) -> str:
 
 def extract_jinja_parameters(yaml_text: str) -> list[dict[str, Any]]:
   """Extracts Jinja2 variables & `default(...)` filters via AST (no execution)."""
+  from . import uris as uris_mod
   try:
     import jinja2
     from jinja2 import meta
@@ -126,6 +192,16 @@ def extract_jinja_parameters(yaml_text: str) -> list[dict[str, Any]]:
     if not _SAFE_PARAM_NAME_RE.match(name):
       continue
     has_default = name in defaults_by_name
+    if has_default:
+      def_v = defaults_by_name[name]
+      if (def_v.strip() and not name.lower().endswith('_env') and
+          uris_mod._SECRET_KEY_RE.search(name)):
+        raise PackageError(
+            f'refusing to bake non-empty defaultValue for secret Jinja '
+            f'parameter {name!r}; omit default(...) or use Secret Manager.',
+            EXIT_USAGE)
+      if def_v:
+        _check_no_inline_secret_text(def_v, f'Jinja default for {name!r}')
     entry: dict[str, Any] = {
         'name': name,
         'label': _humanize_label(name),
@@ -151,8 +227,8 @@ def _validate_region(region: str | None) -> str:
 
 def _validate_image_uri(image_uri: str, flag_name: str = '--image') -> str:
   cleaned = image_uri.strip()
-  if not cleaned or not re.fullmatch(
-      r'[A-Za-z0-9][A-Za-z0-9._/:@-]{0,511}', cleaned):
+  if not cleaned or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/:@-]{0,511}',
+                                     cleaned):
     raise PackageError(
         f'invalid container image URI for {flag_name}: {image_uri!r}',
         EXIT_USAGE)
@@ -327,8 +403,8 @@ def extract_python_pipeline_parameters(py_source: str) -> list[dict[str, Any]]:
   seen: set[str] = set()
 
   for node in ast.walk(tree):
-    if not isinstance(node, ast.Call) or not isinstance(
-        node.func, ast.Attribute):
+    if not isinstance(node, ast.Call) or not isinstance(node.func,
+                                                        ast.Attribute):
       continue
     if node.func.attr not in ('add_argument', 'add_value_provider_argument'):
       continue
@@ -370,6 +446,15 @@ def extract_python_pipeline_parameters(py_source: str) -> list[dict[str, Any]]:
       val = kw_map['default'].value
       if val is not None:
         default_val = str(val)
+        from . import uris as uris_mod
+        if (default_val.strip() and not raw_name.lower().endswith('_env') and
+            uris_mod._SECRET_KEY_RE.search(raw_name)):
+          raise PackageError(
+              f'refusing to bake non-empty defaultValue for secret parameter '
+              f'{raw_name!r}; omit default=... or use Secret Manager.',
+              EXIT_USAGE)
+        if default_val:
+          _check_no_inline_secret_text(default_val, f'default for {raw_name!r}')
 
     is_optional = (not required)
     entry: dict[str, Any] = {
@@ -517,7 +602,8 @@ def generate_python_dockerfile(
 def _generate_yaml_python_wrapper(
     yaml_filename: str, param_names: list[str] | None = None) -> str:
   """Generates a minimal Python Flex entrypoint wrapping a Beam YAML file."""
-  if not re.fullmatch(r'[A-Za-z0-9_.-]+\.ya?ml', yaml_filename) or '..' in yaml_filename:
+  if not re.fullmatch(r'[A-Za-z0-9_.-]+\.ya?ml',
+                      yaml_filename) or '..' in yaml_filename:
     raise PackageError(f'unsafe YAML filename {yaml_filename!r}', EXIT_USAGE)
   clean_params: list[str] = []
   for p in sorted(set(param_names or ())):
@@ -632,8 +718,84 @@ _FALLBACK_LAUNCHER_SRC = (
     '  ]\n'
     '  sys.meta_path.insert(0, _PreviewCliFinder(cli_dir))\n'
     '  canonicalize_cli_module_aliases()\n'
-    '  return cli_dir\n'
-)
+    '  return cli_dir\n')
+
+
+def _check_owned_dir_lstat(dir_path: Path) -> None:
+  st = os.lstat(dir_path)
+  if stat.S_ISLNK(st.st_mode):
+    raise RuntimeError(f'refusing symlinked cache directory {str(dir_path)!r}')
+  if not stat.S_ISDIR(st.st_mode):
+    raise NotADirectoryError(
+        f'cache path is not a directory: {str(dir_path)!r}')
+  if hasattr(os, 'getuid') and st.st_uid != os.getuid():
+    raise RuntimeError(
+        f'refusing foreign-owned cache directory {str(dir_path)!r}')
+  try:
+    os.chmod(dir_path, 0o700)
+  except OSError:
+    pass
+
+
+def _ensure_owned_private_dir(path: Path, *, root: Path | None = None) -> Path:
+  """Creates missing cache dirs with `0o700` and verifies ownership/no symlinks."""
+  target = Path(os.path.abspath(os.fspath(path)))
+  root_abs = (
+      Path(os.path.abspath(os.fspath(root))) if root is not None else None)
+  chain: list[Path] = []
+  cur = target
+  while True:
+    chain.append(cur)
+    if root_abs is not None and cur == root_abs:
+      break
+    parent = cur.parent
+    if parent == cur:
+      break
+    if root_abs is None:
+      try:
+        parent_st = os.lstat(parent)
+        parent_exists = True
+      except FileNotFoundError:
+        parent_exists = False
+        parent_st = None
+      if parent_exists:
+        p_name = parent.name
+        if not (p_name.startswith('beam-cli-cache') or p_name == '.beam' or
+                (parent_st is not None and stat.S_ISLNK(parent_st.st_mode) and
+                 parent not in
+                 (Path('/tmp'), Path('/var'), Path(tempfile.gettempdir())))):
+          break
+    cur = parent
+
+  chain.reverse()
+  base_parent = chain[0].parent
+  if base_parent != chain[0] and not base_parent.exists():
+    base_parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+  for comp in chain:
+    try:
+      os.lstat(comp)
+    except FileNotFoundError:
+      try:
+        os.mkdir(comp, 0o700)
+      except FileExistsError:
+        pass
+    _check_owned_dir_lstat(comp)
+  return target
+
+
+def _is_valid_owned_wheel(wheel_path: Path) -> bool:
+  import zipfile
+  try:
+    st = os.lstat(wheel_path)
+  except FileNotFoundError:
+    return False
+  if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+    raise RuntimeError(
+        f'refusing symlinked or non-regular cached wheel {str(wheel_path)!r}')
+  if hasattr(os, 'getuid') and st.st_uid != os.getuid():
+    raise RuntimeError(
+        f'refusing foreign-owned cached wheel {str(wheel_path)!r}')
+  return zipfile.is_zipfile(wheel_path)
 
 
 def _ensure_cli_bundle_wheel() -> Path:
@@ -654,7 +816,10 @@ def _ensure_cli_bundle_wheel() -> Path:
   version_str = '0.2.0'
   entries: list[tuple[str, bytes]] = []
   if (repo_preview_pkg / 'launcher.py').is_file():
-    for fname in ('__init__.py', 'launcher.py', '_worker_bootstrap.py', 'demo.py'):
+    for fname in ('__init__.py',
+                  'launcher.py',
+                  '_worker_bootstrap.py',
+                  'demo.py'):
       fp = repo_preview_pkg / fname
       if fp.is_file():
         entries.append((f'apache_beam_cli_preview/{fname}', fp.read_bytes()))
@@ -704,23 +869,27 @@ def _ensure_cli_bundle_wheel() -> Path:
   beam_home_env = os.environ.get('BEAM_HOME')
   if explicit_cache:
     cache_root = Path(explicit_cache)
+    check_root = cache_root
   elif beam_home_env:
-    cache_root = Path(os.path.expanduser(beam_home_env)) / 'cache'
+    check_root = Path(os.path.expanduser(beam_home_env))
+    cache_root = check_root / 'cache'
   else:
-    cache_root = Path.home() / '.beam' / 'cache'
+    check_root = Path.home() / '.beam'
+    cache_root = check_root / 'cache'
   wheel_dir = cache_root / 'wheels' / digest
   wheel_name = f'apache_beam_cli_preview-{version_str}-py3-none-any.whl'
   try:
-    wheel_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    wheel_dir = _ensure_owned_private_dir(wheel_dir, root=check_root)
   except OSError:
+    if explicit_cache:
+      raise
     uid_sfx = f'-{os.getuid()}' if hasattr(os, 'getuid') else ''
-    wheel_dir = (
-        Path(tempfile.gettempdir()) / f'beam-cli-cache{uid_sfx}' / 'wheels' /
-        digest)
-    wheel_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    user_tmp_root = Path(tempfile.gettempdir()) / f'beam-cli-cache{uid_sfx}'
+    wheel_dir = _ensure_owned_private_dir(
+        user_tmp_root / 'wheels' / digest, root=user_tmp_root)
 
   wheel_path = wheel_dir / wheel_name
-  if wheel_path.is_file() and not wheel_path.is_symlink():
+  if _is_valid_owned_wheel(wheel_path):
     return wheel_path
 
   dist_info = f'apache_beam_cli_preview-{version_str}.dist-info'
@@ -746,8 +915,8 @@ def _ensure_cli_bundle_wheel() -> Path:
   ]
   record_lines: list[str] = []
   for arcname, data in all_files:
-    b64 = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(
-        b'=').decode('ascii')
+    b64 = base64.urlsafe_b64encode(
+        hashlib.sha256(data).digest()).rstrip(b'=').decode('ascii')
     record_lines.append(f'{arcname},sha256={b64},{len(data)}')
   record_path = f'{dist_info}/RECORD'
   record_lines.append(f'{record_path},,')
@@ -761,7 +930,13 @@ def _ensure_cli_bundle_wheel() -> Path:
       for arcname, data in all_files:
         zf.writestr(arcname, data)
       zf.writestr(record_path, record_bytes)
-    os.replace(tmp_whl, wheel_path)
+    try:
+      os.replace(tmp_whl, wheel_path)
+    except PermissionError:
+      if (wheel_path.is_file() and not wheel_path.is_symlink() and
+          _is_valid_owned_wheel(wheel_path)):
+        return wheel_path
+      raise
   finally:
     if os.path.exists(tmp_whl):
       try:
@@ -826,7 +1001,8 @@ def _write_text_destination(
     client = storage.Client(project=project) if project else storage.Client()
     bucket = client.bucket(bucket_name)
     blob = bucket.blob(blob_name)
-    blob.upload_from_string(content.encode('utf-8'), content_type='application/json')
+    blob.upload_from_string(
+        content.encode('utf-8'), content_type='application/json')
     return
 
   _atomic_write_text(Path(dest), content)
@@ -876,6 +1052,9 @@ def _read_source_text(
     return text, os.path.basename(parts[1]) or 'pipeline.yaml'
 
   p = Path(source)
+  if p.is_symlink():
+    raise PackageError(
+        f'refusing symbolic link pipeline file: {source}', EXIT_USAGE)
   if not p.is_file():
     raise PackageError(f'pipeline file not found: {source}', EXIT_USAGE)
   try:
@@ -919,8 +1098,8 @@ def _build_launch_snippets(
       f' --region={shlex.quote(region)}{proj_flag}{param_flag}')
 
   params_dict_literal = (
-      '{' + ', '.join(f'{k!r}: "<VALUE>"' for k in required_params) + '}'
-      if required_params else '{}')
+      '{' + ', '.join(f'{k!r}: "<VALUE>"' for k in required_params) +
+      '}' if required_params else '{}')
   airflow_snippet = (
       'DataflowStartFlexTemplateOperator(\n'
       f'    task_id="run_{template_name.replace("-", "_")}",\n'
@@ -972,7 +1151,8 @@ def run_package(
     p_str = str(project).strip()
     if (not p_str or p_str.startswith('-') or
         any(ch in p_str for ch in ('\r', '\n', '\x00'))):
-      raise PackageError(f'invalid GCP project identifier {project!r}', EXIT_USAGE)
+      raise PackageError(
+          f'invalid GCP project identifier {project!r}', EXIT_USAGE)
     if build_image or not dry_run:
       from . import uris
       try:
@@ -990,10 +1170,26 @@ def run_package(
         f"unsupported --sdk {sdk!r}; expected 'auto', 'yaml', or 'python'.",
         EXIT_USAGE)
 
+  if requirements_file:
+    req_p = Path(requirements_file)
+    if req_p.is_symlink():
+      raise PackageError(
+          f'refusing symbolic link requirements file: {requirements_file}',
+          EXIT_USAGE)
+    if not req_p.is_file():
+      raise PackageError(
+          f'requirements file not found: {requirements_file}', EXIT_USAGE)
+    _scan_requirements_file_for_secrets(req_p)
+
   is_py_file = source_basename.endswith('.py')
-  if not is_py_file:
+  if is_py_file:
+    _scan_python_source_for_secrets(source_text, source_basename)
+  else:
     from . import output as out_mod
-    if out_mod.redact_inline_secrets(source_text) != source_text:
+    from . import uris as uris_mod
+    if (_SECRET_VALUE_TOKEN_RE.search(source_text) or
+        uris_mod._INLINE_URI_USERINFO_RE.search(source_text) or
+        out_mod.redact_inline_secrets(source_text) != source_text):
       raise PackageError(
           'refusing to bake inline credentials or tokens into Flex Template '
           'YAML; parameterize secrets with Jinja `{{ secret_param }}` or '
@@ -1043,14 +1239,16 @@ def run_package(
     from . import uris as uris_mod
     if isinstance(obj, dict):
       for k, v in obj.items():
-        if uris_mod._SECRET_KEY_RE.search(str(k)):
+        ks = str(k)
+        if not ks.lower().endswith('_env') and uris_mod._SECRET_KEY_RE.search(
+            ks):
           sv = '' if v is None else str(v).strip()
           if sv and sv not in (
               '<REDACTED_SECRET>',
               '<redacted>',
               '__BEAM_JINJA_PLACEHOLDER__',
-          ) and '__BEAM_JINJA_PLACEHOLDER__' not in sv:
-            return str(k)
+          ):
+            return ks
         nested = _mapping_has_literal_secret(v)
         if nested:
           return nested
@@ -1088,9 +1286,8 @@ def run_package(
   if resolved_sdk == 'YAML':
     needed_yaml_pkgs = _detect_yaml_extra_packages(yaml_doc)
     opts_in_yaml = (
-        yaml_doc.get('options')
-        if isinstance(yaml_doc, dict) and isinstance(
-            yaml_doc.get('options'), dict) else {})
+        yaml_doc.get('options') if isinstance(yaml_doc, dict) and
+        isinstance(yaml_doc.get('options'), dict) else {})
     if (needed_yaml_pkgs and not opts_in_yaml.get('requirements_file') and
         not opts_in_yaml.get('extra_packages')):
       warnings_out.append(
@@ -1107,15 +1304,15 @@ def run_package(
 
     yaml_def = source_text
     # Workaround for GoogleCloudPlatform/DataflowTemplates#4565 (private-IP).
-    if (
-        no_use_public_ips
-        and 's3://' not in source_text
-        and 'azfs://' not in source_text
-    ):
-      opts_block = yaml_doc.get('options') if isinstance(yaml_doc, dict) else None
+    if (no_use_public_ips and 's3://' not in source_text and
+        'azfs://' not in source_text):
+      opts_block = yaml_doc.get('options') if isinstance(
+          yaml_doc, dict) else None
       if opts_block is None and not re.search(r'(?m)^options\s*:', yaml_def):
-        yaml_def = yaml_def.rstrip('\n') + '\n\noptions:\n  requirements_file: null\n'
-      elif isinstance(opts_block, dict) and 'requirements_file' not in opts_block:
+        yaml_def = yaml_def.rstrip(
+            '\n') + '\n\noptions:\n  requirements_file: null\n'
+      elif isinstance(opts_block,
+                      dict) and 'requirements_file' not in opts_block:
         yaml_def = re.sub(
             r'(?m)^options\s*:\s*$',
             'options:\n  requirements_file: null',
@@ -1131,7 +1328,9 @@ def run_package(
     container_spec: dict[str, Any] = {
         'image': resolved_image,
         'metadata': metadata,
-        'sdkInfo': {'language': 'YAML'},
+        'sdkInfo': {
+            'language': 'YAML'
+        },
     }
     if default_env:
       container_spec['defaultEnvironment'] = default_env
@@ -1179,9 +1378,6 @@ def run_package(
     }
 
   # `resolved_sdk == 'PYTHON'`
-  if requirements_file and not Path(requirements_file).is_file():
-    raise PackageError(
-        f'requirements file not found: {requirements_file}', EXIT_USAGE)
 
   extra_wheels: list[str] = []
   bundle_preview_wheel_path: Path | None = None
@@ -1254,7 +1450,9 @@ def run_package(
   container_spec = {
       'image': resolved_py_image,
       'metadata': metadata,
-      'sdkInfo': {'language': 'PYTHON'},
+      'sdkInfo': {
+          'language': 'PYTHON'
+      },
   }
   if py_default_env:
     container_spec['defaultEnvironment'] = py_default_env
@@ -1276,14 +1474,12 @@ def run_package(
     if requirements_file:
       req_dst = target_dir / 'requirements.txt'
       if req_dst.is_symlink():
-        raise PackageError(
-            f'refusing symbolic link {req_dst}', EXIT_USAGE)
+        raise PackageError(f'refusing symbolic link {req_dst}', EXIT_USAGE)
       shutil.copy2(requirements_file, req_dst)
     if bundle_preview_wheel_path is not None:
       whl_dst = target_dir / bundle_preview_wheel_path.name
       if whl_dst.is_symlink():
-        raise PackageError(
-            f'refusing symbolic link {whl_dst}', EXIT_USAGE)
+        raise PackageError(f'refusing symbolic link {whl_dst}', EXIT_USAGE)
       shutil.copy2(bundle_preview_wheel_path, whl_dst)
 
   if output_dir and not dry_run:
@@ -1301,7 +1497,14 @@ def run_package(
       build_ctx = Path(output_dir) if output_dir else Path(tmp_d)
       if not output_dir:
         _populate_bundle_dir(build_ctx)
-      cmd = [gcloud_bin, 'builds', 'submit', str(build_ctx), '--tag', resolved_py_image]
+      cmd = [
+          gcloud_bin,
+          'builds',
+          'submit',
+          str(build_ctx),
+          '--tag',
+          resolved_py_image
+      ]
       if project:
         cmd.extend(['--project', project])
       proc = subprocess.run(cmd, capture_output=True, text=True, check=False)

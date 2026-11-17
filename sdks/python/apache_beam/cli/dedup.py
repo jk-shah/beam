@@ -97,6 +97,7 @@ class DeduplicateConfig(NamedTuple):
   timestamp_col: str | None = None
   route_duplicates_to_dlq: bool = False
   force_stateful: bool = False
+  dlq_redact_fields: tuple[str, ...] = ()
 
 
 def parse_deduplicate_config(cfg: dict[str, Any]) -> DeduplicateConfig:
@@ -150,6 +151,10 @@ def parse_deduplicate_config(cfg: dict[str, Any]) -> DeduplicateConfig:
 
   route_dlq = bool(cfg.get('route_duplicates_to_dlq') or cfg.get('dedupe_dlq'))
   force_stateful = bool(cfg.get('force_stateful'))
+  dlq_redact_fields = parse_column_list(cfg.get('dlq_redact_fields'))
+  for rf in dlq_redact_fields:
+    if not output.SAFE_IDENTIFIER_RE.match(rf):
+      raise ValueError(f'invalid column identifier {rf!r} in dlq_redact_fields')
 
   return DeduplicateConfig(
       keys=keys,
@@ -160,6 +165,7 @@ def parse_deduplicate_config(cfg: dict[str, Any]) -> DeduplicateConfig:
       timestamp_col=timestamp_col,
       route_duplicates_to_dlq=route_dlq,
       force_stateful=force_stateful,
+      dlq_redact_fields=dlq_redact_fields,
   )
 
 
@@ -290,11 +296,13 @@ class _StreamingEventDedupeDoFn(beam.DoFn):
       route_dupes_to_dlq: bool,
       err_tag: str,
       route_errors: bool,
+      dlq_redact_fields: tuple[str, ...] = (),
   ):
     self.window_sec = window_sec
     self.route_dupes_to_dlq = route_dupes_to_dlq
     self.err_tag = err_tag
     self.route_errors = route_errors
+    self.dlq_redact_fields = dlq_redact_fields
     self._dropped_ctr = metrics.Metrics.counter(
         'beam_cli', 'duplicates_dropped')
 
@@ -313,7 +321,8 @@ class _StreamingEventDedupeDoFn(beam.DoFn):
                 'CliDeduplicate',
                 'DuplicateKeyError',
                 'Duplicate key suppressed within deduplication window',
-                row))
+                row,
+                redact_fields=self.dlq_redact_fields))
       else:
         self._dropped_ctr.inc(1)
       return
@@ -341,11 +350,13 @@ class _StreamingProcessingDedupeDoFn(beam.DoFn):
       route_dupes_to_dlq: bool,
       err_tag: str,
       route_errors: bool,
+      dlq_redact_fields: tuple[str, ...] = (),
   ):
     self.window_sec = window_sec
     self.route_dupes_to_dlq = route_dupes_to_dlq
     self.err_tag = err_tag
     self.route_errors = route_errors
+    self.dlq_redact_fields = dlq_redact_fields
     self._dropped_ctr = metrics.Metrics.counter(
         'beam_cli', 'duplicates_dropped')
 
@@ -364,7 +375,8 @@ class _StreamingProcessingDedupeDoFn(beam.DoFn):
                 'CliDeduplicate',
                 'DuplicateKeyError',
                 'Duplicate key suppressed within processing-time window',
-                row))
+                row,
+                redact_fields=self.dlq_redact_fields))
       else:
         self._dropped_ctr.inc(1)
       return
@@ -380,10 +392,14 @@ class _StreamingProcessingDedupeDoFn(beam.DoFn):
 
 def cli_deduplicate(
     error_handling: dict[str, Any] | None = None,
+    dlq_redact_fields: Any = None,
     **kwargs,
 ) -> beam.PTransform:
   """Beam YAML factory callable for `type: CliDeduplicate` / `Deduplicate`."""
-  cfg = parse_deduplicate_config(kwargs)
+  cfg_dict = dict(kwargs)
+  if dlq_redact_fields is not None and 'dlq_redact_fields' not in cfg_dict:
+    cfg_dict['dlq_redact_fields'] = dlq_redact_fields
+  cfg = parse_deduplicate_config(cfg_dict)
   err_tag = (error_handling or {}).get('output', 'errors')
   route_errors = bool(error_handling and 'output' in error_handling)
   if cfg.route_duplicates_to_dlq and not route_errors:
@@ -460,7 +476,11 @@ def cli_deduplicate(
           yield pvalue.TaggedOutput(
               err_tag,
               _make_dlq_row(
-                  'CliDeduplicate', type(e).__name__, str(e), element))
+                  'CliDeduplicate',
+                  type(e).__name__,
+                  str(e),
+                  element,
+                  redact_fields=self.cfg.dlq_redact_fields))
         else:
           raise
 
@@ -521,7 +541,8 @@ def cli_deduplicate(
                   'CliDeduplicate',
                   'DuplicateKeyError',
                   'Duplicate key suppressed',
-                  row))
+                  row,
+                  redact_fields=self.cfg.dlq_redact_fields))
         else:
           self._dropped_ctr.inc(1)
 
@@ -602,12 +623,14 @@ def cli_deduplicate(
                 cfg.window_sec,
                 cfg.route_duplicates_to_dlq,
                 err_tag,
-                route_errors)
+                route_errors,
+                cfg.dlq_redact_fields)
             if resolved_domain == 'event' else _StreamingProcessingDedupeDoFn(
                 cfg.window_sec,
                 cfg.route_duplicates_to_dlq,
                 err_tag,
-                route_errors))
+                route_errors,
+                cfg.dlq_redact_fields))
         st_out = (
             keyed_good
             | 'StatefulDeduplicate' >> beam.ParDo(state_dofn).with_outputs(

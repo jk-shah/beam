@@ -186,13 +186,14 @@ def _canonical_number_str_for_digest(
     except OverflowError:
       pass
     ctx = decimal.Context(prec=max(1, float_sig_digits))
-    return _canonical_number_bytes(ctx.plus(decimal.Decimal(val))).decode(
-        'ascii')
+    return _canonical_number_bytes(ctx.plus(
+        decimal.Decimal(val))).decode('ascii')
   return _canonical_number_bytes(val).decode('ascii')
 
 
-def _canonical_value_node(
-    v: Any, float_sig_digits: int | None = None) -> tuple[int, Any]:
+def _canonical_value_node(v: Any,
+                          float_sig_digits: int | None = None
+                          ) -> tuple[int, Any]:
   """Canonicalizes any scalar, temporal, dict, Row, or list recursively."""
   if v is None:
     return (0, '')
@@ -234,8 +235,7 @@ def _encode_key_atom(val: Any) -> tuple[int, bytes]:
     return (5, ts_str.encode('utf-8'))
   if hasattr(val, '_asdict') or isinstance(val, (dict, list, tuple)):
     node = _canonical_value_node(val, None)
-    return (
-        node[0], json.dumps(node[1], separators=(',', ':')).encode('utf-8'))
+    return (node[0], json.dumps(node[1], separators=(',', ':')).encode('utf-8'))
   return (6, repr(val).encode('utf-8'))
 
 
@@ -402,8 +402,8 @@ def _read_endpoint_pcoll(pipeline, label: str, ep: uris.ParsedEndpoint):
       return (
           pipeline
           | f'{label}_Lines' >> beam.io.ReadFromText(path)
-          | f'{label}_Json' >> beam.FlatMap(
-              lambda line: [json.loads(line)] if line.strip() else []))
+          | f'{label}_Json' >>
+          beam.FlatMap(lambda line: [json.loads(line)] if line.strip() else []))
 
   raise uris.UriError(
       f'beam diff currently supports file paths/globs, delta://, iceberg://, '
@@ -442,14 +442,30 @@ def _endpoint_schema(
 # Spellings of the same logical type across Arrow, Avro, BigQuery and Python,
 # so a Parquet-vs-Avro or file-vs-BigQuery diff doesn't report false retypes.
 _TYPE_ALIASES = {
-    'int': 'int', 'int8': 'int', 'int16': 'int', 'int32': 'int',
-    'int64': 'int', 'long': 'int', 'integer': 'int',
-    'float': 'float', 'float32': 'float', 'float64': 'float',
-    'double': 'float', 'halffloat': 'float',
-    'decimal': 'decimal', 'numeric': 'decimal', 'bignumeric': 'decimal',
-    'str': 'str', 'string': 'str', 'large_string': 'str', 'utf8': 'str',
-    'bool': 'bool', 'boolean': 'bool',
-    'bytes': 'bytes', 'binary': 'bytes', 'large_binary': 'bytes',
+    'int': 'int',
+    'int8': 'int',
+    'int16': 'int',
+    'int32': 'int',
+    'int64': 'int',
+    'long': 'int',
+    'integer': 'int',
+    'float': 'float',
+    'float32': 'float',
+    'float64': 'float',
+    'double': 'float',
+    'halffloat': 'float',
+    'decimal': 'decimal',
+    'numeric': 'decimal',
+    'bignumeric': 'decimal',
+    'str': 'str',
+    'string': 'str',
+    'large_string': 'str',
+    'utf8': 'str',
+    'bool': 'bool',
+    'boolean': 'bool',
+    'bytes': 'bytes',
+    'binary': 'bytes',
+    'large_binary': 'bytes',
 }
 
 
@@ -500,17 +516,15 @@ def run_diff(
     explicit_cols = [
         c.strip() for c in str(columns or '').split(',') if c.strip()
     ]
-    if not explicit_cols or any(
-        not c for c in str(columns or '').split(',')):
+    if not explicit_cols or any(not c for c in str(columns or '').split(',')):
       raise uris.UriError(
           "--columns: expected 'shared', 'all', or a comma-separated list "
           'of column names (e.g. --columns qty,location,price)')
   shared_cols: list[frozenset[str] | None] = [
-      (frozenset(explicit_cols) | frozenset(key_cols))
-      if explicit_cols is not None else None
+      (frozenset(explicit_cols)
+       | frozenset(key_cols)) if explicit_cols is not None else None
   ]
-  sig_digits = (
-      max(1, int(-math.log10(rtol))) if (rtol and rtol > 0) else None)
+  sig_digits = (max(1, int(-math.log10(rtol))) if (rtol and rtol > 0) else None)
 
   def _key_row(row):
     d = _row_to_plain_dict(row)
@@ -518,7 +532,8 @@ def run_diff(
       missing = [k for k in key_cols if k not in d]
       if missing:
         raise ValueError(
-            f'key column(s) {missing} not found in row columns {sorted(d.keys())}')
+            f'key column(s) {missing} not found in row columns {sorted(d.keys())}'
+        )
     if shared_cols[0] is not None:
       d = {k: v for k, v in d.items() if k in shared_cols[0]}
     if key_cols:
@@ -530,7 +545,8 @@ def run_diff(
       k_disp = d
     return (k_tuple, (d, k_disp))
 
-  def _acc_add_row(acc: list[Any], item: tuple[dict[str, Any], Any]) -> list[Any]:
+  def _acc_add_row(acc: list[Any], item: tuple[dict[str, Any],
+                                               Any]) -> list[Any]:
     row_dict, key_display = item
     digest_int = int.from_bytes(
         _canonical_row_digest(row_dict, sig_digits), 'big')
@@ -715,8 +731,8 @@ def run_diff(
     else:
       acc['key_lists_truncated'] = True
 
-  def _global_add_event(
-      acc: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
+  def _global_add_event(acc: dict[str, Any],
+                        event: dict[str, Any]) -> dict[str, Any]:
     acc['left_rows'] += event['left_rows']
     acc['right_rows'] += event['right_rows']
     acc['matched_rows'] += event['matched_rows']
@@ -755,7 +771,9 @@ def run_diff(
         'columns_added': sorted(set(right_schema) - set(left_schema)),
         'columns_removed': sorted(set(left_schema) - set(right_schema)),
         'type_changes': {
-            c: {'left': left_schema[c], 'right': right_schema[c]}
+            c: {
+                'left': left_schema[c], 'right': right_schema[c]
+            }
             for c in sorted(set(left_schema) & set(right_schema))
             if left_schema[c] != right_schema[c]
         },
@@ -797,10 +815,9 @@ def run_diff(
     if explicit_cols is not None:
       req_set = set(explicit_cols)
       schema_drift = bool(
-          schema_diff and (
-              (req_set & set(schema_diff['columns_added'])) or
-              (req_set & set(schema_diff['columns_removed'])) or
-              (req_set & set(schema_diff['type_changes']))))
+          schema_diff and ((req_set & set(schema_diff['columns_added'])) or
+                           (req_set & set(schema_diff['columns_removed'])) or
+                           (req_set & set(schema_diff['type_changes']))))
     else:
       schema_drift = bool(
           schema_diff and (
@@ -836,6 +853,7 @@ def run_diff(
   # Zero-SDK-import `local_fast` path (`<= 64 MiB` local file / Delta / Iceberg
   # datasets with no explicit `--runner`): ~25-60ms instead of ~1.2s FnApiRunner!
   import os
+
   def _arg_val(argv_list: list[str], flag: str) -> str | None:
     for idx, tok in enumerate(argv_list):
       if tok == flag and idx + 1 < len(argv_list):
@@ -848,7 +866,8 @@ def run_diff(
   fast_proj = default_project or _arg_val(p_args, '--project')
   _REMOTE_SCHEMES = ('gs://', 's3://', 'azfs://', 'hdfs://')
   if (not os.environ.get('BEAM_CLI_NO_FAST_PATH') and not explicit_runner and
-      not any(u.lower().startswith(_REMOTE_SCHEMES) for u in (left_uri, right_uri))):
+      not any(u.lower().startswith(_REMOTE_SCHEMES)
+              for u in (left_uri, right_uri))):
     parsed_left_opts = uris.parse_kv_options(left_opts, None, '--left-opt')
     parsed_right_opts = uris.parse_kv_options(right_opts, None, '--right-opt')
     cand_left = uris.parse_endpoint(
@@ -904,16 +923,36 @@ def run_diff(
               estimated_bytes=comb_b,
               limit_bytes=cap_limit)
         if l_b is not None and r_b is not None and comb_b <= 256 * 1024 * 1024:
-          def _load_fast_rows(ep_obj: uris.ParsedEndpoint) -> list[dict[str, Any]]:
+
+          def _load_fast_rows(
+              ep_obj: uris.ParsedEndpoint) -> list[dict[str, Any]]:
             try:
               if ep_obj.kind == 'file' and ep_obj.format == 'json':
                 out_r: list[dict[str, Any]] = []
+                rem_decomp = pipe_sql._max_decompressed_bytes()
                 for fp in pipe_sql._match_source_files(ep_obj.config['path']):
-                  with pipe_sql._open_binary(fp) as bf:
+                  with pipe_sql._open_binary(fp,
+                                             max_bytes=rem_decomp) as raw_bf:
+                    bf = (
+                        raw_bf
+                        if isinstance(raw_bf, pipe_sql._BoundedBinaryReader) or
+                        not fp.lower().endswith(
+                            ('.gz', '.bz2')) else pipe_sql._BoundedBinaryReader(
+                                raw_bf, max_bytes=rem_decomp))
+                    start_read = getattr(bf, '_bytes_read', 0)
                     for raw_ln in bf:
-                      txt_ln = raw_ln.decode('utf-8-sig', errors='replace').strip()
+                      if not isinstance(bf, pipe_sql._BoundedBinaryReader):
+                        rem_decomp -= len(raw_ln)
+                        if rem_decomp < 0:
+                          raise uris.UriError(
+                              'decompressed input exceeds 512 MiB safety limit')
+                      txt_ln = raw_ln.decode(
+                          'utf-8-sig', errors='replace').strip()
                       if txt_ln:
                         out_r.append(json.loads(txt_ln))
+                    if isinstance(bf, pipe_sql._BoundedBinaryReader):
+                      rem_decomp = max(
+                          1, rem_decomp - (bf._bytes_read - start_read))
                 return out_r
               _, loaded_r, _ = pipe_sql.load_endpoint_rows(
                   ep_obj, default_project=fast_proj)
@@ -946,7 +985,8 @@ def run_diff(
                 }))
             _global_add_event(g_acc, ev)
           sanitized_summary = json.loads(
-              json.dumps(output.sanitize_untrusted_value(g_acc), allow_nan=False))
+              json.dumps(
+                  output.sanitize_untrusted_value(g_acc), allow_nan=False))
           return _finalize_report(
               sanitized_summary, schema_diff_fast, runner_tag='local_fast')
 
@@ -959,8 +999,8 @@ def run_diff(
   proj = default_project or opts.view_as(GoogleCloudOptions).project
 
   std_opts = opts.view_as(StandardOptions)
-  if not std_opts.runner or std_opts.runner.lower() in (
-      'direct', 'directrunner'):
+  if not std_opts.runner or std_opts.runner.lower() in ('direct',
+                                                        'directrunner'):
     std_opts.runner = 'FnApiRunner'
 
   from apache_beam.io.filesystems import FileSystems
@@ -988,7 +1028,8 @@ def run_diff(
     if ep_chk.kind == 'file':
       if not FileSystems.match([ep_chk.config['path']])[0].metadata_list:
         raise uris.UriError(
-            f'no files matched {ep_chk.raw!r} (checked {ep_chk.config["path"]!r})')
+            f'no files matched {ep_chk.raw!r} (checked {ep_chk.config["path"]!r})'
+        )
 
   if max_bytes is not None:
     limit = cost_guard.parse_byte_size(max_bytes)
@@ -1077,7 +1118,11 @@ def run_diff(
   import uuid
 
   remote_runner = (std_opts.runner or '').lower() not in (
-      'fnapirunner', 'directrunner', 'direct', 'prismrunner', 'prism',
+      'fnapirunner',
+      'directrunner',
+      'direct',
+      'prismrunner',
+      'prism',
       'bundlebaseddirectrunner')
   temp_loc = opts.view_as(GoogleCloudOptions).temp_location
   if remote_runner and not temp_loc:
@@ -1111,19 +1156,18 @@ def run_diff(
         | 'KeyRight' >> beam.Map(_key_row)
         | 'CombineRight' >> beam.CombinePerKey(_KeySummaryCombineFn()))
 
-    _ = (
-        {
-            'left': left_sum, 'right': right_sum
-        }
-        | 'CoGroup' >> beam.CoGroupByKey()
-        | 'CompareKeys' >> beam.Map(_compare_grouped)
-        | 'SummarizeDiff' >> beam.CombineGlobally(
-            _GlobalDiffReportCombineFn()).without_defaults()
-        | 'SerializeSummary' >> beam.Map(
-            lambda d: json.dumps(
-                output.sanitize_untrusted_value(d), allow_nan=False))
-        | 'WriteSummary' >> beam.io.WriteToText(
-            out_file_prefix, num_shards=1, shard_name_template=''))
+    _ = ({
+        'left': left_sum, 'right': right_sum
+    }
+         | 'CoGroup' >> beam.CoGroupByKey()
+         | 'CompareKeys' >> beam.Map(_compare_grouped)
+         | 'SummarizeDiff' >> beam.CombineGlobally(
+             _GlobalDiffReportCombineFn()).without_defaults()
+         | 'SerializeSummary' >> beam.Map(
+             lambda d: json.dumps(
+                 output.sanitize_untrusted_value(d), allow_nan=False))
+         | 'WriteSummary' >> beam.io.WriteToText(
+             out_file_prefix, num_shards=1, shard_name_template=''))
     res = pipeline.run()
     wait_st = res.wait_until_finish()
     if wait_st:
@@ -1166,5 +1210,14 @@ def run_diff(
   finally:
     if tmp_dir is not None:
       shutil.rmtree(tmp_dir, ignore_errors=True)
+    else:
+      try:
+        rem_matches = FileSystems.match([out_file_prefix + '*'
+                                         ])[0].metadata_list
+        if rem_matches:
+          FileSystems.delete([m.path for m in rem_matches])
+      except Exception:  # pylint: disable=broad-except
+        pass
 
-  return _finalize_report(summary, schema_diff, job_id=job_id, final_state=final_state)
+  return _finalize_report(
+      summary, schema_diff, job_id=job_id, final_state=final_state)

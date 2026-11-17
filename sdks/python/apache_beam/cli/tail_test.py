@@ -41,16 +41,14 @@ class TailCommandsTest(unittest.TestCase):
     self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
     self.beam_home = os.path.join(self.tmp, 'beam_home')
     self._env_patch = mock.patch.dict(
-        os.environ, {'BEAM_HOME': self.beam_home}, clear=False
-    )
+        os.environ, {'BEAM_HOME': self.beam_home}, clear=False)
     self._env_patch.start()
     self.addCleanup(self._env_patch.stop)
 
   def test_interactive_tail_formatter_color_and_sanitization(self):
     for color in (True, False):
       fmt = tail.InteractiveTailFormatter(
-          'kafka://broker:9092/events\x1b[31m', follow=True, use_color=color
-      )
+          'kafka://broker:9092/events\x1b[31m', follow=True, use_color=color)
       stderr = io.StringIO()
       stdout = io.StringIO()
       with (
@@ -61,7 +59,9 @@ class TailCommandsTest(unittest.TestCase):
         fmt.on_stream_record(
             {
                 'id': 1,
-                'meta': {'env': 'prod'},
+                'meta': {
+                    'env': 'prod'
+                },
                 'msg': 'x' * 80 + '\x1b]0;pwn\x07',
             },
             1,
@@ -74,20 +74,23 @@ class TailCommandsTest(unittest.TestCase):
 
   def test_local_tail_leases_and_pubsub_gc_protection(self):
     now = time.time()
-    tail._write_local_tail_lease('beam-cli-follow-60000000-live', int(now) + 600)
+    tail._write_local_tail_lease(
+        'beam-cli-follow-60000000-a1b2c3d4', int(now) + 600)
     self.assertTrue(
-        tail._is_local_tail_pid_alive('beam-cli-follow-60000000-live', now)
-    )
-    tail._remove_local_tail_lease('beam-cli-follow-60000000-live')
+        tail._is_local_tail_pid_alive('beam-cli-follow-60000000-a1b2c3d4', now))
+    tail._remove_local_tail_lease('beam-cli-follow-60000000-a1b2c3d4')
     self.assertFalse(
-        tail._is_local_tail_pid_alive('beam-cli-follow-60000000-live', now)
-    )
+        tail._is_local_tail_pid_alive('beam-cli-follow-60000000-a1b2c3d4', now))
 
-    # Expired lease file is unlinked automatically
-    tail._write_local_tail_lease('beam-cli-peek-60000000-old', int(now) - 3600)
-    self.assertFalse(
-        tail._is_local_tail_pid_alive('beam-cli-peek-60000000-old', now)
-    )
+    # Live PID survives expired lease_until (e.g. laptop sleep), while dead PID
+    # lease file is unlinked automatically.
+    tail._write_local_tail_lease(
+        'beam-cli-peek-60000000-11112222', int(now) - 3600)
+    self.assertTrue(
+        tail._is_local_tail_pid_alive('beam-cli-peek-60000000-11112222', now))
+    with mock.patch('os.kill', side_effect=ProcessLookupError()):
+      self.assertFalse(
+          tail._is_local_tail_pid_alive('beam-cli-peek-60000000-11112222', now))
 
     old_hex = format(int(now) - 3600, 'x')
     deleted: list[str] = []
@@ -95,14 +98,20 @@ class TailCommandsTest(unittest.TestCase):
     class FakeSubscriber:
       def get_subscription(self, request):
         name = request['subscription']
-        if 'activelease' in name:
+        if 'aa000001' in name:
           return types.SimpleNamespace(
-              labels={'beam_mode': 'follow', 'beam_lease_until': str(int(now) + 900)}
-          )
-        if 'expiredlease' in name:
+              labels={
+                  'beam_cli': 'peek',
+                  'beam_mode': 'follow',
+                  'beam_lease_until': str(int(now) + 900),
+              })
+        if 'bb000002' in name:
           return types.SimpleNamespace(
-              labels={'beam_mode': 'peek', 'beam_lease_until': str(int(now) - 900)}
-          )
+              labels={
+                  'beam_cli': 'peek',
+                  'beam_mode': 'peek',
+                  'beam_lease_until': str(int(now) - 900),
+              })
         raise RuntimeError('IAM denied get_subscription')
 
       def delete_subscription(self, request):
@@ -110,21 +119,19 @@ class TailCommandsTest(unittest.TestCase):
 
     fake_pub = types.SimpleNamespace(
         list_topic_subscriptions=lambda request: [
-            f'projects/p/subscriptions/user-prod-sub',
-            f'projects/p/subscriptions/beam-cli-follow-{old_hex}-activelease',
-            f'projects/p/subscriptions/beam-cli-peek-{old_hex}-expiredlease',
-            f'projects/p/subscriptions/beam-cli-follow-{old_hex}-nolabel24h',
-            f'projects/p/subscriptions/beam-cli-peek-{old_hex}-nolabelpeek',
-        ]
-    )
+            'projects/p/subscriptions/user-prod-sub',
+            'projects/p/subscriptions/beam-cli-peek-60000000-nothex00',
+            f'projects/p/subscriptions/beam-cli-follow-{old_hex}-aa000001',
+            f'projects/p/subscriptions/beam-cli-peek-{old_hex}-bb000002',
+            f'projects/p/subscriptions/beam-cli-follow-{old_hex}-cc000003',
+            f'projects/p/subscriptions/beam-cli-peek-{old_hex}-dd000004', ])
     tail._gc_stale_peek_subscriptions(
-        FakeSubscriber(), fake_pub, 'projects/p/topics/t', max_age_sec=900.0
-    )
+        FakeSubscriber(), fake_pub, 'projects/p/topics/t', max_age_sec=900.0)
     self.assertEqual(
         deleted,
         [
-            f'projects/p/subscriptions/beam-cli-peek-{old_hex}-expiredlease',
-            f'projects/p/subscriptions/beam-cli-peek-{old_hex}-nolabelpeek',
+            f'projects/p/subscriptions/beam-cli-peek-{old_hex}-bb000002',
+            f'projects/p/subscriptions/beam-cli-peek-{old_hex}-dd000004',
         ],
     )
 
@@ -164,8 +171,7 @@ class TailCommandsTest(unittest.TestCase):
                   message_id='m-1',
                   data=b'{"order_id": 10}',
                   publish_time=datetime.datetime(
-                      2026, 11, 15, tzinfo=datetime.timezone.utc
-                  ),
+                      2026, 11, 15, tzinfo=datetime.timezone.utc),
                   attributes={'src': 'web'},
               ),
           )
@@ -198,8 +204,7 @@ class TailCommandsTest(unittest.TestCase):
     fake_pubsub = types.ModuleType('google.cloud.pubsub_v1')
     fake_pubsub.SubscriberClient = FakeSubClient
     fake_pubsub.PublisherClient = lambda: types.SimpleNamespace(
-        list_topic_subscriptions=lambda request: []
-    )
+        list_topic_subscriptions=lambda request: [])
     fake_gc = types.ModuleType('google.cloud')
     fake_gc.pubsub_v1 = fake_pubsub
     fake_api_core = types.ModuleType('google.api_core')
@@ -300,7 +305,9 @@ class TailCommandsTest(unittest.TestCase):
       with open(csv_file, 'a', encoding='utf-8') as f:
         f.write('2,PAID\n')
       pq.write_table(
-          pa.table({'id': [3], 'status': ['SHIPPED']}),
+          pa.table({
+              'id': [3], 'status': ['SHIPPED']
+          }),
           os.path.join(watch_dir, 'part-00001.parquet'),
       )
 
@@ -358,15 +365,27 @@ class TailCommandsTest(unittest.TestCase):
     p0 = os.path.join(delta_dir, 'part-0.parquet')
     pq.write_table(pa.Table.from_pylist([{'id': 1, 'msg': 'v0'}]), p0)
     commit0 = [
-        json.dumps({'protocol': {'minReaderVersion': 1, 'minWriterVersion': 2}}),
+        json.dumps({'protocol': {
+            'minReaderVersion': 1, 'minWriterVersion': 2
+        }}),
         json.dumps({
             'metaData': {
                 'id': 't1',
                 'schemaString': json.dumps({
                     'type': 'struct',
                     'fields': [
-                        {'name': 'id', 'type': 'long', 'nullable': True, 'metadata': {}},
-                        {'name': 'msg', 'type': 'string', 'nullable': True, 'metadata': {}},
+                        {
+                            'name': 'id',
+                            'type': 'long',
+                            'nullable': True,
+                            'metadata': {}
+                        },
+                        {
+                            'name': 'msg',
+                            'type': 'string',
+                            'nullable': True,
+                            'metadata': {}
+                        },
                     ],
                 }),
                 'partitionColumns': [],
@@ -405,9 +424,7 @@ class TailCommandsTest(unittest.TestCase):
                     'modificationTime': 1700000001000,
                     'dataChange': True,
                 }
-            })
-            + '\n'
-        )
+            }) + '\n')
 
     td = threading.Thread(target=commit_v1, daemon=True)
     td.start()
@@ -449,8 +466,7 @@ class TailCommandsTest(unittest.TestCase):
     tr = threading.Thread(target=rotate_and_append, daemon=True)
     tr.start()
     res_rot = tail.run_tail(
-        rot_log, limit=2, duration='2s', follow=True, poll_interval=0.05
-    )
+        rot_log, limit=2, duration='2s', follow=True, poll_interval=0.05)
     tr.join(timeout=2)
     self.assertEqual(res_rot['sampled_count'], 2)
 

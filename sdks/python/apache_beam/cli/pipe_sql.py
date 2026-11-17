@@ -34,6 +34,7 @@ import decimal
 import glob
 import io
 import json
+import keyword
 import math
 import os
 import re
@@ -50,9 +51,11 @@ from . import uris
 dlq.ensure_csv_field_size_limit()
 
 _SQL_THREAD_LOCAL = threading.local()
+_UMASK_LOCK = threading.Lock()
 _EMPTY_PLACEHOLDER_COL = '__beam_cli_empty_placeholder__'
 
-_ALIAS_PREFIX_RE = re.compile(r'^(?P<alias>[A-Za-z_][A-Za-z0-9_]*)=(?P<uri>.+)$')
+_ALIAS_PREFIX_RE = re.compile(
+    r'^(?P<alias>[A-Za-z_][A-Za-z0-9_]*)=(?P<uri>.+)$')
 _SAFE_IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 
 
@@ -156,9 +159,10 @@ def parse_named_sources(
 
     has_jinja_syntax = uris._has_jinja_syntax(target_uri)
     mixed_groups = (
-        uris.local_format_groups(target_uri)
-        if (not from_format and (allow_sniff or not has_jinja_syntax)) else {})
-    eff_format = from_format or (next(iter(mixed_groups), None) if mixed_groups else None)
+        uris.local_format_groups(target_uri) if
+        (not from_format and (allow_sniff or not has_jinja_syntax)) else {})
+    eff_format = from_format or (
+        next(iter(mixed_groups), None) if mixed_groups else None)
 
     ep = uris.parse_endpoint(
         target_uri,
@@ -200,7 +204,8 @@ def validate_readonly_select_sql(
     raise SqlPipeError('--sql query cannot be empty')
   if not sqlite3.complete_statement(q + ';'):
     raise SqlPipeError(f'incomplete --sql query: {sql_query!r}')
-  lead = q.lstrip('(').lstrip().split(None, 1)[0].upper() if q.strip('(').strip() else ''
+  lead = q.lstrip('(').lstrip().split(
+      None, 1)[0].upper() if q.strip('(').strip() else ''
   if lead not in ('SELECT', 'WITH'):
     raise SqlPipeError(
         f'--sql only accepts read-only SELECT or WITH queries (got {lead!r})')
@@ -208,10 +213,88 @@ def validate_readonly_select_sql(
 
 
 def _unquote_sql_ident(ident: str) -> str:
+  if any(c in ident for c in ('\r', '\n', '\x00')):
+    raise SqlPipeError(
+        f'column or alias identifier cannot contain control characters: {ident!r}'
+    )
   s = ident.strip()
   if len(s) >= 2 and s[0] in ('"', '`') and s[-1] == s[0]:
-    return s[1:-1].replace(s[0] * 2, s[0]).strip()
+    res = s[1:-1].replace(s[0] * 2, s[0]).strip()
+    if any(c in res for c in ('\r', '\n', '\x00')):
+      raise SqlPipeError(
+          f'column or alias identifier cannot contain control characters: {ident!r}'
+      )
+    return res
   return s
+
+
+def _reject_ctrl_in_backtick_idents(sql_text: str) -> None:
+  """Rejects CR/LF/NUL inside backtick-quoted SQL column identifiers."""
+  if '\x00' in sql_text:
+    raise SqlPipeError('column identifier cannot contain NUL bytes')
+  for is_c, seg in _scan_sql_outside_literals(sql_text):
+    if not is_c:
+      continue
+    for m in re.finditer(r'`(?:``|[^`])*`', seg):
+      tok = m.group(0)
+      if '\r' in tok or '\n' in tok:
+        raise SqlPipeError(
+            f'column identifier cannot contain newline characters: {tok!r}')
+
+
+def _compile_sql_select_safe(
+    raw_select: str,
+    *,
+    allow_jinja: bool = False,
+    flag_name: str = '--select',
+) -> dict[str, Any]:
+  """Compiles SELECT items, using `getattr(__row__, col)` for backticked/non-ident columns."""
+  from . import expressions
+  _reject_ctrl_in_backtick_idents(raw_select)
+  cfg = dict(
+      expressions.compile_select(
+          raw_select,
+          known_columns=None,
+          allow_jinja=allow_jinja,
+          flag_name=flag_name)[0])
+  fields_cfg = dict(cfg.get('fields') or {})
+  needs_py = cfg.get('language') == 'python'
+  for part in expressions._split_top_level_commas(raw_select):
+    p_s = part.strip()
+    if not p_s or p_s == '*' or re.match(r'^\*\s+EXCEPT\s*\(', p_s, re.I):
+      continue
+    m_as = expressions._AS_ALIAS_RE.match(part)
+    m_eq = expressions._EQ_ALIAS_RE.match(part) if not m_as else None
+    if m_as:
+      alias = m_as.group('alias')
+      expr_tok = m_as.group('expr').strip()
+    elif m_eq:
+      alias = m_eq.group('alias')
+      expr_tok = m_eq.group('expr').strip()
+    else:
+      plain_direct = expressions._unwrap_plain_col(p_s)
+      if plain_direct is None:
+        continue
+      alias = plain_direct
+      expr_tok = p_s
+    col = expressions._unwrap_plain_col(expr_tok)
+    if col is None:
+      continue
+    if any(c in col for c in ('\r', '\n', '\x00')):
+      raise SqlPipeError(
+          f'column identifier cannot contain control characters: {col!r}')
+    from_bt = expr_tok.startswith('`')
+    if (from_bt or not col.isidentifier() or
+        keyword.iskeyword(col)) and (alias in fields_cfg):
+      fields_cfg[alias] = {
+          'callable': f'def _cli_fn(__row__):\n  return getattr(__row__, {col!r})\n'
+      }
+      needs_py = True
+  if fields_cfg:
+    cfg['fields'] = fields_cfg
+  if needs_py:
+    cfg['language'] = 'python'
+  return cfg
 
 
 def _split_top_level_sql_and(clause: str) -> list[str]:
@@ -1391,10 +1474,10 @@ def _merge_extra_sql_dlq_refs(
   if not extra_refs:
     return
   transforms = spec_out.setdefault('pipeline', {}).setdefault('transforms', [])
-  merge_node = next(
-      (t for t in transforms if t.get('name') == 'MergeDlq'), None)
-  write_node = next(
-      (t for t in transforms if t.get('name') == 'WriteDlq'), None)
+  merge_node = next((t for t in transforms if t.get('name') == 'MergeDlq'),
+                    None)
+  write_node = next((t for t in transforms if t.get('name') == 'WriteDlq'),
+                    None)
   if merge_node is not None:
     cur_in = list(merge_node.get('input') or [])
     for r in extra_refs:
@@ -1403,8 +1486,8 @@ def _merge_extra_sql_dlq_refs(
     merge_node['input'] = cur_in
   elif write_node is not None:
     prev_in = write_node['input']
-    all_refs = list(extra_refs) + (
-        [prev_in] if isinstance(prev_in, str) else list(prev_in))
+    all_refs = list(extra_refs) + ([prev_in] if isinstance(prev_in, str) else
+                                   list(prev_in))
     if len(all_refs) == 1:
       write_node['input'] = all_refs[0]
     else:
@@ -1498,8 +1581,7 @@ def _rewrite_sql_case_and_cast(code_seg: str) -> str:
   return out
 
 
-def _normalize_sql_scalar_expr(
-    raw_expr: str, table_aliases: set[str]) -> str:
+def _normalize_sql_scalar_expr(raw_expr: str, table_aliases: set[str]) -> str:
   low_aliases = {a.lower() for a in table_aliases if a}
   qual_re = re.compile(
       r'(?<![A-Za-z0-9_])(?P<qa>[A-Za-z_][A-Za-z0-9_]*|`[^`]+`|"[^"]+")\s*\.\s*'
@@ -1588,7 +1670,7 @@ class LoweredSqlPlan(NamedTuple):
 
 def try_lower_sql_to_python_yaml(
     sql_query: str,
-    source_aliases: Iterable[str] = ('source',),
+    source_aliases: Iterable[str] = ('source', ),
     *,
     strict: bool = False,
 ) -> LoweredSqlPlan | None:
@@ -1607,11 +1689,11 @@ def try_lower_sql_to_python_yaml(
       format='json',
       yaml_type='ReadFromJson',
       config={'path': 'memory://input.jsonl'})
-  ns = NamedSource(alias=aliases[0], uri='memory://input.jsonl', endpoint=dummy_ep)
+  ns = NamedSource(
+      alias=aliases[0], uri='memory://input.jsonl', endpoint=dummy_ep)
   spec = _try_lower_single_source_sql(
       ns,
-      clean_q,
-      [],
+      clean_q, [],
       f'Read_{ns.alias}',
       None,
       has_unbounded=False,
@@ -1653,17 +1735,24 @@ def _try_lower_single_source_sql(
           'HAVING / TUMBLE / HOP / SESSION / LIMIT and 2-source ASOF / INTERVAL JOIN. '
           'Omit --sql-engine=python to use Calcite SQL or local DuckDB/SQLite.')
 
+  _reject_ctrl_in_backtick_idents(clean_q)
   code_upper = ' '.join(
       seg for is_c, seg in _scan_sql_outside_literals(clean_q) if is_c)
   if re.search(r'^\s*WITH\b', code_upper, re.I):
     _bail('WITH CTEs require Calcite or local SQL engine')
     return None
   if re.search(r'\bOVER\s*\(', code_upper, re.I):
-    _bail('analytic OVER(...) window functions require Calcite or local SQL engine')
+    _bail(
+        'analytic OVER(...) window functions require Calcite or local SQL engine'
+    )
     return None
-  if re.search(r'\b(?:UNION|INTERSECT)\b|\bEXCEPT\s+(?:ALL\s+|DISTINCT\s+)?SELECT\b',
-               code_upper, re.I):
-    _bail('set operations (UNION/INTERSECT/EXCEPT SELECT) require Calcite or local SQL engine')
+  if re.search(
+      r'\b(?:UNION|INTERSECT)\b|\bEXCEPT\s+(?:ALL\s+|DISTINCT\s+)?SELECT\b',
+      code_upper,
+      re.I):
+    _bail(
+        'set operations (UNION/INTERSECT/EXCEPT SELECT) require Calcite or local SQL engine'
+    )
     return None
 
   # Scan top-level clause boundaries outside string literals and parentheses.
@@ -1701,7 +1790,9 @@ def _try_lower_single_source_sql(
               _bail('non-temporal JOIN requires Calcite or local SQL engine')
               return None
             if kw_norm == 'ORDER BY':
-              _bail('ORDER BY is not supported on unordered distributed PCollections')
+              _bail(
+                  'ORDER BY is not supported on unordered distributed PCollections'
+              )
               return None
             clauses.append((kw_norm, pos + i, pos + i + len(km.group(0))))
             i += len(km.group(0))
@@ -1719,7 +1810,8 @@ def _try_lower_single_source_sql(
     if kw_name in clause_bodies or kw_name not in expected_order:
       _bail(f'duplicate or unsupported clause {kw_name}')
       return None
-    if seen_order and expected_order.index(kw_name) < expected_order.index(seen_order[-1]):
+    if seen_order and expected_order.index(kw_name) < expected_order.index(
+        seen_order[-1]):
       _bail(f'out-of-order SQL clause {kw_name}')
       return None
     seen_order.append(kw_name)
@@ -1730,7 +1822,8 @@ def _try_lower_single_source_sql(
   is_distinct = False
   if re.match(r'^DISTINCT\b', select_raw, re.I):
     is_distinct = True
-    select_raw = re.sub(r'^DISTINCT\s+', '', select_raw, count=1, flags=re.I).strip()
+    select_raw = re.sub(
+        r'^DISTINCT\s+', '', select_raw, count=1, flags=re.I).strip()
   elif re.match(r'^ALL\b', select_raw, re.I):
     select_raw = re.sub(r'^ALL\s+', '', select_raw, count=1, flags=re.I).strip()
 
@@ -1758,18 +1851,22 @@ def _try_lower_single_source_sql(
     if w_fn == 'TUMBLE' and len(iv_parts) == 1:
       window_cfg = {
           'type': 'fixed',
-          'size': _format_seconds_duration(_parse_sql_interval_literal(iv_parts[0])),
+          'size': _format_seconds_duration(
+              _parse_sql_interval_literal(iv_parts[0])),
       }
     elif w_fn == 'HOP' and len(iv_parts) == 2:
       window_cfg = {
           'type': 'sliding',
-          'period': _format_seconds_duration(_parse_sql_interval_literal(iv_parts[0])),
-          'size': _format_seconds_duration(_parse_sql_interval_literal(iv_parts[1])),
+          'period': _format_seconds_duration(
+              _parse_sql_interval_literal(iv_parts[0])),
+          'size': _format_seconds_duration(
+              _parse_sql_interval_literal(iv_parts[1])),
       }
     elif w_fn == 'SESSION' and len(iv_parts) == 1:
       window_cfg = {
           'type': 'sessions',
-          'gap': _format_seconds_duration(_parse_sql_interval_literal(iv_parts[0])),
+          'gap': _format_seconds_duration(
+              _parse_sql_interval_literal(iv_parts[0])),
       }
     else:
       _bail(f'invalid {w_fn} TVF interval arguments')
@@ -1792,7 +1889,9 @@ def _try_lower_single_source_sql(
   limit_val: int | None = None
   if 'LIMIT' in clause_bodies:
     if not re.fullmatch(r'[0-9]+', clause_bodies['LIMIT']):
-      _bail(f'LIMIT expects a non-negative integer, got {clause_bodies["LIMIT"]!r}')
+      _bail(
+          f'LIMIT expects a non-negative integer, got {clause_bodies["LIMIT"]!r}'
+      )
       return None
     limit_val = int(clause_bodies['LIMIT'])
 
@@ -1810,7 +1909,9 @@ def _try_lower_single_source_sql(
       gm = leg_win_re.match(g_part.strip())
       if gm:
         if window_cfg is not None:
-          _bail('cannot specify multiple windowing functions in FROM and GROUP BY')
+          _bail(
+              'cannot specify multiple windowing functions in FROM and GROUP BY'
+          )
           return None
         raw_ts = _normalize_sql_scalar_expr(gm.group('ts'), table_aliases)
         ts_col = _unquote_sql_ident(raw_ts)
@@ -1819,24 +1920,29 @@ def _try_lower_single_source_sql(
         if w_fn == 'TUMBLE' and len(iv_parts) == 1:
           window_cfg = {
               'type': 'fixed',
-              'size': _format_seconds_duration(_parse_sql_interval_literal(iv_parts[0])),
+              'size': _format_seconds_duration(
+                  _parse_sql_interval_literal(iv_parts[0])),
           }
         elif w_fn == 'HOP' and len(iv_parts) == 2:
           window_cfg = {
               'type': 'sliding',
-              'period': _format_seconds_duration(_parse_sql_interval_literal(iv_parts[0])),
-              'size': _format_seconds_duration(_parse_sql_interval_literal(iv_parts[1])),
+              'period': _format_seconds_duration(
+                  _parse_sql_interval_literal(iv_parts[0])),
+              'size': _format_seconds_duration(
+                  _parse_sql_interval_literal(iv_parts[1])),
           }
         elif w_fn == 'SESSION' and len(iv_parts) == 1:
           window_cfg = {
               'type': 'sessions',
-              'gap': _format_seconds_duration(_parse_sql_interval_literal(iv_parts[0])),
+              'gap': _format_seconds_duration(
+                  _parse_sql_interval_literal(iv_parts[0])),
           }
         else:
           _bail(f'invalid {w_fn} window arguments in GROUP BY')
           return None
       else:
-        raw_group_exprs.append(_normalize_sql_scalar_expr(g_part, table_aliases))
+        raw_group_exprs.append(
+            _normalize_sql_scalar_expr(g_part, table_aliases))
 
   if ts_col is not None:
     ts_cfg: dict[str, Any] = {'timestamp_col': ts_col}
@@ -1851,20 +1957,28 @@ def _try_lower_single_source_sql(
     if wire_yaml_dlq:
       transforms.append(
           dlq.build_dlq_normalizer_transform(
-              'NormalizeSqlTsDlq', 'AssignSqlTimestamps.errors', 'CliAssignTimestamps'))
+              'NormalizeSqlTsDlq',
+              'AssignSqlTimestamps.errors',
+              'CliAssignTimestamps'))
       dlq_refs.append('NormalizeSqlTsDlq')
       current_ref = 'AssignSqlTimestamps.good'
     else:
       current_ref = 'AssignSqlTimestamps'
 
   if 'WHERE' in clause_bodies:
-    norm_where = _normalize_sql_scalar_expr(clause_bodies['WHERE'], table_aliases)
+    norm_where = _normalize_sql_scalar_expr(
+        clause_bodies['WHERE'], table_aliases)
     try:
       where_cfg = expressions.compile_where(
-          norm_where, known_columns=None, allow_jinja=allow_jinja, flag_name='--sql WHERE')[0]
+          norm_where,
+          known_columns=None,
+          allow_jinja=allow_jinja,
+          flag_name='--sql WHERE')[0]
     except expressions.ExpressionError as e:
       if strict:
-        raise SqlPipeError(f'unsupported WHERE expression in --sql-engine=python: {e}') from None
+        raise SqlPipeError(
+            f'unsupported WHERE expression in --sql-engine=python: {e}'
+        ) from None
       return None
     if wire_yaml_dlq:
       where_cfg = dict(where_cfg)
@@ -1887,13 +2001,14 @@ def _try_lower_single_source_sql(
         'name': 'SqlWindowInto',
         'type': 'WindowInto',
         'input': current_ref,
-        'config': {'windowing': window_cfg},
+        'config': {
+            'windowing': window_cfg
+        },
     })
     current_ref = 'SqlWindowInto'
 
   agg_head_re = re.compile(
-      r'^(?P<fn>COUNT|SUM|AVG|MIN|MAX|STDDEV_POP|STDDEV|VAR_POP)\s*\(',
-      re.I)
+      r'^(?P<fn>COUNT|SUM|AVG|MIN|MAX|STDDEV_POP|STDDEV|VAR_POP)\s*\(', re.I)
 
   def _match_whole_agg_call(expr_text: str) -> tuple[str, str] | None:
     s_ex = expr_text.strip()
@@ -1960,7 +2075,8 @@ def _try_lower_single_source_sql(
         a_part = None
     if _match_whole_agg_call(e_part) is not None or inl_agg_re.search(e_part):
       has_agg_in_select = True
-    if window_cfg is not None and re.search(r'\b(?:window_start|window_end)\b', e_part):
+    if window_cfg is not None and re.search(r'\b(?:window_start|window_end)\b',
+                                            e_part):
       needs_window_bounds = True
     if a_part:
       select_alias_to_expr[a_part.lower()] = e_part
@@ -1975,7 +2091,9 @@ def _try_lower_single_source_sql(
     if g_item.isdigit():
       ord_idx = int(g_item) - 1
       if ord_idx < 0 or ord_idx >= len(parsed_select_items):
-        _bail(f'GROUP BY ordinal {g_item} out of range (1..{len(parsed_select_items)})')
+        _bail(
+            f'GROUP BY ordinal {g_item} out of range (1..{len(parsed_select_items)})'
+        )
         return None
       g_item = parsed_select_items[ord_idx][0]
     elif g_item.lower() in select_alias_to_expr:
@@ -1992,13 +2110,36 @@ def _try_lower_single_source_sql(
   is_grouped_query = bool(
       group_raw is not None or has_agg_in_select or 'HAVING' in clause_bodies)
 
+  def _is_plain_safe_col(col: str, *, from_backticks: bool) -> bool:
+    return (
+        not from_backticks and col.isidentifier() and
+        not keyword.iskeyword(col) and
+        bool(output.SAFE_IDENTIFIER_RE.match(col)) and not col.startswith('__'))
+
+  def _sql_col_value_spec(col: str, *,
+                          from_backticks: bool) -> tuple[Any, bool]:
+    if any(c in col for c in ('\r', '\n', '\x00')) or col.startswith('__'):
+      raise SqlPipeError(f'invalid SQL column identifier {col!r}')
+    if _is_plain_safe_col(col, from_backticks=from_backticks):
+      return col, False
+    return ({
+        'callable': f'def _cli_fn(__row__):\n  return getattr(__row__, {col!r})\n'
+    },
+            True)
+
   if is_grouped_query:
     pre_proj_exprs: list[str] = []
     group_cols: list[str] = []
     group_expr_to_col: dict[str, str] = {}
     for idx_g, g_ex in enumerate(group_exprs):
       plain_g = expressions._unwrap_plain_col(g_ex)
-      if plain_g is not None:
+      g_from_bt = g_ex.strip().startswith('`')
+      if plain_g is not None and any(c in plain_g
+                                     for c in ('\r', '\n', '\x00')):
+        raise SqlPipeError(
+            f'column identifier cannot contain control characters: {g_ex!r}')
+      if plain_g is not None and _is_plain_safe_col(plain_g,
+                                                    from_backticks=g_from_bt):
         group_cols.append(plain_g)
         group_expr_to_col[g_ex] = plain_g
       else:
@@ -2006,6 +2147,9 @@ def _try_lower_single_source_sql(
         pre_proj_exprs.append(f'{g_ex} AS {syn_g}')
         group_cols.append(syn_g)
         group_expr_to_col[g_ex] = syn_g
+        if plain_g is not None:
+          group_expr_to_col[plain_g] = syn_g
+          group_expr_to_col[f'`{plain_g}`'] = syn_g
 
     combines: dict[str, Any] = {}
     agg_sig_to_alias: dict[str, str] = {}
@@ -2014,20 +2158,26 @@ def _try_lower_single_source_sql(
     syn_agg_counter = 0
 
     def _register_agg(
-        fn_raw: str, arg_raw: str, preferred_alias: str | None = None
-    ) -> str | None:
+        fn_raw: str,
+        arg_raw: str,
+        preferred_alias: str | None = None) -> str | None:
       nonlocal syn_agg_counter
       fn_low = fn_raw.strip().lower()
       arg_s = arg_raw.strip()
       is_dist_arg = False
       if re.match(r'^DISTINCT\b', arg_s, re.I):
         if fn_low != 'count':
-          _bail(f'{fn_low.upper()}(DISTINCT ...) requires Calcite or local SQL engine')
+          _bail(
+              f'{fn_low.upper()}(DISTINCT ...) requires Calcite or local SQL engine'
+          )
           return None
         is_dist_arg = True
         arg_s = re.sub(r'^DISTINCT\s+', '', arg_s, count=1, flags=re.I).strip()
-        if not arg_s or arg_s == '*' or expressions._split_top_level_commas(arg_s) != [arg_s]:
-          _bail('COUNT(DISTINCT ...) expects a single expression in --sql-engine=python')
+        if not arg_s or arg_s == '*' or expressions._split_top_level_commas(
+            arg_s) != [arg_s]:
+          _bail(
+              'COUNT(DISTINCT ...) expects a single expression in --sql-engine=python'
+          )
           return None
 
       sig = (
@@ -2037,7 +2187,8 @@ def _try_lower_single_source_sql(
         return agg_sig_to_alias[sig]
 
       if preferred_alias and output.SAFE_IDENTIFIER_RE.match(
-          preferred_alias) and preferred_alias not in combines and preferred_alias not in group_cols:
+          preferred_alias
+      ) and preferred_alias not in combines and preferred_alias not in group_cols:
         dest_col = preferred_alias
       else:
         dest_col = f'sql_agg_{syn_agg_counter}'
@@ -2045,12 +2196,16 @@ def _try_lower_single_source_sql(
 
       if is_dist_arg:
         p_arg = expressions._unwrap_plain_col(arg_s)
+        p_bt = arg_s.startswith('`')
         if p_arg is None:
           p_arg = f'sql_agg_in_{syn_agg_counter}'
           syn_agg_counter += 1
           pre_proj_exprs.append(f'{arg_s} AS {p_arg}')
+          val_spec: Any = p_arg
+        else:
+          val_spec, _ = _sql_col_value_spec(p_arg, from_backticks=p_bt)
         combines[dest_col] = {
-            'value': p_arg,
+            'value': val_spec,
             'fn': {
                 'type': 'apache_beam.cli.windowing.CountDistinctCombineFn',
                 'config': {},
@@ -2066,9 +2221,14 @@ def _try_lower_single_source_sql(
             p_arg = f'sql_agg_in_{syn_agg_counter}'
             syn_agg_counter += 1
             pre_proj_exprs.append(f'{arg_s} AS {p_arg}')
+          elif any(c in p_arg
+                   for c in ('\r', '\n', '\x00')) or p_arg.startswith('__'):
+            raise SqlPipeError(f'invalid SQL column identifier {p_arg!r}')
           c_src = f'lambda row: 0 if getattr(row, {p_arg!r}, None) is None else 1'
         combines[dest_col] = {
-            'value': {'callable': c_src, 'output_type': 'integer'},
+            'value': {
+                'callable': c_src, 'output_type': 'integer'
+            },
             'fn': 'sum',
             '_needs_python': True,
         }
@@ -2077,17 +2237,22 @@ def _try_lower_single_source_sql(
           _bail(f'{fn_low.upper()}(*) is invalid')
           return None
         p_arg = expressions._unwrap_plain_col(arg_s)
+        p_bt = arg_s.startswith('`')
         if p_arg is None:
           p_arg = f'sql_agg_in_{syn_agg_counter}'
           syn_agg_counter += 1
           pre_proj_exprs.append(f'{arg_s} AS {p_arg}')
+          val_spec = p_arg
+        else:
+          val_spec, _ = _sql_col_value_spec(p_arg, from_backticks=p_bt)
         comb_fqn = (
-            'apache_beam.cli.windowing.VarPopCombineFn'
-            if fn_low == 'var_pop' else
-            'apache_beam.cli.windowing.StddevPopCombineFn')
+            'apache_beam.cli.windowing.VarPopCombineFn' if fn_low == 'var_pop'
+            else 'apache_beam.cli.windowing.StddevPopCombineFn')
         combines[dest_col] = {
-            'value': p_arg,
-            'fn': {'type': comb_fqn, 'config': {}},
+            'value': val_spec,
+            'fn': {
+                'type': comb_fqn, 'config': {}
+            },
             '_needs_python': True,
         }
       else:
@@ -2096,11 +2261,19 @@ def _try_lower_single_source_sql(
           return None
         fn_clean = 'mean' if fn_low == 'avg' else fn_low
         p_arg = expressions._unwrap_plain_col(arg_s)
+        p_bt = arg_s.startswith('`')
         if p_arg is None:
           p_arg = f'sql_agg_in_{syn_agg_counter}'
           syn_agg_counter += 1
           pre_proj_exprs.append(f'{arg_s} AS {p_arg}')
-        combines[dest_col] = {'value': p_arg, 'fn': fn_clean}
+          val_spec = p_arg
+          needs_py = False
+        else:
+          val_spec, needs_py = _sql_col_value_spec(p_arg, from_backticks=p_bt)
+        comb_entry: dict[str, Any] = {'value': val_spec, 'fn': fn_clean}
+        if needs_py:
+          comb_entry['_needs_python'] = True
+        combines[dest_col] = comb_entry
 
       agg_sig_to_alias[sig] = dest_col
       return dest_col
@@ -2114,7 +2287,8 @@ def _try_lower_single_source_sql(
             expressions._unwrap_plain_col(arg_s) or
             (fn_low if fn_low != 'mean' else 'avg'))
         out_alias = a_part or default_alias or f'{fn_low}_{idx_s}'
-        if not output.SAFE_IDENTIFIER_RE.match(out_alias):
+        if not output.SAFE_IDENTIFIER_RE.match(out_alias) or keyword.iskeyword(
+            out_alias):
           out_alias = f'{fn_low}_{idx_s}'
         reg_col = _register_agg(fn_low, arg_s, preferred_alias=out_alias)
         if reg_col is None:
@@ -2126,13 +2300,16 @@ def _try_lower_single_source_sql(
           post_proj_items.append(out_alias)
       elif inl_agg_re.search(e_part):
         if not a_part:
-          _bail(f'compound aggregate SELECT expression {e_part!r} requires AS <alias>')
+          _bail(
+              f'compound aggregate SELECT expression {e_part!r} requires AS <alias>'
+          )
           return None
         agg_failed = False
 
         def _sub_sel_agg(sm: re.Match[str]) -> str:
           nonlocal agg_failed
-          rc = _register_agg(sm.group('fn'), sm.group('arg'), preferred_alias=None)
+          rc = _register_agg(
+              sm.group('fn'), sm.group('arg'), preferred_alias=None)
           if rc is None:
             agg_failed = True
             return sm.group(0)
@@ -2150,7 +2327,8 @@ def _try_lower_single_source_sql(
         need_post_proj = True
       else:
         mapped_g = group_expr_to_col.get(e_part)
-        plain_e = mapped_g or expressions._unwrap_plain_col(e_part)
+        orig_plain_e = expressions._unwrap_plain_col(e_part)
+        plain_e = mapped_g or orig_plain_e
         if window_cfg is not None and plain_e in ('window_start', 'window_end'):
           needs_window_bounds = True
           need_post_proj = True
@@ -2159,18 +2337,27 @@ def _try_lower_single_source_sql(
           else:
             post_proj_items.append(plain_e)
         elif plain_e is not None and plain_e in group_cols:
-          if a_part and a_part != plain_e:
-            post_proj_items.append(f'{plain_e} AS {a_part}')
+          eff_alias = a_part
+          if (eff_alias is None and orig_plain_e is not None and
+              orig_plain_e != plain_e and
+              output.SAFE_IDENTIFIER_RE.match(orig_plain_e) and
+              not keyword.iskeyword(orig_plain_e)):
+            eff_alias = orig_plain_e
+          if eff_alias and eff_alias != plain_e:
+            post_proj_items.append(f'{plain_e} AS {eff_alias}')
             need_post_proj = True
           else:
             post_proj_items.append(plain_e)
         else:
-          _bail(f'non-aggregated SELECT expression {e_part!r} must appear in GROUP BY')
+          _bail(
+              f'non-aggregated SELECT expression {e_part!r} must appear in GROUP BY'
+          )
           return None
 
     having_norm: str | None = None
     if 'HAVING' in clause_bodies:
-      raw_hav = _normalize_sql_scalar_expr(clause_bodies['HAVING'], table_aliases)
+      raw_hav = _normalize_sql_scalar_expr(
+          clause_bodies['HAVING'], table_aliases)
       if window_cfg is not None:
         raw_hav = _rewrite_sql_window_bound_calls(raw_hav)
         if re.search(r'\b(?:window_start|window_end)\b', raw_hav):
@@ -2181,12 +2368,13 @@ def _try_lower_single_source_sql(
       def _sub_hav_agg(hm: re.Match[str]) -> str:
         nonlocal need_post_proj, hav_failed
         sig_probe = (
-            f'count(distinct {re.sub(r"^DISTINCT\\s+", "", hm.group("arg").strip(), count=1, flags=re.I).strip()})'.lower()
-            if re.match(r'^DISTINCT\b', hm.group('arg').strip(), re.I) else
-            f'{hm.group("fn").lower()}({hm.group("arg").strip()})'.lower())
+            f'count(distinct {re.sub(r"^DISTINCT\\s+", "", hm.group("arg").strip(), count=1, flags=re.I).strip()})'
+            .lower() if re.match(r'^DISTINCT\b', hm.group('arg').strip(), re.I)
+            else f'{hm.group("fn").lower()}({hm.group("arg").strip()})'.lower())
         if sig_probe not in agg_sig_to_alias:
           need_post_proj = True
-        rc = _register_agg(hm.group('fn'), hm.group('arg'), preferred_alias=None)
+        rc = _register_agg(
+            hm.group('fn'), hm.group('arg'), preferred_alias=None)
         if rc is None:
           hav_failed = True
           return hm.group(0)
@@ -2197,16 +2385,18 @@ def _try_lower_single_source_sql(
           for is_c, seg in _scan_sql_outside_literals(raw_hav))
       if hav_failed:
         return None
+      for g_orig, g_syn in group_expr_to_col.items():
+        if g_orig != g_syn:
+          having_norm = having_norm.replace(g_orig, g_syn)
 
     if not combines and group_cols and window_cfg is None:
       # `SELECT region FROM s GROUP BY region` -> deduplicate by group_cols!
       if pre_proj_exprs:
         try:
-          pre_cfg = expressions.compile_select(
+          pre_cfg = _compile_sql_select_safe(
               '*, ' + ', '.join(pre_proj_exprs),
-              known_columns=None,
               allow_jinja=allow_jinja,
-              flag_name='--sql GROUP BY')[0]
+              flag_name='--sql GROUP BY')
         except expressions.ExpressionError as e:
           if strict:
             raise SqlPipeError(str(e)) from None
@@ -2222,7 +2412,9 @@ def _try_lower_single_source_sql(
           'name': 'GroupDistinct',
           'type': 'CliDeduplicate',
           'input': current_ref,
-          'config': {'keys': group_cols, 'keep': 'first'},
+          'config': {
+              'keys': group_cols, 'keep': 'first'
+          },
       })
       current_ref = 'GroupDistinct'
       need_post_proj = True
@@ -2230,18 +2422,19 @@ def _try_lower_single_source_sql(
       if not combines:
         # Windowed GROUP BY without explicit agg (`SELECT window_start, region ... GROUP BY window_start, region`)
         combines['sql_win_cnt'] = {
-            'value': {'callable': 'lambda row: 1', 'output_type': 'integer'},
+            'value': {
+                'callable': 'lambda row: 1', 'output_type': 'integer'
+            },
             'fn': 'sum',
             '_needs_python': True,
         }
         need_post_proj = True
       if pre_proj_exprs:
         try:
-          pre_cfg = expressions.compile_select(
+          pre_cfg = _compile_sql_select_safe(
               '*, ' + ', '.join(pre_proj_exprs),
-              known_columns=None,
               allow_jinja=allow_jinja,
-              flag_name='--sql')[0]
+              flag_name='--sql')
         except expressions.ExpressionError as e:
           if strict:
             raise SqlPipeError(str(e)) from None
@@ -2254,8 +2447,9 @@ def _try_lower_single_source_sql(
         })
         current_ref = 'PreGroupProject'
 
-      comb_cfg = pipe_spec._build_combine_config(
-          {'group_by': group_cols, 'combine': combines})
+      comb_cfg = pipe_spec._build_combine_config({
+          'group_by': group_cols, 'combine': combines
+      })
       transforms.append({
           'name': 'SqlCombine',
           'type': 'Combine',
@@ -2293,11 +2487,10 @@ def _try_lower_single_source_sql(
 
     if need_post_proj and post_proj_items:
       try:
-        post_cfg = expressions.compile_select(
+        post_cfg = _compile_sql_select_safe(
             ', '.join(post_proj_items),
-            known_columns=None,
             allow_jinja=allow_jinja,
-            flag_name='--sql SELECT')[0]
+            flag_name='--sql SELECT')
       except expressions.ExpressionError as e:
         if strict:
           raise SqlPipeError(str(e)) from None
@@ -2337,14 +2530,15 @@ def _try_lower_single_source_sql(
 
     if not (len(norm_sel_parts) == 1 and norm_sel_parts[0] == '*'):
       try:
-        sel_cfg = expressions.compile_select(
+        sel_cfg = _compile_sql_select_safe(
             ', '.join(norm_sel_parts),
-            known_columns=None,
             allow_jinja=allow_jinja,
-            flag_name='--sql SELECT')[0]
+            flag_name='--sql SELECT')
       except expressions.ExpressionError as e:
         if strict:
-          raise SqlPipeError(f'unsupported SELECT expression in --sql-engine=python: {e}') from None
+          raise SqlPipeError(
+              f'unsupported SELECT expression in --sql-engine=python: {e}'
+          ) from None
         return None
       if wire_yaml_dlq:
         sel_cfg = dict(sel_cfg)
@@ -2358,20 +2552,27 @@ def _try_lower_single_source_sql(
       if wire_yaml_dlq:
         transforms.append(
             dlq.build_dlq_normalizer_transform(
-                'NormalizeSqlSelectDlq', 'SelectSqlFields.errors', 'MapToFields'))
+                'NormalizeSqlSelectDlq',
+                'SelectSqlFields.errors',
+                'MapToFields'))
         dlq_refs.append('NormalizeSqlSelectDlq')
       current_ref = 'SelectSqlFields'
 
     if is_distinct:
       if not distinct_keys or any(
-          p == '*' or re.match(r'^\*\s+EXCEPT\s*\(', p, re.I) for p in norm_sel_parts):
-        _bail('SELECT DISTINCT with * requires explicit column names in --sql-engine=python')
+          p == '*' or re.match(r'^\*\s+EXCEPT\s*\(', p, re.I)
+          for p in norm_sel_parts):
+        _bail(
+            'SELECT DISTINCT with * requires explicit column names in --sql-engine=python'
+        )
         return None
       transforms.append({
           'name': 'SelectSqlDistinct',
           'type': 'CliDeduplicate',
           'input': current_ref,
-          'config': {'keys': distinct_keys, 'keep': 'first'},
+          'config': {
+              'keys': distinct_keys, 'keep': 'first'
+          },
       })
       current_ref = 'SelectSqlDistinct'
 
@@ -2380,7 +2581,9 @@ def _try_lower_single_source_sql(
         'name': 'LimitSqlRows',
         'type': 'CliLimitRows',
         'input': current_ref,
-        'config': {'limit': limit_val},
+        'config': {
+            'limit': limit_val
+        },
     })
     current_ref = 'LimitSqlRows'
 
@@ -2419,8 +2622,8 @@ def _try_lower_single_source_sql(
 
   needs_cli_provider = bool(
       dlq_refs or any(
-          str(t.get('type', '')).startswith(('Cli', 'ReadCsvWithDlq', 'ReadJsonWithDlq'))
-          for t in transforms))
+          str(t.get('type', '')).startswith((
+              'Cli', 'ReadCsvWithDlq', 'ReadJsonWithDlq')) for t in transforms))
   spec_out: dict[str, Any] = {'pipeline': {'transforms': transforms}}
   if needs_cli_provider:
     spec_out['providers'] = [dlq.cli_yaml_provider_spec()]
@@ -2434,9 +2637,8 @@ def _parse_redact_fields(
 ) -> tuple[str, ...]:
   if not dlq_redact_fields:
     return ()
-  items = (
-      [dlq_redact_fields]
-      if isinstance(dlq_redact_fields, str) else list(dlq_redact_fields))
+  items = ([dlq_redact_fields]
+           if isinstance(dlq_redact_fields, str) else list(dlq_redact_fields))
   out: list[str] = []
   seen: set[str] = set()
   for item in items:
@@ -2448,8 +2650,8 @@ def _parse_redact_fields(
   return tuple(out)
 
 
-def _normalize_yaml_file_read_cfg(
-    s_type: str, cfg: dict[str, Any]) -> dict[str, Any]:
+def _normalize_yaml_file_read_cfg(s_type: str,
+                                  cfg: dict[str, Any]) -> dict[str, Any]:
   out = dict(cfg)
   if s_type == 'ReadFromJson':
     out.pop('sample_rows', None)
@@ -2472,17 +2674,24 @@ def _normalize_yaml_file_read_cfg(
 
 
 def _apply_dlq_redaction_to_spec(
-    spec_out: dict[str, Any], redact_fields: tuple[str, ...]
-) -> dict[str, Any]:
+    spec_out: dict[str, Any], redact_fields: tuple[str, ...]) -> dict[str, Any]:
   if not redact_fields:
     return spec_out
   transforms = spec_out.get('pipeline', {}).get('transforms', [])
   step_ret_re = re.compile(r'return\s+([\'"][^\'"]*[\'"])')
   for idx, t in enumerate(transforms):
-    if (t.get('type') == 'MapToFields' and
-        str(t.get('name', '')).startswith('Normalize')):
+    t_type = t.get('type')
+    if t_type in ('CliAssignTimestamps', 'CliIntervalJoin', 'CliDeduplicate'):
+      t_cfg = dict(t.get('config') or {})
+      t_cfg['dlq_redact_fields'] = list(redact_fields)
+      t['config'] = t_cfg
+    elif (t_type == 'MapToFields' and
+          str(t.get('name', '')).startswith('Normalize')):
       fields_cfg = (t.get('config') or {}).get('fields') or {}
-      if set(fields_cfg.keys()) >= {'step', 'error_type', 'error', 'raw_payload'}:
+      if set(fields_cfg.keys()) >= {'step',
+                                    'error_type',
+                                    'error',
+                                    'raw_payload'}:
         step_src = str((fields_cfg.get('step') or {}).get('callable') or '')
         m = step_ret_re.search(step_src)
         step_label = ast_literal_str(m.group(1)) if m else str(t.get('name'))
@@ -2543,8 +2752,8 @@ def build_sql_yaml_spec(
         parsed_expect_rules.append(r)
       except (ValueError, TypeError) as e:
         raise SqlPipeError(f'invalid --expect rule {item!r}: {e}') from None
-    if any(
-        r.on_violation == 'dlq' for r in parsed_expect_rules) and dlq_ep is None:
+    if any(r.on_violation == 'dlq'
+           for r in parsed_expect_rules) and dlq_ep is None:
       raise SqlPipeError(
           'cannot route expectation violations to DLQ without a DLQ sink; '
           'specify --dlq <PATH> or use --on-violation {fail|drop}')
@@ -2563,8 +2772,8 @@ def build_sql_yaml_spec(
         sub_read_name = f'Read_{ns.alias}_{sub_fmt}'
         sub_yaml_type = f'ReadFrom{uris.FILE_FORMATS.get(sub_fmt, sub_fmt.capitalize())}'
         sub_cfg = {
-            k: v for k, v in ns.endpoint.config.items()
-            if not k.startswith('_')
+            k: v
+            for k, v in ns.endpoint.config.items() if not k.startswith('_')
         }
         sub_cfg['path'] = list(sub_files)
         sub_cfg = _normalize_yaml_file_read_cfg(sub_yaml_type, sub_cfg)
@@ -2582,8 +2791,8 @@ def build_sql_yaml_spec(
       sql_inputs[ns.alias] = read_name
     else:
       cfg = {
-          k: v for k, v in ns.endpoint.config.items()
-          if not k.startswith('_')
+          k: v
+          for k, v in ns.endpoint.config.items() if not k.startswith('_')
       }
       s_type = ns.endpoint.yaml_type
       counts_int = False
@@ -2665,9 +2874,8 @@ def build_sql_yaml_spec(
   post_s_cfg: dict[str, Any] | None = None
   if post_select:
     try:
-      post_s_cfg = dict(
-          expressions.compile_select(
-              post_select, known_columns=None, allow_jinja=allow_jinja)[0])
+      post_s_cfg = _compile_sql_select_safe(
+          post_select, allow_jinja=allow_jinja)
     except expressions.ExpressionError as e:
       raise SqlPipeError(str(e)) from None
 
@@ -2847,9 +3055,34 @@ def build_sql_yaml_spec(
             _attach_post_select(py_spec), redact_tuple)
 
   _SQL_RESERVED_TAGS = frozenset({
-      'in', 'select', 'from', 'where', 'group', 'order', 'by', 'join', 'on',
-      'as', 'table', 'user', 'values', 'union', 'limit', 'having', 'all', 'and',
-      'or', 'not', 'null', 'is', 'true', 'false', 'case', 'when', 'then', 'end',
+      'in',
+      'select',
+      'from',
+      'where',
+      'group',
+      'order',
+      'by',
+      'join',
+      'on',
+      'as',
+      'table',
+      'user',
+      'values',
+      'union',
+      'limit',
+      'having',
+      'all',
+      'and',
+      'or',
+      'not',
+      'null',
+      'is',
+      'true',
+      'false',
+      'case',
+      'when',
+      'then',
+      'end',
   })
   eff_sql_inputs = dict(sql_inputs)
   calcite_query = clean_q
@@ -2858,12 +3091,14 @@ def build_sql_yaml_spec(
     only_alias, only_read = next(iter(eff_sql_inputs.items()))
     refs_source = bool(re.search(r'\bFROM\s+source\b', code_only, re.I))
     refs_alias = bool(
-        re.search(rf'\bFROM\s+[`"]?{re.escape(only_alias)}[`"]?\b', code_only, re.I))
+        re.search(
+            rf'\bFROM\s+[`"]?{re.escape(only_alias)}[`"]?\b', code_only, re.I))
     if refs_source and not refs_alias and only_alias.lower() != 'source':
       rw_parts: list[str] = []
       for is_c, seg in _scan_sql_outside_literals(calcite_query):
         if is_c:
-          s_rw = re.sub(r'\bFROM\s+source\b', 'FROM PCOLLECTION', seg, flags=re.I)
+          s_rw = re.sub(
+              r'\bFROM\s+source\b', 'FROM PCOLLECTION', seg, flags=re.I)
           s_rw = re.sub(r'\bsource\s*\.', 'PCOLLECTION.', s_rw, flags=re.I)
           rw_parts.append(s_rw)
         else:
@@ -2872,8 +3107,9 @@ def build_sql_yaml_spec(
       use_single_pcollection = True
     elif refs_source and 'source' not in eff_sql_inputs:
       eff_sql_inputs['source'] = only_read
-    if (not use_single_pcollection and only_alias.lower() in _SQL_RESERVED_TAGS
-        and only_alias in eff_sql_inputs):
+    if (not use_single_pcollection and
+        only_alias.lower() in _SQL_RESERVED_TAGS and
+        only_alias in eff_sql_inputs):
       safe_alias = f'tbl_{only_alias}'
       if not refs_alias:
         del eff_sql_inputs[only_alias]
@@ -2881,9 +3117,8 @@ def build_sql_yaml_spec(
           eff_sql_inputs[safe_alias] = only_read
 
   sql_input_val: Any = (
-      next(iter(eff_sql_inputs.values()))
-      if len(eff_sql_inputs) == 1 and (
-          use_single_pcollection or 'pcollection' in code_only.lower()) else
+      next(iter(eff_sql_inputs.values())) if len(eff_sql_inputs) == 1 and
+      (use_single_pcollection or 'pcollection' in code_only.lower()) else
       eff_sql_inputs)
   transforms.append({
       'name': 'SqlQuery',
@@ -3019,27 +3254,149 @@ def _match_source_files(
   return sorted(m.path for m in matches)
 
 
-def _open_binary(path: str, *, decompress: bool = True):
+_DEFAULT_MAX_DECOMPRESSED_BYTES = 512 * 1024 * 1024
+_DECOMPRESS_READ_CHUNK = 1024 * 1024
+
+
+def _max_decompressed_bytes() -> int:
+  raw = os.environ.get('BEAM_CLI_MAX_DECOMPRESSED_BYTES', '').strip()
+  if raw:
+    try:
+      val = int(raw)
+      if val > 0:
+        return val
+    except ValueError:
+      pass
+  return _DEFAULT_MAX_DECOMPRESSED_BYTES
+
+
+class _BoundedBinaryReader(io.BufferedIOBase):
+  """Caps decompressed bytes read from `.gz` / `.bz2` streams to prevent zip bombs."""
+  def __init__(self, fh: Any, max_bytes: int = _DEFAULT_MAX_DECOMPRESSED_BYTES):
+    self._fh = fh
+    self._max_bytes = max(1, int(max_bytes))
+    self._bytes_read = 0
+
+  def _account(self, data: bytes) -> bytes:
+    self._bytes_read += len(data)
+    if self._bytes_read > self._max_bytes:
+      try:
+        self._fh.close()
+      except Exception:  # pylint: disable=broad-except
+        pass
+      raise SqlPipeError(
+          f'decompressed stream exceeds {self._max_bytes}-byte safety limit '
+          '(set BEAM_CLI_MAX_DECOMPRESSED_BYTES to increase)')
+    return data
+
+  def readable(self) -> bool:
+    return True
+
+  def writable(self) -> bool:
+    return False
+
+  def seekable(self) -> bool:
+    return False
+
+  @property
+  def closed(self) -> bool:
+    return bool(getattr(self._fh, 'closed', False))
+
+  def flush(self) -> None:
+    if hasattr(self._fh, 'flush') and not self.closed:
+      self._fh.flush()
+
+  def close(self) -> None:
+    try:
+      self._fh.close()
+    finally:
+      super().close()
+
+  def read(self, size: int | None = -1) -> bytes:
+    if size is None or size < 0:
+      chunks: list[bytes] = []
+      while True:
+        rem = self._max_bytes - self._bytes_read + 1
+        piece = self._fh.read(min(_DECOMPRESS_READ_CHUNK, max(1, rem)))
+        if not piece:
+          break
+        chunks.append(self._account(piece))
+      return b''.join(chunks)
+    if size == 0:
+      return b''
+    rem = self._max_bytes - self._bytes_read + 1
+    if size <= rem:
+      return self._account(self._fh.read(size))
+    chunks = []
+    left = size
+    while left > 0:
+      rem = self._max_bytes - self._bytes_read + 1
+      piece = self._fh.read(min(left, _DECOMPRESS_READ_CHUNK, max(1, rem)))
+      if not piece:
+        break
+      chunks.append(self._account(piece))
+      left -= len(piece)
+    return b''.join(chunks)
+
+  def read1(self, size: int = -1) -> bytes:
+    eff = _DECOMPRESS_READ_CHUNK if (size is None or size < 0) else size
+    if eff == 0:
+      return b''
+    rem = self._max_bytes - self._bytes_read + 1
+    req = min(eff, max(1, rem))
+    if hasattr(self._fh, 'read1'):
+      return self._account(self._fh.read1(req))
+    return self._account(self._fh.read(req))
+
+  def readline(self, size: int | None = -1) -> bytes:
+    rem = self._max_bytes - self._bytes_read + 1
+    lim = max(1, rem) if (size is None or size < 0) else min(size, max(1, rem))
+    return self._account(self._fh.readline(lim))
+
+  def __iter__(self):
+    return self
+
+  def __next__(self) -> bytes:
+    line = self.readline()
+    if not line:
+      raise StopIteration
+    return line
+
+  def __enter__(self):
+    return self
+
+  def __exit__(self, exc_type, exc, tb):
+    self.close()
+    return False
+
+
+def _open_binary(
+    path: str, *, decompress: bool = True, max_bytes: int | None = None):
   low = path.lower()
+  cap = _max_decompressed_bytes() if max_bytes is None else max_bytes
+  is_compressed = low.endswith(('.gz', '.bz2'))
   if '://' not in path:
     if decompress and low.endswith('.gz'):
       import gzip
-      return gzip.open(path, 'rb')
+      return _BoundedBinaryReader(gzip.open(path, 'rb'), max_bytes=cap)
     if decompress and low.endswith('.bz2'):
       import bz2
-      return bz2.open(path, 'rb')
+      return _BoundedBinaryReader(bz2.open(path, 'rb'), max_bytes=cap)
     return open(path, 'rb')
   from apache_beam.io.filesystem import CompressionTypes
   from apache_beam.io.filesystems import FileSystems
   comp = CompressionTypes.AUTO if decompress else CompressionTypes.UNCOMPRESSED
-  return FileSystems.open(path, compression_type=comp)
+  fh = FileSystems.open(path, compression_type=comp)
+  if decompress and is_compressed:
+    return _BoundedBinaryReader(fh, max_bytes=cap)
+  return fh
 
 
 def _coerce_csv_val(
     val: str, kind: str, null_values=dlq.DEFAULT_CSV_NULL_VALUES) -> Any:
   if kind == 'str':
-    if val == '' or val in null_values or (
-        val.strip() and val.strip() in null_values):
+    if val == '' or val in null_values or (val.strip() and
+                                           val.strip() in null_values):
       return None
     return val
   s = val.strip()
@@ -3076,28 +3433,107 @@ def _redact_dlq_entry(
   err_msg = str(out.get('error', ''))
   for col in redact_fields:
     err_msg = re.sub(
+        r'(\b(?:column|field)\s+[\'"`]?' + re.escape(col) +
+        r'[\'"`]?\s*:\s*)[^\r\n]*',
+        r'\1<REDACTED>',
+        err_msg,
+        flags=re.IGNORECASE)
+    err_msg = re.sub(
         r'([\'"]?' + re.escape(col) +
         r'[\'"]?\s*[:=]\s*)(?:([\'"]).*?\2|[^,\s)\]}]+)',
         r'\1<REDACTED>',
         err_msg)
-  out['error'] = err_msg
+  out['error'] = dlq.scrub_unparseable_dlq_text(err_msg, redact_fields)
+
+  def _redact_csv_cells(cells: Sequence[Any]) -> list[Any]:
+    if header:
+      if len(cells) == len(header):
+        return [
+            '<REDACTED>' if header[idx] in rk_set else val
+            for idx, val in enumerate(cells)
+        ]
+      if rk_set.intersection(header):
+        return ['<REDACTED>' for _ in cells]
+      return [
+          dlq.scrub_unparseable_dlq_text(str(val), redact_fields) if isinstance(
+              val, str) else val for val in cells
+      ]
+    return ['<REDACTED>' for _ in cells]
+
+  def _redact_csv_line_str(line_s: str) -> str:
+    if header and rk_set.intersection(header):
+      try:
+        parsed_cells = next(csv.reader([line_s], delimiter=delim), None)
+        if parsed_cells is not None and len(parsed_cells) == len(header):
+          masked_cells = [
+              '<REDACTED>' if header[idx] in rk_set else parsed_cells[idx]
+              for idx in range(len(parsed_cells))
+          ]
+          sio = io.StringIO()
+          csv.writer(
+              sio, delimiter=delim, lineterminator='').writerow(masked_cells)
+          return dlq.scrub_unparseable_dlq_text(sio.getvalue(), redact_fields)
+      except csv.Error:
+        pass
+      _ = dlq.scrub_unparseable_dlq_text(line_s, redact_fields)
+      return '<REDACTED>'
+    return dlq.scrub_unparseable_dlq_text(line_s, redact_fields)
+
+  def _redact_payload_dict(d: dict[str, Any]) -> dict[str, Any]:
+    res: dict[str, Any] = {}
+    for k, v in d.items():
+      ks = str(k)
+      if ks in rk_set:
+        res[k] = '<REDACTED>'
+      elif ks == 'cells' and isinstance(v, (list, tuple)):
+        res[k] = _redact_csv_cells(v)
+      elif ks == 'raw_line' and isinstance(v, str):
+        handled_json = False
+        if v.lstrip().startswith(
+            ('{', '[')) or (header is None and 'file' not in d):
+          try:
+            parsed_rl = json.loads(v)
+            if isinstance(parsed_rl, dict):
+              dumped_rl = json.dumps(
+                  _redact_payload_dict(parsed_rl), default=str, allow_nan=False)
+              res[k] = dlq.scrub_unparseable_dlq_text(dumped_rl, redact_fields)
+              handled_json = True
+            elif isinstance(parsed_rl, list):
+              masked_rl = (
+                  _redact_csv_cells(parsed_rl) if header else
+                  dlq.redact_nested_fields(parsed_rl, redact_fields))
+              res[k] = json.dumps(masked_rl, default=str, allow_nan=False)
+              handled_json = True
+          except Exception:  # pylint: disable=broad-except
+            handled_json = False
+        if not handled_json:
+          if header:
+            res[k] = _redact_csv_line_str(v)
+          elif 'file' in d:
+            res[k] = '<REDACTED>'
+          else:
+            res[k] = dlq.scrub_unparseable_dlq_text(v, redact_fields)
+      else:
+        res[k] = dlq.redact_nested_fields(v, redact_fields)
+    return res
 
   raw_p = out.get('raw_payload')
-  if isinstance(raw_p, str):
+  if isinstance(raw_p, dict):
+    out['raw_payload'] = _redact_payload_dict(raw_p)
+  elif isinstance(raw_p, list):
+    out['raw_payload'] = (
+        _redact_csv_cells(raw_p) if header else dlq.redact_nested_fields(
+            raw_p, redact_fields))
+  elif isinstance(raw_p, str):
     scrubbed: str | None = None
     try:
       parsed_p = json.loads(raw_p)
       if isinstance(parsed_p, dict):
         scrubbed = json.dumps(
-            dlq.redact_nested_fields(parsed_p, redact_fields),
-            default=str,
-            allow_nan=False)
+            _redact_payload_dict(parsed_p), default=str, allow_nan=False)
       elif isinstance(parsed_p, list) and header:
-        masked_list = [
-            '<REDACTED>' if idx < len(header) and header[idx] in rk_set else val
-            for idx, val in enumerate(parsed_p)
-        ]
-        scrubbed = json.dumps(masked_list, default=str, allow_nan=False)
+        scrubbed = json.dumps(
+            _redact_csv_cells(parsed_p), default=str, allow_nan=False)
       elif isinstance(parsed_p, list):
         scrubbed = json.dumps(
             dlq.redact_nested_fields(parsed_p, redact_fields),
@@ -3106,16 +3542,7 @@ def _redact_dlq_entry(
     except Exception:  # pylint: disable=broad-except
       scrubbed = None
     if scrubbed is None:
-      tmp_s = raw_p
-      if header and any(h in rk_set for h in header):
-        parts = raw_p.split(delim)
-        if len(parts) == len(header):
-          for idx, col_n in enumerate(header):
-            if col_n in rk_set:
-              parts[idx] = '<REDACTED>'
-          tmp_s = delim.join(parts)
-      scrubbed = dlq.scrub_unparseable_dlq_text(tmp_s, redact_fields)
-    out['error'] = dlq.scrub_unparseable_dlq_text(out['error'], redact_fields)
+      scrubbed = _redact_csv_line_str(raw_p)
     out['raw_payload'] = scrubbed
   return out
 
@@ -3178,10 +3605,9 @@ def load_endpoint_rows(
       fname = str(f['name'])
       ft = str(f.get('type', 'string')).lower()
       sq_t = (
-          'BOOLEAN' if ft in ('boolean', 'bool') else
-          'INTEGER' if ft in ('long', 'integer', 'short', 'byte') else
-          'REAL' if ft in ('double', 'float') or ft.startswith('decimal') else
-          'TEXT')
+          'BOOLEAN' if ft in ('boolean', 'bool') else 'INTEGER' if ft in (
+              'long', 'integer', 'short', 'byte') else 'REAL' if ft in (
+                  'double', 'float') or ft.startswith('decimal') else 'TEXT')
       cols.append((fname, sq_t))
       arrow_map[fname] = _lakehouse_type_to_arrow(ft)
     _SQL_THREAD_LOCAL.last_endpoint_arrow_types = arrow_map
@@ -3199,8 +3625,8 @@ def load_endpoint_rows(
       ft = str(f.get('type', 'string')).lower()
       sq_t = (
           'BOOLEAN' if ft in ('boolean', 'bool') else
-          'INTEGER' if ft in ('long', 'int') else 'REAL'
-          if ft in ('double', 'float') or ft.startswith('decimal') else 'TEXT')
+          'INTEGER' if ft in ('long', 'int') else 'REAL' if ft in (
+              'double', 'float') or ft.startswith('decimal') else 'TEXT')
       cols.append((fname, sq_t))
       arrow_map[fname] = _lakehouse_type_to_arrow(ft)
     _SQL_THREAD_LOCAL.last_endpoint_arrow_types = arrow_map
@@ -3306,19 +3732,16 @@ def load_endpoint_rows(
             kinds, parsed_types, str(ep.raw), allow_new_columns=True)
       except ValueError as e:
         raise SqlPipeError(str(e)) from None
-    cols = [
-        (
-            c,
-            'BOOLEAN' if kinds.get(c) == 'bool' else
-            'INTEGER' if kinds.get(c) == 'int' else
-            'REAL' if kinds.get(c) == 'float' else 'TEXT',
-        ) for c in header
-    ]
+    cols = [(
+        c,
+        'BOOLEAN' if kinds.get(c) == 'bool' else 'INTEGER' if kinds.get(c)
+        == 'int' else 'REAL' if kinds.get(c) == 'float' else 'TEXT',
+    ) for c in header]
     _SQL_THREAD_LOCAL.last_endpoint_arrow_types = {
         c: (
-            pa.bool_() if kinds.get(c) == 'bool' else
-            pa.int64() if kinds.get(c) == 'int' else
-            pa.float64() if kinds.get(c) == 'float' else pa.string())
+            pa.bool_()
+            if kinds.get(c) == 'bool' else pa.int64() if kinds.get(c) == 'int'
+            else pa.float64() if kinds.get(c) == 'float' else pa.string())
         for c in header
     }
     rows = []
@@ -3336,32 +3759,30 @@ def load_endpoint_rows(
                 first = False
                 if dlq_records is not None:
                   dlq_records.append(
-                      _redact_dlq_entry(
-                          {
-                              'step': 'ReadCsvWithDlq',
-                              'error_type': type(csv_err).__name__,
-                              'error': str(csv_err),
-                              'raw_payload': bad_line.rstrip('\r\n'),
-                          },
-                          redact_tuple,
-                          header=header,
-                          delim=delim))
+                      _redact_dlq_entry({
+                          'step': 'ReadCsvWithDlq',
+                          'error_type': type(csv_err).__name__,
+                          'error': str(csv_err),
+                          'raw_payload': bad_line.rstrip('\r\n'),
+                      },
+                                        redact_tuple,
+                                        header=header,
+                                        delim=delim))
                   continue
                 raise SqlPipeError(
                     f'malformed CSV header in {fp}: {csv_err}') from None
               raw_count += 1
               if dlq_records is not None:
                 dlq_records.append(
-                    _redact_dlq_entry(
-                        {
-                            'step': 'ReadCsvWithDlq',
-                            'error_type': type(csv_err).__name__,
-                            'error': str(csv_err),
-                            'raw_payload': bad_line.rstrip('\r\n'),
-                        },
-                        redact_tuple,
-                        header=header,
-                        delim=delim))
+                    _redact_dlq_entry({
+                        'step': 'ReadCsvWithDlq',
+                        'error_type': type(csv_err).__name__,
+                        'error': str(csv_err),
+                        'raw_payload': bad_line.rstrip('\r\n'),
+                    },
+                                      redact_tuple,
+                                      header=header,
+                                      delim=delim))
                 continue
               raise SqlPipeError(
                   f'malformed CSV row in {fp}: {csv_err}') from None
@@ -3375,16 +3796,15 @@ def load_endpoint_rows(
               err_msg = f'expected {len(header)} columns, got {len(rec)}'
               if dlq_records is not None:
                 dlq_records.append(
-                    _redact_dlq_entry(
-                        {
-                            'step': 'ReadCsvWithDlq',
-                            'error_type': 'CsvColumnCountMismatch',
-                            'error': err_msg,
-                            'raw_payload': json.dumps(rec),
-                        },
-                        redact_tuple,
-                        header=header,
-                        delim=delim))
+                    _redact_dlq_entry({
+                        'step': 'ReadCsvWithDlq',
+                        'error_type': 'CsvColumnCountMismatch',
+                        'error': err_msg,
+                        'raw_payload': json.dumps(rec),
+                    },
+                                      redact_tuple,
+                                      header=header,
+                                      delim=delim))
                 continue
               raise SqlPipeError(f'malformed CSV row in {fp}: {err_msg}')
             try:
@@ -3396,16 +3816,15 @@ def load_endpoint_rows(
             except Exception as e:  # pylint: disable=broad-except
               if dlq_records is not None:
                 dlq_records.append(
-                    _redact_dlq_entry(
-                        {
-                            'step': 'ReadCsvWithDlq',
-                            'error_type': type(e).__name__,
-                            'error': str(e),
-                            'raw_payload': json.dumps(dict(zip(header, rec))),
-                        },
-                        redact_tuple,
-                        header=header,
-                        delim=delim))
+                    _redact_dlq_entry({
+                        'step': 'ReadCsvWithDlq',
+                        'error_type': type(e).__name__,
+                        'error': str(e),
+                        'raw_payload': json.dumps(dict(zip(header, rec))),
+                    },
+                                      redact_tuple,
+                                      header=header,
+                                      delim=delim))
                 continue
               raise SqlPipeError(f'corrupt CSV value in {fp}: {e}') from None
         finally:
@@ -3424,8 +3843,8 @@ def load_endpoint_rows(
       eff_sample = dlq.resolve_json_sample_rows(
           files, ep.config.get('sample_rows'))
       allow_unknown = (
-          dlq.parse_unknown_fields_opt(ep.config.get('on_unknown_fields')) ==
-          'ignore')
+          dlq.parse_unknown_fields_opt(
+              ep.config.get('on_unknown_fields')) == 'ignore')
     except ValueError as e:
       raise SqlPipeError(str(e)) from None
     # JSONL is typed from a sample like `beam pipe` does, so a value that
@@ -3458,8 +3877,8 @@ def load_endpoint_rows(
               for k, v in obj.items():
                 if v is not None and k not in col_types:
                   col_types[k] = (
-                      'BOOLEAN' if isinstance(v, bool) else
-                      'INTEGER' if isinstance(v, int) else
+                      'BOOLEAN' if isinstance(
+                          v, bool) else 'INTEGER' if isinstance(v, int) else
                       'REAL' if isinstance(v, float) else 'TEXT')
                 elif k not in col_types:
                   col_types[k] = 'TEXT'
@@ -3503,14 +3922,13 @@ def load_endpoint_rows(
         except Exception as e:  # pylint: disable=broad-except
           if dlq_records is not None:
             dlq_records.append(
-                _redact_dlq_entry(
-                    {
-                        'step': 'ReadFromJsonWithDlq',
-                        'error_type': type(e).__name__,
-                        'error': str(e),
-                        'raw_payload': s,
-                    },
-                    redact_tuple))
+                _redact_dlq_entry({
+                    'step': 'ReadFromJsonWithDlq',
+                    'error_type': type(e).__name__,
+                    'error': str(e),
+                    'raw_payload': s,
+                },
+                                  redact_tuple))
             continue
           raise SqlPipeError(
               f'invalid JSON record in {fp}: {type(e).__name__}') from None
@@ -3518,16 +3936,15 @@ def load_endpoint_rows(
       warnings.append(dlq.schema_drift_warning(drift_count, drift_fields))
     if kinds is not None:
       col_types = {
-          k: ('BOOLEAN' if v == 'bool' else
-              'INTEGER' if v == 'int' else
-              'REAL' if v == 'float' else 'TEXT')
+          k: (
+              'BOOLEAN' if v == 'bool' else
+              'INTEGER' if v == 'int' else 'REAL' if v == 'float' else 'TEXT')
           for k, v in kinds.items()
       }
     _SQL_THREAD_LOCAL.last_endpoint_arrow_types = {
         k: (
-            pa.bool_() if ct == 'BOOLEAN' else
-            pa.int64() if ct == 'INTEGER' else
-            pa.float64() if ct == 'REAL' else pa.string())
+            pa.bool_() if ct == 'BOOLEAN' else pa.int64() if ct == 'INTEGER'
+            else pa.float64() if ct == 'REAL' else pa.string())
         for k, ct in col_types.items()
     }
     cols = list(col_types.items())
@@ -3546,16 +3963,15 @@ def load_endpoint_rows(
           for k, v in d.items():
             if k not in col_types and v is not None:
               col_types[k] = (
-                  'BOOLEAN' if isinstance(v, bool) else
-                  'INTEGER' if isinstance(v, int) else
+                  'BOOLEAN' if isinstance(
+                      v, bool) else 'INTEGER' if isinstance(v, int) else
                   'REAL' if isinstance(v, (float, decimal.Decimal)) else 'TEXT')
             elif k not in col_types:
               col_types[k] = 'TEXT'
     _SQL_THREAD_LOCAL.last_endpoint_arrow_types = {
         k: (
-            pa.bool_() if ct == 'BOOLEAN' else
-            pa.int64() if ct == 'INTEGER' else
-            pa.float64() if ct == 'REAL' else pa.string())
+            pa.bool_() if ct == 'BOOLEAN' else pa.int64() if ct == 'INTEGER'
+            else pa.float64() if ct == 'REAL' else pa.string())
         for k, ct in col_types.items()
     }
     return list(col_types.items()), rows, len(rows)
@@ -3616,44 +4032,36 @@ def _normalize_sqlite_param(v: Any) -> Any:
 def _register_scalar_functions(conn: sqlite3.Connection) -> None:
   conn.create_function(
       'LEN',
-      1,
-      lambda x: None if x is None else len(str(x)),
+      1, lambda x: None if x is None else len(str(x)),
       deterministic=True)
   conn.create_function(
       'STRIP',
-      1,
-      lambda x: None if x is None else str(x).strip(),
+      1, lambda x: None if x is None else str(x).strip(),
       deterministic=True)
   conn.create_function(
       'CONCAT',
-      -1,
-      lambda *args: ''.join('' if a is None else str(a) for a in args),
+      -1, lambda *args: ''.join('' if a is None else str(a) for a in args),
       deterministic=True)
   conn.create_function(
       'FLOOR',
-      1,
-      lambda x: None if x is None else math.floor(float(x)),
+      1, lambda x: None if x is None else math.floor(float(x)),
       deterministic=True)
   conn.create_function(
       'CEIL',
-      1,
-      lambda x: None if x is None else math.ceil(float(x)),
+      1, lambda x: None if x is None else math.ceil(float(x)),
       deterministic=True)
   conn.create_function(
       'CEILING',
-      1,
-      lambda x: None if x is None else math.ceil(float(x)),
+      1, lambda x: None if x is None else math.ceil(float(x)),
       deterministic=True)
   conn.create_function(
       'POWER',
-      2,
-      lambda x, y: None if (x is None or y is None) else math.pow(
-          float(x), float(y)),
+      2, lambda x, y: None
+      if (x is None or y is None) else math.pow(float(x), float(y)),
       deterministic=True)
   conn.create_function(
       'SQRT',
-      1,
-      lambda x: None if x is None else math.sqrt(float(x)),
+      1, lambda x: None if x is None else math.sqrt(float(x)),
       deterministic=True)
 
   def _split_part(s: Any, delim: Any, idx: Any) -> str | None:
@@ -3694,17 +4102,19 @@ def _register_scalar_functions(conn: sqlite3.Connection) -> None:
     return ('***@' + dom) if len(loc) <= 1 else (loc[0] + '***@' + dom)
 
   conn.create_function('SHA256', 1, _sha256_sql, deterministic=True)
-  conn.create_function('MASK', 1, lambda v: _mask_sql(v, 4, '*'), deterministic=True)
-  conn.create_function('MASK', 2, lambda v, k: _mask_sql(v, k, '*'), deterministic=True)
+  conn.create_function(
+      'MASK', 1, lambda v: _mask_sql(v, 4, '*'), deterministic=True)
+  conn.create_function(
+      'MASK', 2, lambda v, k: _mask_sql(v, k, '*'), deterministic=True)
   conn.create_function('MASK', 3, _mask_sql, deterministic=True)
   conn.create_function(
       'MASK_LAST4', 1, lambda v: _mask_sql(v, 4, '*'), deterministic=True)
   conn.create_function('MASK_EMAIL', 1, _mask_email_sql, deterministic=True)
   conn.create_function(
       'REDACT',
-      1,
-      lambda v: None if v is None else '<REDACTED>',
+      1, lambda v: None if v is None else '<REDACTED>',
       deterministic=True)
+
   def _to_utc(val: Any) -> str | None:
     """Normalizes ISO-8601 (Z / offset / naive) or epoch sec/ms to ISO UTC."""
     if val is None:
@@ -3728,8 +4138,8 @@ def _register_scalar_functions(conn: sqlite3.Connection) -> None:
     iso = s[:-1] + '+00:00' if s.endswith(('Z', 'z')) else s
     dt = datetime.fromisoformat(iso)
     dt = (
-        dt.replace(tzinfo=timezone.utc)
-        if dt.tzinfo is None else dt.astimezone(timezone.utc))
+        dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(
+            timezone.utc))
     return (
         dt.strftime('%Y-%m-%dT%H:%M:%SZ')
         if dt.microsecond == 0 else dt.isoformat().replace('+00:00', 'Z'))
@@ -3744,7 +4154,8 @@ def _register_scalar_functions(conn: sqlite3.Connection) -> None:
     except (ValueError, TypeError):
       return ts
     try:
-      num = float(ts) if not isinstance(ts, (int, float)) and str(ts).strip().lstrip('+-').replace('.', '', 1).isdigit() else ts
+      num = float(ts) if not isinstance(ts, (int, float)) and str(
+          ts).strip().lstrip('+-').replace('.', '', 1).isdigit() else ts
       if isinstance(num, (int, float)):
         if abs(num) >= 1e11:
           return num + (secs * 1000.0)
@@ -3759,11 +4170,13 @@ def _register_scalar_functions(conn: sqlite3.Connection) -> None:
       from datetime import timedelta
       iso = s[:-1] + '+00:00' if s.endswith(('Z', 'z')) else s
       dt = datetime.fromisoformat(iso)
-      dt = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+      dt = dt.replace(
+          tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(
+              timezone.utc)
       new_dt = dt + timedelta(seconds=secs)
       return (
-          new_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
-          if new_dt.microsecond == 0 else new_dt.isoformat().replace('+00:00', 'Z'))
+          new_dt.strftime('%Y-%m-%dT%H:%M:%SZ') if new_dt.microsecond == 0 else
+          new_dt.isoformat().replace('+00:00', 'Z'))
     except Exception:
       return ts
 
@@ -3798,8 +4211,7 @@ class _Quantile:
       qf = float(q)
       if math.isnan(qf) or math.isinf(qf):
         raise ValueError(f'quantile must be finite, got {q!r}')
-      self._q_dec = (
-          decimal.Decimal(str(q)) / decimal.Decimal(str(self.scale)))
+      self._q_dec = (decimal.Decimal(str(q)) / decimal.Decimal(str(self.scale)))
     if value is not None:
       try:
         fv = float(value)
@@ -3873,7 +4285,8 @@ class _StddevPop:
     if not self._values:
       return None
     mean = sum(self._values) / len(self._values)
-    return math.sqrt(sum((v - mean)**2 for v in self._values) / len(self._values))
+    return math.sqrt(
+        sum((v - mean)**2 for v in self._values) / len(self._values))
 
 
 class _VarianceSamp:
@@ -4079,28 +4492,37 @@ def _register_aggregate_functions(conn: sqlite3.Connection) -> None:
 
 # Functions and syntax from other dialects mapped to what local SQL supports.
 _SQL_DIALECT_HINTS = (
-    (re.compile(r'within\s+group', re.I),
-     'WITHIN GROUP is not supported by the default SQLite engine; use '
-     'percentile(col, 95), quantile(col, 0.95) or median(col), or pass '
-     '--sql-engine duckdb'),
-    (re.compile(r'no such function: (percentile_cont|percentile_disc|'
-                r'approx_quantiles|approx_percentile)', re.I),
-     'use percentile(col, 95), quantile(col, 0.95) or median(col) (exact, '
-     'linear interpolation)'),
-    (re.compile(r'no such function: approx_count_distinct', re.I),
-     'use COUNT(DISTINCT col)'),
-    (re.compile(r'no such function: (date_trunc|format_timestamp|extract)',
-                re.I),
-     "use strftime(), e.g. strftime('%Y-%m', ts)"),
-    (re.compile(
-        r'no such function: (arg_max|arg_min|'
-        r'max_by|min_by|mode|bool_and|bool_or|string_agg|array_agg)',
-        re.I),
-     'advanced warehouse aggregates require --sql-engine duckdb'),
-    (re.compile(r'no such table|table .* does not exist|replacement scan', re.I),
-     'name each input with --from ALIAS=PATH / --join ALIAS=PATH (inputs are '
-     'pre-loaded as tables, never file paths; without an alias use the file '
-     'name or FROM source)'),
+    (
+        re.compile(r'within\s+group', re.I),
+        'WITHIN GROUP is not supported by the default SQLite engine; use '
+        'percentile(col, 95), quantile(col, 0.95) or median(col), or pass '
+        '--sql-engine duckdb'),
+    (
+        re.compile(
+            r'no such function: (percentile_cont|percentile_disc|'
+            r'approx_quantiles|approx_percentile)',
+            re.I),
+        'use percentile(col, 95), quantile(col, 0.95) or median(col) (exact, '
+        'linear interpolation)'),
+    (
+        re.compile(r'no such function: approx_count_distinct', re.I),
+        'use COUNT(DISTINCT col)'),
+    (
+        re.compile(
+            r'no such function: (date_trunc|format_timestamp|extract)', re.I),
+        "use strftime(), e.g. strftime('%Y-%m', ts)"),
+    (
+        re.compile(
+            r'no such function: (arg_max|arg_min|'
+            r'max_by|min_by|mode|bool_and|bool_or|string_agg|array_agg)',
+            re.I),
+        'advanced warehouse aggregates require --sql-engine duckdb'),
+    (
+        re.compile(
+            r'no such table|table .* does not exist|replacement scan', re.I),
+        'name each input with --from ALIAS=PATH / --join ALIAS=PATH (inputs are '
+        'pre-loaded as tables, never file paths; without an alias use the file '
+        'name or FROM source)'),
 )
 
 _SQLITE_CAST_TYPE_MAP = {
@@ -4291,8 +4713,8 @@ def _rewrite_source_uri_table_refs(
 def _sql_error_hint(message: str, query: str) -> str:
   """Returns a '; hint: ...' suffix for a local SQL error, or ''."""
   for pattern, hint in _SQL_DIALECT_HINTS:
-    if pattern.search(message) or (
-        pattern.pattern.startswith('within') and pattern.search(query)):
+    if pattern.search(message) or (pattern.pattern.startswith('within') and
+                                   pattern.search(query)):
       return f'; hint: {hint}'
   if 'no such function' in message.lower():
     return (
@@ -4332,8 +4754,9 @@ _LOCAL_ONLY_SQL_FUNCTIONS = (
 _LOCAL_ONLY_SQL_KEYWORDS = ('qualify', 'glob', 'regexp', 'ilike')
 
 
-def analyze_sql_portability(
-    query: str, *, sql_engine: str = 'sqlite') -> list[str]:
+def analyze_sql_portability(query: str,
+                            *,
+                            sql_engine: str = 'sqlite') -> list[str]:
   """Returns non-portable SQL functions/clauses used outside string literals."""
   del sql_engine
   code_only = ' '.join(
@@ -4431,7 +4854,8 @@ def _normalize_sqlite_bool_comparisons(
   for idx, (is_code, seg) in enumerate(segs):
     if (not is_code and len(seg) >= 2 and seg[0] == "'" and seg[-1] == "'"):
       inner = seg[1:-1].replace("''", "'").strip().lower()
-      if inner in ('true', 'false') and _is_bool_col_comparison(segs, idx, bool_cols):
+      if inner in ('true', 'false') and _is_bool_col_comparison(
+          segs, idx, bool_cols):
         out.append('1' if inner == 'true' else '0')
         continue
     out.append(seg)
@@ -4469,24 +4893,23 @@ _ARROW_TYPES_FOR_SQLITE = {
 def _arrow_table(cols, rows, arrow_hints: dict[str, Any] | None = None):
   """Builds a pyarrow Table from loaded rows, keeping nested values."""
   import pyarrow as pa
-  names = [c for c, _ in cols] or (
-      list(rows[0]) if rows else [_EMPTY_PLACEHOLDER_COL])
+  names = [c for c, _ in cols
+           ] or (list(rows[0]) if rows else [_EMPTY_PLACEHOLDER_COL])
   types = dict(cols)
   hints = (
-      arrow_hints
-      if arrow_hints is not None else getattr(
-          _SQL_THREAD_LOCAL, 'last_endpoint_arrow_types', None) or {})
+      arrow_hints if arrow_hints is not None else
+      getattr(_SQL_THREAD_LOCAL, 'last_endpoint_arrow_types', None) or {})
   arrays = []
   for name in names:
     values = [r.get(name) for r in rows]
     exact_pa = hints.get(name)
     declared = _ARROW_TYPES_FOR_SQLITE.get(types.get(name, ''), None)
     try:
-      if exact_pa is not None and not any(
-          isinstance(v, (dict, list)) for v in values):
+      if exact_pa is not None and not any(isinstance(v, (dict, list))
+                                          for v in values):
         arrays.append(pa.array(values, type=exact_pa))
-      elif declared and not any(
-          isinstance(v, (dict, list, decimal.Decimal)) for v in values):
+      elif declared and not any(isinstance(v, (dict, list, decimal.Decimal))
+                                for v in values):
         arrays.append(pa.array(values, type=declared))
       else:
         arr = pa.array(values) if values else pa.array([], type=pa.string())
@@ -4497,9 +4920,11 @@ def _arrow_table(cols, rows, arrow_hints: dict[str, Any] | None = None):
       # Mixed types in one column: keep the values as text.
       arrays.append(
           pa.array([
-              None if v is None else
-              (json.dumps(v, default=str) if isinstance(v, (dict, list)) else
-               str(v)) for v in values
+              None if v is None else (
+                  json.dumps(v, default=str) if isinstance(v,
+                                                           (dict,
+                                                            list)) else str(v))
+              for v in values
           ],
                    type=pa.string()))
   return pa.Table.from_arrays(arrays, names=names)
@@ -4587,7 +5012,8 @@ def _run_duckdb(
       })
   try:
     statements = con.extract_statements(clean_q)
-    if len(statements) != 1 or statements[0].type != duckdb.StatementType.SELECT:
+    if len(
+        statements) != 1 or statements[0].type != duckdb.StatementType.SELECT:
       raise SqlPipeError('--sql only accepts a single read-only SELECT query')
     first_alias = None
     used_lower = set()
@@ -4614,16 +5040,17 @@ def _run_duckdb(
       # `input`) when there is only one source so queries like
       # `SELECT * FROM data` execute without requiring the user to know the
       # inferred file stem alias.
-      extra_views = (
-          ('PCOLLECTION', 'source', 'data', 'tbl', 'input')
-          if len(named_sources) == 1 else ('PCOLLECTION', 'source'))
+      extra_views = (('PCOLLECTION', 'source', 'data', 'tbl',
+                      'input') if len(named_sources) == 1 else
+                     ('PCOLLECTION', 'source'))
       for view_name in extra_views:
         if view_name.lower() not in used_lower:
           con.execute(
               f'CREATE VIEW {_quote_ident(view_name)} AS '
               f'SELECT * FROM {_quote_ident(first_alias)}')
     con.execute("SET TimeZone = 'UTC'")
-    con.execute(r'''
+    con.execute(
+        r'''
       CREATE MACRO to_utc(x) AS (
         CASE
           WHEN x IS NULL OR trim(CAST(x AS VARCHAR)) = '' THEN NULL
@@ -4778,14 +5205,13 @@ def _make_local_transform_dlq_dict(
   clean_err = out_mod.redact_inline_secrets(
       out_mod.sanitize_untrusted_text(str(error_msg), max_chars=4096),
       placeholder='<REDACTED_SECRET>')[:4096]
-  return _redact_dlq_entry(
-      {
-          'step': str(step),
-          'error_type': str(error_type),
-          'error': clean_err,
-          'raw_payload': raw_json,
-      },
-      redact_tuple)
+  return _redact_dlq_entry({
+      'step': str(step),
+      'error_type': str(error_type),
+      'error': clean_err,
+      'raw_payload': raw_json,
+  },
+                           redact_tuple)
 
 
 def _apply_local_sql_post_select(
@@ -4812,9 +5238,9 @@ def _apply_local_sql_post_select(
 
   is_append = bool(sel_cfg.get('append'))
   drop_set = set(sel_cfg.get('drop') or ())
-  base_cols = ([
-      c for c in out_cols if c not in drop_set and c not in compiled_fields
-  ] if is_append else [])
+  base_cols = (
+      [c for c in out_cols
+       if c not in drop_set and c not in compiled_fields] if is_append else [])
   final_cols = list(base_cols) + list(compiled_fields.keys())
   projected: list[dict[str, Any]] = []
   for r in out_rows:
@@ -4833,8 +5259,7 @@ def _apply_local_sql_post_select(
     except Exception as exc:  # pylint: disable=broad-except
       if dlq_records is None:
         raise SqlPipeError(
-            f"{type(exc).__name__}: {exc} [while running '--select']"
-        ) from None
+            f"{type(exc).__name__}: {exc} [while running '--select']") from None
       dlq_records.append(
           _make_local_transform_dlq_dict(
               'MapToFields', type(exc).__name__, str(exc), r, redact_tuple))
@@ -4858,9 +5283,9 @@ def _apply_local_sql_expect(
   from . import expect as expect_mod
   redact_tuple = _parse_redact_fields(dlq_redact_fields)
   eff_default = (
-      'drop'
-      if (drop_bad and on_violation == 'dlq' and dlq_records is not None) else
-      on_violation)
+      'drop' if
+      (drop_bad and on_violation == 'dlq' and
+       dlq_records is not None) else on_violation)
   parsed_rules = []
   for item in expect:
     try:
@@ -5259,9 +5684,9 @@ def run_in_memory_sql(
     # Register Beam SQL `PCOLLECTION` and `source` views on the primary input
     # (plus common single-table aliases `data`, `tbl`, `input` when unary).
     if first_alias is not None:
-      extra_views = (
-          ('PCOLLECTION', 'source', 'data', 'tbl', 'input')
-          if len(named_sources) == 1 else ('PCOLLECTION', 'source'))
+      extra_views = (('PCOLLECTION', 'source', 'data', 'tbl',
+                      'input') if len(named_sources) == 1 else
+                     ('PCOLLECTION', 'source'))
       for view_name in extra_views:
         if view_name.lower() not in used_lower:
           conn.execute(
@@ -5291,9 +5716,8 @@ def run_in_memory_sql(
 
     def _readonly_authorizer(action_code, arg1, arg2, dbname, source):
       del arg1, dbname, source
-      if action_code == sqlite3.SQLITE_FUNCTION and (
-          str(arg2 or '').lower() in {'zeroblob', 'randomblob', 'load_extension'}
-      ):
+      if action_code == sqlite3.SQLITE_FUNCTION and (str(
+          arg2 or '').lower() in {'zeroblob', 'randomblob', 'load_extension'}):
         return sqlite3.SQLITE_DENY
       if action_code in allowed_actions:
         return sqlite3.SQLITE_OK
@@ -5387,9 +5811,9 @@ def run_in_memory_sql(
               orig_code_only,
               re.I)) and not cast_bool
       if (cast_bool or (oc.lower() in pure_bool_cols and not non_bool_expr)):
-        if all(
-            r.get(oc) is None or (isinstance(r.get(oc), int) and r.get(oc) in (0, 1))
-            for r in out_rows):
+        if all(r.get(oc) is None or
+               (isinstance(r.get(oc), int) and r.get(oc) in (0, 1))
+               for r in out_rows):
           out_bool_cols.add(oc)
           for r in out_rows:
             val = r.get(oc)
@@ -5451,8 +5875,10 @@ def keyed_json_options(sink_ep) -> dict[str, str] | None:
     raise SqlPipeError(
         '--to-opt key= writes one JSON document, so --to must be a local '
         '.json file (not .jsonl or another format)')
-  return {k: str(sink_ep.config[k]) for k in KEYED_JSON_OPTIONS
-          if k in sink_ep.config}
+  return {
+      k: str(sink_ep.config[k])
+      for k in KEYED_JSON_OPTIONS if k in sink_ep.config
+  }
 
 
 def _embedded_json(value):
@@ -5494,6 +5920,40 @@ def keyed_json_document(columns, rows, key: str, value: str | None = None):
   return doc
 
 
+def _read_process_umask() -> int:
+  """Returns the process umask without racing concurrent threads."""
+  try:
+    with open('/proc/self/status', encoding='utf-8') as f:
+      for line in f:
+        if line.startswith('Umask:'):
+          return int(line.split(':', 1)[1].strip(), 8)
+  except (OSError, ValueError):
+    pass
+  with _UMASK_LOCK:
+    cur = os.umask(0o077)
+    os.umask(cur)
+    return cur
+
+
+def _is_private_sql_staging_target(path: str) -> bool:
+  norm = os.path.abspath(path).replace('\\', '/')
+  return any(seg.startswith('.beam_sql_') for seg in norm.split('/'))
+
+
+def _finalize_staged_file_mode(
+    tmp_path: str, target_path: str, tag: str) -> None:
+  if tag == 'dlq' or _is_private_sql_staging_target(target_path):
+    try:
+      os.chmod(tmp_path, 0o600)
+    except OSError:
+      pass
+    return
+  try:
+    os.chmod(tmp_path, 0o666 & ~_read_process_umask())
+  except OSError:
+    pass
+
+
 def _new_sql_stage_path(target: str, tag: str) -> str:
   import tempfile
   abs_target = os.path.abspath(target)
@@ -5502,11 +5962,15 @@ def _new_sql_stage_path(target: str, tag: str) -> str:
   base = os.path.basename(abs_target) or 'out'
   fd, tmp_path = tempfile.mkstemp(
       prefix=f'.{base}.{tag}.', suffix='.tmp', dir=parent)
-  os.close(fd)
   try:
-    cur_umask = os.umask(0o077)
-    os.umask(cur_umask)
-    os.chmod(tmp_path, 0o666 & ~cur_umask)
+    if hasattr(os, 'fchmod'):
+      os.fchmod(fd, 0o600)
+  except OSError:
+    pass
+  finally:
+    os.close(fd)
+  try:
+    os.chmod(tmp_path, 0o600)
   except OSError:
     pass
   return tmp_path
@@ -5531,6 +5995,7 @@ def write_json_document(path: str, doc: Any) -> str:
       json.dump(
           _sanitize_json_nan(doc), f, indent=2, default=str, allow_nan=False)
       f.write('\n')
+    _finalize_staged_file_mode(tmp_path, path, 'doc')
     os.replace(tmp_path, path)
   finally:
     if os.path.exists(tmp_path):
@@ -5584,14 +6049,17 @@ def stage_rows_to_local_file(
   keyed = keyed_json_options(sink_ep)
   if keyed is not None:
     if if_exists == 'append':
-      raise SqlPipeError('--to-opt key= cannot be combined with --if-exists append')
-    doc = keyed_json_document(out_cols, out_rows, keyed['key'], keyed.get('value'))
+      raise SqlPipeError(
+          '--to-opt key= cannot be combined with --if-exists append')
+    doc = keyed_json_document(
+        out_cols, out_rows, keyed['key'], keyed.get('value'))
     tmp_path = _new_sql_stage_path(target, tag)
     try:
       with open(tmp_path, 'w', encoding='utf-8') as f:
         json.dump(
             _sanitize_json_nan(doc), f, indent=2, default=str, allow_nan=False)
         f.write('\n')
+      _finalize_staged_file_mode(tmp_path, target, tag)
     except BaseException:
       if os.path.exists(tmp_path):
         try:
@@ -5642,8 +6110,8 @@ def stage_rows_to_local_file(
             for f in tbl.schema:
               if pa.types.is_null(f.type):
                 fb_t = eff_col_types.get(f.name, pa.string())
-                fixed_cols[f.name] = pa.array(
-                    [None] * len(rows_to_write), type=fb_t)
+                fixed_cols[f.name] = pa.array([None] * len(rows_to_write),
+                                              type=fb_t)
               else:
                 fixed_cols[f.name] = tbl.column(f.name)
             tbl = pa.table(fixed_cols)
@@ -5670,15 +6138,15 @@ def stage_rows_to_local_file(
         non_null = [r.get(col) for r in rows_to_write if r.get(col) is not None]
         if non_null and all(isinstance(v, bool) for v in non_null):
           ak = 'boolean'
-        elif non_null and all(
-            isinstance(v, int) and not isinstance(v, bool) for v in non_null):
+        elif non_null and all(isinstance(v, int) and not isinstance(v, bool)
+                              for v in non_null):
           ak = 'long'
         elif non_null and all(
             isinstance(v, (int, float)) and not isinstance(v, bool)
             for v in non_null):
           ak = 'double'
-        elif non_null and all(
-            isinstance(v, (bytes, bytearray, memoryview)) for v in non_null):
+        elif non_null and all(isinstance(v, (bytes, bytearray, memoryview))
+                              for v in non_null):
           ak = 'bytes'
         else:
           ak = 'string'
@@ -5722,8 +6190,9 @@ def stage_rows_to_local_file(
           writer.writeheader()
           for r in rows_to_write:
             writer.writerow({
-                k: ('' if v is None else json.dumps(
-                    _sanitize_json_nan(v), default=str, allow_nan=False)
+                k: (
+                    '' if v is None else json.dumps(
+                        _sanitize_json_nan(v), default=str, allow_nan=False)
                     if isinstance(v, (dict, list)) else v)
                 for k, v in r.items()
             })
@@ -5734,6 +6203,7 @@ def stage_rows_to_local_file(
           f.write(
               json.dumps(_sanitize_json_nan(r), default=str, allow_nan=False) +
               '\n')
+    _finalize_staged_file_mode(tmp_path, final_path, tag)
   except BaseException:
     if os.path.exists(tmp_path):
       try:
@@ -5742,4 +6212,3 @@ def stage_rows_to_local_file(
         pass
     raise
   return tmp_path, final_path
-

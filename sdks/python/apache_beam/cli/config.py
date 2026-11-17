@@ -38,8 +38,10 @@ import functools
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 from typing import NamedTuple
@@ -234,13 +236,7 @@ def _option_catalog(
 
 
 def _fresh_config() -> dict[str, Any]:
-  return {
-      'active_profile': 'default', 'profiles': {
-          'default': {
-              'options': {}
-          }
-      }
-  }
+  return {'active_profile': 'default', 'profiles': {'default': {'options': {}}}}
 
 
 @contextlib.contextmanager
@@ -255,8 +251,30 @@ def _config_lock(config_path: str):
     raise ConfigError(
         f'refusing symbolic link config lock file {lock_path}', _EXIT_USAGE)
   from . import jobs as _jobs_mod
-  with _jobs_mod._file_lock(Path(lock_path)):
+  try:
+    cm = _jobs_mod._file_lock(Path(lock_path))
+    cm.__enter__()
+  except _jobs_mod.JobError as exc:
+    raise ConfigError(str(exc), _EXIT_USAGE) from None
+  try:
     yield
+  finally:
+    cm.__exit__(*sys.exc_info())
+
+
+def _backup_corrupt_config_copy(path: str, backup_path: str) -> bool:
+  if os.path.islink(backup_path):
+    raise ConfigError(
+        f'refusing symbolic link backup path {backup_path}', _EXIT_USAGE)
+  if os.path.islink(path) or not os.path.exists(path):
+    return False
+  shutil.copy2(path, backup_path)
+  if os.name == 'posix':
+    try:
+      os.chmod(backup_path, 0o600)
+    except OSError:
+      pass
+  return True
 
 
 def _load_or_recover_for_mutation(path: str) -> dict[str, Any]:
@@ -266,17 +284,15 @@ def _load_or_recover_for_mutation(path: str) -> dict[str, Any]:
     if not err.is_corrupt:
       raise
     backup_path = f'{path}.corrupt'
-    if os.path.islink(backup_path):
-      raise ConfigError(
-          f'refusing symbolic link backup path {backup_path}',
-          _EXIT_USAGE) from None
     try:
-      if os.path.exists(path):
-        os.replace(path, backup_path)
+      if _backup_corrupt_config_copy(path, backup_path):
         print(
-            f'warning: backed up corrupt config {path} to {backup_path} '
-            'and initialized fresh configuration',
+            _sanitize_stderr_text(
+                f'warning: backed up corrupt config {path} to {backup_path} '
+                'and initialized fresh configuration'),
             file=sys.stderr)
+    except ConfigError:
+      raise
     except OSError as exc:
       raise ConfigError(
           f'could not back up corrupt config {path}: {exc}',
@@ -288,7 +304,8 @@ def _load_or_recover_for_mutation(path: str) -> dict[str, Any]:
   return data
 
 
-def _ensure_profile_options(data: dict[str, Any], profile: str) -> dict[str, Any]:
+def _ensure_profile_options(data: dict[str, Any],
+                            profile: str) -> dict[str, Any]:
   profiles = data.setdefault('profiles', {})
   if not isinstance(profiles, dict):
     profiles = {}
@@ -308,8 +325,7 @@ def run_command(args, config_path=None):
   """Executes `beam config <action>` and returns an exit code."""
   path = _default_config_path(config_path)
   if os.path.islink(path):
-    raise ConfigError(
-        f'refusing symbolic link config file {path}', _EXIT_USAGE)
+    raise ConfigError(f'refusing symbolic link config file {path}', _EXIT_USAGE)
   action = args.config_action
 
   if action == 'use':
@@ -341,14 +357,19 @@ def run_command(args, config_path=None):
           if not err.is_corrupt:
             raise
           backup_path = f'{path}.corrupt'
-          if not os.path.islink(backup_path) and os.path.exists(path):
-            try:
-              os.replace(path, backup_path)
+          if os.path.islink(backup_path):
+            raise ConfigError(
+                f'refusing symbolic link backup path {backup_path}',
+                _EXIT_USAGE) from None
+          try:
+            if _backup_corrupt_config_copy(path, backup_path):
               print(
-                  f'warning: backed up corrupt config {path} to {backup_path}',
+                  _sanitize_stderr_text(
+                      f'warning: backed up corrupt config {path} to '
+                      f'{backup_path}'),
                   file=sys.stderr)
-            except OSError:
-              pass
+          except OSError:
+            pass
         _save_config(path, _fresh_config())
     print(f'Reset configuration ({path}).')
     return 0
@@ -381,9 +402,8 @@ def run_command(args, config_path=None):
   profile = _select_profile(data, getattr(args, 'profile', None))
   prof_entry = (data.get('profiles') or {}).get(profile) or {}
   options = (
-      prof_entry.get('options')
-      if isinstance(prof_entry, dict) and isinstance(
-          prof_entry.get('options'), dict) else {})
+      prof_entry.get('options') if isinstance(prof_entry, dict) and
+      isinstance(prof_entry.get('options'), dict) else {})
 
   if action == 'get':
     stripped = _validate_option_key(args.option)
@@ -418,8 +438,7 @@ def resolve_pipeline_args(
     return list(cli_args)
   path = _default_config_path(config_path)
   if os.path.islink(path):
-    raise ConfigError(
-        f'refusing symbolic link config file {path}', _EXIT_USAGE)
+    raise ConfigError(f'refusing symbolic link config file {path}', _EXIT_USAGE)
   if not os.path.isfile(path):
     return list(cli_args)
 
@@ -438,20 +457,20 @@ def resolve_pipeline_args(
   overridden = _overridden_dests(cli_args)
   by_dest, _ = _option_catalog()
   injected: list[str] = []
-  for key, value in options.items():
-    norm_k = str(key).strip().lstrip('-').replace('-', '_').lower()
-    if norm_k in _DANGEROUS_CONFIG_OPTIONS:
-      raise ConfigError(
-          f'refusing code/package option {key!r} from config file {path}; '
-          'pass code-loading options explicitly on the command line',
-          _EXIT_USAGE)
-    if key in overridden or value is None:
+  for raw_key, value in options.items():
+    key = str(raw_key)
+    _validate_option_key(key)
+    if value is None:
+      continue
+    _validate_option_value(key, value)
+    if key in overridden:
       continue
     injected.extend(_option_to_flags(key, value, by_dest.get(key)))
 
   if injected:
     print(
-        f'Using config profile {active!r} ({path}): {" ".join(injected)}',
+        _sanitize_stderr_text(
+            f'Using config profile {active!r} ({path}): {" ".join(injected)}'),
         file=sys.stderr)
   return injected + list(cli_args)
 
@@ -465,8 +484,7 @@ def configured_sql_runner(
     return 'direct'
   path = _default_config_path(config_path)
   if os.path.islink(path):
-    raise ConfigError(
-        f'refusing symbolic link config file {path}', _EXIT_USAGE)
+    raise ConfigError(f'refusing symbolic link config file {path}', _EXIT_USAGE)
   if not os.path.isfile(path):
     return 'direct'
 
@@ -481,10 +499,30 @@ def configured_sql_runner(
     norm = norm[:-len('runner')]
   if norm in ('direct', 'dataflow'):
     print(
-        f'Using config profile {active!r} ({path}): --runner={norm}',
+        _sanitize_stderr_text(
+            f'Using config profile {active!r} ({path}): --runner={norm}'),
         file=sys.stderr)
     return norm
   return 'direct'
+
+
+_FALLBACK_UNSAFE_TEXT_RE = re.compile(
+    r'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|'
+    r'\x1b\[[0-9;?]*[ -/]*[@-~]|'
+    r'\x1b[@-_]|\x1b|'
+    r'[\x00-\x08\x0b-\x1f\x7f-\x9f'
+    r'\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]')
+
+
+def _sanitize_stderr_text(text: str) -> str:
+  out_mod = sys.modules.get(f'{__package__}.output') if __package__ else None
+  if out_mod is not None and hasattr(out_mod, 'sanitize_untrusted_text'):
+    return out_mod.sanitize_untrusted_text(str(text))
+  try:
+    from . import output as _out_mod
+    return _out_mod.sanitize_untrusted_text(str(text))
+  except Exception:  # pylint: disable=broad-except
+    return _FALLBACK_UNSAFE_TEXT_RE.sub('', str(text))
 
 
 def _is_disabled(no_config):
@@ -521,19 +559,27 @@ def _select_profile(data, explicit_profile):
 _DANGEROUS_CONFIG_OPTIONS = frozenset([
     'beam_plugin',
     'beam_plugins',
-    'setup_file',
+    'beam_services',
     'extra_package',
     'extra_packages',
+    'flink_job_server_jar',
+    'job_server_java_launcher',
+    'job_server_jvm_properties',
+    'job_server_jvm_property',
+    'maven_repository_url',
+    'pickle_library',
+    'prism_location',
+    'profiler_agent',
     'requirements_file',
     'sdk_location',
-    'pickle_library',
+    'setup_file',
+    'spark_job_server_jar',
 ])
 
 
 def _load_config(path) -> dict[str, Any]:
   if os.path.islink(path):
-    raise ConfigError(
-        f'refusing symbolic link config file {path}', _EXIT_USAGE)
+    raise ConfigError(f'refusing symbolic link config file {path}', _EXIT_USAGE)
   if not os.path.isfile(path):
     return _fresh_config()
   if os.name == 'posix':
@@ -574,8 +620,7 @@ def _load_config(path) -> dict[str, Any]:
 
 def _save_config(path, data):
   if os.path.islink(path):
-    raise ConfigError(
-        f'refusing symbolic link config file {path}', _EXIT_USAGE)
+    raise ConfigError(f'refusing symbolic link config file {path}', _EXIT_USAGE)
   import yaml
   dumper = getattr(yaml, 'CSafeDumper', yaml.SafeDumper)
   parent = os.path.dirname(os.path.abspath(path))
@@ -603,7 +648,14 @@ def _save_config(path, data):
     if os.path.islink(path):
       raise ConfigError(
           f'refusing symbolic link config file {path}', _EXIT_USAGE)
-    os.replace(tmp_path, path)
+    for attempt in range(6):
+      try:
+        os.replace(tmp_path, path)
+        break
+      except PermissionError:
+        if os.name != 'nt' or attempt >= 5:
+          raise
+        time.sleep(0.01)
     if os.name == 'posix':
       try:
         os.chmod(path, 0o600)
@@ -652,23 +704,60 @@ def _validate_option_key(raw_option: str) -> str:
   return stripped
 
 
-def _validate_option_value(raw_value: str) -> None:
+_UNSET_VALUE = object()
+
+
+def _validate_option_value(
+    key_or_value: Any,
+    raw_value: Any = _UNSET_VALUE,
+) -> None:
+  if raw_value is _UNSET_VALUE:
+    option_key = None
+    val = key_or_value
+  else:
+    option_key = str(key_or_value)
+    val = raw_value
+  if val is None or isinstance(val, (bool, int, float)):
+    return
+  if isinstance(val, (list, tuple)):
+    for item in val:
+      _validate_option_value(option_key or '', item)
+    return
+  if isinstance(val, dict):
+    for sub_k, sub_v in val.items():
+      if _SECRET_KEY_RE.search(str(sub_k)):
+        raise ConfigError(
+            f'refusing secret key {sub_k!r} in config option '
+            f'{option_key or "<dict>"!r}',
+            _EXIT_USAGE)
+      _validate_option_value(str(sub_k), sub_v)
+    return
+
   from . import output as out_mod
   from . import uris
-  text = str(raw_value)
+  text = str(val)
+  if any(c in text for c in ('\x00', '\r', '\n')):
+    raise ConfigError(
+        'control or newline characters are not allowed in config option values',
+        _EXIT_USAGE)
   try:
     uris.reject_inline_credentials(text)
     for part in text.split(','):
       seg = part.strip()
       uris.reject_inline_credentials(seg)
       if '=' in seg:
-        _, rhs = seg.split('=', 1)
+        lhs, rhs = seg.split('=', 1)
+        if _SECRET_KEY_RE.search(lhs.strip()):
+          raise ConfigError(
+              f'refusing inline secret key {lhs.strip()!r} in config option '
+              f'{option_key or ""!r}',
+              _EXIT_USAGE)
         uris.reject_inline_credentials(rhs.strip())
   except uris.UriError as e:
     raise ConfigError(str(e), _EXIT_USAGE) from None
 
-  if _SECRET_VALUE_TOKEN_RE.search(text) or (
-      out_mod.redact_inline_secrets(text) != text):
+  if _SECRET_VALUE_TOKEN_RE.search(text) or (out_mod.redact_inline_secrets(text)
+                                             != text):
     raise ConfigError(
         'refusing to store inline credentials or secret token in plain-text '
         'config; use credentials providers or environment variables instead',
@@ -686,7 +775,9 @@ def _canonical_dest(raw_option, warn_unknown=True):
         normalized, by_dest.keys(), n=1, cutoff=0.75)
     hint = f' (did you mean {matches[0]!r}?)' if matches else ''
     print(
-        f'warning: {stripped!r} is not a built-in Beam pipeline option{hint}',
+        _sanitize_stderr_text(
+            f'warning: {stripped!r} is not a built-in Beam pipeline option'
+            f'{hint}'),
         file=sys.stderr)
   return stripped
 
@@ -694,7 +785,7 @@ def _canonical_dest(raw_option, warn_unknown=True):
 def _parse_key_value(raw_option, raw_value):
   stripped = raw_option.strip().lstrip('-')
   dest = _canonical_dest(raw_option, warn_unknown=True)
-  _validate_option_value(raw_value)
+  _validate_option_value(stripped, raw_value)
   by_dest, by_flag = _option_catalog()
   meta = by_dest.get(dest)
   _, flag_bool = by_flag.get(stripped, (dest, None))

@@ -51,6 +51,9 @@ class SchedulerError(Exception):
     self.exit_code = exit_code
 
 
+ScheduleError = SchedulerError
+
+
 class ScheduleExportReport(NamedTuple):
   orchestrator: str
   schedule: str
@@ -60,20 +63,28 @@ class ScheduleExportReport(NamedTuple):
   job_name: str | None
 
 
+_CRON_TOKEN_RE = re.compile(r'^[A-Za-z0-9*,/_#?-]+$')
+
+
 def validate_cron_expression(expr: str) -> str:
   """Validates standard 5-field cron syntax or standard Airflow macros."""
-  cleaned = str(expr).strip()
+  raw = str(expr)
+  if any(ch in raw for ch in ('\r', '\n', '\x00')):
+    raise SchedulerError(
+        f'Invalid cron expression {expr!r}; newline and control characters '
+        'are not allowed.')
+  cleaned = raw.strip(' \t')
   if not cleaned:
     raise SchedulerError('Schedule expression cannot be empty.')
   if cleaned.lower() in _CRON_MACROS:
     return cleaned.lower()
-  parts = cleaned.split()
-  if len(parts) != 5:
+  parts = re.split(r'[ \t]+', cleaned)
+  if len(parts) != 5 or not all(_CRON_TOKEN_RE.match(p) for p in parts):
     raise SchedulerError(
         f'Invalid cron expression {expr!r}; expected standard 5-part cron syntax '
         '(minute hour day-of-month month day-of-week) or macro (@daily, @hourly).'
     )
-  return cleaned
+  return ' '.join(parts)
 
 
 def _sanitize_identifier(name: str) -> str:
@@ -86,7 +97,8 @@ def _sanitize_identifier(name: str) -> str:
   return sanitized
 
 
-_JINJA_PLACEHOLDER_RE = re.compile(r'\{\{.*?\}\}|\{%.*?%\}|\{#.*?#\}', re.DOTALL)
+_JINJA_PLACEHOLDER_RE = re.compile(
+    r'\{\{.*?\}\}|\{%.*?%\}|\{#.*?#\}', re.DOTALL)
 _SECRET_VALUE_TOKEN_RE = re.compile(
     r'(?:'
     r'\bya29\.[A-Za-z0-9._-]{8,}|'
@@ -126,8 +138,7 @@ def _parse_yaml_options_dict(raw_text: str, label: str) -> dict[str, Any]:
     return {}
   normalized: dict[str, Any] = {}
   for k, v in opts.items():
-    if v == '__BEAM_JINJA_PLACEHOLDER__' or (
-        isinstance(v, str) and '__BEAM_JINJA_PLACEHOLDER__' in v):
+    if isinstance(v, str) and v.strip() == '__BEAM_JINJA_PLACEHOLDER__':
       continue
     norm_k = str(k).strip().lstrip('-').replace('-', '_')
     normalized[norm_k] = v
@@ -154,8 +165,7 @@ def _load_pipeline_options_from_source(source: str) -> dict[str, Any]:
 
   if s_trim.lower().endswith(('.yaml', '.yml')):
     if os.path.islink(s_trim):
-      raise SchedulerError(
-          f'refusing symbolic link pipeline file {s_trim!r}')
+      raise SchedulerError(f'refusing symbolic link pipeline file {s_trim!r}')
     if not os.path.isfile(s_trim):
       raise SchedulerError(f'pipeline file not found: {s_trim}')
     try:
@@ -184,17 +194,52 @@ def _is_truthy_opt(val: Any) -> bool:
 def _validate_param_value_no_secrets(key: str, val: str) -> None:
   from . import output
   from . import uris
+  if uris._INLINE_URI_USERINFO_RE.search(val):
+    raise SchedulerError(
+        f'Refusing to bake inline credentials in parameter {key!r}; '
+        'pass a Secret Manager resource name instead')
   try:
     uris.reject_inline_credentials(val)
   except uris.UriError as exc:
     raise SchedulerError(
         f'Refusing to bake inline credentials in parameter {key!r}: {exc}'
     ) from None
-  if _SECRET_VALUE_TOKEN_RE.search(val) or (
-      output.redact_inline_secrets(val) != val):
+  if _SECRET_VALUE_TOKEN_RE.search(val) or (output.redact_inline_secrets(val)
+                                            != val):
     raise SchedulerError(
         f'Refusing to bake inline secret or token in parameter {key!r}; '
         'pass a Secret Manager resource name instead')
+
+
+def _validate_options_no_secrets(obj: Any, key_path: str = 'options') -> None:
+  """Recursively scans YAML `options:` for secret keys or inline secret tokens."""
+  from . import uris
+  if isinstance(obj, dict):
+    for k, v in obj.items():
+      ks = str(k).strip()
+      sub_path = f'{key_path}.{ks}'
+      if not ks.lower().endswith('_env') and uris._SECRET_KEY_RE.search(ks):
+        sv = '' if v is None else str(v).strip()
+        if sv and sv not in (
+            '<REDACTED_SECRET>',
+            '<redacted>',
+            '__BEAM_JINJA_PLACEHOLDER__',
+        ):
+          raise SchedulerError(
+              f'Refusing to bake secret option {ks!r} from pipeline YAML into '
+              'exported schedule; pass a Secret Manager resource name instead')
+      _validate_options_no_secrets(v, sub_path)
+  elif isinstance(obj, (list, tuple)):
+    for idx, item in enumerate(obj):
+      _validate_options_no_secrets(item, f'{key_path}[{idx}]')
+  elif isinstance(obj, str):
+    sv = obj.strip()
+    if sv and sv not in (
+        '<REDACTED_SECRET>',
+        '<redacted>',
+        '__BEAM_JINJA_PLACEHOLDER__',
+    ):
+      _validate_param_value_no_secrets(key_path, obj)
 
 
 def generate_composer_dag(
@@ -367,6 +412,7 @@ def run_export_schedule(
 
   # Extract options from pipeline YAML if present
   pipeline_opts = _load_pipeline_options_from_source(source)
+  _validate_options_no_secrets(pipeline_opts)
   eff_project = str(
       project or pipeline_opts.get('project') or
       os.environ.get('GOOGLE_CLOUD_PROJECT') or 'my-gcp-project').strip()
@@ -401,21 +447,25 @@ def run_export_schedule(
     eff_streaming_engine = _is_truthy_opt(
         pipeline_opts.get('enable_streaming_engine'))
 
-  if not re.fullmatch(r'[a-z0-9.:-]+', eff_project) or eff_project.startswith('-'):
+  if not re.fullmatch(r'[a-z0-9.:-]+',
+                      eff_project) or eff_project.startswith('-'):
     raise SchedulerError(f'Invalid GCP project identifier {eff_project!r}')
-  if not re.fullmatch(r'[a-z0-9-]+', eff_location) or eff_location.startswith('-'):
+  if not re.fullmatch(r'[a-z0-9-]+',
+                      eff_location) or eff_location.startswith('-'):
     raise SchedulerError(f'Invalid GCP region/location {eff_location!r}')
 
   raw_base = (
       os.path.splitext(os.path.basename(source))[0]
       if source and source != '-' else 'beam_pipeline')
   clean_base = _sanitize_identifier(raw_base)
-  slug_base = re.sub(r'[^a-zA-Z0-9._-]+', '-', clean_base).strip('-') or 'pipeline'
+  slug_base = re.sub(r'[^a-zA-Z0-9._-]+', '-',
+                     clean_base).strip('-') or 'pipeline'
 
   # Resolve template GCS path (guaranteed free of spaces)
   eff_template = template_gcs_path
   if not eff_template:
-    if source.startswith('gs://') and source.endswith('.json') and ' ' not in source:
+    if source.startswith('gs://') and source.endswith(
+        '.json') and ' ' not in source:
       eff_template = source
     else:
       eff_template = f'gs://{eff_project}-templates/{slug_base}.json'

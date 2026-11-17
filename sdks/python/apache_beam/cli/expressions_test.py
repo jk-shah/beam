@@ -56,7 +56,8 @@ class ExpressionsTest(unittest.TestCase):
     src = cfg['keep']
     self.assertTrue(
         _eval_keep(
-            src, {
+            src,
+            {
                 'state': 'OR',
                 'note': 'active',
                 'deleted_at': None,
@@ -64,7 +65,8 @@ class ExpressionsTest(unittest.TestCase):
             }))
     self.assertFalse(
         _eval_keep(
-            src, {
+            src,
+            {
                 'state': 'WA',
                 'note': 'active',
                 'deleted_at': None,
@@ -77,17 +79,19 @@ class ExpressionsTest(unittest.TestCase):
     cfg, cols = expressions.compile_where('user_id == 42 and id > 0')
     self.assertEqual(cols, frozenset(['user_id', 'id']))
     self.assertTrue(
-        _eval_keep(cfg['keep'], {'user_id': 42, 'id': 1, 'or_flag': 0}))
+        _eval_keep(cfg['keep'], {
+            'user_id': 42, 'id': 1, 'or_flag': 0
+        }))
     # Simple filters are emitted as native, NULL-guarded Beam YAML text.
-    self.assertEqual(cfg['keep'], 'user_id == 42 and (id is not None and id > 0)')
+    self.assertEqual(
+        cfg['keep'], 'user_id == 42 and (id is not None and id > 0)')
     self.assertFalse(_eval_keep(cfg['keep'], {'user_id': 42, 'id': None}))
 
   def test_sql_equals_not_equals_cast_and_keyword_columns(self):
     cfg, cols = expressions.compile_where(
         "age = 21 AND country <> 'CA' AND class = 'enterprise' "
         "AND `order-type` = 'b2b'")
-    self.assertEqual(
-        cols, frozenset(['age', 'country', 'class', 'order-type']))
+    self.assertEqual(cols, frozenset(['age', 'country', 'class', 'order-type']))
     src = cfg['keep']['callable']
     self.assertTrue(
         _eval_callable(
@@ -115,8 +119,10 @@ class ExpressionsTest(unittest.TestCase):
         '`class` AS cust_class')
     self.assertEqual(
         sel_cols, frozenset(['order_id', 'amount', 'tier', 'class']))
-    self.assertEqual(sel_cfg['fields']['cust_class'], 'class')
+    self.assertIn('callable', sel_cfg['fields']['cust_class'])
     row = {'order_id': '101', 'amount': '120.556', 'tier': None, 'class': 'pro'}
+    self.assertEqual(
+        _eval_callable(sel_cfg['fields']['cust_class']['callable'], row), 'pro')
     self.assertEqual(
         _eval_callable(sel_cfg['fields']['order_id']['callable'], row), 101)
     self.assertEqual(
@@ -166,10 +172,7 @@ class ExpressionsTest(unittest.TestCase):
     self.assertEqual(cfg['fields']['clean_email']['output_type'], 'string')
     self.assertEqual(cfg['fields']['total']['output_type'], 'number')
     row = {
-        'id': 7,
-        'email': 'Ada@Example.COM',
-        'amount': 10.0,
-        'nickname': None
+        'id': 7, 'email': 'Ada@Example.COM', 'amount': 10.0, 'nickname': None
     }
     self.assertEqual(
         _eval_callable(cfg['fields']['clean_email']['callable'], row),
@@ -199,9 +202,8 @@ class ExpressionsTest(unittest.TestCase):
         "amount >= {{ min_amount | default(50) }} AND country = '{{ region }}'",
         allow_jinja=True)
     self.assertEqual(w_cols, frozenset(['amount', 'country']))
-    self.assertIn(
-        '{{ min_amount | default(50) }}', w_cfg['keep']['callable'])
-    self.assertIn("'{{ region }}'", w_cfg['keep']['callable'])
+    self.assertIn('{{ min_amount | default(50) }}', w_cfg['keep']['callable'])
+    self.assertIn('{{ region }}', w_cfg['keep']['callable'])
 
     s_cfg, s_cols = expressions.compile_select(
         'order_id, amount * {{ tax_rate | default(1.08) }} AS taxed_amount',
@@ -219,7 +221,8 @@ class ExpressionsTest(unittest.TestCase):
         'amount >= {% if true %}1{% endif %}',
         '{{ fn_name }}(amount) > 0',
     ):
-      with self.assertRaises(ExpressionError, msg=f'expected error: {bad_where}'):
+      with self.assertRaises(ExpressionError,
+                             msg=f'expected error: {bad_where}'):
         expressions.compile_where(bad_where, allow_jinja=True)
 
     with self.assertRaisesRegex(ExpressionError, 'requires an alias'):
@@ -230,8 +233,12 @@ class ExpressionsTest(unittest.TestCase):
     self.assertEqual(cfg['keep'], 'amount is not None and amount > 100')
     self.assertFalse(_eval_keep(cfg['keep'], {'amount': None}))
     self.assertTrue(_eval_keep(cfg['keep'], {'amount': 101}))
-    for raw in ('NOT (amount > 5)', "upper(name) == 'A'", 'user.tier == 1',
-                'qty * price > 3', '`order-id` > 1', 'CAST(zip AS int) > 1'):
+    for raw in ('NOT (amount > 5)',
+                "upper(name) == 'A'",
+                'user.tier == 1',
+                'qty * price > 3',
+                '`order-id` > 1',
+                'CAST(zip AS int) > 1'):
       self.assertIsInstance(
           expressions.compile_where(raw)[0]['keep'], dict, raw)
     # A keyword-named source column that appears inside the text would break
@@ -243,7 +250,8 @@ class ExpressionsTest(unittest.TestCase):
         'amount > 1', known_columns={'amount', 'class'})
     self.assertIsInstance(cfg['keep'], str)
     sel, _ = expressions.compile_select('id, amount + 1 AS a1, qty * 2 AS q')
-    self.assertEqual(sel['fields']['a1'], 'None if amount is None else amount + 1')
+    self.assertEqual(
+        sel['fields']['a1'], 'None if amount is None else amount + 1')
     self.assertIn('callable', sel['fields']['q'])
 
 
@@ -256,12 +264,24 @@ class SqlNullSemanticsTest(unittest.TestCase):
   text evaluated the way Beam binds fields.
   """
   ROWS = [
-      {'id': 1, 'state': 'CA', 'amount': 120.0, 'qty': 2},
-      {'id': 2, 'state': None, 'amount': 50.0, 'qty': 0},
-      {'id': 3, 'state': 'NY', 'amount': None, 'qty': 3},
-      {'id': 4, 'state': 'C', 'amount': 0.0, 'qty': None},
-      {'id': 5, 'state': '', 'amount': 300.0, 'qty': 1},
-      {'id': 6, 'state': None, 'amount': None, 'qty': None},
+      {
+          'id': 1, 'state': 'CA', 'amount': 120.0, 'qty': 2
+      },
+      {
+          'id': 2, 'state': None, 'amount': 50.0, 'qty': 0
+      },
+      {
+          'id': 3, 'state': 'NY', 'amount': None, 'qty': 3
+      },
+      {
+          'id': 4, 'state': 'C', 'amount': 0.0, 'qty': None
+      },
+      {
+          'id': 5, 'state': '', 'amount': 300.0, 'qty': 1
+      },
+      {
+          'id': 6, 'state': None, 'amount': None, 'qty': None
+      },
   ]
   EXPRESSIONS = [
       "state = 'CA'",
@@ -291,7 +311,8 @@ class SqlNullSemanticsTest(unittest.TestCase):
   def setUpClass(cls):
     import sqlite3
     cls.conn = sqlite3.connect(':memory:')
-    cls.conn.execute('CREATE TABLE t (id INT, state TEXT, amount REAL, qty INT)')
+    cls.conn.execute(
+        'CREATE TABLE t (id INT, state TEXT, amount REAL, qty INT)')
     cls.conn.executemany(
         'INSERT INTO t VALUES (:id, :state, :amount, :qty)', cls.ROWS)
 
@@ -307,11 +328,13 @@ class SqlNullSemanticsTest(unittest.TestCase):
     for expr in self.EXPRESSIONS:
       cfg, _ = expressions.compile_where(expr)
       got = sorted(r['id'] for r in self.ROWS if _eval_keep(cfg['keep'], r))
-      self.assertEqual(got, self._sqlite_ids(expr), f'{expr!r} -> {cfg["keep"]}')
+      self.assertEqual(
+          got, self._sqlite_ids(expr), f'{expr!r} -> {cfg["keep"]}')
 
   def test_callable_form_matches_sqlite(self):
     from unittest import mock
-    with mock.patch.object(expressions, '_native_expression', return_value=None):
+    with mock.patch.object(expressions, '_native_expression',
+                           return_value=None):
       for expr in self.EXPRESSIONS:
         cfg, _ = expressions.compile_where(expr)
         self.assertIn('callable', cfg['keep'])
@@ -358,11 +381,17 @@ class SqlNullSemanticsTest(unittest.TestCase):
     self.assertTrue(
         check_cmd._is_safe_inline_callable(ilike_cfg['keep']['callable']))
     self.assertTrue(
-        _eval_keep(ilike_cfg['keep'], {'city': 'Munich', 'code': 'a1'}))
+        _eval_keep(ilike_cfg['keep'], {
+            'city': 'Munich', 'code': 'a1'
+        }))
     self.assertFalse(
-        _eval_keep(ilike_cfg['keep'], {'city': 'Munich', 'code': 'X99'}))
+        _eval_keep(ilike_cfg['keep'], {
+            'city': 'Munich', 'code': 'X99'
+        }))
     self.assertFalse(
-        _eval_keep(ilike_cfg['keep'], {'city': None, 'code': 'a1'}))
+        _eval_keep(ilike_cfg['keep'], {
+            'city': None, 'code': 'a1'
+        }))
 
   def test_temporal_comparisons_iso_str_and_aware_vs_naive(self):
     import datetime
@@ -373,14 +402,16 @@ class SqlNullSemanticsTest(unittest.TestCase):
     self.assertTrue(check_cmd._is_safe_inline_callable(cfg['keep']['callable']))
     self.assertTrue(
         _eval_keep(
-            cfg['keep'], {
+            cfg['keep'],
+            {
                 'created_at': datetime.datetime(2026, 2, 1, 0, 0),
                 'updated_at': datetime.datetime(
                     2026, 2, 1, 1, 0, tzinfo=datetime.timezone.utc),
             }))
     self.assertFalse(
         _eval_keep(
-            cfg['keep'], {
+            cfg['keep'],
+            {
                 'created_at': datetime.date(2025, 12, 31),
                 'updated_at': datetime.datetime(2026, 2, 1, 1, 0),
             }))
