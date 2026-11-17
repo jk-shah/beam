@@ -351,6 +351,8 @@ def build_pipe_spec(
     to_opts: Iterable[str] | None = None,
     from_opt_file: str | None = None,
     to_opt_file: str | None = None,
+    join_opts: Iterable[str] | None = None,
+    join_opt_file: str | None = None,
     default_project: str | None = None,
     known_source_columns: set[str] | None = None,
     include_counters: bool = False,
@@ -452,6 +454,9 @@ def build_pipe_spec(
   try:
     parsed_from_opts = uris.parse_kv_options(
         from_opts, from_opt_file, '--from-opt')
+    parsed_join_opts = (
+        uris.parse_kv_options(join_opts, join_opt_file, '--join-opt')
+        if (join_opts or join_opt_file) else {})
     parsed_to_opts = uris.parse_kv_options(to_opts, to_opt_file, '--to-opt')
     raw_cdc_fields = parsed_from_opts.pop('fields', None) if cdc else None
     if (',' in source and '://' not in source and not allow_jinja and
@@ -477,7 +482,7 @@ def build_pipe_spec(
             clean_join_source,
             is_read=True,
             explicit_format=from_format,
-            options=dict(parsed_from_opts),
+            options={**parsed_from_opts, **parsed_join_opts},
             default_project=default_project,
             allow_sniff=not allow_jinja,
             allow_jinja=allow_jinja) if clean_join_source else None)
@@ -547,9 +552,10 @@ def build_pipe_spec(
       (
           allowed_lateness is not None and
           (window is not None or
-           (asof_join is None and pattern is None))) or trigger is not None or
-      accumulation is not None or late_action is not None or
-      late_dlq_ep is not None or emit_pane_info or watermark_lag is not None)
+           (asof_join is None and interval_join is None and pattern is None)))
+      or trigger is not None or accumulation is not None or
+      late_action is not None or late_dlq_ep is not None or emit_pane_info or
+      watermark_lag is not None)
 
   if zero_copy:
     if limit is not None:
@@ -705,6 +711,7 @@ def build_pipe_spec(
     eff_skew_act = skew_action or (
         'dlq' if
         (dlq_ep is not None and max_watermark_skew is not None) else None)
+    eff_ij_lateness = allowed_lateness if window is None else None
     try:
       if isinstance(interval_join, str):
         ij_str = interval_join
@@ -716,7 +723,8 @@ def build_pipe_spec(
             max_watermark_skew=max_watermark_skew,
             skew_action=eff_skew_act,
             left_alias=left_alias_hint,
-            right_alias=right_alias_hint)
+            right_alias=right_alias_hint,
+            allowed_lateness=eff_ij_lateness)
       elif isinstance(interval_join, dict):
         interval_join_cfg = dict(interval_join)
         if clean_timestamp_col and not any(k in interval_join_cfg for k in (
@@ -730,6 +738,9 @@ def build_pipe_spec(
           interval_join_cfg['max_watermark_skew'] = max_watermark_skew
         if eff_skew_act is not None and 'skew_action' not in interval_join_cfg:
           interval_join_cfg['skew_action'] = eff_skew_act
+        if (eff_ij_lateness is not None and
+            'allowed_lateness' not in interval_join_cfg):
+          interval_join_cfg['allowed_lateness'] = eff_ij_lateness
       else:
         raise ValueError(
             f'unsupported interval_join type {type(interval_join).__name__}')

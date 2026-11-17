@@ -229,10 +229,10 @@ def render_llms_txt() -> str:
 
 ## 6. Canonical Agent Workflow Examples
 ```bash
-# 1. Nightly JSON to Partitioned Iceberg (+ Zero-Docker Flex Template & Composer DAG)
+# 1. Nightly JSON to Partitioned Iceberg (+ Zero-Docker Flex Template & Composer DAG; overwrite_partitions=true makes retries idempotent)
 beam pipe --from "gs://my-bucket/raw/events/{{{{ ds }}}}/*.jsonl" \\
           --to "iceberg://lake.events?warehouse=gs://my-bucket/wh" \\
-          --select "*, '{{{{ ds }}}}' AS dt" --to-opt partition_fields=dt \\
+          --select "*, '{{{{ ds }}}}' AS dt" --to-opt partition_fields=dt --to-opt overwrite_partitions=true \\
           --if-exists append --dlq "gs://my-bucket/dlq/events/{{{{ ds }}}}/" --emit-yaml > nightly.yaml
 beam package nightly.yaml --to gs://my-bucket/templates/nightly.json --json
 beam export-schedule nightly.yaml --template-spec gs://my-bucket/templates/nightly.json \\
@@ -244,17 +244,18 @@ beam pipe --from "kafka://broker:9092/payments?auto_offset_reset=latest" \\
           --where "status = 'CAPTURED' AND amount > 0" \\
           --select "payment_id, sha256(user_id) AS user_hash, mask_email(email) AS email, mask_last4(card_number) AS card_masked, amount, event_ts" \\
           --to-opt partition_fields="day(event_ts)" --dlq gs://my-bucket/dlq/payments/ \\
-          --dlq-redact-fields email,card_number --from-opt-file kafka.opts \\
+          --dlq-redact-fields email,card_number --from-opt-file kafka.opts --to-opt-file catalog.opts \\
           --runner=DataflowRunner --project=my-proj --region=us-central1 --json
 
 # 3. Join Two Live Kafka Streams + Read-Only Kafka Peek (beam tail)
-beam tail "kafka://broker:9092/clicks?schema_registry=https://sr.internal:8081" -n 5 --duration 5s --from-opt-file kafka.opts --json
+beam tail "kafka://broker:9092/clicks?schema_registry=https://sr.internal:8081&no_group=true&raw_bytes=true" -n 5 --duration 5s --from-opt-file kafka.opts --json
 beam pipe --from "c=kafka://broker:9092/clicks?timestamp_policy=CreateTime" \\
           --join "o=kafka://broker:9092/orders?timestamp_policy=CreateTime" \\
           --to "iceberg://lake.attributed_orders?warehouse=gs://my-bucket/wh" \\
+          --allowed-lateness 5m \\
           --sql "SELECT o.order_id, o.user_id, c.campaign_id, o.amount, o.order_ts FROM c JOIN o ON c.user_id = o.user_id AND o.order_ts BETWEEN c.click_ts AND c.click_ts + INTERVAL '15' MINUTE" \\
           --max-watermark-skew 30m --skew-action dlq --dlq gs://my-bucket/dlq/skew/ \\
-          --from-opt-file kafka.opts --runner=DataflowRunner --project=my-proj --region=us-central1 --json
+          --from-opt-file kafka.opts --join-opt-file kafka.opts --runner=DataflowRunner --project=my-proj --region=us-central1 --json
 
 # 4. PostgreSQL Debezium CDC & Partitioned/Unpartitioned Delta Lake -> Iceberg v2
 beam pipe --from "postgres://pg.internal:5432/prod?table=public.orders" \\

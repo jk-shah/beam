@@ -325,8 +325,10 @@ _CLI_ONE_FLAGS = {
         '--if-exists',
         '--from-opt',
         '--to-opt',
+        '--join-opt',
         '--from-opt-file',
         '--to-opt-file',
+        '--join-opt-file',
         '--max-bytes',
         '--verify-key',
         '--primary-key',
@@ -359,10 +361,14 @@ _CLI_ONE_FLAGS = {
         '--right-opt',
         '--source-opt',
         '--target-opt',
+        '--from-opt',
+        '--to-opt',
         '--left-opt-file',
         '--right-opt-file',
         '--source-opt-file',
         '--target-opt-file',
+        '--from-opt-file',
+        '--to-opt-file',
         '--rtol',
         '--atol',
         '--columns',
@@ -386,7 +392,10 @@ _CLI_ONE_FLAGS = {
         '--search',
         '--max-scanned-bytes',
         '--from-opt',
+        '--opt',
         '--from-opt-file',
+        '--opt-file',
+        '--to-opt-file',
         '--project',
         '--profile',
     ]),
@@ -403,7 +412,9 @@ _CLI_ONE_FLAGS = {
         '--from-format',
         '--format',
         '--from-opt',
+        '--opt',
         '--from-opt-file',
+        '--opt-file',
         '--project',
         '--profile',
     ]),
@@ -1241,8 +1252,16 @@ def _build_parser():
       metavar='KEY=VAL',
       help='sink option or @file.yaml (repeatable; e.g. key=COL for keyed JSON)'
   )
+  g_io.add_argument(
+      '--join-opt',
+      dest='join_opts',
+      action='append',
+      default=[],
+      metavar='KEY=VAL',
+      help='join source option or @file.yaml (repeatable)')
   g_io.add_argument('--from-opt-file', metavar='FILE', help=argparse.SUPPRESS)
   g_io.add_argument('--to-opt-file', metavar='FILE', help=argparse.SUPPRESS)
+  g_io.add_argument('--join-opt-file', metavar='FILE', help=argparse.SUPPRESS)
   g_io.add_argument(
       '--zero-copy',
       action='store_true',
@@ -1705,6 +1724,7 @@ def _build_parser():
   diff_p.add_argument(
       '--left-opt',
       '--source-opt',
+      '--from-opt',
       dest='left_opts',
       action='append',
       default=[],
@@ -1713,6 +1733,7 @@ def _build_parser():
   diff_p.add_argument(
       '--right-opt',
       '--target-opt',
+      '--to-opt',
       dest='right_opts',
       action='append',
       default=[],
@@ -1721,6 +1742,7 @@ def _build_parser():
   diff_p.add_argument(
       '--left-opt-file',
       '--source-opt-file',
+      '--from-opt-file',
       dest='left_opt_file',
       default=None,
       metavar='FILE',
@@ -1728,6 +1750,7 @@ def _build_parser():
   diff_p.add_argument(
       '--right-opt-file',
       '--target-opt-file',
+      '--to-opt-file',
       dest='right_opt_file',
       default=None,
       metavar='FILE',
@@ -1833,12 +1856,20 @@ def _build_parser():
       help='maximum bytes read during local/GCS head scan (default: 64MB)')
   insp.add_argument(
       '--from-opt',
+      '--opt',
       dest='from_opts',
       action='append',
       default=[],
       metavar='KEY=VAL',
       help='source option or @file.yaml (repeatable)')
-  insp.add_argument('--from-opt-file', metavar='FILE', help=argparse.SUPPRESS)
+  insp.add_argument(
+      '--from-opt-file',
+      '--opt-file',
+      '--to-opt-file',
+      dest='from_opt_file',
+      default=None,
+      metavar='FILE',
+      help=argparse.SUPPRESS)
   insp.add_argument('--project', metavar='PROJECT', help='default GCP project')
   _add_config_selection_args(insp)
 
@@ -1967,6 +1998,7 @@ def _build_parser():
   )
   tail_p.add_argument(
       '--from-opt',
+      '--opt',
       dest='from_opts',
       action='append',
       default=[],
@@ -1974,6 +2006,7 @@ def _build_parser():
       help='source option or @file.yaml (repeatable)')
   tail_p.add_argument(
       '--from-opt-file',
+      '--opt-file',
       dest='from_opt_file',
       default=None,
       metavar='FILE',
@@ -2361,6 +2394,7 @@ def _build_parser():
     sp.add_argument(
         '--source-opt',
         '--left-opt',
+        '--from-opt',
         action='append',
         dest='source_opts',
         metavar='KEY=VAL',
@@ -2368,6 +2402,7 @@ def _build_parser():
     sp.add_argument(
         '--target-opt',
         '--right-opt',
+        '--to-opt',
         action='append',
         dest='target_opts',
         metavar='KEY=VAL',
@@ -2375,12 +2410,14 @@ def _build_parser():
     sp.add_argument(
         '--source-opt-file',
         '--left-opt-file',
+        '--from-opt-file',
         dest='source_opt_file',
         default=None,
         help=argparse.SUPPRESS)
     sp.add_argument(
         '--target-opt-file',
         '--right-opt-file',
+        '--to-opt-file',
         dest='target_opt_file',
         default=None,
         help=argparse.SUPPRESS)
@@ -2494,12 +2531,37 @@ def _build_parser():
       default=None,
       help='default GCP project')
   sync_p.add_argument(
+      '--from-opt',
+      '--source-opt',
+      dest='from_opts',
+      action='append',
+      default=[],
+      metavar='KEY=VAL',
+      help='source option (repeatable)')
+  sync_p.add_argument(
+      '--from-opt-file',
+      '--source-opt-file',
+      dest='from_opt_file',
+      default=None,
+      metavar='FILE',
+      help=argparse.SUPPRESS)
+  sync_p.add_argument(
       '--catalog-opt',
+      '--to-opt',
+      '--target-opt',
       dest='catalog_opts',
       action='append',
       default=[],
       metavar='KEY=VAL',
       help='catalog option (repeatable)')
+  sync_p.add_argument(
+      '--catalog-opt-file',
+      '--to-opt-file',
+      '--target-opt-file',
+      dest='catalog_opt_file',
+      default=None,
+      metavar='FILE',
+      help=argparse.SUPPRESS)
   sync_p.add_argument(
       '--verbose', action='store_true', help='show tracebacks for errors')
   _add_config_selection_args(sync_p)
@@ -3152,9 +3214,18 @@ def _catalog(
         '(or --from SOURCE --to TARGET)',
         EXIT_USAGE)
 
+  from . import uris
   cfg_args = _resolve_config_args(args, [])
   eff_proj = args.project or _extract_opt_from_resolved(cfg_args, '--project')
   try:
+    eff_src_opts = _merge_opt_file_into_kv_list(
+        getattr(args, 'from_opts', None),
+        getattr(args, 'from_opt_file', None),
+        '--from-opt')
+    eff_cat_opts = _merge_opt_file_into_kv_list(
+        getattr(args, 'catalog_opts', None),
+        getattr(args, 'catalog_opt_file', None),
+        '--catalog-opt')
     res = lakehouse.sync_lakehouse_catalog(
         eff_from,
         eff_to,
@@ -3164,8 +3235,9 @@ def _catalog(
         zero_copy=args.zero_copy,
         dry_run=args.dry_run,
         default_project=eff_proj,
-        catalog_opts=args.catalog_opts)
-  except lakehouse.LakehouseError as e:
+        catalog_opts=eff_cat_opts,
+        source_opts=eff_src_opts)
+  except (lakehouse.LakehouseError, uris.UriError, ValueError, FileNotFoundError) as e:
     raise _CliError(str(e), EXIT_USAGE) from None
   except Exception as e:
     raise _CliError(f'catalog sync failed: {e}', EXIT_PIPELINE_FAILED) from None
@@ -4063,9 +4135,17 @@ def _pipe_impl(
           'multiple --from sources or --join requires --sql "SELECT ..." '
           'or --interval-join <SPEC>',
           EXIT_USAGE)
+    has_non_lateness_b23 = bool(
+        getattr(args, 'trigger', None) or getattr(args, 'accumulation', None)
+        or getattr(args, 'late_action', None) or
+        getattr(args, 'late_data_dlq', None) or
+        getattr(args, 'emit_pane_info', False))
     if (getattr(args, 'pre_select', None) or
         getattr(args, 'post_where', None) or args.cdc or args.zero_copy or
-        args.window or has_b23_flags or getattr(args, 'dedupe_by', None) or
+        args.window or has_non_lateness_b23 or
+        (getattr(args, 'allowed_lateness', None) and
+         (len(raw_sources) + len(raw_joins)) < 2) or
+        getattr(args, 'dedupe_by', None) or
         getattr(args, 'enrich_specs', None) or
         getattr(args, 'infer_specs', None)):
       raise _CliError(
@@ -4081,6 +4161,13 @@ def _pipe_impl(
     try:
       parsed_from_opts = uris.parse_kv_options(
           args.from_opts, args.from_opt_file, '--from-opt')
+      parsed_join_opts = (
+          uris.parse_kv_options(
+              getattr(args, 'join_opts', None),
+              getattr(args, 'join_opt_file', None),
+              '--join-opt')
+          if (getattr(args, 'join_opts', None) or
+              getattr(args, 'join_opt_file', None)) else None)
       parsed_to_opts = uris.parse_kv_options(
           args.to_opts, args.to_opt_file, '--to-opt')
       named_sources = pipe_sql.parse_named_sources(
@@ -4088,6 +4175,7 @@ def _pipe_impl(
           raw_joins,
           from_format=args.from_format or args.format,
           from_opts=parsed_from_opts,
+          join_opts=parsed_join_opts,
           default_project=default_proj,
           allow_sniff=not allow_jinja,
           allow_jinja=allow_jinja)
@@ -4131,6 +4219,7 @@ def _pipe_impl(
           args.sql_engine != 'python' and not has_window_sql and
           is_local_runner and not args.dry_run and
           not getattr(args, 'portable', False) and
+          not getattr(args, 'allowed_lateness', None) and
           not any(ns.endpoint.is_unbounded for ns in named_sources) and
           not any(ns.endpoint.kind != 'file' for ns in named_sources) and
           (sink_ep is None or sink_ep.kind == 'file'))
@@ -4149,6 +4238,7 @@ def _pipe_impl(
           allow_jinja=allow_jinja,
           max_watermark_skew=getattr(args, 'max_watermark_skew', None),
           skew_action=getattr(args, 'skew_action', None),
+          allowed_lateness=getattr(args, 'allowed_lateness', None),
           dlq_ep=dlq_ep,
           dlq_redact_fields=getattr(args, 'dlq_redact_fields', None),
           for_local_only=will_run_local_sql,
@@ -4724,6 +4814,8 @@ def _pipe_impl(
         to_opts=args.to_opts,
         from_opt_file=args.from_opt_file,
         to_opt_file=args.to_opt_file,
+        join_opts=getattr(args, 'join_opts', None),
+        join_opt_file=getattr(args, 'join_opt_file', None),
         default_project=default_proj,
         include_counters=want_counters,
         prefer_python_bigquery_sink=prefer_py_bq,

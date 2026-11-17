@@ -1980,6 +1980,7 @@ def commit_iceberg_snapshot(
     new_eq_delete_files: Optional[list[dict[str, Any]]] = None,
     partition_spec: Optional[dict[str, Any]] = None,
     replace_table: bool = False,
+    overwrite_partitions: bool = False,
     fail_if_exists: bool = False,
     cdc_seq_state: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
@@ -1997,6 +1998,7 @@ def commit_iceberg_snapshot(
             new_eq_delete_files=new_eq_delete_files,
             partition_spec=partition_spec,
             replace_table=replace_table,
+            overwrite_partitions=overwrite_partitions,
             fail_if_exists=fail_if_exists,
             cdc_seq_state=cdc_seq_state)
       except FileExistsError:
@@ -2021,6 +2023,7 @@ def _commit_iceberg_snapshot_once(
     new_eq_delete_files: Optional[list[dict[str, Any]]] = None,
     partition_spec: Optional[dict[str, Any]] = None,
     replace_table: bool = False,
+    overwrite_partitions: bool = False,
     fail_if_exists: bool = False,
     cdc_seq_state: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
@@ -2168,6 +2171,7 @@ def _commit_iceberg_snapshot_once(
 
   new_ml_entries: list[dict[str, Any]] = []
   commit_uuid = uuid.uuid4().hex
+  overwritten_part_tuples: set[tuple[tuple[str, Any], ...]] = set()
 
   # 1. Write data manifest (`content = 0`) if any data files were added.
   if new_data_files:
@@ -2175,6 +2179,9 @@ def _commit_iceberg_snapshot_once(
     total_added_rows = 0
     name_to_type = {str(f['name']): str(f['type']) for f in cur_schema['fields']}
     m_avro_schema = _build_manifest_schema(part_spec, name_to_type)
+    part_field_names = [
+        str(pf['name']) for pf in (part_spec.get('fields') or [])
+    ] if part_spec else []
     for df in new_data_files:
       rc = int(df['record_count'])
       total_added_rows += rc
@@ -2189,6 +2196,8 @@ def _commit_iceberg_snapshot_once(
             coerced_part[pcol] = _coerce_partition_value(raw_val, ptype)
           else:
             coerced_part[pcol] = None
+        overwritten_part_tuples.add(
+            tuple((pcol, coerced_part.get(pcol)) for pcol in part_field_names))
       m_data_records.append({
           'status': 1,
           'snapshot_id': snap_id,
@@ -2233,6 +2242,106 @@ def _commit_iceberg_snapshot_once(
         'existing_rows_count': 0,
         'deleted_rows_count': 0,
     })
+
+  # 1b. Dynamic partition overwrite: mark prior data files in overwritten
+  #     partitions as DELETED (`status = 2`) while preserving untouched partitions.
+  did_partition_overwrite = False
+  if (overwrite_partitions and overwritten_part_tuples and prior_ml_entries and
+      part_spec and part_spec.get('fields')):
+    import fastavro
+    part_field_names = [str(pf['name']) for pf in part_spec['fields']]
+    name_to_type = {str(f['name']): str(f['type']) for f in cur_schema['fields']}
+    m_avro_schema = _build_manifest_schema(part_spec, name_to_type)
+    kept_prior_ml: list[dict[str, Any]] = []
+    for p_idx, m_entry in enumerate(prior_ml_entries):
+      if int(m_entry.get('content') or 0) != 0:
+        kept_prior_ml.append(m_entry)
+        continue
+      m_path = _resolve_iceberg_metadata_child(
+          table_dir, str(m_entry['manifest_path']), 'manifest_path')
+      with _fs_open_read(m_path) as mf:
+        m_rows = [dict(r) for r in fastavro.reader(mf)]
+      matched_any = False
+      rewritten_rows: list[dict[str, Any]] = []
+      ex_files = 0
+      del_files = 0
+      ex_rows = 0
+      del_rows = 0
+      for mr in m_rows:
+        st_code = int(mr.get('status') or 0)
+        if st_code == 2:
+          continue
+        df_obj = dict(mr.get('data_file') or {})
+        raw_p = dict(df_obj.get('partition') or {})
+        pt = tuple(
+            (
+                pcol,
+                _coerce_partition_value(
+                    raw_p.get(pcol), name_to_type.get(pcol, 'string'))
+                if raw_p.get(pcol) is not None else None)
+            for pcol in part_field_names)
+        rc_val = int(df_obj.get('record_count') or 0)
+        inh_seq = int(
+            mr.get('sequence_number') or m_entry.get('sequence_number') or 1)
+        inh_fseq = int(mr.get('file_sequence_number') or inh_seq)
+        if pt in overwritten_part_tuples:
+          matched_any = True
+          did_partition_overwrite = True
+          del_files += 1
+          del_rows += rc_val
+          rewritten_rows.append({
+              'status': 2,
+              'snapshot_id': snap_id,
+              'sequence_number': inh_seq,
+              'file_sequence_number': inh_fseq,
+              'data_file': df_obj,
+          })
+        else:
+          ex_files += 1
+          ex_rows += rc_val
+          rewritten_rows.append({
+              'status': 0,
+              'snapshot_id': int(
+                  mr.get('snapshot_id') or m_entry.get('added_snapshot_id') or
+                  snap_id),
+              'sequence_number': inh_seq,
+              'file_sequence_number': inh_fseq,
+              'data_file': df_obj,
+          })
+      if not matched_any:
+        kept_prior_ml.append(m_entry)
+      elif rewritten_rows:
+        rw_bytes = _write_avro_bytes(
+            m_avro_schema,
+            rewritten_rows,
+            metadata={
+                'schema': json.dumps(cur_schema),
+                'schema-id': str(cur_schema.get('schema-id', 0)),
+                'partition-spec': json.dumps(part_spec['fields']),
+                'partition-spec-id': str(part_spec.get('spec-id', 0)),
+                'format-version': '2',
+                'content': 'data',
+            })
+        rw_path = _join_fs(meta_dir, f'{commit_uuid}-p{p_idx}.avro')
+        _fs_write_bytes(rw_path, rw_bytes)
+        kept_prior_ml.append({
+            'manifest_path': _to_iceberg_uri(rw_path),
+            'manifest_length': len(rw_bytes),
+            'partition_spec_id': int(part_spec.get('spec-id', 0)),
+            'content': 0,
+            'sequence_number': seq_num,
+            'min_sequence_number': int(
+                m_entry.get('min_sequence_number') or
+                m_entry.get('sequence_number') or 1),
+            'added_snapshot_id': snap_id,
+            'added_files_count': 0,
+            'existing_files_count': ex_files,
+            'deleted_files_count': del_files,
+            'added_rows_count': 0,
+            'existing_rows_count': ex_rows,
+            'deleted_rows_count': del_rows,
+        })
+    prior_ml_entries = kept_prior_ml
 
   # 2. Write equality-delete manifest (`content = 1` in manifest-list, `2` in entry)
   eq_files = list(new_eq_delete_files or [])
@@ -2318,7 +2427,7 @@ def _commit_iceberg_snapshot_once(
       'summary': {
           'operation': (
               'replace' if replace_table else
-              ('overwrite' if eq_files else 'append')),
+              ('overwrite' if (eq_files or did_partition_overwrite) else 'append')),
           'added-data-files': str(len(new_data_files)),
           'added-delete-files': str(len(eq_files)),
       },
@@ -2754,6 +2863,7 @@ def sync_lakehouse_catalog(
     dry_run: bool = False,
     default_project: Optional[str] = None,
     catalog_opts: Optional[list[str]] = None,
+    source_opts: Optional[list[str]] = None,
 ) -> dict[str, Any]:
   """Synchronizes metadata from Delta Lake, Iceberg, or Parquet datasets into catalogs with zero copying.
 
@@ -2774,6 +2884,7 @@ def sync_lakehouse_catalog(
       committing to the catalog.
     default_project: Default GCP project ID for resolving unqualified table paths.
     catalog_opts: Optional key=value option pairs passed to catalog registration.
+    source_opts: Optional key=value option pairs passed to source endpoint parsing.
 
   Returns:
     A structured dictionary containing operation status, discovered file counts, byte sizes,
@@ -2809,10 +2920,12 @@ def sync_lakehouse_catalog(
     elif os.path.isdir(eff_from):
       format_override = 'parquet'
 
+  parsed_src_opts = uris.parse_kv_options(source_opts, None, '--from-opt')
   source_ep = uris.parse_endpoint(
       eff_from,
       is_read=True,
       explicit_format=format_override,
+      options=parsed_src_opts or None,
       default_project=default_project,
       allow_sniff=True)
 
@@ -3480,6 +3593,7 @@ def cli_write_to_iceberg(
     sequence_number_column: Optional[str] = None,
     partition_fields: Optional[list[str] | str] = None,
     partition_by: Optional[list[str] | str] = None,
+    overwrite_partitions: Optional[bool | str] = None,
     if_exists: str = 'append',
     triggering_frequency_seconds: Optional[int] = None,
     **_extra_kwargs: Any,
@@ -3493,6 +3607,14 @@ def cli_write_to_iceberg(
       partition_fields if partition_fields is not None else
       (partition_by if partition_by is not None else
        _extra_kwargs.get('partition_columns')))
+  raw_ov_part = (
+      overwrite_partitions if overwrite_partitions is not None else
+      _extra_kwargs.get(
+          'dynamic_partition_overwrite',
+          _extra_kwargs.get('replace_partition', False)))
+  eff_overwrite_partitions = (
+      raw_ov_part if isinstance(raw_ov_part, bool) else
+      str(raw_ov_part).strip().lower() in ('1', 'true', 'yes', 'on'))
   cfg = {
       'table': table,
       'catalog_name': catalog_name,
@@ -3674,6 +3796,7 @@ def cli_write_to_iceberg(
               new_eq_delete_files=new_eq_del,
               partition_spec=part_spec_out,
               replace_table=should_replace,
+              overwrite_partitions=(eff_overwrite_partitions and not is_mor),
               fail_if_exists=(if_exists == 'fail'),
               cdc_seq_state=cdc_seq_state_out)
 

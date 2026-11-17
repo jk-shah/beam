@@ -289,6 +289,7 @@ class IntervalJoinConfig(NamedTuple):
   left_fields: tuple[str, ...] = ()
   right_fields: tuple[str, ...] = ()
   force_stateful: bool = False
+  allowed_lateness: float = 0.0
 
   @property
   def lower_bound_sec(self) -> float:
@@ -306,6 +307,7 @@ def parse_interval_join_spec_str(
     skew_action: str | None = None,
     left_alias: str | None = None,
     right_alias: str | None = None,
+    allowed_lateness: str | None = None,
 ) -> dict[str, Any]:
   """Parses CLI `--interval-join SPEC` shorthand into a YAML-ready config dict."""
   if not isinstance(spec_str, str) or not spec_str.strip():
@@ -358,6 +360,8 @@ def parse_interval_join_spec_str(
       cfg['max_watermark_skew'] = v
     elif k == 'skew_action':
       cfg['skew_action'] = v
+    elif k in ('allowed_lateness', 'lateness'):
+      cfg['allowed_lateness'] = v
     elif k == 'force_stateful':
       cfg['force_stateful'] = v.lower() in ('1', 'true', 'yes')
     else:
@@ -382,7 +386,8 @@ def parse_interval_join_spec_str(
           'left_fields',
           'right_fields',
           'max_skew',
-          'skew_action'
+          'skew_action',
+          'allowed_lateness',
       ]
       close = difflib.get_close_matches(k, valid_ij, n=1, cutoff=0.55)
       hint = f' (did you mean {close[0]!r}?)' if close else ''
@@ -397,6 +402,8 @@ def parse_interval_join_spec_str(
     cfg['max_watermark_skew'] = max_watermark_skew
   if skew_action is not None:
     cfg['skew_action'] = skew_action
+  if allowed_lateness is not None and 'allowed_lateness' not in cfg:
+    cfg['allowed_lateness'] = allowed_lateness
   # Validate eagerly so invalid CLI flags fail immediately at build time.
   parse_interval_join_config(cfg)
   return cfg
@@ -497,6 +504,13 @@ def parse_interval_join_config(cfg: dict[str, Any]) -> IntervalJoinConfig:
         f'skew_action must be "drop", "warn", "dlq", or "fail" (got {skew_action!r})'
     )
 
+  lat_raw = cfg.get('allowed_lateness')
+  allowed_lateness = (
+      parse_interval_duration(lat_raw) if lat_raw is not None else 0.0)
+  if allowed_lateness < 0:
+    raise ValueError(
+        f'allowed_lateness must be >= 0 (got {allowed_lateness}s)')
+
   left_fields = parse_column_list(cfg.get('left_fields'))
   right_fields = parse_column_list(cfg.get('right_fields'))
   force_stateful = bool(cfg.get('force_stateful'))
@@ -517,6 +531,7 @@ def parse_interval_join_config(cfg: dict[str, Any]) -> IntervalJoinConfig:
       left_fields=left_fields,
       right_fields=right_fields,
       force_stateful=force_stateful,
+      allowed_lateness=allowed_lateness,
   )
 
 
@@ -1058,8 +1073,9 @@ class IntervalJoinStatefulDoFn(beam.DoFn):
         yield dlq_out
       return
 
-    deadline = ((t + self.config.upper_bound + 1.0) if tag == 'L' else
-                (t - self.config.lower_bound + 1.0))
+    lat = self.config.allowed_lateness
+    deadline = ((t + self.config.upper_bound + lat + 1.0) if tag == 'L' else
+                (t - self.config.lower_bound + lat + 1.0))
     if not (_MIN_BEAM_TS < t < _MAX_BEAM_TS and
             _MIN_BEAM_TS < deadline < _MAX_BEAM_TS):
       dlq_out = self._handle_bad_or_skewed(
@@ -1138,8 +1154,8 @@ class IntervalJoinStatefulDoFn(beam.DoFn):
     evicted_wm = cur_wm.get('evicted_wm')
     already_past_gc = (
         evicted_wm is not None and
-        ((tag == 'L' and (t + self.config.upper_bound) < evicted_wm) or
-         (tag == 'R' and (t - self.config.lower_bound) < evicted_wm)))
+        ((tag == 'L' and (t + self.config.upper_bound + lat) < evicted_wm) or
+         (tag == 'R' and (t - self.config.lower_bound + lat) < evicted_wm)))
 
     encoded_self = _encode_state_payload(row_payload)
 
@@ -1240,13 +1256,14 @@ class IntervalJoinStatefulDoFn(beam.DoFn):
       next_gc=beam.DoFn.StateParam(NEXT_GC_STATE),
   ):
     watermark = float(timestamp)
+    lat = self.config.allowed_lateness
     min_surviving_deadline: float | None = None
 
     left_items = list(left_buf.read())
     surviving_left = []
     left_evicted = False
     for (t_l, l_json, l_matched) in left_items:
-      if (t_l + self.config.upper_bound) < watermark:
+      if (t_l + self.config.upper_bound + lat) < watermark:
         left_evicted = True
         if self.config.join_type in ('left', 'full') and not l_matched:
           l_payload = _decode_state_payload(l_json)
@@ -1255,7 +1272,7 @@ class IntervalJoinStatefulDoFn(beam.DoFn):
               beam_timestamp.Timestamp.of(t_l))
       else:
         surviving_left.append((t_l, l_json, l_matched))
-        dl = t_l + self.config.upper_bound + 1.0
+        dl = t_l + self.config.upper_bound + lat + 1.0
         if min_surviving_deadline is None or dl < min_surviving_deadline:
           min_surviving_deadline = dl
     if left_evicted:
@@ -1267,7 +1284,7 @@ class IntervalJoinStatefulDoFn(beam.DoFn):
     surviving_right = []
     right_evicted = False
     for (t_r, r_json, r_matched) in right_items:
-      if (t_r - self.config.lower_bound) < watermark:
+      if (t_r - self.config.lower_bound + lat) < watermark:
         right_evicted = True
         if self.config.join_type in ('right', 'full') and not r_matched:
           r_payload = _decode_state_payload(r_json)
@@ -1276,7 +1293,7 @@ class IntervalJoinStatefulDoFn(beam.DoFn):
               beam_timestamp.Timestamp.of(t_r))
       else:
         surviving_right.append((t_r, r_json, r_matched))
-        dl = t_r - self.config.lower_bound + 1.0
+        dl = t_r - self.config.lower_bound + lat + 1.0
         if min_surviving_deadline is None or dl < min_surviving_deadline:
           min_surviving_deadline = dl
     if right_evicted:

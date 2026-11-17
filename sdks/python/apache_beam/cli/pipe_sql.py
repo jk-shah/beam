@@ -116,18 +116,23 @@ def parse_named_sources(
     *,
     from_format: str | None = None,
     from_opts: dict[str, Any] | None = None,
+    join_opts: dict[str, Any] | None = None,
     default_project: str | None = None,
     allow_sniff: bool = True,
     allow_jinja: bool = False,
 ) -> list[NamedSource]:
   """Parses `--from [ALIAS=]URI` and `--join [ALIAS=]URI` into `NamedSource`s."""
-  combined = list(raw_sources or []) + list(raw_joins or [])
+  src_list = [(s, False) for s in (raw_sources or [])]
+  join_list = [(s, True) for s in (raw_joins or [])]
+  combined = src_list + join_list
   if not combined:
     raise SqlPipeError('--from requires at least one source URI')
 
   out: list[NamedSource] = []
   used_aliases: set[str] = set()
-  for entry in combined:
+  base_from_opts = dict(from_opts or {})
+  eff_join_opts = {**base_from_opts, **(join_opts or {})}
+  for entry, is_join_entry in combined:
     entry_s = (entry or '').strip()
     if not entry_s:
       raise SqlPipeError('source URI cannot be empty')
@@ -159,7 +164,7 @@ def parse_named_sources(
         target_uri,
         is_read=True,
         explicit_format=eff_format,
-        options=dict(from_opts or {}),
+        options=dict(eff_join_opts if is_join_entry else base_from_opts),
         default_project=default_project,
         allow_sniff=allow_sniff,
         allow_jinja=allow_jinja)
@@ -321,6 +326,7 @@ def _lower_temporal_interval_join_sql(
     has_unbounded: bool,
     max_watermark_skew: str | None = None,
     skew_action: str | None = None,
+    allowed_lateness: str | None = None,
     dlq_ep: uris.ParsedEndpoint | None = None,
     allow_jinja: bool = False,
 ) -> dict[str, Any]:
@@ -656,6 +662,8 @@ def _lower_temporal_interval_join_sql(
     ij_cfg['select'] = select_map
   if max_watermark_skew is not None:
     ij_cfg['max_watermark_skew'] = max_watermark_skew
+  if allowed_lateness is not None:
+    ij_cfg['allowed_lateness'] = allowed_lateness
 
   try:
     interval_join.parse_interval_join_config(ij_cfg)
@@ -1092,6 +1100,7 @@ def _lower_asof_join_sql(
     has_unbounded: bool,
     max_watermark_skew: str | None = None,
     skew_action: str | None = None,
+    allowed_lateness: str | None = None,
     dlq_ep: uris.ParsedEndpoint | None = None,
     allow_jinja: bool = False,
 ) -> dict[str, Any]:
@@ -1239,6 +1248,8 @@ def _lower_asof_join_sql(
     aj_cfg['select'] = select_map
   if max_watermark_skew is not None:
     aj_cfg['max_watermark_skew'] = max_watermark_skew
+  if allowed_lateness is not None:
+    aj_cfg['allowed_lateness'] = allowed_lateness
 
   try:
     asof_join.parse_asof_join_config(aj_cfg)
@@ -2500,6 +2511,7 @@ def build_sql_yaml_spec(
     allow_jinja: bool = False,
     max_watermark_skew: str | None = None,
     skew_action: str | None = None,
+    allowed_lateness: str | None = None,
     dlq_ep: uris.ParsedEndpoint | None = None,
     dlq_redact_fields: Sequence[str] | str | None = None,
     for_local_only: bool = False,
@@ -2778,6 +2790,7 @@ def build_sql_yaml_spec(
         has_unbounded=has_unbounded,
         max_watermark_skew=max_watermark_skew,
         skew_action=skew_action,
+        allowed_lateness=allowed_lateness,
         dlq_ep=dlq_ep,
         allow_jinja=allow_jinja)
     if sql_dlq_norm_refs and dlq_ep is not None:
@@ -2785,7 +2798,7 @@ def build_sql_yaml_spec(
     return _apply_dlq_redaction_to_spec(
         _attach_post_select(res_asof), redact_tuple)
   if has_join and (has_interval or max_watermark_skew is not None or
-                   skew_action is not None or
+                   skew_action is not None or allowed_lateness is not None or
                    (has_unbounded and len(named_sources) >= 2)):
     res_ij = _lower_temporal_interval_join_sql(
         named_sources,
@@ -2796,12 +2809,17 @@ def build_sql_yaml_spec(
         has_unbounded=has_unbounded,
         max_watermark_skew=max_watermark_skew,
         skew_action=skew_action,
+        allowed_lateness=allowed_lateness,
         dlq_ep=dlq_ep,
         allow_jinja=allow_jinja)
     if sql_dlq_norm_refs and dlq_ep is not None:
       _merge_extra_sql_dlq_refs(res_ij, sql_dlq_norm_refs, dlq_ep)
     return _apply_dlq_redaction_to_spec(
         _attach_post_select(res_ij), redact_tuple)
+  if allowed_lateness is not None:
+    raise SqlPipeError(
+        '--sql cannot be combined with --allowed-lateness except on 2-source '
+        'ASOF or temporal INTERVAL JOINs')
 
   if prefer_python_lowering or strict_python_lowering:
     if len(named_sources) != 1 or has_join:

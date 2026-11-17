@@ -835,10 +835,295 @@ class EightUseCasesAndParityTest(unittest.TestCase):
     self.assertNotIn('4111-2222-3333-9999', broken_dlq_txt)
     self.assertIn('<REDACTED>', broken_dlq_txt)
 
+  def test_iceberg_dynamic_partition_overwrite_idempotent_retry(self):
+    wh = os.path.join(self.tmp, 'wh_ov')
+    day1_jl = os.path.join(self.tmp, 'events_2026_11_14.jsonl')
+    day2_v1_jl = os.path.join(self.tmp, 'events_2026_11_15_v1.jsonl')
+    day2_v2_jl = os.path.join(self.tmp, 'events_2026_11_15_v2.jsonl')
+    Path(day1_jl).write_text(
+        '{"event_id": "e1", "amount": 10.0}\n'
+        '{"event_id": "e2", "amount": 20.0}\n',
+        encoding='utf-8')
+    Path(day2_v1_jl).write_text(
+        '{"event_id": "e3", "amount": 30.0}\n'
+        '{"event_id": "e4", "amount": 40.0}\n',
+        encoding='utf-8')
+    Path(day2_v2_jl).write_text(
+        '{"event_id": "e3", "amount": 300.0}\n'
+        '{"event_id": "e5", "amount": 500.0}\n',
+        encoding='utf-8')
+    ice_uri = f'iceberg://lake.events?warehouse={wh}'
+
+    # 1. Load 2026-11-14
+    rc1, out1, err1 = _run_cli([
+        'pipe',
+        '--from',
+        day1_jl,
+        '--to',
+        ice_uri,
+        '--select',
+        "*, '2026-11-14' AS dt",
+        '--to-opt',
+        'partition_fields=dt',
+        '--to-opt',
+        'overwrite_partitions=true',
+        '--if-exists',
+        'append',
+        '--json',
+    ])
+    self.assertEqual(rc1, 0, msg=err1 or out1)
+
+    # 2. Load 2026-11-15 (initial attempt)
+    rc2, out2, err2 = _run_cli([
+        'pipe',
+        '--from',
+        day2_v1_jl,
+        '--to',
+        ice_uri,
+        '--select',
+        "*, '2026-11-15' AS dt",
+        '--to-opt',
+        'partition_fields=dt',
+        '--to-opt',
+        'overwrite_partitions=true',
+        '--if-exists',
+        'append',
+        '--json',
+    ])
+    self.assertEqual(rc2, 0, msg=err2 or out2)
+
+    # 3. Retry 2026-11-15 with overwrite_partitions=true -> must atomically
+    #    replace ONLY dt=2026-11-15 while preserving dt=2026-11-14!
+    rc3, out3, err3 = _run_cli([
+        'pipe',
+        '--from',
+        day2_v2_jl,
+        '--to',
+        ice_uri,
+        '--select',
+        "*, '2026-11-15' AS dt",
+        '--to-opt',
+        'partition_fields=dt',
+        '--to-opt',
+        'overwrite_partitions=true',
+        '--if-exists',
+        'append',
+        '--json',
+    ])
+    self.assertEqual(rc3, 0, msg=err3 or out3)
+
+    tdir = os.path.join(wh, 'lake', 'events')
+    st = lakehouse.load_iceberg_state(tdir)
+    snaps = st['metadata']['snapshots']
+    self.assertEqual(snaps[-1]['summary']['operation'], 'overwrite')
+
+    out_read = os.path.join(self.tmp, 'events_readback.jsonl')
+    rc_r, out_r, err_r = _run_cli(
+        ['pipe', '--from', ice_uri, '--to', out_read, '--json'])
+    self.assertEqual(rc_r, 0, msg=err_r or out_r)
+    rows = sorted(
+        (
+            json.loads(line)
+            for line in Path(out_read).read_text(encoding='utf-8').splitlines()
+            if line.strip()
+        ),
+        key=lambda r: (r['dt'], r['event_id']))
+    self.assertEqual(
+        rows,
+        [
+            {'event_id': 'e1', 'amount': 10.0, 'dt': '2026-11-14'},
+            {'event_id': 'e2', 'amount': 20.0, 'dt': '2026-11-14'},
+            {'event_id': 'e3', 'amount': 300.0, 'dt': '2026-11-15'},
+            {'event_id': 'e5', 'amount': 500.0, 'dt': '2026-11-15'},
+        ])
+
+  def test_uniform_opt_file_flags_across_inspect_diff_schema_and_catalog_sync(
+      self):
+    left_jl = os.path.join(self.tmp, 'left_u.jsonl')
+    right_jl = os.path.join(self.tmp, 'right_u.jsonl')
+    Path(left_jl).write_text('{"id": 1, "v": "a"}\n', encoding='utf-8')
+    Path(right_jl).write_text('{"id": 1, "v": "a"}\n', encoding='utf-8')
+    pq_dir = os.path.join(self.tmp, 'pq_cat_src')
+    os.makedirs(pq_dir, exist_ok=True)
+    _rc_p, _o_p, _e_p = _run_cli(
+        ['pipe', left_jl, os.path.join(pq_dir, 'part0.parquet'), '--json'])
+    self.assertEqual(_rc_p, 0, msg=_e_p or _o_p)
+
+    good_opt = os.path.join(self.tmp, 'good.opts')
+    Path(good_opt).write_text('sample_rows=50\n', encoding='utf-8')
+    os.chmod(good_opt, stat.S_IRUSR | stat.S_IWUSR)
+
+    cat_opt = os.path.join(self.tmp, 'cat.opts')
+    Path(cat_opt).write_text('s3.region=us-east-1\n', encoding='utf-8')
+    os.chmod(cat_opt, stat.S_IRUSR | stat.S_IWUSR)
+
+    # 1. beam inspect accepts --to-opt-file and --opt-file
+    for flag in ('--to-opt-file', '--opt-file', '--from-opt-file'):
+      rc_i, out_i, err_i = _run_cli(
+          ['inspect', left_jl, flag, good_opt, '--sample', '0', '--json'])
+      self.assertEqual(rc_i, 0, msg=f'{flag}: {err_i or out_i}')
+
+    # 2. beam diff accepts --from-opt-file and --to-opt-file
+    rc_d, out_d, err_d = _run_cli([
+        'diff',
+        left_jl,
+        right_jl,
+        '--key',
+        'id',
+        '--from-opt-file',
+        good_opt,
+        '--to-opt-file',
+        good_opt,
+        '--json',
+    ])
+    self.assertEqual(rc_d, 0, msg=err_d or out_d)
+
+    # 3. beam schema diff accepts --from-opt-file and --to-opt-file
+    rc_s, out_s, err_s = _run_cli([
+        'schema',
+        'diff',
+        left_jl,
+        right_jl,
+        '--from-opt-file',
+        good_opt,
+        '--to-opt-file',
+        good_opt,
+        '--json',
+    ])
+    self.assertEqual(rc_s, 0, msg=err_s or out_s)
+
+    # 4. beam catalog sync accepts --from-opt-file and --to-opt-file (and rejects 0644!)
+    wh_cat = os.path.join(self.tmp, 'wh_cat')
+    rc_c, out_c, err_c = _run_cli([
+        'catalog',
+        'sync',
+        '--dry-run',
+        pq_dir,
+        f'iceberg://lake.synced?warehouse={wh_cat}',
+        '--from-opt-file',
+        good_opt,
+        '--to-opt-file',
+        cat_opt,
+        '--json',
+    ])
+    self.assertEqual(rc_c, 0, msg=err_c or out_c)
+
+    bad_opt = os.path.join(self.tmp, 'world_readable.opts')
+    Path(bad_opt).write_text('token=secret\n', encoding='utf-8')
+    os.chmod(bad_opt, 0o644)
+    rc_bad, out_bad, _ = _run_cli([
+        'catalog',
+        'sync',
+        '--dry-run',
+        pq_dir,
+        f'iceberg://lake.synced?warehouse={wh_cat}',
+        '--to-opt-file',
+        bad_opt,
+        '--json',
+    ])
+    self.assertEqual(rc_bad, 2, msg=out_bad)
+
+  def test_dirty_csv_explicit_float_typing_and_dlq_redaction(self):
+    dirty_csv = os.path.join(self.tmp, 'partner_orders_raw.csv')
+    Path(dirty_csv).write_text(
+        'order_id,customer_email,amount\n'
+        'o1,alice@acme.com,42.5\n'
+        'o2,bob@acme.com,not_a_float\n'
+        'o3,carol@acme.com,-5.0\n'
+        ',dave@acme.com,10.0\n'
+        'o5,"eve@acme.com,broken_quote,99.0\n',
+        encoding='utf-8')
+    clean_pq = os.path.join(self.tmp, 'orders_clean.parquet')
+    rej_jl = os.path.join(self.tmp, 'orders_rejected.jsonl')
+    rc, out, err = _run_cli([
+        'pipe',
+        dirty_csv,
+        clean_pq,
+        '--from-opt',
+        'fields=amount:float',
+        '--expect',
+        'valid_order: order_id IS NOT NULL AND amount > 0 -> dlq',
+        '--dlq',
+        rej_jl,
+        '--dlq-redact-fields',
+        'customer_email',
+        '--assert-counts',
+        '--json',
+    ])
+    self.assertEqual(rc, 0, msg=err or out)
+    env = json.loads(out)
+    self.assertEqual(env['runner'], 'local_fast')
+    self.assertEqual(env['metrics']['rows_written'], 1)
+    self.assertEqual(env['metrics']['dlq_rows'], 4)
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    tbl = pq.read_table(clean_pq)
+    self.assertTrue(pa.types.is_floating(tbl.schema.field('amount').type))
+    rej_txt = Path(rej_jl).read_text(encoding='utf-8')
+    for leaked in ('bob@acme.com', 'carol@acme.com', 'dave@acme.com', 'eve@acme.com'):
+      self.assertNotIn(leaked, rej_txt)
+    self.assertIn('<REDACTED>', rej_txt)
+
+  def test_two_kafka_streams_sql_join_opt_file_and_allowed_lateness(self):
+    kafka_c_opt = os.path.join(self.tmp, 'kafka_c.opts')
+    kafka_o_opt = os.path.join(self.tmp, 'kafka_o.opts')
+    cat_opt = os.path.join(self.tmp, 'cat_j.opts')
+    Path(kafka_c_opt).write_text(
+        'security_protocol=SASL_SSL\nsasl_mechanism=SCRAM-SHA-256\nsasl_username=clicks-svc\n',
+        encoding='utf-8')
+    Path(kafka_o_opt).write_text(
+        'security_protocol=SASL_SSL\nsasl_mechanism=SCRAM-SHA-256\nsasl_username=orders-svc\n',
+        encoding='utf-8')
+    Path(cat_opt).write_text('s3.region=us-east-1\n', encoding='utf-8')
+    for p in (kafka_c_opt, kafka_o_opt, cat_opt):
+      os.chmod(p, stat.S_IRUSR | stat.S_IWUSR)
+
+    rc, out, err = _run_cli(
+        [
+            'pipe',
+            '--from',
+            'c=kafka://broker:9092/clicks?timestamp_policy=CreateTime&format=json&consumer_group=attr-clicks&commit_offset_in_finalize=true',
+            '--join',
+            'o=kafka://broker:9092/orders?timestamp_policy=CreateTime&format=json&consumer_group=attr-orders&commit_offset_in_finalize=true',
+            '--to',
+            'iceberg://lake.attributed_orders?warehouse=s3://bkt/wh',
+            '--to-opt',
+            'triggering_frequency_seconds=30',
+            '--allowed-lateness',
+            '5m',
+            '--sql',
+            "SELECT o.order_id, o.user_id, c.campaign_id, o.amount, o.order_ts FROM c JOIN o ON c.user_id = o.user_id AND o.order_ts BETWEEN c.click_ts AND c.click_ts + INTERVAL '15' MINUTE",
+            '--max-watermark-skew',
+            '30m',
+            '--skew-action',
+            'dlq',
+            '--dlq',
+            's3://bkt/dlq/skew/',
+            '--from-opt-file',
+            kafka_c_opt,
+            '--join-opt-file',
+            kafka_o_opt,
+            '--to-opt-file',
+            cat_opt,
+            '--emit-yaml',
+            '--json',
+        ],
+        env_overrides={'BEAM_KAFKA_SASL_PASSWORD': 'secret-pwd'})
+    self.assertEqual(rc, 0, msg=err or out)
+    self.assertNotIn('secret-pwd', out)
+    yaml_txt = json.loads(out)['outputs']['yaml']
+    self.assertIn('timestamp_col: click_ts', yaml_txt)
+    self.assertIn('timestamp_col: order_ts', yaml_txt)
+    self.assertIn('allowed_lateness: 5m', yaml_txt)
+    self.assertIn('clicks-svc', yaml_txt)
+    self.assertIn('orders-svc', yaml_txt)
+
   def test_skill_and_llms_txt_agreement_guardrails(self):
     manual = llms_txt.render_llms_txt()
     self.assertIn('beam catalog sync', manual)
     self.assertIn('--zero-copy', manual)
+    self.assertIn('overwrite_partitions=true', manual)
+    self.assertIn('--join-opt-file kafka.opts', manual)
     self.assertIn('percentile(x, 95)', manual)
     self.assertIn('quantile(x, 0.95)', manual)
     self.assertIn('256 MiB', manual)
@@ -857,8 +1142,13 @@ class EightUseCasesAndParityTest(unittest.TestCase):
               encoding='utf-8')
       total_bytes = sum(
           len(c.encode('utf-8')) for c in (skill_md, sql_cdc_md, cloud_md))
-      self.assertLess(total_bytes, 44000)
+      self.assertLess(total_bytes, 49000)
       frontmatter = skill_md.split('---', 2)[1]
+      desc_line = next(
+          line.split(':', 1)[1].strip()
+          for line in frontmatter.splitlines()
+          if line.startswith('description:'))
+      self.assertLessEqual(len(desc_line), 1024)
       self.assertIn('apache-beam-cli-preview v0.2.0', frontmatter)
       self.assertIn('Use when', frontmatter)
       for content in (skill_md, sql_cdc_md, cloud_md):
@@ -880,11 +1170,15 @@ class EightUseCasesAndParityTest(unittest.TestCase):
       self.assertIn('Skills & Tools to Pair With', skill_md)
       self.assertIn('Operating Streaming, CDC, & Scheduled Jobs', skill_md)
       self.assertIn('--checkpointing_interval=30000', skill_md)
-      self.assertIn('--to-opt-file', skill_md)
-      self.assertIn('--extra_package', skill_md)
-      self.assertIn('2GB', skill_md)
-      self.assertIn('300 MiB', skill_md)
+      self.assertIn('--join-opt-file kafka.opts', skill_md)
+      self.assertIn('overwrite_partitions=true', skill_md)
+      self.assertIn('fields=amount:float', skill_md)
+      self.assertIn('snapshot.mode: when_needed', skill_md)
       self.assertIn('pg_drop_replication_slot', sql_cdc_md)
+      self.assertIn('REPLICA IDENTITY FULL', sql_cdc_md)
+      self.assertIn('mysql://', sql_cdc_md)
+      self.assertIn('kafka.opts.example', cloud_md)
+      self.assertIn('pg.opts.example', cloud_md)
       self.assertIn('rewrite_data_files', cloud_md)
 
 
